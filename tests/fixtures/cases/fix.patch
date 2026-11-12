@@ -1,0 +1,5 @@
+--- a/parser.c
++++ b/parser.c
+@@ -17 +17 @@
+-    char *token = malloc(MAX_TOKEN);
++    char *token = malloc(MAX_TOKEN + 1);
