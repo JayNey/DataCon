@@ -30,12 +30,14 @@ def test_migration_can_be_applied_repeatedly(database, postgres_dsn):
             connection.execute(sql)
 
         row = database.execute(
-            "SELECT request, state FROM jobs WHERE job_id = %s", (sentinel_id,)
+            "SELECT request, state, reason_code FROM jobs WHERE job_id = %s",
+            (sentinel_id,),
         ).fetchone()
         assert row is not None, "re-running the migration deleted an existing job"
-        request, state = row
+        request, state, reason_code = row
         assert request == sentinel_request
         assert state == "QUEUED"
+        assert reason_code is None
 
         assert database.execute("SELECT count(*) FROM jobs").fetchone()[0] == before
         assert (
@@ -46,5 +48,10 @@ def test_migration_can_be_applied_repeatedly(database, postgres_dsn):
             database.execute("SELECT to_regclass('public.jobs_queue_idx')").fetchone()[0]
             == "jobs_queue_idx"
         )
+        assert database.execute(
+            "SELECT data_type, is_nullable FROM information_schema.columns "
+            "WHERE table_schema = 'public' AND table_name = 'jobs' "
+            "AND column_name = 'reason_code'"
+        ).fetchone() == ("text", "YES")
     finally:
         database.execute("DELETE FROM jobs WHERE job_id = %s", (sentinel_id,))

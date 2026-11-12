@@ -17,7 +17,7 @@ DataCon 是面向授权实验环境的 CVE 复现平台项目。它的目标是�
 
 - **T01 案例与测试基线**：`tests/fixtures/cases/` 提供 B01/B02 的缺陷版、修复版、正常与候选输入、构建配方、依赖快照、预期退出码和预期 ASan 签名。`manifest.json` 固定全部材料摘要。
 - **T02 任务入口**：`src/datacon/contracts.py` 校验请求并计算稳定计划摘要；`src/datacon/cli.py` 实现 `datacon submit` 和 `datacon status`；`src/datacon/store.py` 使用 PostgreSQL 保存任务；`migrations/001_create_jobs.sql` 只创建提交和查询所需表。
-- 合法请求返回唯一 `job_id` 和 `QUEUED` 状态。新 CLI 进程可从数据库查回同一任务。省略预算时应用 SRS 默认值。
+- 合法 source 请求返回唯一 `job_id` 和 `QUEUED` 状态；结构合法的 binary 请求在提交时归档为 `BLOCKED`，原因码为 `UNSUPPORTED_TARGET`。新 CLI 进程可从数据库查回同一任务。省略预算时应用 SRS 默认值。
 - 非法 CVE 格式、超出上限的预算、未知字段、重复 JSON 键和其他结构错误返回退出码 `2`，并在连接数据库前拒绝，不产生任务。
 - **B03 准入**：`tests/fixtures/cases/B03-admission.json` 和 `B03-admission.md` 记录公开候选 `CVE-2019-13224` 的公告、修复提交、许可、离线构建、共享 harness 和 ASan 计划。状态为 `conditional_admission`；真实案例执行与发布验收按任务顺序留到 T05/T08，本轮不执行真实案例。
 
@@ -88,7 +88,7 @@ uv run datacon status <uuid>
 | `pids` | 128 |
 | `scratch_mib` | 512 |
 
-请求拒绝未知字段、重复 JSON 键、`NaN`/`Infinity`、非法 UTF-8 和非对象顶层值。合法的 `binary` 请求当前会被接收并保存为 `QUEUED`；按测试计划，MVP 范围的阻断由后续 Supervisor 任务处理。
+请求拒绝未知字段、重复 JSON 键、`NaN`/`Infinity`、非法 UTF-8 和非对象顶层值。合法的 `binary` 请求结构上通过校验，但超出 MVP 范围，提交时直接归档为 `BLOCKED`，原因码为 `UNSUPPORTED_TARGET`；不会停留在 `QUEUED`，也不进入后续 Supervisor 流程。
 
 ### 退出码
 

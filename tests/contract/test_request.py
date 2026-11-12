@@ -3,6 +3,7 @@ import json
 import pytest
 
 from datacon.contracts import DEFAULT_LIMITS, InvalidRequest, parse_request
+from datacon.store import initial_state
 
 REQUEST = {
     "schema_version": 1,
@@ -88,9 +89,10 @@ def test_missing_required_fields_are_rejected():
             parse_request(json.dumps(request))
 
 
-def test_binary_target_is_accepted_for_the_later_supervisor_to_block():
+def test_binary_target_is_accepted_and_archived_as_blocked_on_submit():
     request = parse_request(payload(target=REQUEST["target"] | {"kind": "binary"}))
     assert request["target"]["kind"] == "binary"
+    assert initial_state(request) == ("BLOCKED", "UNSUPPORTED_TARGET")
 
 
 @pytest.mark.parametrize(

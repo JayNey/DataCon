@@ -15,6 +15,7 @@ REQUEST = (
     '{"schema_version":1,"cve_id":"CVE-2099-0001",'
     '"target":{"kind":"source","case_id":"fixture-c-parser","goal":"验证 ASan"}}'
 )
+BINARY_REQUEST = REQUEST.replace('"kind":"source"', '"kind":"binary"')
 # This DSN cannot be reached. If the CLI tries to connect before validating the
 # request it exits 1 (DATABASE_ERROR) instead of 2 (INVALID_REQUEST).
 UNREACHABLE_DATABASE_URL = (
@@ -83,10 +84,51 @@ def test_submit_and_status_in_separate_processes(database, postgres_dsn, tmp_pat
         "evidence_refs": [],
     }
 
-    (stored,) = database.execute(
-        "SELECT request FROM jobs WHERE job_id = %s", (UUID(first["job_id"]),)
+    (stored, stored_state, stored_reason) = database.execute(
+        "SELECT request, state, reason_code FROM jobs WHERE job_id = %s",
+        (UUID(first["job_id"]),),
     ).fetchone()
     assert stored == json.loads(REQUEST) | {"limits": DEFAULTS}
+    assert stored_state == "QUEUED"
+    assert stored_reason is None
+
+
+def test_binary_submit_is_archived_as_blocked(database, postgres_dsn, tmp_path):
+    request = tmp_path / "binary.json"
+    request.write_text(BINARY_REQUEST, encoding="utf-8")
+
+    first = submit(postgres_dsn, request)
+    second = submit(postgres_dsn, request)
+
+    assert first["state"] == "BLOCKED", first
+    assert second["state"] == "BLOCKED", second
+    assert str(UUID(first["job_id"])) == first["job_id"]
+    assert first["job_id"] != second["job_id"]
+
+    result = cli("status", first["job_id"], database_url=postgres_dsn)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {
+        "job_id": first["job_id"],
+        "state": "BLOCKED",
+        "stage": None,
+        "pending_plan": None,
+        "review_state": None,
+        "reason_code": "UNSUPPORTED_TARGET",
+        "last_error": None,
+        "evidence_refs": [],
+    }
+
+    row = database.execute(
+        "SELECT state, reason_code FROM jobs WHERE job_id = %s",
+        (UUID(first["job_id"]),),
+    ).fetchone()
+    assert row == ("BLOCKED", "UNSUPPORTED_TARGET"), row
+
+    queued_binary = database.execute(
+        "SELECT count(*) FROM jobs "
+        "WHERE request->'target'->>'kind' = 'binary' AND state = 'QUEUED'"
+    ).fetchone()[0]
+    assert queued_binary == 0, "binary requests must never remain queued"
 
 
 @pytest.mark.parametrize(
