@@ -1,0 +1,28 @@
+# Python environments and caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Packaging and coverage
+/build/
+/dist/
+*.egg-info/
+.coverage
+.coverage.*
+htmlcov/
+
+# Local configuration
+.env
+.env.*
+!.env.example
+.DS_Store
+
+# DataCon local runtime files and private evidence
+/.datacon/
+/artifacts/
+/evidence/
+/runs/
