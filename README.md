@@ -26,7 +26,7 @@ DataCon 是面向授权实验环境的 CVE 复现平台项目。它的目标是�
 ### 依赖
 
 - Python 3.11+
-- [uv](https://docs.astral.sh/uv/)（仓库锁定依赖，提交了 `uv.lock`）
+- [uv](https://docs.astral.sh/uv/) 0.12.7（仓库锁定依赖，提交了 `uv.lock`；`pyproject.toml` 的 `required-version` 与 `uv_build==0.12.7` 同 CI 固定的 uv 版本一致）
 - PostgreSQL 17
 - `clang` + `llvm-symbolizer`（仅 B01/B02 的 ASan 合成回放需要）。本地和 CI smoke 使用宿主 clang，版本不锁定；`silkeh/clang:19-bookworm` 固定镜像声明 clang 19.1.7，由 T05 容器回放验证。缺少 `clang` 时相关测试跳过；缺少 `llvm-symbolizer` 时，签名用例在断言错误类型/操作后跳过函数/源码帧断言（CI 会安装 LLVM 并执行该断言）。
 
@@ -35,8 +35,8 @@ DataCon 是面向授权实验环境的 CVE 复现平台项目。它的目标是�
 已有 PostgreSQL 时直接设置连接串即可；没有时可用 Docker：
 
 ```bash
-# 本地测试口令由环境变量提供；下面的值只是占位符，不要用于共享环境。
-export DATACON_DB_PASSWORD="${DATACON_DB_PASSWORD:-change-me-local-only}"
+# 本地测试口令必须由环境变量显式提供；未设置时下面的命令会直接失败。
+: "${DATACON_DB_PASSWORD:?export DATACON_DB_PASSWORD with a local-only password}"
 
 docker run --rm -d --name datacon-pg \
   -e POSTGRES_USER=datacon \
@@ -117,9 +117,9 @@ uv run pytest -q tests/integration/test_fixture_replay.py
 ```
 
 - `tests/contract/` 固定请求校验、默认预算、计划摘要规范化 JSON 与 UTF-8 规则、案例材料摘要和 B03 准入记录。
-- `tests/integration/test_cli.py` 使用真实 PostgreSQL，通过子进程验证跨进程提交/查询、唯一任务 ID、默认预算落库，以及非法输入无落库副作用。未设置 `DATACON_TEST_DATABASE_URL` 时跳过。
+- `tests/integration/test_cli.py` 使用真实 PostgreSQL，通过子进程验证跨进程提交/查询、唯一任务 ID、默认预算落库，以及非法输入（含 CLI 层的非法 UTF-8、`NaN`、`Infinity`）在连接数据库前被拒绝且无落库副作用。该文件的非法请求用例使用不可达 DSN，若代码尝试连接就会得到退出码 `1`，因此返回 `2` 证明了校验先于连接。未设置 `DATACON_TEST_DATABASE_URL` 时跳过。
 - `tests/integration/test_cli_operational.py` 不需要 PostgreSQL，验证未配置数据库和数据库操作失败都返回退出码 `1`。
-- `tests/integration/test_migrations.py` 验证 `001_create_jobs.sql` 可重复执行且不破坏已有任务。
+- `tests/integration/test_migrations.py` 在迁移前插入哨兵任务，重复执行 `001_create_jobs.sql` 后断言该行仍存在且内容不变，验证迁移“不破坏已有任务”。
 - `tests/integration/test_fixture_replay.py` 用宿主 `clang` + ASan 编译 B01/B02 两版，验证正常输入、缺陷版命中预期 `heap-buffer-overflow`、修复版和 B02 候选正常退出。错误类型、操作和访问大小始终断言；未安装 `llvm-symbolizer` 时，签名用例在完成这些断言后跳过函数/源码帧断言。它是合成材料回归，不是 T05 的容器隔离验收。
 
 ## 计划摘要
@@ -156,12 +156,12 @@ tests/fixtures/cases/ B01/B02 合成材料与 B03 准入记录
 ## 安全与数据
 
 - `.datacon/`、`.env`、运行产物和证据目录由 `.gitignore` 排除。
-- 仓库不包含数据库凭证、真实案例输入、完整诊断或实验日志。CI 数据库口令默认为无意义的临时占位符，可用 `DATACON_CI_DB_PASSWORD` secret 覆盖。
+- 仓库不包含数据库凭证、真实案例输入、完整诊断或实验日志。CI 的 PostgreSQL service 只在隔离的 runner 上以 `POSTGRES_HOST_AUTH_METHOD=trust` 启动，连接串不含口令；该 trust 配置不得复用于共享或生产数据库。本地 Docker 示例也不提供默认口令，必须显式设置 `DATACON_DB_PASSWORD`。
 - 合成案例只用于离线回归；真实案例的准入与使用边界见 B03 记录。
 
 ## CI
 
-`.github/workflows/ci.yml` 在 Pull Request 和 `main` 分支推送时运行：安装锁定依赖、启动固定 digest 的 PostgreSQL 17、应用迁移、安装宿主 `clang`/LLVM symbolizer、运行合成 ASan 回放，并执行完整 `pytest`。`uv` 按 `requirements-ci.txt` 中的 wheel hash 安装；第三方 Action 固定到完整提交 SHA，工作流只有 `contents: read` 权限。ASan smoke 使用 runner 的宿主 clang，锁定的 clang 19.1.7 镜像留给 T05 验证。
+`.github/workflows/ci.yml` 在 Pull Request 和 `main` 分支推送时运行：安装锁定依赖、启动固定 digest 的 PostgreSQL 17、应用迁移、安装宿主 `clang`/LLVM symbolizer、运行合成 ASan 回放，并执行完整 `pytest`。`uv` 按 `requirements-ci.txt` 中的 wheel hash 安装；构建后端固定为 uv 自带的 `uv_build==0.12.7`，`uv sync --frozen` 不解析或安装 setuptools，CI 还会以 verbose 重装确认实际使用的是内置后端。第三方 Action 固定到完整提交 SHA，工作流只有 `contents: read` 权限。ASan smoke 使用 runner 的宿主 clang，锁定的 clang 19.1.7 镜像留给 T05 验证。
 
 ## 开发方式
 

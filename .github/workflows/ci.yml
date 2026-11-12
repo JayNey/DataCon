@@ -21,21 +21,21 @@ jobs:
         image: postgres:17-bookworm@sha256:665dc7b37ac52a17e298511414c21d23ffa4e6a6ef6225b3e5d59c7afb35e994
         env:
           POSTGRES_USER: datacon
-          POSTGRES_PASSWORD: "${{ secrets.DATACON_CI_DB_PASSWORD || 'datacon_ci_ephemeral' }}"
+          # The database is reachable only from this isolated runner. Localhost
+          # trust keeps every credential out of the repository; never reuse this
+          # setting for a shared or production database.
+          POSTGRES_HOST_AUTH_METHOD: trust
           POSTGRES_DB: datacon
         ports:
-          - 5432:5432
+          - 127.0.0.1:5432:5432
         options: >-
           --health-cmd "pg_isready -U datacon -d datacon"
           --health-interval 5s
           --health-timeout 5s
           --health-retries 20
     env:
-      # Ephemeral CI-only credential. Set DATACON_CI_DB_PASSWORD only when the
-      # password must come from a repository/environment secret; keep it
-      # URL-safe so it can be embedded in the DSNs below.
-      DATACON_DATABASE_URL: "postgresql://datacon:${{ secrets.DATACON_CI_DB_PASSWORD || 'datacon_ci_ephemeral' }}@127.0.0.1:5432/datacon"
-      DATACON_TEST_DATABASE_URL: "postgresql://datacon:${{ secrets.DATACON_CI_DB_PASSWORD || 'datacon_ci_ephemeral' }}@127.0.0.1:5432/datacon"
+      DATACON_DATABASE_URL: "postgresql://datacon@127.0.0.1:5432/datacon"
+      DATACON_TEST_DATABASE_URL: "postgresql://datacon@127.0.0.1:5432/datacon"
       UV_CACHE_DIR: /tmp/uv-cache
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -48,6 +48,16 @@ jobs:
             --only-binary :all: -r requirements-ci.txt
       - name: Install locked dependencies
         run: uv sync --frozen
+      - name: Verify the build backend is bundled with uv
+        shell: bash
+        run: |
+          output="$(uv sync --frozen --reinstall-package datacon -v 2>&1)"
+          printf '%s\n' "$output"
+          grep -Fq "Performing direct build for datacon" <<<"$output"
+          if grep -Fiq "setuptools" <<<"$output"; then
+            echo "setuptools must not be resolved as the build backend" >&2
+            exit 1
+          fi
       - name: Apply database migration
         run: |
           uv run --frozen python - <<'PY'

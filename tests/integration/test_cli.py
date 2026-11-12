@@ -15,6 +15,17 @@ REQUEST = (
     '{"schema_version":1,"cve_id":"CVE-2099-0001",'
     '"target":{"kind":"source","case_id":"fixture-c-parser","goal":"验证 ASan"}}'
 )
+# This DSN cannot be reached. If the CLI tries to connect before validating the
+# request it exits 1 (DATABASE_ERROR) instead of 2 (INVALID_REQUEST).
+UNREACHABLE_DATABASE_URL = (
+    "postgresql://datacon@/datacon?host=/nonexistent-datacon-socket"
+)
+INVALID_UTF8_REQUEST = (
+    b'{"schema_version":1,"cve_id":"CVE-2099-0001",'
+    b'"target":{"kind":"source","case_id":"fixture-c-parser","goal":"\xff"}}'
+)
+NAN_REQUEST = REQUEST.replace('"goal":"验证 ASan"', '"goal":NaN')
+INFINITY_REQUEST = REQUEST.replace('"goal":"验证 ASan"', '"goal":Infinity')
 DEFAULTS = {
     "prepare_seconds": 600,
     "execute_seconds": 1200,
@@ -81,25 +92,46 @@ def test_submit_and_status_in_separate_processes(database, postgres_dsn, tmp_pat
 @pytest.mark.parametrize(
     "payload",
     [
-        REQUEST.replace("CVE-2099-0001", "cve-2099-0001"),
-        REQUEST[:-1] + ',"limits":{"cpu":3}}',
-        REQUEST[:-1] + ',"unknown":1}',
-        REQUEST.replace('"kind":"source"', '"kind":"source","kind":"source"'),
-        REQUEST[:-1] + ',',
+        pytest.param(
+            REQUEST.replace("CVE-2099-0001", "cve-2099-0001"), id="lowercase-cve"
+        ),
+        pytest.param(
+            REQUEST[:-1] + ',"limits":{"cpu":3}}', id="budget-above-maximum"
+        ),
+        pytest.param(REQUEST[:-1] + ',"unknown":1}', id="unknown-field"),
+        pytest.param(
+            REQUEST.replace('"kind":"source"', '"kind":"source","kind":"source"'),
+            id="duplicate-json-key",
+        ),
+        pytest.param(REQUEST[:-1] + ",", id="trailing-comma"),
+        pytest.param(INVALID_UTF8_REQUEST, id="invalid-utf8"),
+        pytest.param(NAN_REQUEST, id="nan"),
+        pytest.param(INFINITY_REQUEST, id="infinity"),
     ],
 )
-def test_invalid_request_has_no_database_side_effect(
+def test_invalid_request_is_rejected_before_database_connection(
     database, postgres_dsn, tmp_path, payload
 ):
     request = tmp_path / "invalid.json"
-    request.write_text(payload, encoding="utf-8")
+    if isinstance(payload, bytes):
+        request.write_bytes(payload)
+    else:
+        request.write_text(payload, encoding="utf-8")
     before = database.execute("SELECT count(*) FROM jobs").fetchone()[0]
 
-    result = cli("submit", "--request", str(request), database_url=postgres_dsn)
+    result = cli(
+        "submit", "--request", str(request), database_url=UNREACHABLE_DATABASE_URL
+    )
 
     assert result.returncode == 2, result.stderr
     assert result.stdout == ""
     assert json.loads(result.stderr)["reason_code"] == "INVALID_REQUEST"
+
+    # Re-run against the reachable database to confirm rejection stays free of
+    # side effects; the unreachable run above proves validation wins over I/O.
+    reachable = cli("submit", "--request", str(request), database_url=postgres_dsn)
+    assert reachable.returncode == 2, reachable.stderr
+    assert json.loads(reachable.stderr)["reason_code"] == "INVALID_REQUEST"
     assert database.execute("SELECT count(*) FROM jobs").fetchone()[0] == before
 
 
