@@ -36,10 +36,22 @@ def cli(*args, database_url=None):
     )
 
 
-def test_missing_database_configuration_is_an_operational_error():
-    result = cli("status", str(uuid4()))
+@pytest.mark.parametrize(
+    "args",
+    [
+        ("status", str(uuid4())),
+        ("submit", "--request", str(EXAMPLE)),
+    ],
+    ids=["status", "submit"],
+)
+def test_missing_database_configuration_is_an_operational_error(args):
+    result = cli(*args)
     assert result.returncode == 1
+    assert result.stdout == ""
     assert json.loads(result.stderr)["reason_code"] == "DATABASE_NOT_CONFIGURED"
+    assert SENTINEL_PASSWORD not in result.stderr
+    assert UNREACHABLE_DATABASE_URL not in result.stderr
+    assert "postgresql://" not in result.stderr
 
 
 @pytest.mark.parametrize(

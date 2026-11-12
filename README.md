@@ -16,7 +16,7 @@ DataCon 是面向授权实验环境的 CVE 复现平台项目。它的目标是�
 ## 当前实现（T01–T02）
 
 - **T01 案例与测试基线**：`tests/fixtures/cases/` 提供 B01/B02 的缺陷版、修复版、正常与候选输入、构建配方、依赖快照、预期退出码和预期 ASan 签名。`manifest.json` 固定全部材料摘要。
-- **T02 任务入口**：`src/datacon/contracts.py` 校验请求并计算稳定计划摘要；`src/datacon/cli.py` 实现 `datacon submit` 和 `datacon status`；`src/datacon/store.py` 使用 PostgreSQL 保存任务；`migrations/001_create_jobs.sql` 只创建提交和查询所需表。
+- **T02 任务入口**：`src/datacon/contracts.py` 校验请求并计算稳定计划摘要；`src/datacon/cli.py` 实现 `datacon submit` 和 `datacon status`；`src/datacon/store.py` 使用 PostgreSQL 保存任务；`migrations/001_create_jobs.sql` 创建提交和查询所需表，并为旧版 jobs 表补上 `reason_code` 列。
 - 合法 source 请求返回唯一 `job_id` 和 `QUEUED` 状态；结构合法的 binary 请求在提交时归档为 `BLOCKED`，原因码为 `UNSUPPORTED_TARGET`。新 CLI 进程可从数据库查回同一任务。省略预算时应用 SRS 默认值。
 - 非法 CVE 格式、超出上限的预算、未知字段、重复 JSON 键和其他结构错误返回退出码 `2`，并在连接数据库前拒绝，不产生任务。
 - **B03 准入**：`tests/fixtures/cases/B03-admission.json` 和 `B03-admission.md` 记录公开候选 `CVE-2019-13224` 的公告、修复提交、许可、离线构建、共享 harness 和 ASan 计划。状态为 `conditional_admission`；真实案例执行与发布验收按任务顺序留到 T05/T08，本轮不执行真实案例。
@@ -118,9 +118,11 @@ uv run pytest -q tests/integration/test_fixture_replay.py
 
 - `tests/contract/` 固定请求校验、默认预算、计划摘要规范化 JSON 与 UTF-8 规则、案例材料摘要和 B03 准入记录。
 - `tests/integration/test_cli.py` 使用真实 PostgreSQL，通过子进程验证跨进程提交/查询、唯一任务 ID、默认预算落库，以及非法输入（含 CLI 层的非法 UTF-8、`NaN`、`Infinity`）在连接数据库前被拒绝且无落库副作用。该文件的非法请求用例使用不可达 DSN，若代码尝试连接就会得到退出码 `1`，因此返回 `2` 证明了校验先于连接。未设置 `DATACON_TEST_DATABASE_URL` 时跳过。
-- `tests/integration/test_cli_operational.py` 不需要 PostgreSQL，验证未配置数据库和数据库操作失败都返回退出码 `1`。
-- `tests/integration/test_migrations.py` 在迁移前插入哨兵任务，重复执行 `001_create_jobs.sql` 后断言该行仍存在且内容不变，验证迁移“不破坏已有任务”。
+- `tests/integration/test_cli_operational.py` 不需要 PostgreSQL，验证 `status` 与 `submit` 在未配置数据库时均返回退出码 `1`、stdout 为空且原因码为 `DATABASE_NOT_CONFIGURED`；同时验证数据库操作失败返回 `DATABASE_ERROR`，错误信息不包含 DSN、密码或连接串。
+- `tests/integration/test_migrations.py` 使用真实 PostgreSQL。除 public schema 的重复执行用例外，还在独立 schema 中创建不含 `reason_code` 的旧版 `jobs` 表并插入哨兵任务，先断言该列不存在，再连续执行两次 `001_create_jobs.sql`；随后断言哨兵行与 request 保留、state 仍为 `QUEUED`、reason_code 为 NULL，且 `reason_code` 被补为可空 `text`、`jobs` 表与 `jobs_queue_idx` 索引存在。该用例不依赖 `public.jobs`，未设置 `DATACON_TEST_DATABASE_URL` 时跳过。
 - `tests/integration/test_fixture_replay.py` 用宿主 `clang` + ASan 编译 B01/B02 两版，验证正常输入、缺陷版命中预期 `heap-buffer-overflow`、修复版和 B02 候选正常退出。错误类型、操作和访问大小始终断言；未安装 `llvm-symbolizer` 时，签名用例在完成这些断言后跳过函数/源码帧断言。它是合成材料回归，不是 T05 的容器隔离验收。
+
+`001_create_jobs.sql` 只升级 schema，不回填历史数据：升级前已经存在的 `binary` 且 `state='QUEUED'` 行保持原状，只有升级后经 CLI 提交的 binary 请求才会直接写入 `BLOCKED`/`UNSUPPORTED_TARGET`。
 
 ## 计划摘要
 
