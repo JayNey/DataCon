@@ -123,12 +123,6 @@ def test_missing_job_and_malformed_id(database, postgres_dsn):
     assert json.loads(malformed.stderr)["reason_code"] == "INVALID_REQUEST"
 
 
-def test_missing_database_configuration_is_an_operational_error(database):
-    result = cli("status", str(uuid4()))
-    assert result.returncode == 1
-    assert json.loads(result.stderr)["reason_code"] == "DATABASE_NOT_CONFIGURED"
-
-
 def test_shipped_example_can_be_submitted(database, postgres_dsn):
     result = cli("submit", "--request", str(EXAMPLE), database_url=postgres_dsn)
     assert result.returncode == 0, result.stderr

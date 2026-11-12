@@ -28,20 +28,24 @@ DataCon 是面向授权实验环境的 CVE 复现平台项目。它的目标是�
 - Python 3.11+
 - [uv](https://docs.astral.sh/uv/)（仓库锁定依赖，提交了 `uv.lock`）
 - PostgreSQL 17
-- `clang`（仅 B01/B02 的本地 ASan 合成回放需要；缺失时相关测试跳过）
+- `clang` + `llvm-symbolizer`（仅 B01/B02 的 ASan 合成回放需要）。本地和 CI smoke 使用宿主 clang，版本不锁定；`silkeh/clang:19-bookworm` 固定镜像声明 clang 19.1.7，由 T05 容器回放验证。缺少 `clang` 时相关测试跳过；缺少 `llvm-symbolizer` 时，签名用例在断言错误类型/操作后跳过函数/源码帧断言（CI 会安装 LLVM 并执行该断言）。
 
 ### 1. 启动 PostgreSQL
 
 已有 PostgreSQL 时直接设置连接串即可；没有时可用 Docker：
 
 ```bash
+# 本地测试口令由环境变量提供；下面的值只是占位符，不要用于共享环境。
+export DATACON_DB_PASSWORD="${DATACON_DB_PASSWORD:-change-me-local-only}"
+
 docker run --rm -d --name datacon-pg \
   -e POSTGRES_USER=datacon \
-  -e POSTGRES_PASSWORD=datacon \
+  -e POSTGRES_PASSWORD="$DATACON_DB_PASSWORD" \
   -e POSTGRES_DB=datacon \
-  -p 55432:5432 postgres:17-bookworm
+  -p 55432:5432 \
+  postgres:17-bookworm@sha256:665dc7b37ac52a17e298511414c21d23ffa4e6a6ef6225b3e5d59c7afb35e994
 
-export DATACON_DATABASE_URL='postgresql://datacon:datacon@127.0.0.1:55432/datacon'
+export DATACON_DATABASE_URL="postgresql://datacon:${DATACON_DB_PASSWORD}@127.0.0.1:55432/datacon"
 ```
 
 ### 2. 安装依赖并建表
@@ -107,12 +111,16 @@ uv run pytest -q
 ```bash
 uv run pytest -q tests/contract
 uv run pytest -q tests/integration/test_cli.py
+uv run pytest -q tests/integration/test_cli_operational.py
+uv run pytest -q tests/integration/test_migrations.py
 uv run pytest -q tests/integration/test_fixture_replay.py
 ```
 
 - `tests/contract/` 固定请求校验、默认预算、计划摘要规范化 JSON 与 UTF-8 规则、案例材料摘要和 B03 准入记录。
 - `tests/integration/test_cli.py` 使用真实 PostgreSQL，通过子进程验证跨进程提交/查询、唯一任务 ID、默认预算落库，以及非法输入无落库副作用。未设置 `DATACON_TEST_DATABASE_URL` 时跳过。
-- `tests/integration/test_fixture_replay.py` 用本机 `clang` + ASan 编译 B01/B02 两版，验证正常输入、缺陷版命中预期 `heap-buffer-overflow`、修复版和 B02 候选正常退出。它是合成材料回归，不是 T05 的容器隔离验收。
+- `tests/integration/test_cli_operational.py` 不需要 PostgreSQL，验证未配置数据库和数据库操作失败都返回退出码 `1`。
+- `tests/integration/test_migrations.py` 验证 `001_create_jobs.sql` 可重复执行且不破坏已有任务。
+- `tests/integration/test_fixture_replay.py` 用宿主 `clang` + ASan 编译 B01/B02 两版，验证正常输入、缺陷版命中预期 `heap-buffer-overflow`、修复版和 B02 候选正常退出。错误类型、操作和访问大小始终断言；未安装 `llvm-symbolizer` 时，签名用例在完成这些断言后跳过函数/源码帧断言。它是合成材料回归，不是 T05 的容器隔离验收。
 
 ## 计划摘要
 
@@ -125,6 +133,7 @@ uv run pytest -q tests/integration/test_fixture_replay.py
 - B01 合成正例：缺陷版对 `inputs/candidate.txt` 触发 `heap-buffer-overflow`（`parse_token`，退出码 `86`），修复版正常；正常输入在两版均输出 `OK`。
 - B02 合成反例：`inputs/clean.txt` 未越界，两版均正常退出，预期 `NOT_REPRODUCED`。
 - 双版本源码、patch、harness、构建脚本、依赖锁和输入都带 SHA-256 摘要；CI 验证缺失和篡改会被发现。
+- `fix.patch` 是 vulnerable 到 fixed 的完整 diff；契约测试会把 patch 应用到 vulnerable 副本，并与 fixed 逐字节比对。
 
 B03 只提交公开元数据，不提交真实案例输入、构建日志、诊断或证据包。准入记录明确 `asan_replay` 仍由 T05 执行并冻结签名；T08 才能做发布验收。
 
@@ -147,12 +156,12 @@ tests/fixtures/cases/ B01/B02 合成材料与 B03 准入记录
 ## 安全与数据
 
 - `.datacon/`、`.env`、运行产物和证据目录由 `.gitignore` 排除。
-- 仓库不包含数据库凭证、真实案例输入、完整诊断或实验日志。
+- 仓库不包含数据库凭证、真实案例输入、完整诊断或实验日志。CI 数据库口令默认为无意义的临时占位符，可用 `DATACON_CI_DB_PASSWORD` secret 覆盖。
 - 合成案例只用于离线回归；真实案例的准入与使用边界见 B03 记录。
 
 ## CI
 
-`.github/workflows/ci.yml` 在 Pull Request 和 `main` 分支推送时运行：安装锁定依赖、启动 PostgreSQL 17、应用迁移、用 `clang` 运行合成 ASan 回放，并执行完整 `pytest`。第三方 Action 固定到完整提交 SHA，工作流只有 `contents: read` 权限。
+`.github/workflows/ci.yml` 在 Pull Request 和 `main` 分支推送时运行：安装锁定依赖、启动固定 digest 的 PostgreSQL 17、应用迁移、安装宿主 `clang`/LLVM symbolizer、运行合成 ASan 回放，并执行完整 `pytest`。`uv` 按 `requirements-ci.txt` 中的 wheel hash 安装；第三方 Action 固定到完整提交 SHA，工作流只有 `contents: read` 权限。ASan smoke 使用 runner 的宿主 clang，锁定的 clang 19.1.7 镜像留给 T05 验证。
 
 ## 开发方式
 

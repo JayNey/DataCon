@@ -18,10 +18,10 @@ jobs:
     timeout-minutes: 20
     services:
       postgres:
-        image: postgres:17-bookworm
+        image: postgres:17-bookworm@sha256:665dc7b37ac52a17e298511414c21d23ffa4e6a6ef6225b3e5d59c7afb35e994
         env:
           POSTGRES_USER: datacon
-          POSTGRES_PASSWORD: datacon
+          POSTGRES_PASSWORD: "${{ secrets.DATACON_CI_DB_PASSWORD || 'datacon_ci_ephemeral' }}"
           POSTGRES_DB: datacon
         ports:
           - 5432:5432
@@ -31,8 +31,11 @@ jobs:
           --health-timeout 5s
           --health-retries 20
     env:
-      DATACON_DATABASE_URL: postgresql://datacon:datacon@127.0.0.1:5432/datacon
-      DATACON_TEST_DATABASE_URL: postgresql://datacon:datacon@127.0.0.1:5432/datacon
+      # Ephemeral CI-only credential. Set DATACON_CI_DB_PASSWORD only when the
+      # password must come from a repository/environment secret; keep it
+      # URL-safe so it can be embedded in the DSNs below.
+      DATACON_DATABASE_URL: "postgresql://datacon:${{ secrets.DATACON_CI_DB_PASSWORD || 'datacon_ci_ephemeral' }}@127.0.0.1:5432/datacon"
+      DATACON_TEST_DATABASE_URL: "postgresql://datacon:${{ secrets.DATACON_CI_DB_PASSWORD || 'datacon_ci_ephemeral' }}@127.0.0.1:5432/datacon"
       UV_CACHE_DIR: /tmp/uv-cache
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -40,7 +43,9 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install uv
-        run: python -m pip install --disable-pip-version-check uv==0.12.7
+        run: |
+          python -m pip install --disable-pip-version-check --require-hashes \
+            --only-binary :all: -r requirements-ci.txt
       - name: Install locked dependencies
         run: uv sync --frozen
       - name: Apply database migration
@@ -53,11 +58,15 @@ jobs:
           with psycopg.connect(os.environ["DATACON_DATABASE_URL"], autocommit=True) as conn:
               conn.execute(sql)
           PY
-      - name: Install clang and LLVM symbolizer
+      - name: Install host clang, LLVM symbolizer and patch
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang llvm
-      - name: Verify clang for ASan fixture replay
-        run: clang --version
+          sudo apt-get install -y clang llvm patch
+      - name: Verify host ASan smoke toolchain
+        run: |
+          # Local/CI smoke uses the runner's host clang. The pinned clang 19.1.7
+          # replay image is verified by the T05 task, not here.
+          clang --version
+          llvm-symbolizer --version
       - name: Run contract, PostgreSQL and ASan fixture tests
         run: uv run --frozen pytest -q

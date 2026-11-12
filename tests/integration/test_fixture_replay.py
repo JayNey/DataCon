@@ -94,8 +94,25 @@ def test_b01_candidate_hits_the_expected_asan_signature(manifest, binaries, tmp_
     )
     assert result.returncode == case["expected_exit"]["candidate_asan"], result.stderr
     assert f'ERROR: AddressSanitizer: {signature["error"]}' in result.stderr
-    assert "WRITE of size 1" in result.stderr
-    assert signature["function"] in result.stderr
+    assert (
+        f'{signature["operation"]} of size {signature["access_size"]}'
+        in result.stderr
+    )
+
+    symbolized = (
+        signature["function"] in result.stderr
+        and f'{signature["source"]}:' in result.stderr
+    )
+    if not symbolized:
+        if shutil.which("llvm-symbolizer") is None:
+            pytest.skip(
+                "ASan frames are not symbolized; install llvm-symbolizer to assert "
+                f"{signature['function']} at {signature['source']} (CI installs llvm)"
+            )
+        pytest.fail(
+            "llvm-symbolizer is installed but the ASan report lacks the expected "
+            f"{signature['function']} frame from {signature['source']}"
+        )
 
 
 def test_b01_candidate_is_clean_on_the_fixed_version(manifest, binaries, tmp_path):

@@ -2,6 +2,8 @@ import hashlib
 import json
 from pathlib import Path
 import re
+import shutil
+import subprocess
 
 import pytest
 
@@ -31,6 +33,9 @@ def test_manifest_materials_and_cases_are_consistent():
     assert manifest["versions"]["fixed"] != manifest["versions"]["vulnerable"]
     assert DIGEST.fullmatch(manifest["image"].split("@", 1)[1])
     assert manifest["toolchain"]["sanitizer"] == "address"
+    assert "host clang" in manifest["toolchain"]["local_smoke"]
+    assert manifest["toolchain"]["pinned_image_verified_in"] == "T05"
+    assert manifest["toolchain"]["image_digest_verified_local"] is False
 
     for name, digest in manifest["materials"].items():
         verify_material(CASES / name, digest)
@@ -48,6 +53,7 @@ def test_manifest_materials_and_cases_are_consistent():
     assert set(manifest["cases"]) == {"B01", "B02"}
 
     assert manifest["asan_signature"]["operation"] == "WRITE"
+    assert manifest["asan_signature"]["access_size"] == 1
     assert manifest["cases"]["B01"]["expected_exit"]["candidate_asan"] == 86
     assert manifest["cases"]["B01"]["expected_verdict"] == "REPRODUCED"
     assert any(
@@ -79,9 +85,39 @@ def test_case_requests_use_registered_case_ids_and_manifest_limits():
 
 def test_build_lock_references_the_same_toolchain_image():
     manifest = load("manifest.json")
-    lock = (CASES / manifest["dependencies"]).read_text(encoding="utf-8")
-    assert f"image={manifest['image']}" in lock
-    assert "additional_dependencies=none" in lock
+    lock_text = (CASES / manifest["dependencies"]).read_text(encoding="utf-8")
+    lock = {}
+    for line in lock_text.splitlines():
+        if not line or line.startswith("#"):
+            continue
+        key, value = line.split("=", 1)
+        lock[key] = value
+
+    assert lock["image"] == manifest["image"]
+    assert lock["target"] == manifest["platform"]
+    assert lock["scope"] == "T05-replay"
+    assert lock["clang"] == manifest["toolchain"]["pinned_image_version"]
+    assert lock["additional_dependencies"] == "none"
+    image_major = manifest["toolchain"]["pinned_image_version"].split(".", 1)[0]
+    assert manifest["image"].startswith(f"silkeh/clang:{image_major}-")
+
+
+def test_fix_patch_applies_to_vulnerable_and_matches_fixed(tmp_path):
+    manifest = load("manifest.json")
+    patch_tool = shutil.which("patch")
+    if patch_tool is None:
+        pytest.skip("patch(1) is required to verify the fixture patch")
+
+    target = tmp_path / "parser.c"
+    target.write_bytes((CASES / manifest["versions"]["vulnerable"]).read_bytes())
+    result = subprocess.run(
+        [patch_tool, "-p1", "-i", str(CASES / manifest["patch"])],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert target.read_bytes() == (CASES / manifest["versions"]["fixed"]).read_bytes()
 
 
 def test_missing_and_tampered_material_is_detected(tmp_path):

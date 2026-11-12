@@ -1,0 +1,4 @@
+# CI bootstrap only. The hash is for the manylinux x86_64 wheel used by
+# ubuntu-latest; a runner architecture change fails closed instead of silently
+# installing a different artifact.
+uv==0.12.7 --hash=sha256:4545e87c7ac64af317d8daffd279e23e93b0e05035662363033d3525923339d2
