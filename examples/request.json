@@ -1,0 +1,9 @@
+{
+  "schema_version": 1,
+  "cve_id": "CVE-2099-0001",
+  "target": {
+    "kind": "source",
+    "case_id": "fixture-c-parser",
+    "goal": "验证固定输入在缺陷版触发预期 ASan 异常"
+  }
+}

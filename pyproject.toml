@@ -1,0 +1,36 @@
+[build-system]
+# uv_build ships inside uv, so `uv sync --frozen` builds the project without
+# resolving a separate, unlocked build backend from PyPI.
+requires = ["uv_build==0.12.7"]
+build-backend = "uv_build"
+
+[project]
+name = "datacon"
+version = "0.1.0"
+description = "DataCon CVE reproduction control plane"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+dependencies = ["psycopg[binary]>=3.2,<4"]
+
+[project.scripts]
+datacon = "datacon.cli:main"
+
+[dependency-groups]
+dev = ["pytest>=8,<10"]
+
+[tool.uv]
+# Keep the uv bundled with the project equal to the version pinned in
+# requirements-ci.txt, which also pins the bundled uv_build backend.
+required-version = "==0.12.7"
+
+[tool.uv.build-backend]
+module-name = "datacon"
+module-root = "src"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "postgres: requires a migrated PostgreSQL test database",
+    "asan: requires a C compiler with AddressSanitizer support",
+]
