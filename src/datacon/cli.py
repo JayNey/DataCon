@@ -23,6 +23,22 @@ def _error(exit_code: int, reason_code: str, message: str) -> int:
     return exit_code
 
 
+DATABASE_ERROR_MESSAGE = "database operation failed"
+
+
+def _database_error_message(error: psycopg.Error) -> str:
+    """Return a generic database failure message.
+
+    ``psycopg`` error text can embed the full connection URI, including the
+    user, password, and host, so it must never reach stderr. Only the SQLSTATE
+    (a non-sensitive server-side code) may be appended as extra context.
+    """
+    sqlstate = getattr(error, "sqlstate", None)
+    if sqlstate:
+        return f"{DATABASE_ERROR_MESSAGE} (sqlstate: {sqlstate})"
+    return DATABASE_ERROR_MESSAGE
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="datacon")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -53,7 +69,7 @@ def main(argv: list[str] | None = None) -> int:
         try:
             result = store.submit(dsn, request)
         except psycopg.Error as error:
-            return _error(1, "DATABASE_ERROR", f"database operation failed: {error}")
+            return _error(1, "DATABASE_ERROR", _database_error_message(error))
         print(json.dumps(result, ensure_ascii=False))
         return 0
 
@@ -68,7 +84,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         result = store.status(dsn, job_id)
     except psycopg.Error as error:
-        return _error(1, "DATABASE_ERROR", f"database operation failed: {error}")
+        return _error(1, "DATABASE_ERROR", _database_error_message(error))
     if result is None:
         return _error(3, "JOB_NOT_FOUND", "job does not exist")
     print(json.dumps(result, ensure_ascii=False))
