@@ -66,6 +66,24 @@ class RetryableAnalysisError(Exception):
         self.message = message
 
 
+MAX_ADVISORY_BYTES = 1024 * 1024
+
+
+def _analysis_contract_reason(error: ValueError) -> str:
+    """Classify a canonical-analysis contract failure.
+
+    Finding/evidence field violations are evidence errors. Paths and other
+    material-derived fields are repairable material errors. Both are blocked;
+    neither may escape to the workflow's generic ``FAILED`` handler.
+    """
+    message = str(error)
+    if message.startswith(
+        ("finding.", "evidence_ref", "a finding requires")
+    ):
+        return "EVIDENCE_INVALID"
+    return "MATERIAL_MISSING"
+
+
 @dataclass(frozen=True)
 class AnalyzedCase:
     plan: dict[str, Any]
@@ -113,14 +131,22 @@ def _advisory(
     registry_commits: dict[str, str],
     resolved_commits: dict[str, str],
 ) -> dict[str, Any]:
+    if len(advisory_bytes) > MAX_ADVISORY_BYTES:
+        raise AnalysisBlocked(
+            "MATERIAL_MISSING",
+            f"advisory snapshot exceeds the {MAX_ADVISORY_BYTES} byte cap",
+        )
     try:
         advisory = jsonutil.loads_strict(advisory_bytes)
     except jsonutil.StrictJsonError as error:
         raise AnalysisBlocked("MATERIAL_MISSING", f"advisory snapshot is invalid: {error}")
     if not isinstance(advisory, dict):
         raise AnalysisBlocked("MATERIAL_MISSING", "advisory snapshot must be an object")
-    if advisory.get("schema_version") != 1:
-        raise AnalysisBlocked("MATERIAL_MISSING", "advisory schema_version must be 1")
+    advisory_version = advisory.get("schema_version")
+    if type(advisory_version) is not int or advisory_version != 1:
+        raise AnalysisBlocked(
+            "MATERIAL_MISSING", "advisory schema_version must be 1"
+        )
     if advisory.get("cve_id") != case.cve_id:
         raise AnalysisBlocked(
             "SOURCE_CONFLICT", "advisory snapshot names a different CVE"
@@ -198,6 +224,28 @@ def _diff_counts(patch: bytes) -> tuple[int, int]:
         elif line.startswith("-") and not line.startswith("---"):
             removed += 1
     return added, removed
+
+
+_PATCH_HEADER_PREFIXES = (
+    b"diff --git ",
+    b"index ",
+    b"new file mode ",
+    b"deleted file mode ",
+    b"old mode ",
+    b"new mode ",
+    b"similarity index ",
+    b"rename from ",
+    b"rename to ",
+)
+
+
+def _patch_body(patch: bytes) -> bytes:
+    """Return a patch body without transport headers for byte comparison."""
+    return b"".join(
+        line
+        for line in patch.splitlines(keepends=True)
+        if not line.startswith(_PATCH_HEADER_PREFIXES)
+    )
 
 
 def _deterministic_findings(
@@ -612,6 +660,11 @@ def analyze_case(
             "SOURCE_CONFLICT",
             "the pinned fix patch does not match the Git diff line counts",
         )
+    if _patch_body(patch) != _patch_body(diff.patch):
+        raise AnalysisBlocked(
+            "SOURCE_CONFLICT",
+            "the pinned fix patch does not match the Git diff content",
+        )
     findings, evidence_refs = _deterministic_findings(
         cve_id=case.cve_id,
         vulnerable=vulnerable,
@@ -698,8 +751,15 @@ def analyze_case(
         "symbols": [*definitions["vulnerable"], *definitions["fixed"], *call_sites],
         "findings": [finding.as_dict() for finding in findings],
     }
-    normalized_analysis = jsonutil.loads_strict(canonical_analysis_bytes(analysis))
-    normalized_analysis_digest = analysis_digest(normalized_analysis)
+    try:
+        normalized_analysis = jsonutil.loads_strict(
+            canonical_analysis_bytes(analysis)
+        )
+        normalized_analysis_digest = analysis_digest(normalized_analysis)
+    except ValueError as error:
+        raise AnalysisBlocked(
+            _analysis_contract_reason(error), str(error)
+        ) from error
 
     image = manifest.get("image")
     if not isinstance(image, str) or "@" not in image:

@@ -13,6 +13,8 @@ from datacon import jsonutil
 MAX_SOURCE_BYTES = 4 * 1024 * 1024
 MAX_DIFF_BYTES = 8 * 1024 * 1024
 MAX_TREE_PATHS = 100_000
+MAX_CHANGED_PATHS = 10_000
+MAX_SYMBOLS = 10_000
 _REF = re.compile(r"refs/(?:heads|tags)/[A-Za-z0-9][A-Za-z0-9._/-]*")
 _OID = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
 
@@ -50,21 +52,35 @@ class GitDiff:
     digest: str
 
 
+_GIT_ENV_REMOVE = (
+    "GIT_CONFIG_COUNT",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_SSH_COMMAND",
+    "GIT_ASKPASS",
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+)
+_GIT_ENV_PREFIXES = ("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_")
+
+
 def _git_environment(hooks: Path) -> dict[str, str]:
     environment = os.environ.copy()
+    for key in list(environment):
+        if key in _GIT_ENV_REMOVE or key.startswith(_GIT_ENV_PREFIXES):
+            environment.pop(key, None)
     environment.update(
         {
             "GIT_CONFIG_NOSYSTEM": "1",
             "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_ATTR_NOSYSTEM": "1",
             "GIT_TERMINAL_PROMPT": "0",
             "GIT_ALLOW_PROTOCOL": "file",
             "LC_ALL": "C",
             "LANG": "C",
         }
     )
-    environment.pop("GIT_DIR", None)
-    environment.pop("GIT_WORK_TREE", None)
-    environment.pop("GIT_INDEX_FILE", None)
     return environment
 
 
@@ -232,8 +248,25 @@ class GitRepository:
         safe = jsonutil.safe_relative_path(path, "source path")
         if ":" in safe:
             raise SourceToolError("git.resolve", "source path must not contain ':'")
+        object_name = f"{commit}:{safe}"
         try:
-            data = self._run("cat-file", "blob", f"{commit}:{safe}")
+            raw_size = self._run("cat-file", "-s", object_name)
+        except TransientSourceToolError:
+            raise
+        except SourceToolError as error:
+            raise SourceToolError(
+                "git.resolve", f"path {safe} is missing from commit {commit}"
+            ) from error
+        try:
+            size = int(raw_size.decode("ascii", "strict").strip())
+        except (UnicodeDecodeError, ValueError) as error:
+            raise SourceToolError(
+                "git.resolve", "Git object size is not an integer"
+            ) from error
+        if size > MAX_SOURCE_BYTES:
+            raise SourceToolError("git.resolve", "source file exceeds the analysis cap")
+        try:
+            data = self._run("cat-file", "blob", object_name)
         except TransientSourceToolError:
             raise
         except SourceToolError as error:
@@ -321,6 +354,10 @@ class GitRepository:
                     raise SourceToolError(
                         "git.diff", f"changed path is not allowed: {error}"
                     ) from error
+                if len(paths) > MAX_CHANGED_PATHS:
+                    raise SourceToolError(
+                        "git.diff", "diff changes too many paths"
+                    )
         if not paths:
             raise SourceToolError("git.diff", "the revisions have no changed paths")
         return GitDiff(
@@ -396,6 +433,10 @@ def extract_symbols(
                 continue
         else:
             continue
+        if len(symbols) >= MAX_SYMBOLS:
+            raise SourceToolError(
+                "tree_sitter.extract", "too many symbols in one source file"
+            )
         symbols.append(
             {
                 "name": function_name,

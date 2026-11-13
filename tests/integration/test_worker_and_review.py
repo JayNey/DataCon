@@ -302,6 +302,9 @@ def test_worker_expires_a_pending_review_after_restart(
 ):
     job = queue_job(isolated_database, tmp_path)
     worker(isolated_database.dsn)
+    digest = status(isolated_database.dsn, job["job_id"])["pending_plan"][
+        "plan_digest"
+    ]
     isolated_database.connection.execute(
         "UPDATE jobs SET review_deadline_at = now() - interval '1 second' "
         "WHERE job_id = %s",
@@ -314,6 +317,19 @@ def test_worker_expires_a_pending_review_after_restart(
     current = status(isolated_database.dsn, job["job_id"])
     assert current["reason_code"] == "REVIEW_EXPIRED"
     assert current["review_state"] is None
+    expiry = isolated_database.connection.execute(
+        "SELECT detail FROM audit_events WHERE job_id = %s "
+        "AND event_type = 'review_expired' ORDER BY event_id DESC LIMIT 1",
+        (UUID(job["job_id"]),),
+    ).fetchone()
+    assert expiry is not None
+    expired_generation = scalar(
+        isolated_database,
+        "SELECT generation FROM jobs WHERE job_id = %s",
+        (UUID(job["job_id"]),),
+    )
+    assert expiry[0]["plan_digest"] == digest
+    assert expiry[0]["generation"] == expired_generation - 1
     assert scalar(
         isolated_database,
         "SELECT workflow_synced FROM jobs WHERE job_id = %s",
@@ -523,6 +539,137 @@ def test_non_utf8_registry_blocks_as_material_missing(
         "SELECT count(*) FROM jobs WHERE job_id = %s AND state = 'FAILED'",
         (UUID(job["job_id"]),),
     ) == 0
+
+
+def _write_manifest(case_root, mutate):
+    manifest_path = case_root / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    mutate(manifest)
+    manifest_path.write_text(
+        json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
+    )
+
+
+def _assert_blocked_material_without_plan(isolated_database, job, result):
+    assert result["processed"] == 1
+    assert result["state"] == "BLOCKED"
+    current = status(isolated_database.dsn, job["job_id"])
+    assert current["state"] == "BLOCKED"
+    assert current["state"] != "FAILED"
+    assert current["reason_code"] in {"MATERIAL_MISSING", "EVIDENCE_INVALID"}
+    assert current["reason_code"] != "ANALYSIS_ERROR"
+    assert current["pending_plan"] is None
+    last_error = current["last_error"] or ""
+    assert "ValueError" not in last_error
+    assert "RuntimeError" not in last_error
+    assert "Traceback" not in last_error
+    assert scalar(
+        isolated_database,
+        "SELECT count(*) FROM plans WHERE job_id = %s",
+        (UUID(job["job_id"]),),
+    ) == 0
+    assert scalar(
+        isolated_database,
+        "SELECT count(*) FROM jobs WHERE job_id = %s AND state = 'FAILED'",
+        (UUID(job["job_id"]),),
+    ) == 0
+    return current
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("user", "0:0"),
+        ("user", "root"),
+        ("seccomp", "unconfined"),
+    ],
+)
+def test_invalid_isolation_blocks_as_material_missing(
+    isolated_database, tmp_path, field, value
+):
+    """The registry isolation policy is enforced before a plan is frozen."""
+    case_root = copy_cases(tmp_path)
+    registry_path = case_root / "registry.json"
+    registry = json.loads(registry_path.read_text(encoding="utf-8"))
+    registry["isolation"][field] = value
+    registry_path.write_text(
+        json.dumps(registry, indent=2) + "\n", encoding="utf-8"
+    )
+
+    job = queue_job(isolated_database, tmp_path)
+    result = worker(
+        isolated_database.dsn,
+        env_extra={"DATACON_CASE_ROOT": str(case_root)},
+    )
+
+    current = _assert_blocked_material_without_plan(
+        isolated_database, job, result
+    )
+    assert current["reason_code"] == "MATERIAL_MISSING"
+    assert "isolation" in current["last_error"]
+
+
+def test_whitespace_harness_path_blocks_without_failed(
+    isolated_database, tmp_path
+):
+    """A POSIX-legal spaced filename must be a repairable material error."""
+    case_root = copy_cases(tmp_path)
+    renamed = "harness main.c"
+
+    def mutate(manifest):
+        original = manifest["harness"]
+        (case_root / original).rename(case_root / renamed)
+        manifest["materials"][renamed] = manifest["materials"].pop(original)
+        manifest["harness"] = renamed
+
+    _write_manifest(case_root, mutate)
+    job = queue_job(isolated_database, tmp_path)
+    result = worker(
+        isolated_database.dsn,
+        env_extra={"DATACON_CASE_ROOT": str(case_root)},
+    )
+
+    _assert_blocked_material_without_plan(isolated_database, job, result)
+
+
+def test_overlong_asan_signature_error_blocks_without_failed(
+    isolated_database, tmp_path
+):
+    case_root = copy_cases(tmp_path)
+    _write_manifest(
+        case_root,
+        lambda manifest: manifest["asan_signature"].__setitem__(
+            "error", "x" * 3000
+        ),
+    )
+    job = queue_job(isolated_database, tmp_path)
+    result = worker(
+        isolated_database.dsn,
+        env_extra={"DATACON_CASE_ROOT": str(case_root)},
+    )
+
+    current = _assert_blocked_material_without_plan(
+        isolated_database, job, result
+    )
+    assert current["reason_code"] == "MATERIAL_MISSING"
+    assert "asan_signature.error" in current["last_error"]
+
+
+def test_harness_symlink_loop_blocks_without_failed(
+    isolated_database, tmp_path
+):
+    case_root = copy_cases(tmp_path)
+    harness = case_root / "harness.c"
+    harness.unlink()
+    harness.symlink_to("harness.c")
+
+    job = queue_job(isolated_database, tmp_path)
+    result = worker(
+        isolated_database.dsn,
+        env_extra={"DATACON_CASE_ROOT": str(case_root)},
+    )
+
+    _assert_blocked_material_without_plan(isolated_database, job, result)
 
 
 def test_manifest_path_is_directory_blocks_as_material_missing(

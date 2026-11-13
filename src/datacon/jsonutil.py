@@ -136,6 +136,8 @@ def safe_relative_path(value: Any, label: str, *, allow_dot: bool = False) -> st
     text = require_text(value, label)
     if "\\" in text:
         raise ValueError(f"{label} must use POSIX separators")
+    if any(character.isspace() for character in text):
+        raise ValueError(f"{label} must not contain whitespace")
     path = PurePosixPath(text)
     if path.is_absolute() or ".." in path.parts:
         raise ValueError(f"{label} must stay inside the case directory")
@@ -151,8 +153,18 @@ def safe_relative_path(value: Any, label: str, *, allow_dot: bool = False) -> st
 def resolve_inside(root: Path, relative: str, *, allow_dot: bool = False) -> Path:
     """Resolve a contract path below ``root`` without following symlinks."""
     text = safe_relative_path(relative, "material path", allow_dot=allow_dot)
-    root = root.resolve()
-    candidate = (root / text).resolve()
+    try:
+        root = root.resolve()
+    except (RuntimeError, OSError) as error:
+        raise ValueError(
+            f"material path root cannot be resolved: {error}"
+        ) from error
+    try:
+        candidate = (root / text).resolve()
+    except (RuntimeError, OSError) as error:
+        raise ValueError(
+            f"material path {text} cannot be resolved: {error}"
+        ) from error
     if candidate != root and root not in candidate.parents:
         raise ValueError("material path escapes the case directory")
     current = root

@@ -25,6 +25,9 @@ _REPOSITORY_FIELDS = frozenset(
     {"origin", "bundle", "bundle_digest", "source_path", "refs", "commits", "patch"}
 )
 _SIGNATURE_FIELDS = frozenset({"error", "function", "source"})
+MAX_SIGNATURE_TEXT = 512
+MAX_CASE_JSON_BYTES = 1024 * 1024
+MAX_MATERIAL_BYTES = 64 * 1024 * 1024
 
 
 class CaseConfigurationError(ValueError):
@@ -73,6 +76,17 @@ class CaseDefinition:
                 "MATERIAL_MISSING", f"material {relative} is missing"
             )
         try:
+            size = path.stat().st_size
+        except OSError as error:
+            raise CaseConfigurationError(
+                "MATERIAL_MISSING", f"material {relative} is not readable"
+            ) from error
+        if size > MAX_MATERIAL_BYTES:
+            raise CaseConfigurationError(
+                "MATERIAL_MISSING",
+                f"material {relative} exceeds the {MAX_MATERIAL_BYTES} byte cap",
+            )
+        try:
             data = path.read_bytes()
         except (FileNotFoundError, PermissionError) as error:
             raise CaseConfigurationError(
@@ -115,7 +129,7 @@ def _validate_manifest_for_case(
                 versions[role], f"case manifest versions.{role}"
             )
         for field in ("harness", "build_recipe", "dependencies"):
-            jsonutil.require_text(
+            jsonutil.safe_relative_path(
                 manifest.get(field), f"case manifest {field}"
             )
         signature = jsonutil.require_object(
@@ -125,9 +139,14 @@ def _validate_manifest_for_case(
             label="case manifest asan_signature",
         )
         for field in sorted(_SIGNATURE_FIELDS):
-            jsonutil.require_text(
+            text = jsonutil.require_text(
                 signature[field], f"case manifest asan_signature.{field}"
             )
+            if len(text) > MAX_SIGNATURE_TEXT:
+                raise ValueError(
+                    f"case manifest asan_signature.{field} must be at most "
+                    f"{MAX_SIGNATURE_TEXT} characters"
+                )
         image = jsonutil.require_text(
             manifest.get("image"), "case manifest image"
         )
@@ -257,6 +276,17 @@ def _load_json(path: Path, label: str) -> dict[str, Any]:
             "MATERIAL_MISSING", f"{label} is not a readable file"
         )
     try:
+        size = path.stat().st_size
+    except OSError as error:
+        raise CaseConfigurationError(
+            "MATERIAL_MISSING", f"{label} is not readable"
+        ) from error
+    if size > MAX_CASE_JSON_BYTES:
+        raise CaseConfigurationError(
+            "MATERIAL_MISSING",
+            f"{label} exceeds the {MAX_CASE_JSON_BYTES} byte cap",
+        )
+    try:
         text = path.read_text(encoding="utf-8")
     except UnicodeError as error:
         raise CaseConfigurationError(
@@ -295,7 +325,8 @@ def load_registry(
     """
     base = case_root(path if path is not None else root)
     document = _load_json(base / "registry.json", "case registry")
-    if document.get("schema_version") != 1:
+    version = document.get("schema_version")
+    if type(version) is not int or version != 1:
         raise CaseConfigurationError(
             "MATERIAL_MISSING", "case registry schema_version must be 1"
         )
@@ -313,7 +344,8 @@ def load_registry(
     except ValueError as error:
         raise CaseConfigurationError("MATERIAL_MISSING", str(error)) from error
     manifest = _load_json(base / manifest_path, "case manifest")
-    if manifest.get("schema_version") != 1:
+    manifest_version = manifest.get("schema_version")
+    if type(manifest_version) is not int or manifest_version != 1:
         raise CaseConfigurationError(
             "MATERIAL_MISSING", "case manifest schema_version must be 1"
         )
