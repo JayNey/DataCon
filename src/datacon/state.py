@@ -14,7 +14,10 @@ from psycopg.types.json import Jsonb
 from datacon import jsonutil
 
 REVIEW_WINDOW_HOURS = 24
-LEASE_SECONDS = 300
+# The default lease must cover the largest preparation budget (600s) so a
+# legitimate single analysis pass cannot be stolen mid-flight. A production
+# heartbeat can extend this later; the lease is never shorter than the budget.
+LEASE_SECONDS = 600
 ATTEMPT_STATUSES = frozenset({"started", "completed", "infra_error"})
 
 
@@ -747,7 +750,9 @@ def expire_review(dsn: str, job_id: UUID, generation: int) -> bool:
     with _connect(dsn) as connection:
         job = connection.execute(
             "SELECT state, generation, review_deadline_at, lease_owner, "
-            "lease_expires_at, now() AS db_now "
+            "lease_expires_at, now() AS db_now, "
+            "(SELECT plan_digest FROM plans WHERE plans.job_id = jobs.job_id) "
+            "AS plan_digest "
             "FROM jobs WHERE job_id = %s FOR UPDATE",
             (job_id,),
         ).fetchone()
@@ -780,7 +785,10 @@ def expire_review(dsn: str, job_id: UUID, generation: int) -> bool:
             "review_expired",
             stage="blocked",
             reason_code="REVIEW_EXPIRED",
-            detail={"generation": generation},
+            detail={
+                "generation": generation,
+                "plan_digest": job["plan_digest"],
+            },
         )
         return True
 
