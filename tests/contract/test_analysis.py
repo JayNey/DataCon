@@ -56,6 +56,21 @@ def write_json(path, document):
     path.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
 
 
+RAW_NUMBER = "__RAW_NUMBER__"
+
+
+def write_json_with_raw_number(path, document, raw):
+    """Write JSON with a placeholder string replaced by a raw number literal.
+
+    ``json.dumps`` cannot emit ``1e999`` (it serializes ``inf`` as
+    ``Infinity``), but the manifest is attacker-controlled text, so the test
+    must produce the same overflow the parser sees in production.
+    """
+    text = json.dumps(document, indent=2) + "\n"
+    assert f'"{RAW_NUMBER}"' in text
+    path.write_text(text.replace(f'"{RAW_NUMBER}"', raw), encoding="utf-8")
+
+
 def set_manifest_path(manifest, path, value):
     current = manifest
     for key in path[:-1]:
@@ -290,6 +305,101 @@ def test_wrong_typed_manifest_fields_are_analysis_blocked(case_root, path, value
 
     assert caught.value.reason_code == "MATERIAL_MISSING"
     assert path[-1] in caught.value.message
+
+
+@pytest.mark.parametrize("raw", ["1e999", "-1e999"], ids=["positive", "negative"])
+def test_non_finite_toolchain_value_is_analysis_blocked(case_root, raw):
+    """``1e999`` parses to inf; it must block as a material error, not crash."""
+    manifest_path = case_root / "manifest.json"
+    manifest = read_json(manifest_path)
+    manifest["toolchain"] = {"x": RAW_NUMBER}
+    write_json_with_raw_number(manifest_path, manifest, raw)
+
+    with pytest.raises(AnalysisBlocked) as caught:
+        analyze_case(request(), case_root=case_root)
+
+    assert caught.value.reason_code == "MATERIAL_MISSING"
+    assert "toolchain" in caught.value.message
+
+
+def test_lone_surrogate_toolchain_value_is_analysis_blocked(case_root):
+    """A JSON-escaped lone surrogate cannot be UTF-8 encoded; it must block."""
+    manifest_path = case_root / "manifest.json"
+    manifest = read_json(manifest_path)
+    manifest["toolchain"] = {"x": "\ud800"}
+    write_json(manifest_path, manifest)
+
+    with pytest.raises(AnalysisBlocked) as caught:
+        analyze_case(request(), case_root=case_root)
+
+    assert caught.value.reason_code == "MATERIAL_MISSING"
+    assert "toolchain" in caught.value.message
+
+
+def test_deeply_nested_toolchain_value_is_analysis_blocked(case_root):
+    """Nesting beyond the declared cap must block instead of hitting recursion."""
+    manifest_path = case_root / "manifest.json"
+    manifest = read_json(manifest_path)
+    toolchain = {}
+    cursor = toolchain
+    for _ in range(300):
+        cursor["nested"] = {}
+        cursor = cursor["nested"]
+    cursor["x"] = 1
+    manifest["toolchain"] = toolchain
+    write_json(manifest_path, manifest)
+
+    with pytest.raises(AnalysisBlocked) as caught:
+        analyze_case(request(), case_root=case_root)
+
+    assert caught.value.reason_code == "MATERIAL_MISSING"
+    assert "toolchain" in caught.value.message
+
+
+def test_non_finite_unknown_manifest_case_field_is_analysis_blocked(case_root):
+    """Extra manifest_case fields reach the case config digest, so validate them."""
+    manifest_path = case_root / "manifest.json"
+    manifest = read_json(manifest_path)
+    manifest["cases"]["B01"]["unknown_extra"] = RAW_NUMBER
+    write_json_with_raw_number(manifest_path, manifest, "1e999")
+
+    with pytest.raises(AnalysisBlocked) as caught:
+        analyze_case(request(), case_root=case_root)
+
+    assert caught.value.reason_code == "MATERIAL_MISSING"
+    assert "unknown_extra" in caught.value.message
+
+
+def test_non_finite_asan_signature_operation_is_analysis_blocked(case_root):
+    """Optional signature fields are hashed into the case config too."""
+    manifest_path = case_root / "manifest.json"
+    manifest = read_json(manifest_path)
+    manifest["asan_signature"]["operation"] = RAW_NUMBER
+    write_json_with_raw_number(manifest_path, manifest, "1e999")
+
+    with pytest.raises(AnalysisBlocked) as caught:
+        analyze_case(request(), case_root=case_root)
+
+    assert caught.value.reason_code == "MATERIAL_MISSING"
+    assert "asan_signature.operation" in caught.value.message
+
+
+def test_finite_float_and_extra_fields_stay_valid(case_root):
+    """Ordinary JSON values, including finite floats, keep working.
+
+    The plan contract still restricts its ``toolchain`` shape; this test only
+    proves the new manifest value validation accepts finite floats in the extra
+    manifest_case fields that feed the case config digest.
+    """
+    manifest_path = case_root / "manifest.json"
+    manifest = read_json(manifest_path)
+    manifest["cases"]["B01"]["extra"] = {"enabled": True, "ratio": 0.25}
+    write_json(manifest_path, manifest)
+
+    result = analyze_case(request(), case_root=case_root)
+
+    assert result.plan["toolchain"] == manifest["toolchain"]
+    assert result.plan_digest == plan_digest(result.plan)
 
 
 @pytest.mark.parametrize("name", ["registry.json", "manifest.json"])

@@ -9,6 +9,7 @@ checkout. ``tests/fixtures/cases`` mirrors that directory for the test baseline.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 import os
 from pathlib import Path
 from typing import Any
@@ -28,6 +29,11 @@ _SIGNATURE_FIELDS = frozenset({"error", "function", "source"})
 MAX_SIGNATURE_TEXT = 512
 MAX_CASE_JSON_BYTES = 1024 * 1024
 MAX_MATERIAL_BYTES = 64 * 1024 * 1024
+# Containers deeper than this are treated as a broken case configuration. The
+# validator walks iteratively, so the cap is about rejecting absurd manifests
+# before they reach json.dumps/digest_json (which can recurse), not about the
+# validator's own stack.
+MAX_MANIFEST_NESTING = 128
 
 
 class CaseConfigurationError(ValueError):
@@ -105,6 +111,61 @@ class CaseDefinition:
         return data, digest
 
 
+def _validate_json_string(value: str, label: str) -> None:
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError as error:
+        raise ValueError(
+            f"{label} contains a string that is not valid UTF-8: {error.reason}"
+        ) from error
+
+
+def _validate_json_value(value: Any, label: str) -> None:
+    """Validate a manifest value as strict canonical-JSON material.
+
+    ``json.loads`` accepts numbers such as ``1e999`` (which overflow to
+    infinity) and escaped lone surrogates. ``json.dumps(..., allow_nan=False,
+    ensure_ascii=False)`` later rejects both while digesting the case config,
+    which used to surface as a terminal analysis failure. Reject them here,
+    iteratively, together with pathological nesting, so they are classified as
+    a repairable case configuration error before any digest is computed.
+    """
+    stack: list[tuple[Any, str, int]] = [(value, label, 1)]
+    while stack:
+        current, current_label, depth = stack.pop()
+        if isinstance(current, dict):
+            if depth > MAX_MANIFEST_NESTING:
+                raise ValueError(
+                    f"{current_label} exceeds the maximum nesting depth of "
+                    f"{MAX_MANIFEST_NESTING}"
+                )
+            for key, item in current.items():
+                if not isinstance(key, str):
+                    raise ValueError(f"{current_label} has a non-string key")
+                _validate_json_string(key, f"{current_label} key")
+                stack.append((item, f"{current_label}.{key}", depth + 1))
+            continue
+        if isinstance(current, list):
+            if depth > MAX_MANIFEST_NESTING:
+                raise ValueError(
+                    f"{current_label} exceeds the maximum nesting depth of "
+                    f"{MAX_MANIFEST_NESTING}"
+                )
+            for index, item in enumerate(current):
+                stack.append((item, f"{current_label}[{index}]", depth + 1))
+            continue
+        if isinstance(current, str):
+            _validate_json_string(current, current_label)
+            continue
+        if isinstance(current, float):
+            if not math.isfinite(current):
+                raise ValueError(f"{current_label} must be a finite number")
+            continue
+        if current is None or isinstance(current, (bool, int)):
+            continue
+        raise ValueError(f"{current_label} is not a JSON value")
+
+
 def _validate_manifest_for_case(
     manifest: dict[str, Any],
     manifest_case: dict[str, Any],
@@ -119,6 +180,12 @@ def _validate_manifest_for_case(
     """
     label = f"case manifest cases.{benchmark_id}"
     try:
+        # The whole manifest is validated, not just the fields indexed below:
+        # toolchain, manifest_case (including unknown extra fields), the ASan
+        # signature and every other value are hashed into the case config.
+        _validate_json_value(
+            manifest, f"case manifest for benchmark {benchmark_id}"
+        )
         versions = jsonutil.require_object(
             manifest.get("versions"),
             required={"vulnerable", "fixed"},
@@ -264,10 +331,16 @@ class CaseRegistry:
 
 def case_root(path: str | os.PathLike[str] | None = None) -> Path:
     configured = path or os.getenv("DATACON_CASE_ROOT") or DEFAULT_CASE_ROOT
-    root = Path(configured).expanduser()
-    if not root.is_absolute():
-        root = Path.cwd() / root
-    return root.resolve()
+    try:
+        root = Path(configured).expanduser()
+        if not root.is_absolute():
+            root = Path.cwd() / root
+        return root.resolve()
+    except (RuntimeError, OSError) as error:
+        raise CaseConfigurationError(
+            "MATERIAL_MISSING",
+            f"case root cannot be resolved: {error}",
+        ) from error
 
 
 def _load_json(path: Path, label: str) -> dict[str, Any]:

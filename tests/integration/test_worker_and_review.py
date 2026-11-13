@@ -550,6 +550,21 @@ def _write_manifest(case_root, mutate):
     )
 
 
+RAW_NUMBER = "__RAW_NUMBER__"
+
+
+def _write_manifest_with_raw_number(case_root, mutate, raw):
+    """Persist a raw ``1e999`` literal that ``json.dumps`` cannot produce."""
+    manifest_path = case_root / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    mutate(manifest)
+    text = json.dumps(manifest, indent=2) + "\n"
+    assert f'"{RAW_NUMBER}"' in text
+    manifest_path.write_text(
+        text.replace(f'"{RAW_NUMBER}"', raw), encoding="utf-8"
+    )
+
+
 def _assert_blocked_material_without_plan(isolated_database, job, result):
     assert result["processed"] == 1
     assert result["state"] == "BLOCKED"
@@ -670,6 +685,94 @@ def test_harness_symlink_loop_blocks_without_failed(
     )
 
     _assert_blocked_material_without_plan(isolated_database, job, result)
+
+
+@pytest.mark.parametrize(
+    "kind",
+    ["positive-inf", "negative-inf", "surrogate", "deep"],
+)
+def test_non_canonical_manifest_values_block_without_failed(
+    isolated_database, tmp_path, kind
+):
+    """A canonical-JSON failure in case config is MATERIAL_MISSING, not FAILED.
+
+    The job is submitted against the healthy default root, then the worker sees
+    the broken manifest through DATACON_CASE_ROOT, mirroring a repaired or
+    replaced case directory between submission and execution.
+    """
+    job = queue_job(isolated_database, tmp_path)
+    case_root = copy_cases(tmp_path)
+
+    if kind in {"positive-inf", "negative-inf"}:
+        raw = "1e999" if kind == "positive-inf" else "-1e999"
+        _write_manifest_with_raw_number(
+            case_root,
+            lambda manifest: manifest.__setitem__(
+                "toolchain", {"x": RAW_NUMBER}
+            ),
+            raw,
+        )
+    elif kind == "surrogate":
+        _write_manifest(
+            case_root,
+            lambda manifest: manifest.__setitem__(
+                "toolchain", {"x": "\ud800"}
+            ),
+        )
+    else:
+        def deep_toolchain(manifest):
+            toolchain = {}
+            cursor = toolchain
+            for _ in range(300):
+                cursor["nested"] = {}
+                cursor = cursor["nested"]
+            cursor["x"] = 1
+            manifest["toolchain"] = toolchain
+
+        _write_manifest(case_root, deep_toolchain)
+
+    result = worker(
+        isolated_database.dsn,
+        env_extra={"DATACON_CASE_ROOT": str(case_root)},
+    )
+
+    current = _assert_blocked_material_without_plan(
+        isolated_database, job, result
+    )
+    assert current["reason_code"] == "MATERIAL_MISSING"
+    last_error = current["last_error"] or ""
+    assert "UnicodeEncodeError" not in last_error
+    assert "RecursionError" not in last_error
+    assert scalar(
+        isolated_database,
+        "SELECT workflow_synced FROM jobs WHERE job_id = %s",
+        (UUID(job["job_id"]),),
+    ) is True
+
+
+def test_case_root_symlink_loop_blocks_without_failed(
+    isolated_database, tmp_path
+):
+    """An unresolvable case root is a repairable material error, never FAILED."""
+    job = queue_job(isolated_database, tmp_path)
+    loop_root = tmp_path / "caseloop"
+    loop_root.symlink_to("caseloop")
+
+    result = worker(
+        isolated_database.dsn,
+        env_extra={"DATACON_CASE_ROOT": str(loop_root)},
+    )
+
+    current = _assert_blocked_material_without_plan(
+        isolated_database, job, result
+    )
+    assert current["reason_code"] == "MATERIAL_MISSING"
+    assert "RuntimeError" not in (current["last_error"] or "")
+    assert scalar(
+        isolated_database,
+        "SELECT workflow_synced FROM jobs WHERE job_id = %s",
+        (UUID(job["job_id"]),),
+    ) is True
 
 
 def test_manifest_path_is_directory_blocks_as_material_missing(

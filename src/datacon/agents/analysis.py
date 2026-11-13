@@ -805,7 +805,17 @@ def analyze_case(
         "asan_options": asan_options,
         "asan_signature": manifest["asan_signature"],
     }
-    case_config_digest = jsonutil.digest_json(case_config)
+    try:
+        case_config_digest = jsonutil.digest_json(case_config)
+    except (ValueError, UnicodeError, RecursionError) as error:
+        # Case validation normally rejects these values first. This is the
+        # defense in depth that keeps any remaining non-canonical case config
+        # (for example from a substituted registry entry) a repairable
+        # block instead of an uncaught analysis failure.
+        raise AnalysisBlocked(
+            "MATERIAL_MISSING",
+            f"case configuration is not canonical JSON: {error}",
+        ) from error
 
     plan = {
         "case_id": case.case_id,
