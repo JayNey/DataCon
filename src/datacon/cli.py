@@ -14,7 +14,7 @@ from uuid import UUID
 import psycopg
 
 from datacon import state, store, workflow
-from datacon.contracts import InvalidRequest, parse_request
+from datacon.contracts import MAX_REQUEST_BYTES, InvalidRequest, parse_request
 
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
 
@@ -96,6 +96,11 @@ def _parse_job_id(value: str) -> UUID | None:
 
 def _submit(args) -> int:
     try:
+        size = args.request.stat().st_size
+        if size > MAX_REQUEST_BYTES:
+            raise ValueError(
+                f"request payload exceeds {MAX_REQUEST_BYTES} bytes"
+            )
         request = parse_request(args.request.read_text(encoding="utf-8"))
         operator = _operator_id()
     except (InvalidRequest, UnicodeError, OSError, ValueError) as error:

@@ -27,6 +27,7 @@ INVALID_UTF8_REQUEST = (
 )
 NAN_REQUEST = REQUEST.replace('"goal":"验证 ASan"', '"goal":NaN')
 INFINITY_REQUEST = REQUEST.replace('"goal":"验证 ASan"', '"goal":Infinity')
+OVERSIZED_REQUEST = REQUEST.replace('"goal":"验证 ASan"', '"goal":"' + "x" * 70000 + '"')
 DEFAULTS = {
     "prepare_seconds": 600,
     "execute_seconds": 1200,
@@ -149,6 +150,7 @@ def test_binary_submit_is_archived_as_blocked(database, postgres_dsn, tmp_path):
         pytest.param(INVALID_UTF8_REQUEST, id="invalid-utf8"),
         pytest.param(NAN_REQUEST, id="nan"),
         pytest.param(INFINITY_REQUEST, id="infinity"),
+        pytest.param(OVERSIZED_REQUEST, id="oversized"),
     ],
 )
 def test_invalid_request_is_rejected_before_database_connection(
