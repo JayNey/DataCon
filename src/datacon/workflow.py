@@ -498,7 +498,7 @@ def build_graph(
                 "execution generation is no longer current"
             )
         if job["state"] == "AWAITING_REVIEW":
-            if state_store.expire_review(dsn, job_id, job["generation"]):
+            if state_store.expire_review(dsn, job_id, claimed_generation):
                 return {}
             review = state_store.get_review(dsn, job_id)
             if review is None:
@@ -523,11 +523,19 @@ def build_graph(
                 job = state_store.load_job(dsn, job_id)
                 if job is None:
                     return {}
+                if job["generation"] != claimed_generation:
+                    # A review, expiry, or takeover advanced the generation
+                    # while this worker was parked at the interrupt. Do not
+                    # write the checkpoint or any business state with the
+                    # stale claim; the next claim converges instead.
+                    raise state_store.StaleGeneration(
+                        "execution generation is no longer current"
+                    )
                 if job["state"] == "AWAITING_REVIEW":
-                    if state_store.expire_review(dsn, job_id, job["generation"]):
+                    if state_store.expire_review(dsn, job_id, claimed_generation):
                         return {}
                     if state_store.get_review(dsn, job_id) is None:
-                        return {"generation": job["generation"]}
+                        return {"generation": claimed_generation}
         if job["state"] in ("READY", "BLOCKED"):
             plan = state_store.get_plan(dsn, job_id)
             review = state_store.get_review(dsn, job_id)
@@ -539,11 +547,11 @@ def build_graph(
                 state_store.block_job(
                     dsn,
                     job_id,
-                    generation=job["generation"],
+                    generation=claimed_generation,
                     reason_code="PLAN_MISMATCH",
                     message="the recorded review does not match the frozen plan",
                 )
-        return {"generation": job["generation"]}
+        return {"generation": claimed_generation}
 
     def route(state: SupervisorState) -> str:
         job = state_store.load_job(dsn, _uuid(state["job_id"]))

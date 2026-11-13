@@ -398,6 +398,124 @@ def test_stale_attempt_and_lease_writes_rejected(isolated_database, tmp_path):
     ) == 1
     assert state.finalize_workflow(isolated_database.dsn, job_uuid, 2) is True
 
+    # ``expire_review`` writes business state too, so it must observe the same
+    # generation + active-lease fence as every other stale-sensitive write.
+    # The finalized PREPARING job is claimable again (same as a process exit
+    # before a plan existed), which hands this test a fresh generation.
+    third = state.claim_next(isolated_database.dsn, "worker-c")
+    assert third is not None
+    assert third["job_id"] == job_uuid
+    assert third["generation"] == 3
+    assert state.freeze_plan(
+        isolated_database.dsn,
+        job_uuid,
+        generation=third["generation"],
+        plan={"case_id": "review-fence"},
+        plan_digest="sha256:" + "5" * 64,
+        summary={},
+    ) is True
+    isolated_database.connection.execute(
+        "UPDATE jobs SET review_deadline_at = now() - interval '1 second', "
+        "lease_expires_at = now() - interval '1 second' WHERE job_id = %s",
+        (job_uuid,),
+    )
+    with pytest.raises(state.StaleGeneration):
+        state.expire_review(
+            isolated_database.dsn, job_uuid, third["generation"]
+        )
+    row = isolated_database.connection.execute(
+        "SELECT state, generation, reason_code, lease_owner, "
+        "lease_expires_at IS NOT NULL FROM jobs WHERE job_id = %s",
+        (job_uuid,),
+    ).fetchone()
+    assert row == ("AWAITING_REVIEW", 3, None, "worker-c", True)
+
+
+def test_expire_review_requires_a_live_lease(isolated_database, tmp_path):
+    job = submit(isolated_database.dsn, write_request(tmp_path))
+    job_uuid = uuid.UUID(job["job_id"])
+
+    claimed = state.claim_next(isolated_database.dsn, "worker-a")
+    assert claimed is not None
+    assert claimed["generation"] == 1
+    assert state.freeze_plan(
+        isolated_database.dsn,
+        job_uuid,
+        generation=1,
+        plan={"case_id": "fixture-c-parser"},
+        plan_digest="sha256:" + "4" * 64,
+        summary={},
+    ) is True
+
+    isolated_database.connection.execute(
+        "UPDATE jobs SET review_deadline_at = now() - interval '1 second', "
+        "lease_expires_at = now() - interval '1 second' WHERE job_id = %s",
+        (job_uuid,),
+    )
+
+    # The review deadline has passed, but this worker no longer owns a live
+    # lease. The expiry write must be rejected without touching the row.
+    with pytest.raises(state.StaleGeneration):
+        state.expire_review(isolated_database.dsn, job_uuid, 1)
+
+    row = isolated_database.connection.execute(
+        "SELECT state, generation, reason_code, lease_owner, "
+        "lease_expires_at IS NOT NULL FROM jobs WHERE job_id = %s",
+        (job_uuid,),
+    ).fetchone()
+    assert row == ("AWAITING_REVIEW", 1, None, "worker-a", True)
+
+    # A takeover bumps the generation; the old generation stays rejected.
+    second = state.claim_next(isolated_database.dsn, "worker-b")
+    assert second is not None
+    assert second["generation"] == 2
+    with pytest.raises(state.StaleGeneration):
+        state.expire_review(isolated_database.dsn, job_uuid, 1)
+
+    # The normal path still works: a live lease on the current generation may
+    # expire an overdue review.
+    assert state.expire_review(isolated_database.dsn, job_uuid, 2) is True
+    row = isolated_database.connection.execute(
+        "SELECT state, generation, reason_code, lease_owner, "
+        "lease_expires_at IS NOT NULL FROM jobs WHERE job_id = %s",
+        (job_uuid,),
+    ).fetchone()
+    assert row == ("BLOCKED", 3, "REVIEW_EXPIRED", None, False)
+
+
+def test_record_review_expiry_does_not_require_a_worker_lease(
+    isolated_database, tmp_path
+):
+    job = submit(isolated_database.dsn, write_request(tmp_path))
+    worker(isolated_database.dsn)
+    job_uuid = uuid.UUID(job["job_id"])
+    digest = status(isolated_database.dsn, job["job_id"])["pending_plan"][
+        "plan_digest"
+    ]
+
+    # The operator path is fenced by the review deadline, not by a worker
+    # lease: an expired review must still be recorded from the CLI/API.
+    isolated_database.connection.execute(
+        "UPDATE jobs SET review_deadline_at = now() - interval '1 second', "
+        "lease_owner = 'ghost-worker', "
+        "lease_expires_at = now() - interval '1 second' WHERE job_id = %s",
+        (job_uuid,),
+    )
+    outcome = state.record_review(
+        isolated_database.dsn,
+        job_uuid,
+        plan_digest=digest,
+        decision="approve",
+        reviewer_id="reviewer-expiry",
+    )
+    assert outcome.status == "expired"
+    row = isolated_database.connection.execute(
+        "SELECT state, reason_code, lease_owner, lease_expires_at "
+        "FROM jobs WHERE job_id = %s",
+        (job_uuid,),
+    ).fetchone()
+    assert row == ("BLOCKED", "REVIEW_EXPIRED", None, None)
+
 
 def test_attempts_unique_includes_generation(isolated_database, tmp_path):
     job = submit(isolated_database.dsn, write_request(tmp_path))

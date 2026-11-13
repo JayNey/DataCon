@@ -658,7 +658,8 @@ def record_review(
 def expire_review(dsn: str, job_id: UUID, generation: int) -> bool:
     with _connect(dsn) as connection:
         job = connection.execute(
-            "SELECT state, generation, review_deadline_at, now() AS db_now "
+            "SELECT state, generation, review_deadline_at, lease_owner, "
+            "lease_expires_at, now() AS db_now "
             "FROM jobs WHERE job_id = %s FOR UPDATE",
             (job_id,),
         ).fetchone()
@@ -666,6 +667,11 @@ def expire_review(dsn: str, job_id: UUID, generation: int) -> bool:
             return False
         if job["generation"] != generation:
             raise StaleGeneration("execution generation is no longer current")
+        if (
+            job["lease_expires_at"] is None
+            or job["lease_expires_at"] <= job["db_now"]
+        ):
+            raise StaleGeneration("the worker lease is no longer active")
         if (
             job["review_deadline_at"] is None
             or job["review_deadline_at"] > job["db_now"]
