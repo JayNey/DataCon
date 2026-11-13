@@ -368,6 +368,18 @@ def record_attempt(
     status: str,
     result: dict[str, Any] | list[Any] | None = None,
 ) -> bool:
+    """Persist one attempt row, returning False when the write was not applied.
+
+    ``False`` means the caller no longer owns the generation/lease, or the
+    upsert was rejected because the row is already ``completed`` and the new
+    status would downgrade it. Callers must not treat that as success.
+
+    A committed ``completed`` row is terminal: a later ``started`` or
+    ``infra_error`` write for the same ``(job_id, stage, step_key, attempt_no,
+    generation)`` is rejected. Re-writing ``completed`` (for example when a
+    client retries after a connection reset that happened after commit) is
+    still applied and remains idempotent.
+    """
     if not stage or not step_key:
         raise StateError("attempt requires stage and step_key")
     with _connect(dsn) as connection:
@@ -388,13 +400,16 @@ def record_attempt(
             INSERT INTO attempts
                 (attempt_id, job_id, stage, step_key, attempt_no, generation,
                  input_digest, status, result, finished_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, now())
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s,
+                    CASE WHEN %s = 'started' THEN NULL ELSE now() END)
             ON CONFLICT (job_id, stage, step_key, attempt_no, generation)
             DO UPDATE
             SET input_digest = EXCLUDED.input_digest,
                 status = EXCLUDED.status,
                 result = EXCLUDED.result,
-                finished_at = now()
+                finished_at = EXCLUDED.finished_at
+            WHERE NOT (attempts.status = 'completed'
+                       AND EXCLUDED.status IN ('started', 'infra_error'))
             """,
             (
                 uuid.uuid4(),
@@ -406,6 +421,7 @@ def record_attempt(
                 input_digest,
                 status,
                 Jsonb(result) if result is not None else None,
+                status,
             ),
         )
         return cursor.rowcount > 0
@@ -429,6 +445,11 @@ def analysis_progress(
             (job_id, generation),
         ).fetchall()
     completed = None
+    draft_failed = False
+    for row in rows:
+        if row["status"] != "completed" and isinstance(row["result"], dict):
+            if row["result"].get("phase") == "analysis_draft":
+                draft_failed = True
     for row in reversed(rows):
         if row["status"] == "completed" and isinstance(row["result"], dict):
             completed = row["result"]
@@ -436,6 +457,7 @@ def analysis_progress(
     return {
         "max_attempt": rows[-1]["attempt_no"] if rows else 0,
         "completed": completed,
+        "draft_failed": draft_failed,
     }
 
 

@@ -113,7 +113,11 @@ def test_non_transient_analysis_error_does_not_retry(
 
     assert len(calls) == 1
     assert result["state"] == "BLOCKED"
-    assert analysis_attempts(isolated_database, job["job_id"]) == []
+    # The attempt is reserved before analysis runs, so the durable history
+    # still records the execution even though it ended in a business block.
+    assert analysis_attempts(isolated_database, job["job_id"]) == [
+        (1, "started")
+    ]
     assert scalar(
         isolated_database,
         "SELECT count(*) FROM attempts WHERE job_id = %s AND status = 'infra_error'",
@@ -546,3 +550,540 @@ def test_new_generation_reanalyzes_after_pre_freeze_process_exit(
     current = state.load_job(isolated_database.dsn, job_uuid)
     assert current["workflow_synced"] is True
     assert current["lease_owner"] is None
+
+
+def analysis_rows(database, job_id):
+    return database.connection.execute(
+        "SELECT attempt_no, status, result FROM attempts "
+        "WHERE job_id = %s AND step_key = 'analysis' ORDER BY attempt_no",
+        (UUID(job_id),),
+    ).fetchall()
+
+
+def test_infra_error_write_failure_cannot_reset_the_attempt_counter(
+    isolated_database, tmp_path, monkeypatch
+):
+    """Problem A: an unrecorded infra_error must not unlock a third analysis.
+
+    The first execution fails and its ``infra_error`` write fails. The second
+    execution also fails. Because the ``started`` row already reserved attempt
+    1, the workflow retry consumes attempt 2 and fails closed instead of
+    counting from zero and running a third analysis.
+    """
+    job = queue_job(isolated_database, tmp_path)
+    job_uuid = UUID(job["job_id"])
+    analysis_calls = []
+
+    def flaky_analysis(request, **kwargs):
+        analysis_calls.append(request)
+        if len(analysis_calls) <= 2:
+            raise RetryableAnalysisError("analysis timed out")
+        return real_analyze_case(request, **kwargs)
+
+    real_record = state.record_attempt
+    failed_write = {"done": False}
+
+    def failing_record(*args, **kwargs):
+        if (
+            kwargs.get("step_key") == "analysis"
+            and kwargs.get("status") == "infra_error"
+            and kwargs.get("attempt_no") == 1
+            and not failed_write["done"]
+        ):
+            failed_write["done"] = True
+            raise psycopg.OperationalError(
+                "connection reset while recording the infra_error"
+            )
+        return real_record(*args, **kwargs)
+
+    monkeypatch.setattr(workflow, "analyze_case", flaky_analysis)
+    monkeypatch.setattr(workflow.state_store, "record_attempt", failing_record)
+
+    result = workflow.run_worker(isolated_database.dsn, once=True)
+
+    assert len(analysis_calls) == 2, "analysis must never run a third time"
+    rows = analysis_rows(isolated_database, job["job_id"])
+    assert [row[0] for row in rows] == [1, 2], (
+        "every execution must be represented by its own attempt row"
+    )
+    assert rows[0][1] in ("started", "infra_error")
+    assert rows[1][1] == "infra_error"
+    assert result["state"] == "FAILED"
+    current = isolated_database.connection.execute(
+        "SELECT reason_code, workflow_synced, lease_owner "
+        "FROM jobs WHERE job_id = %s",
+        (job_uuid,),
+    ).fetchone()
+    assert current[0] == "ANALYSIS_ERROR"
+    assert current[1] is True
+    assert current[2] is None
+    assert scalar(
+        isolated_database,
+        "SELECT count(*) FROM plans WHERE job_id = %s",
+        (job_uuid,),
+    ) == 0
+    assert scalar(
+        isolated_database,
+        "SELECT count(*) FROM attempts WHERE job_id = %s "
+        "AND result::text LIKE '%%InvalidUpdateError%%'",
+        (job_uuid,),
+    ) == 0
+
+
+def test_infra_error_write_failure_reserves_attempt_two_for_the_retry(
+    isolated_database, tmp_path, monkeypatch
+):
+    """The retry after a lost ``infra_error`` write is attempt 2, not attempt 1.
+
+    Pre-fix the failed history write reset the counter, so the retry was
+    recorded with ``attempt_no=1`` and the history no longer matched the two
+    executions that actually ran.
+    """
+    job = queue_job(isolated_database, tmp_path)
+    job_uuid = UUID(job["job_id"])
+    analysis_calls = []
+
+    def flaky_analysis(request, **kwargs):
+        analysis_calls.append(request)
+        if len(analysis_calls) == 1:
+            raise RetryableAnalysisError("analysis timed out")
+        return real_analyze_case(request, **kwargs)
+
+    real_record = state.record_attempt
+    failed_write = {"done": False}
+
+    def failing_record(*args, **kwargs):
+        if (
+            kwargs.get("step_key") == "analysis"
+            and kwargs.get("status") == "infra_error"
+            and kwargs.get("attempt_no") == 1
+            and not failed_write["done"]
+        ):
+            failed_write["done"] = True
+            raise psycopg.OperationalError(
+                "connection reset while recording the infra_error"
+            )
+        return real_record(*args, **kwargs)
+
+    monkeypatch.setattr(workflow, "analyze_case", flaky_analysis)
+    monkeypatch.setattr(workflow.state_store, "record_attempt", failing_record)
+
+    result = workflow.run_worker(isolated_database.dsn, once=True)
+
+    assert len(analysis_calls) == 2
+    assert result["state"] == "AWAITING_REVIEW"
+    rows = analysis_rows(isolated_database, job["job_id"])
+    assert [(row[0], row[1]) for row in rows] == [
+        (1, "started"),
+        (2, "completed"),
+    ]
+    assert scalar(
+        isolated_database,
+        "SELECT count(*) FROM plans WHERE job_id = %s",
+        (job_uuid,),
+    ) == 1
+    current = state.load_job(isolated_database.dsn, job_uuid)
+    assert current["state"] == "AWAITING_REVIEW"
+    assert current["workflow_synced"] is True
+    assert current["lease_owner"] is None
+    assert current["lease_expires_at"] is None
+    assert scalar(
+        isolated_database,
+        "SELECT count(*) FROM jobs WHERE job_id = %s AND state = 'FAILED'",
+        (job_uuid,),
+    ) == 0
+
+
+def test_draft_and_block_failures_cannot_run_a_third_analysis(
+    isolated_database, tmp_path, monkeypatch
+):
+    """Problem B: fail-closed block failures must not unlock a third analysis.
+
+    Attempt 1 fails and is recorded. Attempt 2 analyzes successfully, but the
+    completed draft is never written, its ``infra_error`` marker fails, and the
+    first ``block_job`` fails too. The bounded block retry still fails the job
+    closed; a workflow retry must reuse the persisted attempts rather than run
+    analysis a third time.
+    """
+    job = queue_job(isolated_database, tmp_path)
+    job_uuid = UUID(job["job_id"])
+    analysis_calls = []
+
+    def flaky_analysis(request, **kwargs):
+        analysis_calls.append(request)
+        if len(analysis_calls) == 1:
+            raise RetryableAnalysisError("analysis timed out")
+        return real_analyze_case(request, **kwargs)
+
+    real_record = state.record_attempt
+
+    def failing_record(*args, **kwargs):
+        if kwargs.get("step_key") != "analysis":
+            return real_record(*args, **kwargs)
+        if (
+            kwargs.get("status") == "completed"
+            and isinstance(kwargs.get("result"), dict)
+            and "plan" in kwargs["result"]
+        ):
+            raise psycopg.OperationalError(
+                "connection reset while writing the analysis draft"
+            )
+        if kwargs.get("status") == "infra_error" and kwargs.get("attempt_no") == 2:
+            raise psycopg.OperationalError(
+                "connection reset while recording the second failure"
+            )
+        return real_record(*args, **kwargs)
+
+    real_block = state.block_job
+    block_calls = []
+
+    def flaky_block(*args, **kwargs):
+        block_calls.append(kwargs)
+        if len(block_calls) == 1:
+            raise psycopg.OperationalError(
+                "connection reset while blocking the job"
+            )
+        return real_block(*args, **kwargs)
+
+    freeze_calls = []
+    real_freeze = state.freeze_plan
+
+    def counting_freeze(*args, **kwargs):
+        freeze_calls.append(kwargs)
+        return real_freeze(*args, **kwargs)
+
+    monkeypatch.setattr(workflow, "analyze_case", flaky_analysis)
+    monkeypatch.setattr(workflow.state_store, "record_attempt", failing_record)
+    monkeypatch.setattr(workflow.state_store, "block_job", flaky_block)
+    monkeypatch.setattr(workflow.state_store, "freeze_plan", counting_freeze)
+
+    result = workflow.run_worker(isolated_database.dsn, once=True)
+
+    assert len(analysis_calls) == 2, "analysis must never run a third time"
+    assert freeze_calls == [], "a missing draft must never be frozen"
+    assert len(block_calls) == 2, "the fail-closed block gets one bounded retry"
+    rows = analysis_rows(isolated_database, job["job_id"])
+    assert [row[0] for row in rows] == [1, 2]
+    assert rows[0][1] == "infra_error"
+    assert rows[1][1] in ("started", "infra_error")
+    assert result["state"] == "FAILED"
+    current = isolated_database.connection.execute(
+        "SELECT reason_code, workflow_synced, lease_owner "
+        "FROM jobs WHERE job_id = %s",
+        (job_uuid,),
+    ).fetchone()
+    assert current[0] == "ANALYSIS_ERROR"
+    assert current[1] is True
+    assert current[2] is None
+    assert scalar(
+        isolated_database,
+        "SELECT count(*) FROM plans WHERE job_id = %s",
+        (job_uuid,),
+    ) == 0
+    assert scalar(
+        isolated_database,
+        "SELECT count(*) FROM jobs WHERE job_id = %s AND state = 'FAILED'",
+        (job_uuid,),
+    ) == 1
+
+
+def test_committed_draft_is_not_downgraded_by_infra_error(
+    isolated_database, tmp_path, monkeypatch
+):
+    """Problem C: a completed draft committed before a reset stays completed.
+
+    Both draft writes commit and then raise, simulating a client that loses
+    the connection after the server committed. The durable ``completed`` row
+    must be reused; it must never be overwritten with ``infra_error``.
+    """
+    job = queue_job(isolated_database, tmp_path)
+    job_uuid = UUID(job["job_id"])
+    analysis_calls = []
+
+    def counting_analysis(request, **kwargs):
+        analysis_calls.append(request)
+        return real_analyze_case(request, **kwargs)
+
+    real_record = state.record_attempt
+    committed = []
+
+    def commit_then_reset(*args, **kwargs):
+        if (
+            kwargs.get("step_key") == "analysis"
+            and kwargs.get("status") == "completed"
+            and isinstance(kwargs.get("result"), dict)
+            and "plan" in kwargs["result"]
+        ):
+            stored = real_record(*args, **kwargs)
+            assert stored is True, "the draft row must be committed before reset"
+            committed.append(kwargs.get("attempt_no"))
+            raise psycopg.OperationalError(
+                "connection reset after the draft was committed"
+            )
+        return real_record(*args, **kwargs)
+
+    monkeypatch.setattr(workflow, "analyze_case", counting_analysis)
+    monkeypatch.setattr(workflow.state_store, "record_attempt", commit_then_reset)
+
+    result = workflow.run_worker(isolated_database.dsn, once=True)
+
+    assert len(analysis_calls) == 1
+    assert committed == [1, 1], "one bounded draft retry is allowed"
+    rows = analysis_rows(isolated_database, job["job_id"])
+    assert [(row[0], row[1]) for row in rows] == [(1, "completed")]
+    assert rows[0][2]["plan_digest"].startswith("sha256:")
+    assert scalar(
+        isolated_database,
+        "SELECT count(*) FROM attempts WHERE job_id = %s "
+        "AND step_key = 'analysis' AND status = 'infra_error'",
+        (job_uuid,),
+    ) == 0, "a committed completed row must never be downgraded"
+    assert result["state"] == "AWAITING_REVIEW"
+    assert scalar(
+        isolated_database,
+        "SELECT count(*) FROM plans WHERE job_id = %s",
+        (job_uuid,),
+    ) == 1
+    current = state.load_job(isolated_database.dsn, job_uuid)
+    assert current["workflow_synced"] is True
+    assert current["lease_owner"] is None
+
+
+@pytest.mark.parametrize(
+    ("phase", "expected_calls"),
+    [
+        ("started", 0),
+        ("draft", 1),
+        ("failure_marker", 1),
+    ],
+)
+def test_record_attempt_false_stops_the_step_without_failing_the_job(
+    isolated_database, tmp_path, monkeypatch, phase, expected_calls
+):
+    """A ``False`` attempt write is never treated as success.
+
+    Whichever write is rejected (attempt reservation, draft, or failure
+    marker), the step stops before a new analysis or a plan freeze, the job
+    stays ``PREPARING`` rather than being overwritten as ``FAILED``, and the
+    next generation converges.
+    """
+    job = queue_job(isolated_database, tmp_path)
+    job_uuid = UUID(job["job_id"])
+    analysis_calls = []
+
+    def counting_analysis(request, **kwargs):
+        analysis_calls.append(request)
+        if phase == "failure_marker" and len(analysis_calls) == 1:
+            raise RetryableAnalysisError("analysis timed out")
+        return real_analyze_case(request, **kwargs)
+
+    real_record = state.record_attempt
+    rejected = {"done": False}
+
+    def false_once(*args, **kwargs):
+        if not rejected["done"]:
+            matches = (
+                phase == "started"
+                and kwargs.get("step_key") == "analysis"
+                and kwargs.get("status") == "started"
+            ) or (
+                phase == "draft"
+                and kwargs.get("step_key") == "analysis"
+                and kwargs.get("status") == "completed"
+                and isinstance(kwargs.get("result"), dict)
+                and "plan" in kwargs["result"]
+            ) or (
+                phase == "failure_marker"
+                and kwargs.get("step_key") == "analysis"
+                and kwargs.get("status") == "infra_error"
+            )
+            if matches:
+                rejected["done"] = True
+                return False
+        return real_record(*args, **kwargs)
+
+    freeze_calls = []
+    real_freeze = state.freeze_plan
+
+    def counting_freeze(*args, **kwargs):
+        freeze_calls.append(kwargs)
+        return real_freeze(*args, **kwargs)
+
+    monkeypatch.setattr(workflow, "analyze_case", counting_analysis)
+    monkeypatch.setattr(workflow.state_store, "record_attempt", false_once)
+    monkeypatch.setattr(workflow.state_store, "freeze_plan", counting_freeze)
+
+    first = workflow.run_worker(isolated_database.dsn, once=True)
+
+    assert len(analysis_calls) == expected_calls, "no new analysis may start"
+    assert freeze_calls == [], "a rejected attempt write must not freeze a plan"
+    current = state.load_job(isolated_database.dsn, job_uuid)
+    assert current["state"] == "PREPARING"
+    assert current["reason_code"] is None
+    assert current["workflow_synced"] is True
+    assert current["lease_owner"] is None
+    assert first["state"] == "PREPARING"
+    assert scalar(
+        isolated_database,
+        "SELECT count(*) FROM plans WHERE job_id = %s",
+        (job_uuid,),
+    ) == 0
+    assert scalar(
+        isolated_database,
+        "SELECT count(*) FROM jobs WHERE job_id = %s AND state = 'FAILED'",
+        (job_uuid,),
+    ) == 0
+
+    # The rejected write is transient: the next generation converges.
+    recovered = workflow.run_worker(isolated_database.dsn, once=True)
+    assert recovered["state"] == "AWAITING_REVIEW"
+    assert scalar(
+        isolated_database,
+        "SELECT count(*) FROM plans WHERE job_id = %s",
+        (job_uuid,),
+    ) == 1
+    current = state.load_job(isolated_database.dsn, job_uuid)
+    assert current["workflow_synced"] is True
+    assert current["lease_owner"] is None
+
+
+def test_record_attempt_rejects_downgrading_a_completed_row(
+    isolated_database, tmp_path
+):
+    """State-level guard: ``infra_error`` cannot overwrite ``completed``."""
+    job = queue_job(isolated_database, tmp_path)
+    job_uuid = UUID(job["job_id"])
+    claimed = state.claim_next(isolated_database.dsn, "worker-a")
+    assert claimed is not None
+    generation = claimed["generation"]
+
+    assert state.record_attempt(
+        isolated_database.dsn,
+        job_uuid,
+        stage="prepare",
+        step_key="analysis",
+        attempt_no=1,
+        generation=generation,
+        input_digest=None,
+        status="completed",
+        result={"plan_digest": "sha256:" + "1" * 64},
+    ) is True
+    assert state.record_attempt(
+        isolated_database.dsn,
+        job_uuid,
+        stage="prepare",
+        step_key="analysis",
+        attempt_no=1,
+        generation=generation,
+        input_digest=None,
+        status="infra_error",
+        result={"error": "OperationalError"},
+    ) is False
+    assert analysis_attempts(isolated_database, job["job_id"]) == [
+        (1, "completed")
+    ]
+    # An idempotent completed rewrite is still accepted.
+    assert state.record_attempt(
+        isolated_database.dsn,
+        job_uuid,
+        stage="prepare",
+        step_key="analysis",
+        attempt_no=1,
+        generation=generation,
+        input_digest=None,
+        status="completed",
+        result={"plan_digest": "sha256:" + "1" * 64},
+    ) is True
+
+
+def test_unwritable_block_keeps_preparing_without_a_third_analysis(
+    isolated_database, tmp_path, monkeypatch
+):
+    """When the fail-closed block cannot be written, keep PREPARING.
+
+    The bounded retries are exhausted, but the persisted attempts still prove
+    that both analyses ran, so the workflow retry fails closed instead of
+    running a third analysis.
+    """
+    job = queue_job(isolated_database, tmp_path)
+    job_uuid = UUID(job["job_id"])
+    analysis_calls = []
+
+    def flaky_analysis(request, **kwargs):
+        analysis_calls.append(request)
+        if len(analysis_calls) == 1:
+            raise RetryableAnalysisError("analysis timed out")
+        return real_analyze_case(request, **kwargs)
+
+    real_record = state.record_attempt
+
+    def failing_record(*args, **kwargs):
+        if kwargs.get("step_key") != "analysis":
+            return real_record(*args, **kwargs)
+        if (
+            kwargs.get("status") == "completed"
+            and isinstance(kwargs.get("result"), dict)
+            and "plan" in kwargs["result"]
+        ):
+            raise psycopg.OperationalError(
+                "connection reset while writing the analysis draft"
+            )
+        if kwargs.get("status") == "infra_error" and kwargs.get("attempt_no") == 2:
+            raise psycopg.OperationalError(
+                "connection reset while recording the second failure"
+            )
+        return real_record(*args, **kwargs)
+
+    real_block = state.block_job
+    block_calls = []
+
+    def failing_block(*args, **kwargs):
+        block_calls.append(kwargs)
+        raise psycopg.OperationalError("block writes are unavailable")
+
+    monkeypatch.setattr(workflow, "analyze_case", flaky_analysis)
+    monkeypatch.setattr(workflow.state_store, "record_attempt", failing_record)
+    monkeypatch.setattr(workflow.state_store, "block_job", failing_block)
+
+    result = workflow.run_worker(isolated_database.dsn, once=True)
+
+    assert len(analysis_calls) == 2, "analysis must never run a third time"
+    assert block_calls, "the fail-closed block was attempted"
+    assert result["state"] == "PREPARING"
+    rows = analysis_rows(isolated_database, job["job_id"])
+    assert [row[0] for row in rows] == [1, 2]
+    assert scalar(
+        isolated_database,
+        "SELECT count(*) FROM plans WHERE job_id = %s",
+        (job_uuid,),
+    ) == 0
+    assert scalar(
+        isolated_database,
+        "SELECT count(*) FROM jobs WHERE job_id = %s AND state = 'FAILED'",
+        (job_uuid,),
+    ) == 0
+    current = state.load_job(isolated_database.dsn, job_uuid)
+    assert current["state"] == "PREPARING"
+    assert current["workflow_synced"] is True
+    assert current["lease_owner"] is None
+    # A later claim runs against a fresh generation; this generation never
+    # ran a third analysis.
+    assert len(
+        [
+            row
+            for row in isolated_database.connection.execute(
+                "SELECT attempt_no FROM attempts WHERE job_id = %s "
+                "AND step_key = 'workflow' ORDER BY attempt_no",
+                (job_uuid,),
+            ).fetchall()
+        ]
+    ) == 2
+    monkeypatch.setattr(workflow.state_store, "block_job", real_block)
+    monkeypatch.setattr(workflow.state_store, "record_attempt", real_record)
+    recovered = workflow.run_worker(isolated_database.dsn, once=True)
+    assert recovered["state"] == "AWAITING_REVIEW"
+    assert scalar(
+        isolated_database,
+        "SELECT count(*) FROM plans WHERE job_id = %s",
+        (job_uuid,),
+    ) == 1

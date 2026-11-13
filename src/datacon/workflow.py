@@ -149,23 +149,53 @@ def build_graph(
             dsn, job_id, generation=job["generation"]
         )
         analyzed = _reusable_analysis(progress["completed"])
+
+        def fail_analysis(message: str) -> None:
+            """Fail the job closed, retrying the terminal write once.
+
+            ``block_job`` is the fail-closed marker. If it cannot be written
+            the caller stays in ``PREPARING`` and the workflow-level retry
+            re-enters ``prepare``; that retry relies on the persisted attempt
+            and draft history instead of running analysis again.
+            """
+            last_error: BaseException | None = None
+            for _ in range(2):
+                try:
+                    state_store.block_job(
+                        dsn,
+                        job_id,
+                        generation=job["generation"],
+                        reason_code="ANALYSIS_ERROR",
+                        message=message,
+                        state="FAILED",
+                        event_type="failed",
+                    )
+                    return
+                except state_store.StaleGeneration:
+                    raise
+                except (state_store.StateError, psycopg.Error) as error:
+                    last_error = error
+            assert last_error is not None
+            raise last_error
+
         if analyzed is not None:
             # A workflow-level retry after freeze_plan failed must reuse the
             # completed analysis instead of executing it a third time.
             attempt_no = max(progress["max_attempt"], 1)
         else:
+            if progress["draft_failed"]:
+                # A failed draft is fail-closed even if only one attempt was
+                # consumed: re-running analysis cannot repair the missing
+                # draft within this generation.
+                fail_analysis(
+                    "analysis draft failed; failing closed without "
+                    "re-running analysis"
+                )
+                return {}
             if progress["max_attempt"] >= 2:
-                state_store.block_job(
-                    dsn,
-                    job_id,
-                    generation=job["generation"],
-                    reason_code="ANALYSIS_ERROR",
-                    message=(
-                        "analysis already consumed both attempts for this "
-                        "execution generation"
-                    ),
-                    state="FAILED",
-                    event_type="failed",
+                fail_analysis(
+                    "analysis already consumed both attempts for this "
+                    "execution generation"
                 )
                 return {}
             attempt_no = progress["max_attempt"] + 1
@@ -191,14 +221,52 @@ def build_graph(
 
                 return record_tool
 
+            def start_attempt(attempt: int) -> None:
+                """Reserve the attempt before ``analyze_case`` runs.
+
+                The row is written even when the analysis later fails, so a
+                workflow-level retry derives the next attempt number from
+                durable history and cannot silently execute a third time. A
+                failed reservation is never treated as success: the lease
+                check returning ``False`` raises ``StaleGeneration`` and the
+                analysis does not start.
+                """
+                stored = state_store.record_attempt(
+                    dsn,
+                    job_id,
+                    stage="prepare",
+                    step_key="analysis",
+                    attempt_no=attempt,
+                    generation=job["generation"],
+                    input_digest=jsonutil.digest_json(job["request"]),
+                    status="started",
+                )
+                if not stored:
+                    raise state_store.StaleGeneration(
+                        "the worker lease was lost before the analysis started"
+                    )
+
+            def committed_draft() -> AnalyzedCase | None:
+                """Read the durable draft after an ambiguous write failure."""
+                try:
+                    current = state_store.analysis_progress(
+                        dsn, job_id, generation=job["generation"]
+                    )
+                except (state_store.StateError, psycopg.Error):
+                    return None
+                return _reusable_analysis(current["completed"])
+
             def persist_draft(attempt: int, analyzed: AnalyzedCase) -> bool:
                 """Persist the analysis draft used by a workflow-level retry.
 
                 The draft is the only way a retry can freeze the plan without
                 running analysis a third time, so a write failure cannot be
                 ignored. One bounded retry absorbs a transient connection
-                reset; if both writes fail the step fails closed instead of
-                leaving an untracked analysis execution behind.
+                reset. If the connection dropped after the server committed
+                the ``completed`` row, that row is reused rather than
+                downgraded to ``infra_error``. If the draft truly is not
+                stored, the step fails closed and the attempt history stays
+                truthful.
                 """
                 result = {
                     "plan_digest": analyzed.plan_digest,
@@ -224,12 +292,26 @@ def build_graph(
                         continue
                     if stored:
                         return True
+                    # ``record_attempt`` returned False: the lease check or the
+                    # completed-row guard rejected the write. Do not continue
+                    # analyzing as if the draft were persisted.
                     raise state_store.StaleGeneration(
                         "the worker lease was lost before the analysis draft "
                         "was stored"
                     )
+                # The client may have lost the connection after the server
+                # committed the completed row. Never overwrite that row with
+                # infra_error; reuse it when it carries this exact draft.
+                committed = committed_draft()
+                if (
+                    committed is not None
+                    and committed.plan_digest == analyzed.plan_digest
+                ):
+                    return True
+                assert last_error is not None
+                marked = False
                 try:
-                    state_store.record_attempt(
+                    marked = state_store.record_attempt(
                         dsn,
                         job_id,
                         stage="prepare",
@@ -244,18 +326,21 @@ def build_graph(
                         },
                     )
                 except (state_store.StateError, psycopg.Error):
-                    pass
-                state_store.block_job(
-                    dsn,
-                    job_id,
-                    generation=job["generation"],
-                    reason_code="ANALYSIS_ERROR",
-                    message=(
-                        "analysis succeeded but its plan draft could not be "
-                        "persisted"
-                    ),
-                    state="FAILED",
-                    event_type="failed",
+                    marked = False
+                if not marked:
+                    # The marker write was not applied. The reserved attempt
+                    # row still accounts for this execution; re-check the
+                    # durable draft and otherwise fail closed instead of
+                    # starting another analysis.
+                    committed = committed_draft()
+                    if (
+                        committed is not None
+                        and committed.plan_digest == analyzed.plan_digest
+                    ):
+                        return True
+                fail_analysis(
+                    "analysis succeeded but its plan draft could not be "
+                    "persisted"
                 )
                 return False
 
@@ -276,17 +361,9 @@ def build_graph(
                         "the worker lease was lost before the retry"
                     )
                 if attempt >= 2:
-                    state_store.block_job(
-                        dsn,
-                        job_id,
-                        generation=job["generation"],
-                        reason_code="ANALYSIS_ERROR",
-                        message=(
-                            "analysis failed after one retry with "
-                            f"{type(error).__name__}"
-                        ),
-                        state="FAILED",
-                        event_type="failed",
+                    fail_analysis(
+                        "analysis failed after one retry with "
+                        f"{type(error).__name__}"
                     )
                     return False
                 if state_store.prepare_deadline_passed(
@@ -303,6 +380,15 @@ def build_graph(
                 return True
 
             while analyzed is None:
+                if attempt_no > 2:
+                    # Hard cap: the started rows above already account for the
+                    # consumed attempts, so this is only a defensive guard.
+                    fail_analysis(
+                        "analysis already consumed both attempts for this "
+                        "execution generation"
+                    )
+                    return {}
+                start_attempt(attempt_no)
                 try:
                     analyzed = analyze_case(
                         job["request"],
@@ -614,7 +700,10 @@ def _process_claim(graph, dsn: str, claimed: dict[str, Any]) -> dict[str, Any]:
                                 "workflow retry"
                             ),
                         )
-                    except state_store.StateError:
+                    except (state_store.StateError, psycopg.Error):
+                        # The job stays PREPARING; a later workflow or worker
+                        # retry must read the persisted attempts and fail
+                        # closed instead of running analysis again.
                         pass
                     graph_failure = None
                     break
@@ -660,7 +749,9 @@ def _process_claim(graph, dsn: str, claimed: dict[str, Any]) -> dict[str, Any]:
                     state="FAILED",
                     event_type="failed",
                 )
-            except state_store.StateError:
+            except (state_store.StateError, psycopg.Error):
+                # Keep PREPARING when the fail-closed marker cannot be
+                # written; the attempt history already fences a retry.
                 pass
 
     if not business_authoritative:
