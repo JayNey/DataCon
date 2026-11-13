@@ -701,3 +701,140 @@ def test_block_before_plan_is_recovered_after_lease_expiry(
     snapshot = checkpoint_snapshot(isolated_database, job["job_id"])
     assert snapshot.next == ()
     assert not snapshot.interrupts
+
+
+def test_two_workers_lease_takeover_converges(
+    isolated_database, tmp_path, monkeypatch
+):
+    """A takeover during analysis must converge to one plan and one checkpoint.
+
+    Worker A parks inside ``analyze_case``. Its lease is expired and worker B
+    claims the next generation and finishes preparation, parking at the
+    review interrupt. When A resumes it must stop at the generation/lease
+    fence without writing business state or a competing checkpoint.
+    """
+    job = submit(isolated_database.dsn, write_request(tmp_path))
+    job_uuid = uuid.UUID(job["job_id"])
+    started = threading.Event()
+    release = threading.Event()
+    calls = []
+    call_lock = threading.Lock()
+    real_analyze_case = workflow.analyze_case
+    a_results = {}
+    a_errors = []
+
+    def gated_analysis(request, **kwargs):
+        with call_lock:
+            calls.append(request)
+            index = len(calls)
+        if index == 1:
+            started.set()
+            if not release.wait(timeout=60):
+                raise AssertionError("the test did not release worker A")
+        return real_analyze_case(request, **kwargs)
+
+    monkeypatch.setattr(workflow, "analyze_case", gated_analysis)
+
+    def run_worker_a():
+        try:
+            a_results.update(
+                workflow.run_worker(
+                    isolated_database.dsn, once=True, lease_seconds=1
+                )
+            )
+        except BaseException as error:  # noqa: BLE001 - re-raised in the test
+            a_errors.append(error)
+
+    worker_a = threading.Thread(target=run_worker_a, daemon=True)
+    worker_a.start()
+    assert started.wait(timeout=30), "worker A never reached analysis"
+
+    first = state.load_job(isolated_database.dsn, job_uuid)
+    assert first["generation"] == 1
+    assert first["state"] == "PREPARING"
+    assert first["lease_owner"] is not None
+
+    # Simulate the lease lapsing while A is still analysing. B claims the
+    # next generation without waiting for the one second lease to elapse.
+    isolated_database.connection.execute(
+        "UPDATE jobs SET lease_expires_at = now() - interval '1 second' "
+        "WHERE job_id = %s",
+        (job_uuid,),
+    )
+    b = workflow.run_worker(
+        isolated_database.dsn, once=True, lease_seconds=60
+    )
+    assert b["processed"] == 1
+    assert b["state"] == "AWAITING_REVIEW"
+
+    current = state.load_job(isolated_database.dsn, job_uuid)
+    assert current["generation"] == 2
+    assert current["workflow_synced"] is True
+    assert current["lease_owner"] is None
+
+    release.set()
+    worker_a.join(timeout=60)
+    assert not worker_a.is_alive(), "worker A did not stop after the takeover"
+    assert not a_errors, a_errors
+    assert len(calls) >= 2, "worker B must have analysed the new generation"
+
+    a = a_results
+    assert a["processed"] == 1
+    assert a["state"] == "AWAITING_REVIEW"
+
+    assert scalar(
+        isolated_database,
+        "SELECT count(*) FROM plans WHERE job_id = %s",
+        (job_uuid,),
+    ) == 1
+    assert scalar(
+        isolated_database,
+        "SELECT count(*) FROM reviews WHERE job_id = %s",
+        (job_uuid,),
+    ) == 0
+    assert scalar(
+        isolated_database,
+        "SELECT count(*) FROM jobs WHERE job_id = %s AND state = 'FAILED'",
+        (job_uuid,),
+    ) == 0
+
+    current = state.load_job(isolated_database.dsn, job_uuid)
+    assert current["state"] == "AWAITING_REVIEW"
+    assert current["workflow_synced"] is True
+    assert current["lease_owner"] is None
+    assert current["last_error"] is None or (
+        "InvalidUpdateError" not in current["last_error"]
+    )
+    assert scalar(
+        isolated_database,
+        "SELECT count(*) FROM attempts WHERE job_id = %s "
+        "AND result::text LIKE '%%InvalidUpdateError%%'",
+        (job_uuid,),
+    ) == 0
+
+    # The old generation only left its started reservation; the new
+    # generation owns the complete tool ledger.
+    rows = isolated_database.connection.execute(
+        "SELECT generation, step_key, status FROM attempts "
+        "WHERE job_id = %s ORDER BY generation, step_key",
+        (job_uuid,),
+    ).fetchall()
+    generation_one = [row for row in rows if row[0] == 1]
+    assert generation_one == [(1, "analysis", "started")]
+    assert all(
+        row[1] == "analysis" or row[2] == "completed"
+        for row in rows
+        if row[0] == 2
+    )
+    assert any(
+        row[0] == 2 and row[1] == "analysis" and row[2] == "completed"
+        for row in rows
+    )
+
+    # The checkpoint still represents B's parked review, and A's stale
+    # finalize remains fenced.
+    snapshot = checkpoint_snapshot(isolated_database, job["job_id"])
+    assert snapshot.next == ("await_review",)
+    assert snapshot.interrupts
+    assert state.finalize_workflow(isolated_database.dsn, job_uuid, 1) is False
+    assert state.load_job(isolated_database.dsn, job_uuid)["workflow_synced"] is True
