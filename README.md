@@ -149,11 +149,12 @@ uv run datacon status "$job"   # state=READY，review_state.decision=approve
 - 审核批准 / 拒绝或审核过期在同一事务中增加 `generation` 并清空租约。因此在 `await_review` 读取 `review=None` 后提交的审核会使旧 worker 的 finalize 失败：`workflow_synced` 保持 `false`，下一次 `worker` 以新代次恢复检查点后才置为 `true`。`block_job` 故意保留租约，由同代次的 `finalize_workflow` 清空，保证 `BLOCKED` 任务也能同步。
 - 准备阶段固定 `prepare_deadline_at`；计划冻结时由数据库 `now() + interval '24 hours'` 固定 `review_deadline_at`，不使用 worker 进程时钟；执行期限在 T05 首次执行领取时固定。`freeze_plan` 在锁定任务后再次用数据库时钟检查准备期限，分析期间过期则不写计划并阻断为 `BLOCKED/DEADLINE_EXCEEDED`。
 - 待审时进程退出：检查点停在 `await_review` 中断，重新启动只读取既有计划，不会生成第二份。
-- 审核决议已入库但工作流尚未恢复：`review` 与任务状态在同一事务提交（`READY` 或 `BLOCKED`），检查点仍停在中断；下一次 `worker` 用 `Command(resume=...)` 恢复并同步检查点。计划与审核各只有一份有效记录。
+- 审核决议已入库但工作流尚未恢复：`review` 与任务状态在同一事务提交（`READY` 或 `BLOCKED`），检查点仍停在中断；下一次 `worker` 用 `Command(resume=...)` 恢复并同步检查点。计划与审核各只有一份有效记录。resume 不再重复携带 `generation`/`stage`/`state_version` 更新：领取代次经运行配置传入图节点，节点只在成功完成时把代次写回检查点，因此一次 resume 即使重试也只写一次。
 - 图在冻结计划后、`finalize_workflow` 前退出且重启时仍待审：恢复的 worker 结束本次调度而不叠加第二个中断，任务保持 `AWAITING_REVIEW` 并完成同步；之后的批准、拒绝或审核过期由业务记录重新置为未同步，下一次 worker 正常收敛，不会出现 `InvalidUpdateError` 或误判 `FAILED`。
+- 恢复路径中的可重试数据库/检查点错误最多重试一次；业务记录是权威：已提交的 `READY`、`BLOCKED` 和待审计划不会因为调度或检查点异常被改写为 `FAILED`。重试仍失败的 `READY`/`BLOCKED` 任务保持原状态与 `workflow_synced=false`，租约到期后由新代次收敛；只有仍处于 `PREPARING`（没有已提交审核）的明确分析失败才进入 `FAILED/ANALYSIS_ERROR`。
 - 工具尝试按 `job_id/stage/step_key/attempt_no/generation` 记录；同一代次重复执行只更新该代次的行，旧代次不能覆盖新代次，审计事件只追加。
 - 可恢复基础设施错误使用类型化异常，不靠消息字符串匹配：`TransientSourceToolError`（Git 超时、子进程启动/终止或可恢复 I/O）转换为 `RetryableAnalysisError`，Supervisor / 检查点的瞬时错误使用 `RetryableWorkflowError`、`psycopg.OperationalError` / `InterfaceError` 等类型。缺件、摘要不符、来源冲突、契约错误、`AnalysisBlocked`、`StaleGeneration` 和 `PlanConflict` 不重试。
-- 每个逻辑步骤最多额外重试一次（attempt 1 → attempt 2）。重试前用数据库 `now()` 检查 `prepare_deadline_at`；已过期直接 `BLOCKED/DEADLINE_EXCEEDED`。分析成功后的计划草稿随 `attempts` 持久化；workflow 级重试在冻结计划失败时复用该草稿，不会第三次执行分析，也不会用同 attempt_no 的 `completed` 覆盖第一次的 `infra_error`。`attempts` 追加记录 `step_key`、`attempt_no`、`generation` 与 `status=infra_error|completed`；workflow 重试成功时补记 `completed`，第二次仍失败才以 `FAILED/ANALYSIS_ERROR` 终止。检查点 `get_state` / `invoke` 的瞬时错误同样最多重试一次。
+- 每个逻辑步骤最多额外重试一次（attempt 1 → attempt 2）。重试前用数据库 `now()` 检查 `prepare_deadline_at`；已过期直接 `BLOCKED/DEADLINE_EXCEEDED`。分析成功后的计划草稿随 `attempts` 持久化；草稿写入失败先做一次有界重试，仍失败则不冻结计划并以 `FAILED/ANALYSIS_ERROR` 关闭，因此同一执行代次内 `analyze_case` 最多执行两次。workflow 级重试在冻结计划失败时复用该草稿，不会第三次执行分析，也不会用同 attempt_no 的 `completed` 覆盖第一次的 `infra_error`。`attempts` 追加记录 `step_key`、`attempt_no`、`generation` 与 `status=infra_error|completed`；workflow 重试成功时补记 `completed`，第二次仍失败才以 `FAILED/ANALYSIS_ERROR` 终止。检查点 `get_state` / `invoke` 的瞬时错误同样最多重试一次。
 
 ### 审核与恢复
 
@@ -224,6 +225,7 @@ uv run pytest -q tests/integration/test_workflow_migrations.py
 uv run pytest -q tests/integration/test_worker_and_review.py
 uv run pytest -q tests/integration/test_recovery.py
 uv run pytest -q tests/integration/test_finalize_crash_recovery.py
+uv run pytest -q tests/integration/test_resume_retry.py
 uv run pytest -q tests/integration/test_prepare_deadlines.py
 uv run pytest -q tests/integration/test_retry.py
 uv run pytest -q tests/integration/test_fixture_replay.py
@@ -237,8 +239,9 @@ uv run pytest -q tests/contract/test_wheel.py
 - `tests/integration/test_worker_and_review.py`：真实 PostgreSQL 中的计划冻结、待审查询、批准 / 拒绝 / 摘要不符 / 过期（含“过期 + 错误摘要”）、重复与冲突决议、worker 领取、binary 不被领取、过期后下一次 worker 同步。
 - `tests/integration/test_recovery.py`：待审退出后重启、审核已入库但图未恢复、审核在 `await_review` 窗口提交时旧 worker 不能 finalize、租约过期 / 新代次接管后的写回拒绝、`attempts` 按代次保留历史、阻断后 finalize、计划冻结前 `BLOCKED` 且在 finalize 前退出后的领取与同步、双连接单领取、检查点 `thread_id=job_id`、计划与审核各一份。
 - `tests/integration/test_finalize_crash_recovery.py`：冻结计划后、finalize 前退出时，重启仍待审以及随后批准 / 拒绝 / 审核过期的收敛；检查点可读、无第二个中断、无 `FAILED`，旧代次 finalize 仍被拒绝。
+- `tests/integration/test_resume_retry.py`：待审、已批准、已拒绝和 B1 crash-before-finalize 后夹一次可重试 DB 读取错误恢复；连续两次失败时 `READY`/`BLOCKED` 不被覆盖为 `FAILED`、保持 `workflow_synced=false` 并由租约过期后的新代次收敛；断言无 `InvalidUpdateError`、检查点可读且代次与业务记录一致。
 - `tests/integration/test_prepare_deadlines.py`：进程时钟前后偏移时审核窗口仍由数据库时钟生成；`freeze_plan` 与 `ensure_awaiting_review` 两处都覆盖；分析期间准备期限过期时不写计划并阻断。
-- `tests/integration/test_retry.py`：瞬时分析错误重试一次后成功、持续瞬时错误只重试一次后 `FAILED`、非瞬时 `AnalysisBlocked` 不重试、重试前准备时限过期直接 `DEADLINE_EXCEEDED`、检查点瞬时错误重试一次，以及 workflow 级重试复用已持久化分析草稿且保留 `infra_error` 审计记录。
+- `tests/integration/test_retry.py`：瞬时分析错误重试一次后成功、持续瞬时错误只重试一次后 `FAILED`、非瞬时 `AnalysisBlocked` 不重试、重试前准备时限过期直接 `DEADLINE_EXCEEDED`、检查点瞬时错误重试一次；workflow 级重试复用已持久化分析草稿且保留 `infra_error` 审计记录；草稿写入失败一次时有界重试并复用草稿、连续失败时 fail closed 且不出现第三次分析，以及 analysis 后 freeze 前退出时旧代次 `attempts` 保留、旧代次写回被拒绝、新代次重新分析并冻结唯一计划。
 - `tests/integration/test_workflow_migrations.py`：001 旧任务在 002 增量迁移后保留，新表 / 列 / 索引存在，计划与审核每任务唯一，迁移可重复执行；003 在不丢数据的前提下把旧 `attempts` 唯一键升级为包含 `generation`。
 - `tests/integration/test_fixture_replay.py`：宿主 clang + ASan 的 B01/B02 合成回放，仍是 T01 材料回归，不是 T05 容器隔离验收。
 

@@ -10,6 +10,7 @@ from uuid import UUID
 
 import psycopg
 from langgraph.checkpoint.postgres import PostgresSaver
+from langgraph.config import get_config
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, interrupt
 
@@ -56,6 +57,21 @@ def _uuid(value: str) -> UUID:
     return UUID(value)
 
 
+def _claimed_generation(graph_state: SupervisorState) -> int:
+    """Return the generation of the claim that is executing this graph node.
+
+    The checkpoint can still carry the generation that was current when the
+    graph parked at the review interrupt. The claim generation is passed
+    through the run configuration instead of being replayed as a graph state
+    update on every resume, so it is always this invocation's fence.
+    """
+    configurable = get_config().get("configurable", {})
+    generation = configurable.get("datacon_generation")
+    if isinstance(generation, int):
+        return generation
+    return graph_state["generation"]
+
+
 def _reusable_analysis(result: dict[str, Any] | None) -> AnalyzedCase | None:
     """Return a plan draft persisted before a workflow-level retry.
 
@@ -95,10 +111,11 @@ def build_graph(
 
     def prepare(graph_state: SupervisorState) -> dict[str, Any]:
         job_id = _uuid(graph_state["job_id"])
+        claimed_generation = _claimed_generation(graph_state)
         job = state_store.load_job(dsn, job_id)
         if job is None:
             return {}
-        if job["generation"] != graph_state["generation"]:
+        if job["generation"] != claimed_generation:
             raise state_store.StaleGeneration(
                 "execution generation is no longer current"
             )
@@ -173,6 +190,74 @@ def build_graph(
                     )
 
                 return record_tool
+
+            def persist_draft(attempt: int, analyzed: AnalyzedCase) -> bool:
+                """Persist the analysis draft used by a workflow-level retry.
+
+                The draft is the only way a retry can freeze the plan without
+                running analysis a third time, so a write failure cannot be
+                ignored. One bounded retry absorbs a transient connection
+                reset; if both writes fail the step fails closed instead of
+                leaving an untracked analysis execution behind.
+                """
+                result = {
+                    "plan_digest": analyzed.plan_digest,
+                    "plan": analyzed.plan,
+                    "summary": analyzed.summary,
+                }
+                last_error: BaseException | None = None
+                for _ in range(2):
+                    try:
+                        stored = state_store.record_attempt(
+                            dsn,
+                            job_id,
+                            stage="prepare",
+                            step_key="analysis",
+                            attempt_no=attempt,
+                            generation=job["generation"],
+                            input_digest=jsonutil.digest_json(job["request"]),
+                            status="completed",
+                            result=result,
+                        )
+                    except (state_store.StateError, psycopg.Error) as error:
+                        last_error = error
+                        continue
+                    if stored:
+                        return True
+                    raise state_store.StaleGeneration(
+                        "the worker lease was lost before the analysis draft "
+                        "was stored"
+                    )
+                try:
+                    state_store.record_attempt(
+                        dsn,
+                        job_id,
+                        stage="prepare",
+                        step_key="analysis",
+                        attempt_no=attempt,
+                        generation=job["generation"],
+                        input_digest=jsonutil.digest_json(job["request"]),
+                        status="infra_error",
+                        result={
+                            "error": type(last_error).__name__,
+                            "phase": "analysis_draft",
+                        },
+                    )
+                except (state_store.StateError, psycopg.Error):
+                    pass
+                state_store.block_job(
+                    dsn,
+                    job_id,
+                    generation=job["generation"],
+                    reason_code="ANALYSIS_ERROR",
+                    message=(
+                        "analysis succeeded but its plan draft could not be "
+                        "persisted"
+                    ),
+                    state="FAILED",
+                    event_type="failed",
+                )
+                return False
 
             def retry_or_stop(attempt: int, error: BaseException) -> bool:
                 recorded = state_store.record_attempt(
@@ -266,27 +351,11 @@ def build_graph(
                         event_type="failed",
                     )
                     return {}
-                try:
-                    # Persist the draft so a later workflow retry can reuse it.
-                    # A same-generation attempt number is never reused, which
-                    # keeps the attempt history auditable.
-                    state_store.record_attempt(
-                        dsn,
-                        job_id,
-                        stage="prepare",
-                        step_key="analysis",
-                        attempt_no=attempt_no,
-                        generation=job["generation"],
-                        input_digest=jsonutil.digest_json(job["request"]),
-                        status="completed",
-                        result={
-                            "plan_digest": analyzed.plan_digest,
-                            "plan": analyzed.plan,
-                            "summary": analyzed.summary,
-                        },
-                    )
-                except (state_store.StateError, psycopg.Error):
-                    pass
+                # Persist the draft before freezing the plan so a later
+                # workflow retry can reuse it. A same-generation attempt
+                # number is never reused, which keeps the history auditable.
+                if not persist_draft(attempt_no, analyzed):
+                    return {}
 
         try:
             frozen = state_store.freeze_plan(
@@ -327,16 +396,18 @@ def build_graph(
             pass
         return {
             "plan_digest": analyzed.plan_digest,
+            "generation": job["generation"],
             "stage": "review",
             "state_version": graph_state["state_version"] + 1,
         }
 
     def await_review(graph_state: SupervisorState) -> dict[str, Any]:
         job_id = _uuid(graph_state["job_id"])
+        claimed_generation = _claimed_generation(graph_state)
         job = state_store.load_job(dsn, job_id)
         if job is None:
             return {}
-        if job["generation"] != graph_state["generation"]:
+        if job["generation"] != claimed_generation:
             raise state_store.StaleGeneration(
                 "execution generation is no longer current"
             )
@@ -370,7 +441,7 @@ def build_graph(
                     if state_store.expire_review(dsn, job_id, job["generation"]):
                         return {}
                     if state_store.get_review(dsn, job_id) is None:
-                        return {}
+                        return {"generation": job["generation"]}
         if job["state"] in ("READY", "BLOCKED"):
             plan = state_store.get_plan(dsn, job_id)
             review = state_store.get_review(dsn, job_id)
@@ -386,7 +457,7 @@ def build_graph(
                     reason_code="PLAN_MISMATCH",
                     message="the recorded review does not match the frozen plan",
                 )
-        return {}
+        return {"generation": job["generation"]}
 
     def route(state: SupervisorState) -> str:
         job = state_store.load_job(dsn, _uuid(state["job_id"]))
@@ -439,7 +510,12 @@ def _process_claim(graph, dsn: str, claimed: dict[str, Any]) -> dict[str, Any]:
     job_id = claimed["job_id"]
     job_text = str(job_id)
     generation = claimed["generation"]
-    config = {"configurable": {"thread_id": job_text}}
+    config = {
+        "configurable": {
+            "thread_id": job_text,
+            "datacon_generation": generation,
+        }
+    }
     initial: SupervisorState = {
         "job_id": job_text,
         "stage": claimed["stage"] or "prepare",
@@ -451,33 +527,28 @@ def _process_claim(graph, dsn: str, claimed: dict[str, Any]) -> dict[str, Any]:
     graph_failure: BaseException | None = None
     attempt_no = 1
     retried = False
+    resume_requested = False
     while attempt_no <= 2:
         try:
             snapshot = graph.get_state(config)
             if snapshot.next:
-                if snapshot.interrupts:
+                # The claim generation travels in the run configuration, not
+                # in ``Command(update=...)``. Re-sending the same state update
+                # on a retry makes LangGraph see two writes for one step and
+                # raise InvalidUpdateError, which used to overwrite a committed
+                # READY/BLOCKED record as FAILED. The nodes return the claim
+                # generation as ordinary output once they complete, so the
+                # checkpoint converges without an extra write.
+                resume_requested = resume_requested or bool(snapshot.interrupts)
+                if resume_requested:
                     graph.invoke(
                         Command(
-                            resume={"job_id": job_text, "source": "worker"},
-                            update={
-                                "generation": generation,
-                                "stage": stage,
-                                "state_version": claimed["state_version"],
-                            },
+                            resume={"job_id": job_text, "source": "worker"}
                         ),
                         config,
                     )
                 else:
-                    graph.invoke(
-                        Command(
-                            update={
-                                "generation": generation,
-                                "stage": stage,
-                                "state_version": claimed["state_version"],
-                            }
-                        ),
-                        config,
-                    )
+                    graph.invoke(None, config)
             else:
                 graph.invoke(initial, config)
             if retried:
@@ -550,24 +621,53 @@ def _process_claim(graph, dsn: str, claimed: dict[str, Any]) -> dict[str, Any]:
             retried = True
             attempt_no += 1
 
+    business_authoritative = False
     if graph_failure is not None:
+        # The business record is authoritative. A checkpoint, resume or
+        # scheduling failure must never rewrite a committed READY/BLOCKED
+        # review (or an awaiting-review plan) as FAILED; only a PREPARING job
+        # without a committed review is an analysis failure. If the business
+        # state cannot even be read, do not guess.
+        unreadable = object()
         try:
-            state_store.block_job(
-                dsn,
-                job_id,
-                generation=generation,
-                reason_code="ANALYSIS_ERROR",
-                message=f"workflow failed with {type(graph_failure).__name__}",
-                state="FAILED",
-                event_type="failed",
-            )
+            current = state_store.load_job(dsn, job_id)
+        except (state_store.StateError, psycopg.Error):
+            current = unreadable
+        if current is unreadable or current is None or current["state"] != "PREPARING":
+            business_authoritative = True
+            try:
+                state_store.record_attempt(
+                    dsn,
+                    job_id,
+                    stage=stage,
+                    step_key="workflow",
+                    attempt_no=attempt_no,
+                    generation=generation,
+                    input_digest=None,
+                    status="infra_error",
+                    result={"error": type(graph_failure).__name__},
+                )
+            except (state_store.StateError, psycopg.Error):
+                pass
+        else:
+            try:
+                state_store.block_job(
+                    dsn,
+                    job_id,
+                    generation=generation,
+                    reason_code="ANALYSIS_ERROR",
+                    message=f"workflow failed with {type(graph_failure).__name__}",
+                    state="FAILED",
+                    event_type="failed",
+                )
+            except state_store.StateError:
+                pass
+
+    if not business_authoritative:
+        try:
+            state_store.finalize_workflow(dsn, job_id, generation)
         except state_store.StateError:
             pass
-
-    try:
-        state_store.finalize_workflow(dsn, job_id, generation)
-    except state_store.StateError:
-        pass
     job = state_store.load_job(dsn, job_id)
     snapshot = None
     for attempt in (1, 2):
