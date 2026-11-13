@@ -279,3 +279,45 @@ def test_hypothesis_requires_evidence_in_the_plan():
         analysis_digest(changed["analysis"])
     with pytest.raises(ValueError, match="evidence reference"):
         plan_digest(changed)
+
+
+@pytest.mark.parametrize(
+    "user", ["0:0", "0:65534", "65534:0", "root", "ROOT", "Root"]
+)
+def test_isolation_rejects_root_and_root_gid(user):
+    changed = deepcopy(PLAN)
+    changed["isolation"]["user"] = user
+    with pytest.raises(ValueError, match="isolation.user"):
+        plan_digest(changed)
+
+
+@pytest.mark.parametrize(
+    "seccomp", ["unconfined", "UNCONFINED", "", "  ", "custom/profile"]
+)
+def test_isolation_rejects_unconfined_or_unknown_seccomp(seccomp):
+    changed = deepcopy(PLAN)
+    changed["isolation"]["seccomp"] = seccomp
+    with pytest.raises(ValueError, match="isolation.seccomp"):
+        plan_digest(changed)
+
+
+@pytest.mark.parametrize("user", ["65534", "65534:65534", "1000:1000"])
+def test_isolation_accepts_non_root_numeric_user(user):
+    changed = deepcopy(PLAN)
+    changed["isolation"]["user"] = user
+    assert plan_digest(changed).startswith("sha256:")
+
+
+@pytest.mark.parametrize("seccomp", ["runtime/default", "docker/default"])
+def test_isolation_accepts_project_seccomp_profiles(seccomp):
+    changed = deepcopy(PLAN)
+    changed["isolation"]["seccomp"] = seccomp
+    assert plan_digest(changed).startswith("sha256:")
+
+
+@pytest.mark.parametrize("user", ["1000:root", "root:1000", "user:1000", "1:2:3"])
+def test_isolation_rejects_non_numeric_user_forms(user):
+    changed = deepcopy(PLAN)
+    changed["isolation"]["user"] = user
+    with pytest.raises(ValueError, match="isolation.user"):
+        plan_digest(changed)

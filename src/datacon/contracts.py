@@ -12,6 +12,7 @@ from datacon import cases as case_registry
 from datacon import jsonutil
 
 SCHEMA_VERSION = 1
+MAX_REQUEST_BYTES = 64 * 1024
 
 DEFAULT_LIMITS: dict[str, int] = {
     "prepare_seconds": 600,
@@ -65,6 +66,9 @@ _ROLES = frozenset({"definition", "call_site"})
 _REVISIONS = frozenset({"vulnerable", "fixed", "harness"})
 _FINDING_KINDS = frozenset({"fact", "hypothesis"})
 _CONFIDENCE = frozenset({"low", "medium", "high"})
+_SECCOMP_PROFILES = frozenset({"runtime/default", "docker/default"})
+_USER_ID = re.compile(r"(?:0|[1-9][0-9]{0,9})")
+_MAX_USER_ID = 2**32 - 1
 
 
 class InvalidRequest(ValueError):
@@ -189,9 +193,15 @@ def parse_request(payload: str | bytes) -> dict[str, Any]:
     """
     try:
         if isinstance(payload, bytes):
+            if len(payload) > MAX_REQUEST_BYTES:
+                raise ValueError(
+                    f"request payload exceeds {MAX_REQUEST_BYTES} bytes"
+                )
             payload = payload.decode("utf-8")
         if not isinstance(payload, str):
             raise ValueError("request payload must be text or UTF-8 bytes")
+        if len(payload.encode("utf-8")) > MAX_REQUEST_BYTES:
+            raise ValueError(f"request payload exceeds {MAX_REQUEST_BYTES} bytes")
         document = json.loads(
             payload,
             object_pairs_hook=_unique_object,
@@ -320,6 +330,33 @@ def analysis_digest(analysis: Mapping[str, Any]) -> str:
     return "sha256:" + hashlib.sha256(canonical_analysis_bytes(analysis)).hexdigest()
 
 
+def _isolation_user(value: Any) -> str:
+    """Accept only a non-root numeric uid or uid:gid pair.
+
+    ``root`` is rejected case-insensitively even though it is not numeric, so
+    the error names the actual policy violation. Leading zeroes and signs are
+    rejected rather than interpreted, which keeps the accepted form explicit.
+    """
+    text = _text(value, label="isolation.user")
+    if text.casefold() == "root":
+        raise ValueError("isolation.user must not be root")
+    parts = text.split(":")
+    if len(parts) not in (1, 2) or not all(
+        _USER_ID.fullmatch(part) for part in parts
+    ):
+        raise ValueError(
+            "isolation.user must be a numeric uid or uid:gid"
+        )
+    identifiers = [int(part) for part in parts]
+    if identifiers[0] == 0:
+        raise ValueError("isolation.user must not use uid 0")
+    if len(identifiers) == 2 and identifiers[1] == 0:
+        raise ValueError("isolation.user must not use gid 0")
+    if any(identifier > _MAX_USER_ID for identifier in identifiers):
+        raise ValueError("isolation.user uid/gid is out of range")
+    return text
+
+
 def _isolation(value: Any) -> dict[str, Any]:
     _object(
         value,
@@ -335,7 +372,7 @@ def _isolation(value: Any) -> dict[str, Any]:
     network = _text(value["network"], label="isolation.network")
     if network != "none":
         raise ValueError("isolation.network must be none")
-    user = _text(value["user"], label="isolation.user")
+    user = _isolation_user(value["user"])
     if not value["read_only_root"] is True:
         raise ValueError("isolation.read_only_root must be true")
     caps = value["cap_drop"]
@@ -349,6 +386,10 @@ def _isolation(value: Any) -> dict[str, Any]:
     if not value["no_new_privileges"] is True:
         raise ValueError("isolation.no_new_privileges must be true")
     seccomp = _text(value["seccomp"], label="isolation.seccomp")
+    if seccomp not in _SECCOMP_PROFILES:
+        raise ValueError(
+            "isolation.seccomp must be runtime/default or docker/default"
+        )
     return {
         "network": network,
         "user": user,
