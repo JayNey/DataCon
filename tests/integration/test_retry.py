@@ -855,6 +855,7 @@ def test_committed_draft_is_not_downgraded_by_infra_error(
         ("started", 0),
         ("draft", 1),
         ("failure_marker", 1),
+        ("tool", 1),
     ],
 )
 def test_record_attempt_false_stops_the_step_without_failing_the_job(
@@ -862,10 +863,10 @@ def test_record_attempt_false_stops_the_step_without_failing_the_job(
 ):
     """A ``False`` attempt write is never treated as success.
 
-    Whichever write is rejected (attempt reservation, draft, or failure
-    marker), the step stops before a new analysis or a plan freeze, the job
-    stays ``PREPARING`` rather than being overwritten as ``FAILED``, and the
-    next generation converges.
+    Whichever write is rejected (attempt reservation, tool audit row, draft,
+    or failure marker), the step stops before a new analysis or a plan freeze,
+    the job stays ``PREPARING`` rather than being overwritten as ``FAILED``,
+    and the next generation converges.
     """
     job = queue_job(isolated_database, tmp_path)
     job_uuid = UUID(job["job_id"])
@@ -896,6 +897,11 @@ def test_record_attempt_false_stops_the_step_without_failing_the_job(
                 phase == "failure_marker"
                 and kwargs.get("step_key") == "analysis"
                 and kwargs.get("status") == "infra_error"
+            ) or (
+                phase == "tool"
+                and isinstance(kwargs.get("step_key"), str)
+                and kwargs["step_key"].startswith("git.")
+                and kwargs.get("status") == "completed"
             )
             if matches:
                 rejected["done"] = True
@@ -933,6 +939,21 @@ def test_record_attempt_false_stops_the_step_without_failing_the_job(
         "SELECT count(*) FROM jobs WHERE job_id = %s AND state = 'FAILED'",
         (job_uuid,),
     ) == 0
+    if phase == "tool":
+        # The rejected write was the first tool audit row. The analysis must
+        # stop there instead of finishing its remaining tool calls.
+        assert scalar(
+            isolated_database,
+            "SELECT count(*) FROM attempts WHERE job_id = %s "
+            "AND step_key LIKE 'git.%%'",
+            (job_uuid,),
+        ) == 0
+        assert scalar(
+            isolated_database,
+            "SELECT count(*) FROM attempts WHERE job_id = %s "
+            "AND step_key LIKE 'tree_sitter.%%'",
+            (job_uuid,),
+        ) == 0
 
     # The rejected write is transient: the next generation converges.
     recovered = workflow.run_worker(isolated_database.dsn, once=True)
@@ -945,6 +966,241 @@ def test_record_attempt_false_stops_the_step_without_failing_the_job(
     current = state.load_job(isolated_database.dsn, job_uuid)
     assert current["workflow_synced"] is True
     assert current["lease_owner"] is None
+
+
+def checkpoint_snapshot(database, job_id):
+    from langgraph.checkpoint.postgres import PostgresSaver
+
+    from datacon.workflow import build_graph
+
+    with PostgresSaver.from_conn_string(database.dsn) as saver:
+        graph = build_graph(database.dsn, saver)
+        return graph.get_state({"configurable": {"thread_id": job_id}})
+
+
+def test_record_attempt_false_after_freeze_does_not_park_or_finalize(
+    isolated_database, tmp_path, monkeypatch
+):
+    """A rejected plan-row write stops before the review interrupt.
+
+    The plan is already frozen, so the next claim reads the existing plan.
+    This worker must not write a checkpoint or finalize after its lease is
+    gone, and the job must never become FAILED.
+    """
+    job = queue_job(isolated_database, tmp_path)
+    job_uuid = UUID(job["job_id"])
+    real_record = state.record_attempt
+    rejected = {"done": False}
+
+    def false_plan_write(*args, **kwargs):
+        if (
+            not rejected["done"]
+            and kwargs.get("step_key") == "plan"
+            and kwargs.get("status") == "completed"
+        ):
+            rejected["done"] = True
+            isolated_database.connection.execute(
+                "UPDATE jobs SET lease_expires_at = now() - interval '1 second' "
+                "WHERE job_id = %s",
+                (job_uuid,),
+            )
+            return False
+        return real_record(*args, **kwargs)
+
+    monkeypatch.setattr(workflow.state_store, "record_attempt", false_plan_write)
+
+    expire_calls = []
+    real_expire = state.expire_review
+
+    def spy_expire(*args, **kwargs):
+        expire_calls.append(args)
+        return real_expire(*args, **kwargs)
+
+    monkeypatch.setattr(workflow.state_store, "expire_review", spy_expire)
+
+    first = workflow.run_worker(isolated_database.dsn, once=True)
+
+    assert first["processed"] == 1
+    assert expire_calls == [], "the rejected plan write must stop before await_review"
+    assert scalar(
+        isolated_database,
+        "SELECT count(*) FROM plans WHERE job_id = %s",
+        (job_uuid,),
+    ) == 1
+    current = state.load_job(isolated_database.dsn, job_uuid)
+    assert current["state"] == "AWAITING_REVIEW"
+    assert current["reason_code"] is None
+    assert current["workflow_synced"] is False
+    assert current["lease_expires_at"] is not None
+    assert scalar(
+        isolated_database,
+        "SELECT count(*) FROM jobs WHERE job_id = %s AND state = 'FAILED'",
+        (job_uuid,),
+    ) == 0
+    # The stale worker must not have parked a second scheduling pass at the
+    # review interrupt after its plan write was rejected.
+    assert not checkpoint_snapshot(isolated_database, job["job_id"]).interrupts
+
+    # The lease is already expired; the next generation converges.
+    recovered = workflow.run_worker(isolated_database.dsn, once=True)
+    assert recovered["state"] == "AWAITING_REVIEW"
+    current = state.load_job(isolated_database.dsn, job_uuid)
+    assert current["workflow_synced"] is True
+    assert current["lease_owner"] is None
+    assert scalar(
+        isolated_database,
+        "SELECT count(*) FROM plans WHERE job_id = %s",
+        (job_uuid,),
+    ) == 1
+
+
+class _FlakyGraph:
+    """Wrap the real graph and fail the first ``get_state`` calls."""
+
+    def __init__(self, inner, *, failures):
+        self.inner = inner
+        self.failures = failures
+        self.state_calls = 0
+
+    def get_state(self, config):
+        self.state_calls += 1
+        if self.state_calls <= self.failures:
+            raise psycopg.OperationalError("checkpoint connection reset")
+        return self.inner.get_state(config)
+
+    def invoke(self, *args, **kwargs):
+        return self.inner.invoke(*args, **kwargs)
+
+
+def test_workflow_completion_write_false_does_not_finalize(
+    isolated_database, tmp_path, monkeypatch
+):
+    """A rejected workflow ``completed`` row leaves the lease for a retry."""
+    job = queue_job(isolated_database, tmp_path)
+    job_uuid = UUID(job["job_id"])
+    real_build = workflow.build_graph
+    graphs = []
+
+    def build(dsn, checkpointer, **kwargs):
+        graph = _FlakyGraph(
+            real_build(dsn, checkpointer, **kwargs), failures=1
+        )
+        graphs.append(graph)
+        return graph
+
+    real_record = state.record_attempt
+
+    def reject_workflow_completed(*args, **kwargs):
+        if (
+            kwargs.get("step_key") == "workflow"
+            and kwargs.get("status") == "completed"
+        ):
+            return False
+        return real_record(*args, **kwargs)
+
+    monkeypatch.setattr(workflow, "build_graph", build)
+    monkeypatch.setattr(
+        workflow.state_store, "record_attempt", reject_workflow_completed
+    )
+
+    first = workflow.run_worker(isolated_database.dsn, once=True)
+
+    assert first["processed"] == 1
+    assert scalar(
+        isolated_database,
+        "SELECT count(*) FROM plans WHERE job_id = %s",
+        (job_uuid,),
+    ) == 1
+    rows = isolated_database.connection.execute(
+        "SELECT attempt_no, status FROM attempts "
+        "WHERE job_id = %s AND step_key = 'workflow' ORDER BY attempt_no",
+        (job_uuid,),
+    ).fetchall()
+    assert rows == [(1, "infra_error")]
+    current = state.load_job(isolated_database.dsn, job_uuid)
+    assert current["state"] == "AWAITING_REVIEW"
+    assert current["workflow_synced"] is False
+    assert current["lease_owner"] is not None
+    assert current["lease_expires_at"] is not None
+
+    # The next claim syncs the parked review once the lease expires. It is a
+    # fresh worker process, so the injected checkpoint failure is gone.
+    monkeypatch.setattr(workflow, "build_graph", real_build)
+    isolated_database.connection.execute(
+        "UPDATE jobs SET lease_expires_at = now() - interval '1 second' "
+        "WHERE job_id = %s",
+        (job_uuid,),
+    )
+    recovered = workflow.run_worker(isolated_database.dsn, once=True)
+    assert recovered["state"] == "AWAITING_REVIEW"
+    current = state.load_job(isolated_database.dsn, job_uuid)
+    assert current["workflow_synced"] is True
+    assert current["lease_owner"] is None
+
+
+def test_workflow_failure_write_false_stops_the_retry(
+    isolated_database, tmp_path, monkeypatch
+):
+    """A rejected ``infra_error`` row means the lease is gone: do not retry."""
+    job = queue_job(isolated_database, tmp_path)
+    job_uuid = UUID(job["job_id"])
+    real_build = workflow.build_graph
+    graphs = []
+
+    class FlakyInvoke:
+        def __init__(self, inner):
+            self.inner = inner
+            self.invoke_calls = 0
+
+        def get_state(self, config):
+            return self.inner.get_state(config)
+
+        def invoke(self, *args, **kwargs):
+            self.invoke_calls += 1
+            raise psycopg.OperationalError("checkpoint connection reset")
+
+    def build(dsn, checkpointer, **kwargs):
+        graph = FlakyInvoke(real_build(dsn, checkpointer, **kwargs))
+        graphs.append(graph)
+        return graph
+
+    real_record = state.record_attempt
+
+    def reject_workflow_failure(*args, **kwargs):
+        if (
+            kwargs.get("step_key") == "workflow"
+            and kwargs.get("status") == "infra_error"
+        ):
+            isolated_database.connection.execute(
+                "UPDATE jobs SET lease_expires_at = now() - interval '1 second' "
+                "WHERE job_id = %s",
+                (job_uuid,),
+            )
+            return False
+        return real_record(*args, **kwargs)
+
+    monkeypatch.setattr(workflow, "build_graph", build)
+    monkeypatch.setattr(
+        workflow.state_store, "record_attempt", reject_workflow_failure
+    )
+
+    first = workflow.run_worker(isolated_database.dsn, once=True)
+
+    assert first["processed"] == 1
+    assert graphs[0].invoke_calls == 1, "a lost lease must not be retried"
+    assert scalar(
+        isolated_database,
+        "SELECT count(*) FROM attempts WHERE job_id = %s AND step_key = 'workflow'",
+        (job_uuid,),
+    ) == 0
+    current = state.load_job(isolated_database.dsn, job_uuid)
+    assert current["state"] == "PREPARING"
+    assert current["reason_code"] is None
+    assert scalar(
+        isolated_database,
+        "SELECT count(*) FROM jobs WHERE job_id = %s AND state = 'FAILED'",
+        (job_uuid,),
+    ) == 0
 
 
 def test_record_attempt_rejects_downgrading_a_completed_row(

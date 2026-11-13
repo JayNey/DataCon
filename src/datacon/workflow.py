@@ -207,7 +207,7 @@ def build_graph(
                     params: dict[str, Any],
                     result_digest: str,
                 ) -> None:
-                    state_store.record_attempt(
+                    stored = state_store.record_attempt(
                         dsn,
                         job_id,
                         stage="prepare",
@@ -218,6 +218,14 @@ def build_graph(
                         status="completed",
                         result={"tool_id": tool_id, "result_digest": result_digest},
                     )
+                    if not stored:
+                        # A rejected audit row means the lease or generation is
+                        # gone. Stop the analysis instead of finishing with an
+                        # incomplete ledger that the next worker would redo.
+                        raise state_store.StaleGeneration(
+                            "the worker lease was lost while recording the "
+                            "tool attempt"
+                        )
 
                 return record_tool
 
@@ -463,23 +471,27 @@ def build_graph(
             return {}
         if not frozen:
             return {}
-        try:
-            state_store.record_attempt(
-                dsn,
-                job_id,
-                stage="prepare",
-                step_key="plan",
-                attempt_no=attempt_no,
-                generation=job["generation"],
-                input_digest=analyzed.plan["analysis_digest"],
-                status="completed",
-                result={
-                    "plan_digest": analyzed.plan_digest,
-                    "summary": analyzed.summary,
-                },
+        stored = state_store.record_attempt(
+            dsn,
+            job_id,
+            stage="prepare",
+            step_key="plan",
+            attempt_no=attempt_no,
+            generation=job["generation"],
+            input_digest=analyzed.plan["analysis_digest"],
+            status="completed",
+            result={
+                "plan_digest": analyzed.plan_digest,
+                "summary": analyzed.summary,
+            },
+        )
+        if not stored:
+            # The plan is frozen, but this worker no longer owns a live lease.
+            # Stop before parking the review so the next claim reads the
+            # existing plan instead of replaying a stale scheduling pass.
+            raise state_store.StaleGeneration(
+                "the worker lease was lost before the plan attempt was recorded"
             )
-        except Exception:  # noqa: BLE001 - the frozen plan is authoritative
-            pass
         return {
             "plan_digest": analyzed.plan_digest,
             "generation": job["generation"],
@@ -622,6 +634,7 @@ def _process_claim(graph, dsn: str, claimed: dict[str, Any]) -> dict[str, Any]:
     attempt_no = 1
     retried = False
     resume_requested = False
+    stop_finalize = False
     while attempt_no <= 2:
         try:
             snapshot = graph.get_state(config)
@@ -647,7 +660,7 @@ def _process_claim(graph, dsn: str, claimed: dict[str, Any]) -> dict[str, Any]:
                 graph.invoke(initial, config)
             if retried:
                 try:
-                    state_store.record_attempt(
+                    stored = state_store.record_attempt(
                         dsn,
                         job_id,
                         stage=stage,
@@ -659,7 +672,11 @@ def _process_claim(graph, dsn: str, claimed: dict[str, Any]) -> dict[str, Any]:
                         result={"retried": True},
                     )
                 except (state_store.StateError, psycopg.Error):
-                    pass
+                    # The audit row could not be written. The graph already
+                    # converged, but do not finalize a lease we cannot prove.
+                    stored = False
+                if not stored:
+                    stop_finalize = True
             graph_failure = None
             break
         except state_store.StaleGeneration:
@@ -670,7 +687,7 @@ def _process_claim(graph, dsn: str, claimed: dict[str, Any]) -> dict[str, Any]:
             if not _is_retryable_workflow_error(error):
                 break
             try:
-                state_store.record_attempt(
+                stored = state_store.record_attempt(
                     dsn,
                     job_id,
                     stage=stage,
@@ -682,7 +699,16 @@ def _process_claim(graph, dsn: str, claimed: dict[str, Any]) -> dict[str, Any]:
                     result={"error": type(error).__name__},
                 )
             except (state_store.StateError, psycopg.Error):
-                pass
+                # The lease is gone (or the audit row cannot be written), so a
+                # workflow retry would only repeat the stale work.
+                stop_finalize = True
+                break
+            if not stored:
+                # ``False`` means the generation/lease fence or an existing
+                # completed row rejected this write. Retrying is meaningless
+                # and any terminal write would be fenced too.
+                stop_finalize = True
+                break
             if attempt_no >= 2:
                 break
             if stage == "prepare":
@@ -719,7 +745,7 @@ def _process_claim(graph, dsn: str, claimed: dict[str, Any]) -> dict[str, Any]:
             attempt_no += 1
 
     business_authoritative = False
-    if graph_failure is not None:
+    if graph_failure is not None and not stop_finalize:
         # The business record is authoritative. A checkpoint, resume or
         # scheduling failure must never rewrite a committed READY/BLOCKED
         # review (or an awaiting-review plan) as FAILED; only a PREPARING job
@@ -762,7 +788,7 @@ def _process_claim(graph, dsn: str, claimed: dict[str, Any]) -> dict[str, Any]:
                 # written; the attempt history already fences a retry.
                 pass
 
-    if not business_authoritative:
+    if not business_authoritative and not stop_finalize:
         try:
             state_store.finalize_workflow(dsn, job_id, generation)
         except state_store.StateError:
