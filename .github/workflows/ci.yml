@@ -58,15 +58,16 @@ jobs:
             echo "setuptools must not be resolved as the build backend" >&2
             exit 1
           fi
-      - name: Apply database migration
+      - name: Apply database migrations
         run: |
           uv run --frozen python - <<'PY'
           import os
+          import pathlib
           import psycopg
 
-          sql = open("migrations/001_create_jobs.sql", encoding="utf-8").read()
           with psycopg.connect(os.environ["DATACON_DATABASE_URL"], autocommit=True) as conn:
-              conn.execute(sql)
+              for migration in sorted(pathlib.Path("migrations").glob("*.sql")):
+                  conn.execute(migration.read_text(encoding="utf-8"))
           PY
       - name: Install host clang, LLVM symbolizer and patch
         run: |
@@ -78,5 +79,5 @@ jobs:
           # replay image is verified by the T05 task, not here.
           clang --version
           llvm-symbolizer --version
-      - name: Run contract, PostgreSQL and ASan fixture tests
+      - name: Run contract, PostgreSQL, workflow and ASan fixture tests
         run: uv run --frozen pytest -q
