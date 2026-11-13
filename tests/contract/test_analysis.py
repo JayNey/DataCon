@@ -212,6 +212,22 @@ def test_missing_material_blocks_before_a_plan_exists(case_root):
     assert "harness" in caught.value.message
 
 
+@pytest.mark.parametrize("field", ["versions", "harness", "asan_signature"])
+def test_malformed_manifest_is_analysis_blocked(case_root, field):
+    """Structural manifest errors are repairable, not analysis crashes."""
+    manifest_path = case_root / "manifest.json"
+    manifest = read_json(manifest_path)
+    del manifest[field]
+    write_json(manifest_path, manifest)
+
+    with pytest.raises(AnalysisBlocked) as caught:
+        analyze_case(request(), case_root=case_root)
+
+    assert caught.value.reason_code == "MATERIAL_MISSING"
+    assert field in caught.value.message
+    assert "KeyError" not in caught.value.message
+
+
 @pytest.mark.parametrize("relative", ["vulnerable/parser.c", "fixed/parser.c"])
 def test_missing_source_material_blocks(case_root, relative):
     (case_root / relative).unlink()

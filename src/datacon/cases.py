@@ -24,6 +24,7 @@ _CASE_FIELDS = frozenset(
 _REPOSITORY_FIELDS = frozenset(
     {"origin", "bundle", "bundle_digest", "source_path", "refs", "commits", "patch"}
 )
+_SIGNATURE_FIELDS = frozenset({"error", "function", "source"})
 
 
 class CaseConfigurationError(ValueError):
@@ -90,6 +91,102 @@ class CaseDefinition:
         return data, digest
 
 
+def _validate_manifest_for_case(
+    manifest: dict[str, Any],
+    manifest_case: dict[str, Any],
+    benchmark_id: str,
+) -> None:
+    """Validate the manifest fields a plan is built from.
+
+    A broken manifest is a repairable case configuration problem, not an
+    analysis crash. Every structural error is classified as
+    ``MATERIAL_MISSING`` with the offending field in the message before any
+    field is indexed directly by the analyzer.
+    """
+    label = f"case manifest cases.{benchmark_id}"
+    try:
+        versions = jsonutil.require_object(
+            manifest.get("versions"),
+            required={"vulnerable", "fixed"},
+            label="case manifest versions",
+        )
+        for role in ("vulnerable", "fixed"):
+            jsonutil.safe_relative_path(
+                versions[role], f"case manifest versions.{role}"
+            )
+        for field in ("harness", "build_recipe", "dependencies"):
+            jsonutil.require_text(
+                manifest.get(field), f"case manifest {field}"
+            )
+        signature = jsonutil.require_object(
+            manifest.get("asan_signature"),
+            required=set(_SIGNATURE_FIELDS),
+            optional={"operation", "access_size"},
+            label="case manifest asan_signature",
+        )
+        for field in sorted(_SIGNATURE_FIELDS):
+            jsonutil.require_text(
+                signature[field], f"case manifest asan_signature.{field}"
+            )
+        image = jsonutil.require_text(
+            manifest.get("image"), "case manifest image"
+        )
+        tag, separator, image_digest = image.partition("@")
+        if not separator or not tag or not image_digest.startswith("sha256:"):
+            raise ValueError(
+                "case manifest image must be pinned by an @sha256 digest"
+            )
+        jsonutil.require_digest(image_digest, "case manifest image digest")
+        jsonutil.require_text(
+            manifest.get("platform"), "case manifest platform"
+        )
+        jsonutil.require_text(
+            manifest.get("asan_options"), "case manifest asan_options"
+        )
+        toolchain = manifest.get("toolchain")
+        if not isinstance(toolchain, dict) or not toolchain:
+            raise ValueError(
+                "case manifest toolchain must be a non-empty object"
+            )
+        materials = manifest.get("materials")
+        if not isinstance(materials, dict) or not materials:
+            raise ValueError(
+                "case manifest materials must be a non-empty object"
+            )
+        for relative, digest in materials.items():
+            jsonutil.safe_relative_path(
+                relative, f"case manifest materials path {relative}"
+            )
+            jsonutil.require_digest(
+                digest, f"case manifest materials[{relative}]"
+            )
+        inputs = jsonutil.require_object(
+            manifest_case.get("inputs"),
+            required={"candidate", "normal"},
+            label=f"{label}.inputs",
+        )
+        for role in ("candidate", "normal"):
+            jsonutil.safe_relative_path(
+                inputs[role], f"{label}.inputs.{role}"
+            )
+        expected_exit = jsonutil.require_object(
+            manifest_case.get("expected_exit"),
+            required={"normal", "candidate_clean"},
+            optional={"candidate_asan"},
+            label=f"{label}.expected_exit",
+        )
+        for key, value in expected_exit.items():
+            if type(value) is not int or not 0 <= value <= 255:
+                raise ValueError(
+                    f"{label}.expected_exit.{key} must be an exit code"
+                )
+    except ValueError as error:
+        raise CaseConfigurationError(
+            "MATERIAL_MISSING",
+            f"case manifest for benchmark {benchmark_id} is invalid: {error}",
+        ) from error
+
+
 @dataclass(frozen=True)
 class CaseRegistry:
     root: Path
@@ -104,17 +201,29 @@ class CaseRegistry:
                 "INVALID_REQUEST", "case_id is not registered"
             )
         benchmark_id = entry["benchmark_id"]
-        manifest_case = self.manifest["cases"].get(benchmark_id)
+        manifest_cases = self.manifest.get("cases")
+        if not isinstance(manifest_cases, dict):
+            raise CaseConfigurationError(
+                "MATERIAL_MISSING",
+                "case manifest cases must be an object",
+            )
+        manifest_case = manifest_cases.get(benchmark_id)
         if manifest_case is None:
             raise CaseConfigurationError(
                 "MATERIAL_MISSING",
                 f"benchmark {benchmark_id} is missing from the case manifest",
+            )
+        if not isinstance(manifest_case, dict):
+            raise CaseConfigurationError(
+                "MATERIAL_MISSING",
+                f"manifest case {benchmark_id} must be an object",
             )
         if manifest_case.get("case_id") != case_id:
             raise CaseConfigurationError(
                 "SOURCE_CONFLICT",
                 f"manifest case {benchmark_id} is registered for a different case",
             )
+        _validate_manifest_for_case(self.manifest, manifest_case, benchmark_id)
         return CaseDefinition(
             case_id=case_id,
             cve_id=entry["cve_id"],

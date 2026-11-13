@@ -391,6 +391,47 @@ def test_analysis_block_is_visible_in_status_and_creates_no_plan(
     ) == 0
 
 
+@pytest.mark.parametrize("field", ["versions", "harness", "asan_signature"])
+def test_malformed_manifest_blocks_as_material_missing(
+    isolated_database, tmp_path, field
+):
+    """A structural manifest error is a repairable block, not a crash."""
+    case_root = copy_cases(tmp_path)
+    manifest_path = case_root / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    del manifest[field]
+    manifest_path.write_text(
+        json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
+    )
+
+    job = queue_job(isolated_database, tmp_path)
+    result = worker(
+        isolated_database.dsn,
+        env_extra={"DATACON_CASE_ROOT": str(case_root)},
+    )
+
+    assert result["processed"] == 1
+    assert result["state"] == "BLOCKED"
+    current = status(isolated_database.dsn, job["job_id"])
+    assert current["state"] == "BLOCKED"
+    assert current["state"] != "FAILED"
+    assert current["reason_code"] == "MATERIAL_MISSING"
+    assert current["pending_plan"] is None
+    assert current["last_error"] is not None
+    assert "KeyError" not in current["last_error"]
+    assert field in current["last_error"]
+    assert scalar(
+        isolated_database,
+        "SELECT count(*) FROM plans WHERE job_id = %s",
+        (UUID(job["job_id"]),),
+    ) == 0
+    assert scalar(
+        isolated_database,
+        "SELECT count(*) FROM jobs WHERE job_id = %s AND state = 'FAILED'",
+        (UUID(job["job_id"]),),
+    ) == 0
+
+
 def test_binary_job_is_never_claimed_by_the_worker(isolated_database, tmp_path):
     request = tmp_path / "binary.json"
     request.write_text(
