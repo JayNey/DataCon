@@ -85,8 +85,11 @@ def test_findings_require_resolvable_evidence():
         "hypothesis", "the write is the root cause", "medium", (EVIDENCE,)
     )
 
-    assert validate_findings([fact, hypothesis], {EVIDENCE}) == (fact, hypothesis)
-
+    assert validate_findings([hypothesis], {EVIDENCE}) == (hypothesis,)
+    # Facts are produced only by deterministic analysis, never by the model
+    # port, even when the evidence reference itself is resolvable.
+    with pytest.raises(ContractError, match="hypothesis"):
+        validate_findings([fact], {EVIDENCE})
     with pytest.raises(ContractError):
         validate_findings(
             [Finding("fact", "unsupported", "high", ())], {EVIDENCE}
@@ -105,6 +108,20 @@ def test_findings_require_resolvable_evidence():
         validate_findings(
             [Finding("hypothesis", "bad ref", "low", ("intel/\x00",))], {EVIDENCE}
         )
+
+
+def test_model_findings_are_bounded_by_count_and_total_size():
+    too_many = [
+        Finding("hypothesis", f"hypothesis {index}", "low", (EVIDENCE,))
+        for index in range(65)
+    ]
+    with pytest.raises(ContractError, match="too many"):
+        validate_findings(too_many, {EVIDENCE})
+
+    # 40 statements of 1999 characters exceed a 64 KiB total-size budget.
+    huge = Finding("hypothesis", "x" * 1999, "low", (EVIDENCE,))
+    with pytest.raises(ContractError, match="total size"):
+        validate_findings([huge] * 40, {EVIDENCE})
 
 
 def test_hypothesis_without_evidence_is_rejected_by_the_wire_contract():

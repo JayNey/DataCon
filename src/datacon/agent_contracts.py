@@ -12,6 +12,8 @@ CONFIDENCE_LEVELS = frozenset({"low", "medium", "high"})
 OUTCOMES = frozenset({"ok", "blocked", "error"})
 MAX_STATEMENT = 2000
 MAX_REF = 512
+MAX_MODEL_FINDINGS = 64
+MAX_MODEL_FINDING_CHARS = 64 * 1024
 
 
 class ContractError(ValueError):
@@ -105,13 +107,26 @@ class AnalysisModel:
 def validate_findings(
     findings: Iterable[Finding], allowed_refs: set[str] | frozenset[str]
 ) -> tuple[Finding, ...]:
-    """Validate evidence references; no finding may rest on missing evidence."""
+    """Validate model findings; only hypotheses are allowed on this port.
+
+    Facts are produced exclusively by deterministic analysis. A model may
+    propose a hypothesis and cite existing evidence, but a resolvable
+    reference does not make the model's claim a fact.
+    """
     validated: list[Finding] = []
+    total_chars = 0
     for finding in findings:
+        if len(validated) >= MAX_MODEL_FINDINGS:
+            raise ContractError(
+                f"too many model findings; at most {MAX_MODEL_FINDINGS} are allowed"
+            )
         if not isinstance(finding, Finding):
             raise ContractError("finding must be a Finding instance")
-        if finding.kind not in FINDING_KINDS:
-            raise ContractError("finding.kind must be fact or hypothesis")
+        if finding.kind != "hypothesis":
+            raise ContractError(
+                "a model finding must be a hypothesis; facts are produced "
+                "deterministically"
+            )
         if finding.confidence not in CONFIDENCE_LEVELS:
             raise ContractError("finding.confidence is invalid")
         try:
@@ -122,15 +137,22 @@ def validate_findings(
             raise ContractError(
                 "a finding requires at least one evidence reference"
             )
+        total_chars += len(finding.statement)
         for reference in finding.evidence_refs:
             try:
                 _ref(reference)
             except ValueError as error:
                 raise ContractError(str(error)) from error
+            total_chars += len(reference)
             if reference not in allowed_refs:
                 raise ContractError(
                     f"evidence reference is not resolvable: {reference}"
                 )
+        if total_chars > MAX_MODEL_FINDING_CHARS:
+            raise ContractError(
+                "model findings total size exceeds "
+                f"{MAX_MODEL_FINDING_CHARS} characters"
+            )
         validated.append(finding)
     return tuple(validated)
 
