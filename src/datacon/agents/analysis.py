@@ -174,6 +174,7 @@ def _deterministic_findings(
     vulnerable: str,
     fixed: str,
     source_path: str,
+    harness_path: str,
     added: int,
     removed: int,
     definitions: dict[str, list[dict[str, Any]]],
@@ -185,7 +186,9 @@ def _deterministic_findings(
     vulnerable_ref = f"git:blob/{vulnerable}/{source_path}"
     fixed_ref = f"git:blob/{fixed}/{source_path}"
     call_line = call_sites[0]["start_line"] if call_sites else 0
-    harness_ref = f"source/harness.c#L{call_line}" if call_line else "material/harness"
+    harness_ref = (
+        f"source/{harness_path}#L{call_line}" if call_line else "material/harness"
+    )
     refs = {
         diff_ref,
         vulnerable_ref,
@@ -253,6 +256,52 @@ def _deterministic_findings(
     return findings, refs
 
 
+def _evidence_ref_is_resolvable(
+    reference: str,
+    *,
+    vulnerable: str,
+    fixed: str,
+    source_path: str,
+    harness_path: str,
+    call_lines: frozenset[int],
+    symbol_paths: dict[str, frozenset[str]],
+    candidate_digest: str,
+    advisory_digest: str,
+) -> bool:
+    """Check an evidence reference against the artifacts it names."""
+    if reference.startswith("git:commit/"):
+        return reference.removeprefix("git:commit/") in (vulnerable, fixed)
+    if reference.startswith("git:blob/"):
+        oid, separator, path = reference.removeprefix("git:blob/").partition("/")
+        if not separator:
+            return False
+        if oid == vulnerable:
+            return path in symbol_paths["vulnerable"]
+        if oid == fixed:
+            return path in symbol_paths["fixed"]
+        return False
+    if reference.startswith("git:diff/"):
+        return reference == f"git:diff/{vulnerable}..{fixed}/{source_path}"
+    if reference.startswith("intel/"):
+        return reference == f"intel/{advisory_digest}"
+    if reference.startswith("material/input/candidate/"):
+        return reference == f"material/input/candidate/{candidate_digest}"
+    if reference in {
+        "material/harness",
+        "material/build_recipe",
+        "material/dependencies",
+        "material/patch",
+        "material/input/normal",
+    }:
+        return True
+    if reference.startswith("source/"):
+        path, separator, line_text = reference.removeprefix("source/").partition("#L")
+        if not separator or not line_text.isdigit():
+            return False
+        return path == harness_path and int(line_text) in call_lines
+    return False
+
+
 def analyze_case(
     request: dict[str, Any],
     *,
@@ -292,6 +341,12 @@ def analyze_case(
 
     harness, harness_digest = _material(
         case, materials, manifest["harness"], "harness"
+    )
+    vulnerable_material, _ = _material(
+        case, materials, source_rel_vulnerable, "vulnerable source"
+    )
+    fixed_material, _ = _material(
+        case, materials, source_rel_fixed, "fixed source"
     )
     build_recipe, build_recipe_digest = _material(
         case, materials, manifest["build_recipe"], "build recipe"
@@ -364,6 +419,16 @@ def analyze_case(
             )
             vulnerable_source = git.read_blob(vulnerable, source_path)
             fixed_source = git.read_blob(fixed, source_path)
+            if vulnerable_source != vulnerable_material:
+                raise AnalysisBlocked(
+                    "MATERIAL_MISSING",
+                    "the vulnerable source material does not match the Git object",
+                )
+            if fixed_source != fixed_material:
+                raise AnalysisBlocked(
+                    "MATERIAL_MISSING",
+                    "the fixed source material does not match the Git object",
+                )
             if jsonutil.digest_bytes(vulnerable_source) != materials[source_rel_vulnerable]:
                 raise AnalysisBlocked(
                     "MATERIAL_MISSING",
@@ -465,6 +530,7 @@ def analyze_case(
         vulnerable=vulnerable,
         fixed=fixed,
         source_path=source_path,
+        harness_path=manifest["harness"],
         added=added,
         removed=removed,
         definitions=definitions,
@@ -472,6 +538,36 @@ def analyze_case(
         candidate_digest=candidate_digest,
         intel_ref=f"intel/{advisory_digest}",
     )
+    symbol_paths = {
+        "vulnerable": frozenset(
+            {source_path} | {symbol["path"] for symbol in definitions["vulnerable"]}
+        ),
+        "fixed": frozenset(
+            {source_path} | {symbol["path"] for symbol in definitions["fixed"]}
+        ),
+    }
+    call_lines = frozenset(symbol["start_line"] for symbol in call_sites)
+
+    def resolve_all(candidates: list[Finding]) -> None:
+        for finding in candidates:
+            for reference in finding.evidence_refs:
+                if not _evidence_ref_is_resolvable(
+                    reference,
+                    vulnerable=vulnerable,
+                    fixed=fixed,
+                    source_path=source_path,
+                    harness_path=manifest["harness"],
+                    call_lines=call_lines,
+                    symbol_paths=symbol_paths,
+                    candidate_digest=candidate_digest,
+                    advisory_digest=advisory_digest,
+                ):
+                    raise AnalysisBlocked(
+                        "EVIDENCE_INVALID",
+                        f"evidence reference is not resolvable: {reference}",
+                    )
+
+    resolve_all(findings)
 
     context = ModelContext(
         cve_id=case.cve_id,
@@ -499,6 +595,7 @@ def analyze_case(
         model_findings = validate_findings(suggestion.findings, evidence_refs)
     except ContractError as error:
         raise AnalysisBlocked("EVIDENCE_INVALID", str(error)) from error
+    resolve_all(list(model_findings))
     findings.extend(model_findings)
 
     analysis = {
@@ -516,8 +613,17 @@ def analyze_case(
     image_digest = image.split("@", 1)[1]
     try:
         jsonutil.require_digest(image_digest, "image digest")
+        asan_options = jsonutil.require_text(
+            manifest.get("asan_options"), "case asan_options"
+        )
+        platform = jsonutil.require_text(manifest.get("platform"), "case platform")
     except ValueError as error:
         raise AnalysisBlocked("MATERIAL_MISSING", str(error)) from error
+    toolchain = manifest.get("toolchain")
+    if not isinstance(toolchain, dict) or not toolchain:
+        raise AnalysisBlocked(
+            "MATERIAL_MISSING", "case toolchain must be a non-empty object"
+        )
 
     used_materials = {
         key: materials[key]
@@ -540,6 +646,9 @@ def analyze_case(
         "manifest_case": manifest_case,
         "materials": used_materials,
         "image": image,
+        "platform": platform,
+        "toolchain": toolchain,
+        "asan_options": asan_options,
         "asan_signature": manifest["asan_signature"],
     }
     case_config_digest = jsonutil.digest_json(case_config)

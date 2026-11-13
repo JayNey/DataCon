@@ -55,7 +55,8 @@ CREATE TABLE IF NOT EXISTS attempts (
     result jsonb,
     started_at timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP,
     finished_at timestamptz,
-    CONSTRAINT attempts_step_unique UNIQUE (job_id, stage, step_key, attempt_no)
+    CONSTRAINT attempts_step_unique
+        UNIQUE (job_id, stage, step_key, attempt_no, generation)
 );
 
 CREATE TABLE IF NOT EXISTS audit_events (

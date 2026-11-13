@@ -264,6 +264,38 @@ def test_expired_review_blocks_the_plan(isolated_database, tmp_path):
     assert json.loads(again.stderr)["reason_code"] == "REVIEW_EXPIRED"
 
 
+def test_expired_review_with_wrong_digest_blocks(isolated_database, tmp_path):
+    job = queue_job(isolated_database, tmp_path)
+    worker(isolated_database.dsn)
+    digest = status(isolated_database.dsn, job["job_id"])["pending_plan"][
+        "plan_digest"
+    ]
+    isolated_database.connection.execute(
+        "UPDATE jobs SET review_deadline_at = now() - interval '1 second' "
+        "WHERE job_id = %s",
+        (UUID(job["job_id"]),),
+    )
+
+    expired = review(
+        isolated_database.dsn,
+        job["job_id"],
+        "sha256:" + "0" * 64,
+        "approve",
+        env_extra={"DATACON_OPERATOR_ID": "reviewer-1"},
+    )
+    assert expired.returncode == 3
+    assert json.loads(expired.stderr)["reason_code"] == "REVIEW_EXPIRED"
+
+    current = status(isolated_database.dsn, job["job_id"])
+    assert current["state"] == "BLOCKED"
+    assert current["reason_code"] == "REVIEW_EXPIRED"
+    assert scalar(
+        isolated_database, "SELECT count(*) FROM reviews WHERE job_id = %s",
+        (UUID(job["job_id"]),),
+    ) == 0
+    assert current["pending_plan"]["plan_digest"] == digest
+
+
 def test_worker_expires_a_pending_review_after_restart(
     isolated_database, tmp_path
 ):
@@ -281,6 +313,23 @@ def test_worker_expires_a_pending_review_after_restart(
     current = status(isolated_database.dsn, job["job_id"])
     assert current["reason_code"] == "REVIEW_EXPIRED"
     assert current["review_state"] is None
+    assert scalar(
+        isolated_database,
+        "SELECT workflow_synced FROM jobs WHERE job_id = %s",
+        (UUID(job["job_id"]),),
+    ) is False
+
+    # expire_review increments the generation, so the expiring worker cannot
+    # finalize. The next worker claims the BLOCKED job and syncs the checkpoint.
+    synced = worker(isolated_database.dsn)
+    assert synced["processed"] == 1
+    assert synced["state"] == "BLOCKED"
+    assert synced["workflow"] == "completed"
+    assert scalar(
+        isolated_database,
+        "SELECT workflow_synced FROM jobs WHERE job_id = %s",
+        (UUID(job["job_id"]),),
+    ) is True
 
 
 def test_review_rejects_missing_jobs_bad_digests_and_premature_jobs(

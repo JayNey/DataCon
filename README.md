@@ -17,7 +17,7 @@ DataCon 是面向授权实验环境的 CVE 复现平台项目。它的目标是�
 
 - **T01 案例与测试基线**：`tests/fixtures/cases/` 提供 B01/B02 的缺陷版、修复版、正常与候选输入、构建配方、依赖快照、预期退出码和预期 ASan 签名。`manifest.json` 固定全部材料摘要；`fixture-repo.bundle` 是包含两个固定提交的只读 Git bundle；`advisory.json` 是离线公告快照；`registry.json` 把案例、材料、仓库和公告关联起来。
 - **T02 任务入口**：`src/datacon/contracts.py` 校验请求并计算稳定计划摘要；`src/datacon/cli.py` 实现 `submit`、`status`、`review` 和 `worker`；`migrations/001_create_jobs.sql` 创建任务表并为旧表补列。
-- **T03 持久化、Supervisor 与审核**：`migrations/002_workflow.sql` 增量增加计划、审核、尝试、审计和恢复字段，保留既有任务；`src/datacon/state.py` 以 PostgreSQL 业务记录决定状态、审核与租约；`src/datacon/workflow.py` 用 LangGraph 编译 Supervisor，以 `thread_id=job_id` 保存检查点。`worker` 领取 `QUEUED`，生成并冻结计划，置为 `AWAITING_REVIEW`；`review` 在任务、计划摘要、操作者和 24 小时审核时限绑定下写入 `approve|reject`。批准原子地进入 `READY`，拒绝或过期进入 `BLOCKED`，恢复时从业务记录路由。
+- **T03 持久化、Supervisor 与审核**：`migrations/002_workflow.sql` 增量增加计划、审核、尝试、审计和恢复字段，保留既有任务；`003_attempts_generation.sql` 安全升级旧 `attempts` 唯一键。`src/datacon/state.py` 以 PostgreSQL 业务记录决定状态、审核、代次与租约；`src/datacon/workflow.py` 用 LangGraph 编译 Supervisor，以 `thread_id=job_id` 保存检查点。`worker` 领取 `QUEUED`，生成并冻结计划，置为 `AWAITING_REVIEW`；`review` 在任务、计划摘要、操作者和 24 小时审核时限绑定下写入 `approve|reject`。批准原子地进入 `READY`，拒绝或过期进入 `BLOCKED`，恢复时从业务记录路由。审核和过期提交增加 `generation`，旧 worker 无法把 `workflow_synced` 覆盖为 `true`；写回同时校验数据库有效租约。
 - **T04 情报、版本与源码分析**：`src/datacon/cases.py` 读取本地案例注册表；`src/datacon/agents/analysis.py` 读取离线公告、校验来源与摘要、解析固定 Git 提交、生成 diff、事实 / 假设和证据引用，并计算稳定计划摘要；`src/datacon/tools/source.py` 用受限 Git 命令和 Tree-sitter 提取目标函数与调用点。模型是可选的类型化端口，默认离线运行，真实 LLM 调用不是本批验收条件。
 - 合法 source 请求返回唯一 `job_id` 和 `QUEUED`。结构合法的 binary 请求在提交时归档为 `BLOCKED`，原因码 `UNSUPPORTED_TARGET`，不会进入 Supervisor。省略预算时应用 SRS 默认值。
 - 非法 CVE 格式、超出上限的预算、未知字段、重复 JSON 键和其他结构错误返回退出码 `2`，并在连接数据库前拒绝，不产生任务。
@@ -60,7 +60,7 @@ for migration in migrations/*.sql; do
 done
 ```
 
-本机有 `psql` 时也可以逐个执行 `psql "$DATACON_DATABASE_URL" -f "$migration"`。两个迁移都可重复执行；`002` 只增量加列和表，不删除或回填 T01/T02 的任务。
+本机有 `psql` 时也可以逐个执行 `psql "$DATACON_DATABASE_URL" -f "$migration"`。三个迁移都可重复执行；`001`、`002` 只增量加列和表，不删除或回填 T01/T02 的任务；`003` 在不丢数据的前提下把旧 `002` 的 `attempts` 唯一键升级为包含 `generation` 的形状。
 
 ### 3. 提交、生成计划、审核并查询 READY
 
@@ -132,7 +132,7 @@ uv run datacon status "$job"   # state=READY，review_state.decision=approve
 
 `status` 的 `pending_plan` 是冻结计划本身，包含：
 
-- `plan_digest`：对规范化字段计算的 `sha256`；`summary`：案例、双版本、修改路径、事实 / 假设数量、输入、预期退出码、ASan 签名、预算、隔离策略和情报摘要；`plan`：完整计划；`created_at`。
+- `plan_digest`：对规范化字段计算的 `sha256`；`summary`：案例、双版本、修改路径、事实 / 假设数量、输入、预期退出码、ASan 签名、预算、隔离策略和情报摘要；`plan`：完整计划；`created_at`。`case_config_digest` 绑定案例注册项、材料摘要、镜像、`platform`、`toolchain` 与 `asan_options`，任一变化都会改变计划摘要。
 - 双版本完整 Git 对象 ID、仓库来源、bundle 与补丁摘要、依赖锁、镜像摘要、构建配方、harness、候选与正常输入。
 - `expected_exit`、目标 ASan 签名、请求预算、隔离策略（`network=none`、非 root、只读根文件系统、`cap_drop=ALL`、`no_new_privileges`、seccomp）。
 - 情报来源、采集时间、内容摘要与来源 URL 列表。
@@ -140,40 +140,53 @@ uv run datacon status "$job"   # state=READY，review_state.decision=approve
 
 计划摘要的规范化规则固定为：只包含契约字段；Git 完整对象 ID、`sha256` 摘要、预算、隔离策略、情报和分析摘要均校验；按 key 排序、无多余空白、UTF-8 编码。`tests/contract/test_plan.py` 用固定向量锁定字节串和摘要。
 
-审核记录绑定 `job_id`、`plan_digest`、`reviewer_id`、`decision` 与 `decided_at`；审核时限为计划挂起后的 24 小时。同一操作者对同一计划重复提交同一决议幂等；不同决议或不同操作者返回 `REVIEW_CONFLICT`；摘要不符返回 `PLAN_MISMATCH`，原待审计划保持不变；超时在审核请求或 worker 中记录 `BLOCKED/REVIEW_EXPIRED`。
+审核记录绑定 `job_id`、`plan_digest`、`reviewer_id`、`decision` 与 `decided_at`；审核时限为计划挂起后的 24 小时。同一操作者对同一计划重复提交同一决议幂等；不同决议或不同操作者返回 `REVIEW_CONFLICT`；摘要不符返回 `PLAN_MISMATCH`，原待审计划保持不变。过期检查先于摘要比对，因此“过期 + 错误摘要”仍迁移到 `BLOCKED/REVIEW_EXPIRED`；超时在审核请求或 worker 中记录 `BLOCKED/REVIEW_EXPIRED`。
 
 ## Supervisor、恢复与租约
 
 - LangGraph 图是 `prepare → await_review → END`，检查点表由 `langgraph-checkpoint-postgres` 管理，`thread_id` 为 `job_id`。PostgreSQL 业务记录是状态与审核结果的唯一依据；检查点只表示调度位置。
-- `worker` 用 `SELECT ... FOR UPDATE SKIP LOCKED` 领取 `QUEUED`、过期 `PREPARING`、未同步的 `AWAITING_REVIEW` / `READY` / `BLOCKED` 任务，增加 `generation` 并写入有期限的租约。旧代次的写回被拒绝。
+- `worker` 用 `SELECT ... FOR UPDATE SKIP LOCKED` 领取 `QUEUED`、过期 `PREPARING`、未同步的 `AWAITING_REVIEW` / `READY` / `BLOCKED` 任务，增加 `generation` 并写入有期限的租约。`freeze_plan`、`block_job`、`record_attempt` 和 `finalize_workflow` 只在 `generation` 与数据库 `now()` 判定仍有效的租约同时匹配时写入；租约过期后旧 worker 的写回被拒绝，`finalize_workflow` 返回 `False` 且不清空租约。
+- 审核批准 / 拒绝或审核过期在同一事务中增加 `generation` 并清空租约。因此在 `await_review` 读取 `review=None` 后提交的审核会使旧 worker 的 finalize 失败：`workflow_synced` 保持 `false`，下一次 `worker` 以新代次恢复检查点后才置为 `true`。`block_job` 故意保留租约，由同代次的 `finalize_workflow` 清空，保证 `BLOCKED` 任务也能同步。
 - 准备阶段固定 `prepare_deadline_at`；计划冻结时固定 `review_deadline_at`；执行期限在 T05 首次执行领取时固定。
 - 待审时进程退出：检查点停在 `await_review` 中断，重新启动只读取既有计划，不会生成第二份。
 - 审核决议已入库但工作流尚未恢复：`review` 与任务状态在同一事务提交（`READY` 或 `BLOCKED`），检查点仍停在中断；下一次 `worker` 用 `Command(resume=...)` 恢复并同步检查点。计划与审核各只有一份有效记录。
-- 工具尝试按 `job_id/stage/step_key/attempt_no/generation` 记录，重复执行不会覆盖新代次；审计事件只追加。
+- 工具尝试按 `job_id/stage/step_key/attempt_no/generation` 记录；同一代次重复执行只更新该代次的行，旧代次不能覆盖新代次，审计事件只追加。
 
 ### 审核与恢复
 
 ```bash
-# 拒绝：BLOCKED / REVIEW_REJECTED，不产生任何 sandbox 工具尝试
-uv run datacon review "$job" --plan-digest "$digest" --decision reject
+# 为每个场景提交独立任务，避免复用上面已批准的 $job / $digest。
+review_job=$(uv run datacon submit --request examples/request.json | python3 -c 'import json,sys; print(json.load(sys.stdin)["job_id"])')
+uv run datacon worker --once
+review_digest=$(uv run datacon status "$review_job" | python3 -c 'import json,sys; print(json.load(sys.stdin)["pending_plan"]["plan_digest"])')
 
-# 摘要不符：退出码 3，PLAN_MISMATCH，原待审计划保持
-uv run datacon review "$job" --plan-digest "sha256:$(printf '0%.0s' {1..64})" --decision approve
+# 拒绝：BLOCKED / REVIEW_REJECTED，不产生任何 sandbox 工具尝试
+uv run datacon review "$review_job" --plan-digest "$review_digest" --decision reject
+
+# 摘要不符：使用另一个待审任务；退出码 3，PLAN_MISMATCH，原待审计划保持
+mismatch_job=$(uv run datacon submit --request examples/request.json | python3 -c 'import json,sys; print(json.load(sys.stdin)["job_id"])')
+uv run datacon worker --once
+uv run datacon review "$mismatch_job" --plan-digest "sha256:$(printf '0%.0s' {1..64})" --decision approve
 
 # 过期：把待审任务时限调到过去后，审核或 worker 记录 BLOCKED / REVIEW_EXPIRED
-docker exec -i datacon-pg psql -U datacon -d datacon \
-  -c "UPDATE jobs SET review_deadline_at = now() - interval '1 second' WHERE job_id = '$job'"
+# 过期检查先于摘要比对，因此这里即使摘要错误也返回 REVIEW_EXPIRED。
+expire_job=$(uv run datacon submit --request examples/request.json | python3 -c 'import json,sys; print(json.load(sys.stdin)["job_id"])')
 uv run datacon worker --once
-uv run datacon status "$job"
+docker exec -i datacon-pg psql -U datacon -d datacon \
+  -c "UPDATE jobs SET review_deadline_at = now() - interval '1 second' WHERE job_id = '$expire_job'"
+uv run datacon review "$expire_job" --plan-digest "sha256:$(printf '0%.0s' {1..64})" --decision approve
+# 或 uv run datacon worker --once
+uv run datacon status "$expire_job"
 ```
 
 ## 情报、版本与源码分析
 
 - 案例注册表 `tests/fixtures/cases/registry.json` 指向 `manifest.json`、`fixture-repo.bundle` 和 `advisory.json`。部署时可用 `DATACON_CASE_ROOT` 指向自己的注册目录；默认使用仓库内合成案例。
 - 情报只读离线快照：记录 `collected_at`、来源 URL 和快照 SHA-256。快照与注册表 / Git 提交不一致时阻断为 `SOURCE_CONFLICT`；缺失、篡改或摘要不符阻断为 `MATERIAL_MISSING`。
-- Git 通过只读 bare 仓库和固定命令模板读取：禁用全局 / 系统 Git 配置、hooks、外部 diff、textconv、子模块拉取和自由 shell。解析 `refs/heads/vulnerable` 与 `refs/heads/fixed` 的完整对象 ID，并核对注册表与材料摘要；diff 只保留修改路径和摘要。
-- Tree-sitter C 解析器提取目标函数定义（两版）和 harness 中的候选调用点，记录路径与行号。
-- 分析结果的每条 `fact` 必须有可解析的证据引用；`hypothesis` 标注置信级别。伪造引用、事实缺证据或模型输出类型不符阻断为 `EVIDENCE_INVALID`。
+- Git 通过只读 bare 仓库和固定命令模板读取：禁用全局 / 系统 Git 配置、hooks、外部 diff、textconv、子模块拉取和自由 shell。解析 `refs/heads/vulnerable` 与 `refs/heads/fixed` 的完整对象 ID；`manifest["versions"]` 指向的缺陷版 / 修复版源码材料也会按材料清单读取和校验摘要，并与 Git blob 逐字节比对，删除或篡改任一源码文件立即阻断。diff 只保留修改路径和摘要。
+- Tree-sitter C 解析器提取目标函数定义（两版）和 `manifest["harness"]` 指向的实际 harness 文件中的候选调用点，记录真实路径与行号。
+- 分析结果的每条 `fact` 必须有可解析的证据引用；证据引用会按 `git:commit`、`git:blob`、`git:diff`、`intel`、`material` 和 `source/<harness 实际路径>#L<行号>` 逐项解析到实际材料，而不是只做白名单成员检查。`hypothesis` 标注置信级别；伪造引用、事实缺证据或模型输出类型不符阻断为 `EVIDENCE_INVALID`。
+- 计划摘要绑定 `asan_options`、`platform` 和 `toolchain`；修改这些固定字段会改变 `case_config_digest` 与计划摘要。
 - 公告文本、源码注释、diff 和工具输出都只作为数据；分析器只调用 `git.resolve`、`git.diff`、`tree_sitter.extract`，不会因外部文本触发执行工具。
 - 模型是可选端口（`AnalysisModel` / `ModelSuggestion`）；默认离线替身不产生建议，测试用替身验证合法假设与伪造引用。真实 LLM 调用不属于本批验收条件。
 
@@ -211,10 +224,10 @@ uv run pytest -q tests/integration/test_fixture_replay.py
 
 - `tests/contract/test_request.py`、`test_plan.py`、`test_fixtures.py`：请求、计划摘要、案例材料与 B03 记录。
 - `test_agent_contracts.py`：`AgentInput` / `AgentOutput` / `Finding` 的字段、枚举、时间戳、事实证据和错误码。
-- `test_analysis.py`：从真实合成材料生成冻结计划、稳定摘要、事实 / 假设、Tree-sitter 提取、缺件 / 冲突 / 篡改 / 二进制 / 伪造引用 / 外部文本注入 / 可选模型替身。
-- `tests/integration/test_worker_and_review.py`：真实 PostgreSQL 中的计划冻结、待审查询、批准 / 拒绝 / 摘要不符 / 过期、重复与冲突决议、worker 领取、binary 不被领取。
-- `tests/integration/test_recovery.py`：待审退出后重启、审核已入库但图未恢复、旧代次写入失败、检查点 `thread_id=job_id`、计划与审核各一份。
-- `tests/integration/test_workflow_migrations.py`：001 旧任务在 002 增量迁移后保留，新表 / 列 / 索引存在，计划与审核每任务唯一，迁移可重复执行。
+- `test_analysis.py`：从真实合成材料生成冻结计划、稳定摘要、事实 / 假设、Tree-sitter 提取、缺件 / 冲突 / 篡改 / 二进制 / 伪造引用 / 外部文本注入 / 可选模型替身；并覆盖源码材料删除与篡改、harness 改名后的实际证据路径、`asan_options` / `platform` / `toolchain` 摘要绑定，以及公告、源码注释、diff 和模型上下文的注入。
+- `tests/integration/test_worker_and_review.py`：真实 PostgreSQL 中的计划冻结、待审查询、批准 / 拒绝 / 摘要不符 / 过期（含“过期 + 错误摘要”）、重复与冲突决议、worker 领取、binary 不被领取、过期后下一次 worker 同步。
+- `tests/integration/test_recovery.py`：待审退出后重启、审核已入库但图未恢复、审核在 `await_review` 窗口提交时旧 worker 不能 finalize、租约过期 / 新代次接管后的写回拒绝、`attempts` 按代次保留历史、阻断后 finalize、双连接单领取、检查点 `thread_id=job_id`、计划与审核各一份。
+- `tests/integration/test_workflow_migrations.py`：001 旧任务在 002 增量迁移后保留，新表 / 列 / 索引存在，计划与审核每任务唯一，迁移可重复执行；003 在不丢数据的前提下把旧 `attempts` 唯一键升级为包含 `generation`。
 - `tests/integration/test_fixture_replay.py`：宿主 clang + ASan 的 B01/B02 合成回放，仍是 T01 材料回归，不是 T05 容器隔离验收。
 
 未设置 `DATACON_TEST_DATABASE_URL` 时，PostgreSQL 用例跳过；契约、Agent 和分析用例仍离线运行。
@@ -232,7 +245,7 @@ src/datacon/
   agent_contracts.py    AgentInput / AgentOutput / Finding
   agents/analysis.py    离线情报、版本、diff、事实 / 假设与计划冻结
   tools/source.py       受限 Git 与 Tree-sitter
-migrations/             001 任务表、002 工作流增量
+migrations/             001 任务表、002 工作流增量、003 attempts 代次键升级
 examples/               示例请求
 tests/contract/         请求、计划、Agent、分析、案例材料与 B03
 tests/integration/      真实 PostgreSQL CLI / 审核 / 恢复 / 迁移 / ASan 回放
