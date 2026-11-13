@@ -1,0 +1,7 @@
+# Toolchain lock for the T05 replay container. Local and CI ASan smoke tests
+# intentionally use the host clang, so this pin is not a local requirement.
+target=linux/amd64
+scope=T05-replay
+clang=19.1.7
+image=silkeh/clang:19-bookworm@sha256:f5ce959d91f059acf5a4b3f1c19f46713c4b2881c7d7cd1d5143ca1d1412277f
+additional_dependencies=none

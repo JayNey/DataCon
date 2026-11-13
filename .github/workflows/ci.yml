@@ -79,5 +79,40 @@ jobs:
           # replay image is verified by the T05 task, not here.
           clang --version
           llvm-symbolizer --version
+      - name: Build wheel and verify the packaged case registry
+        shell: bash
+        run: |
+          uv build --wheel
+          wheel="$(ls -t dist/*.whl | head -n 1)"
+          target="$RUNNER_TEMP/datacon-wheel"
+          rm -rf "$target"
+          mkdir -p "$target"
+          python -m zipfile -e "$wheel" "$target"
+          cd "$RUNNER_TEMP"
+          env -u DATACON_CASE_ROOT PYTHONPATH="$target" python -S - <<'PY'
+          import json
+          import os
+
+          import datacon
+
+          assert os.path.dirname(os.path.realpath(datacon.__file__)) == os.path.join(
+              os.environ["PYTHONPATH"], "datacon"
+          )
+          from datacon.contracts import parse_request
+
+          request = {
+              "schema_version": 1,
+              "cve_id": "CVE-2099-0001",
+              "target": {
+                  "kind": "source",
+                  "case_id": "fixture-c-parser",
+                  "goal": "wheel smoke",
+              },
+          }
+          assert parse_request(json.dumps(request))["target"]["case_id"] == (
+              "fixture-c-parser"
+          )
+          print("wheel case registry ok")
+          PY
       - name: Run contract, PostgreSQL, workflow and ASan fixture tests
         run: uv run --frozen pytest -q

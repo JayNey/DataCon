@@ -1,8 +1,9 @@
 """Registered cases for offline planning.
 
 A deployment points ``DATACON_CASE_ROOT`` at a directory containing
-``registry.json`` and the materials it references. Local development and CI use
-the synthetic case shipped under ``tests/fixtures/cases``.
+``registry.json`` and the materials it references. The default synthetic case
+is shipped as package data, so an installed wheel works without a source
+checkout. ``tests/fixtures/cases`` mirrors that directory for the test baseline.
 """
 
 from __future__ import annotations
@@ -15,7 +16,7 @@ from typing import Any
 from datacon import jsonutil
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_CASE_ROOT = PROJECT_ROOT / "tests" / "fixtures" / "cases"
+DEFAULT_CASE_ROOT = Path(__file__).resolve().parent / "data" / "cases"
 
 _CASE_FIELDS = frozenset(
     {"cve_id", "benchmark_id", "repository", "advisory"}
@@ -32,6 +33,14 @@ class CaseConfigurationError(ValueError):
         super().__init__(message)
         self.reason_code = reason_code
         self.message = message
+
+
+class TransientCaseError(CaseConfigurationError):
+    """A recoverable I/O error while reading pinned case material.
+
+    Missing files and digest mismatches stay ``CaseConfigurationError``; only
+    failures that may succeed on a second attempt use this subclass.
+    """
 
 
 @dataclass(frozen=True)
@@ -64,9 +73,13 @@ class CaseDefinition:
             )
         try:
             data = path.read_bytes()
-        except OSError as error:
+        except (FileNotFoundError, PermissionError) as error:
             raise CaseConfigurationError(
-                "MATERIAL_MISSING", f"material {relative} cannot be read: {error}"
+                "MATERIAL_MISSING", f"material {relative} is not readable"
+            ) from error
+        except OSError as error:
+            raise TransientCaseError(
+                "MATERIAL_IO_ERROR", f"material {relative} cannot be read: {error}"
             ) from error
         digest = jsonutil.digest_bytes(data)
         if expected_digest is not None and digest != expected_digest:
@@ -132,9 +145,13 @@ def case_root(path: str | os.PathLike[str] | None = None) -> Path:
 def _load_json(path: Path, label: str) -> dict[str, Any]:
     try:
         text = path.read_text(encoding="utf-8")
-    except OSError as error:
+    except (FileNotFoundError, PermissionError) as error:
         raise CaseConfigurationError(
-            "MATERIAL_MISSING", f"{label} is missing: {error}"
+            "MATERIAL_MISSING", f"{label} is not readable: {error}"
+        ) from error
+    except OSError as error:
+        raise TransientCaseError(
+            "MATERIAL_IO_ERROR", f"{label} cannot be read: {error}"
         ) from error
     try:
         document = jsonutil.loads_strict(text)

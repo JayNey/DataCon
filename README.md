@@ -15,10 +15,10 @@ DataCon 是面向授权实验环境的 CVE 复现平台项目。它的目标是�
 
 ## 当前实现（T01–T04）
 
-- **T01 案例与测试基线**：`tests/fixtures/cases/` 提供 B01/B02 的缺陷版、修复版、正常与候选输入、构建配方、依赖快照、预期退出码和预期 ASan 签名。`manifest.json` 固定全部材料摘要；`fixture-repo.bundle` 是包含两个固定提交的只读 Git bundle；`advisory.json` 是离线公告快照；`registry.json` 把案例、材料、仓库和公告关联起来。
+- **T01 案例与测试基线**：`src/datacon/data/cases/` 随 wheel 发布 B01/B02 的缺陷版、修复版、正常与候选输入、构建配方、依赖快照、预期退出码和预期 ASan 签名；`tests/fixtures/cases/` 保留同一套测试基线。`manifest.json` 固定全部材料摘要；`fixture-repo.bundle` 是包含两个固定提交的只读 Git bundle；`advisory.json` 是离线公告快照；`registry.json` 把案例、材料、仓库和公告关联起来。
 - **T02 任务入口**：`src/datacon/contracts.py` 校验请求并计算稳定计划摘要；`src/datacon/cli.py` 实现 `submit`、`status`、`review` 和 `worker`；`migrations/001_create_jobs.sql` 创建任务表并为旧表补列。
-- **T03 持久化、Supervisor 与审核**：`migrations/002_workflow.sql` 增量增加计划、审核、尝试、审计和恢复字段，保留既有任务；`003_attempts_generation.sql` 安全升级旧 `attempts` 唯一键。`src/datacon/state.py` 以 PostgreSQL 业务记录决定状态、审核、代次与租约；`src/datacon/workflow.py` 用 LangGraph 编译 Supervisor，以 `thread_id=job_id` 保存检查点。`worker` 领取 `QUEUED`，生成并冻结计划，置为 `AWAITING_REVIEW`；`review` 在任务、计划摘要、操作者和 24 小时审核时限绑定下写入 `approve|reject`。批准原子地进入 `READY`，拒绝或过期进入 `BLOCKED`，恢复时从业务记录路由。审核和过期提交增加 `generation`，旧 worker 无法把 `workflow_synced` 覆盖为 `true`；写回同时校验数据库有效租约。
-- **T04 情报、版本与源码分析**：`src/datacon/cases.py` 读取本地案例注册表；`src/datacon/agents/analysis.py` 读取离线公告、校验来源与摘要、解析固定 Git 提交、生成 diff、事实 / 假设和证据引用，并计算稳定计划摘要；`src/datacon/tools/source.py` 用受限 Git 命令和 Tree-sitter 提取目标函数与调用点。模型是可选的类型化端口，默认离线运行，真实 LLM 调用不是本批验收条件。
+- **T03 持久化、Supervisor 与审核**：`migrations/002_workflow.sql` 增量增加计划、审核、尝试、审计和恢复字段，保留既有任务；`003_attempts_generation.sql` 安全升级旧 `attempts` 唯一键。`src/datacon/state.py` 以 PostgreSQL 业务记录决定状态、审核、代次与租约；`src/datacon/workflow.py` 用 LangGraph 编译 Supervisor，以 `thread_id=job_id` 保存检查点。`worker` 领取 `QUEUED`，生成并冻结计划，置为 `AWAITING_REVIEW`；`review` 在任务、计划摘要、操作者和 24 小时审核时限绑定下写入 `approve|reject`。批准原子地进入 `READY`，拒绝或过期进入 `BLOCKED`，恢复时从业务记录路由。审核和过期提交增加 `generation`，旧 worker 无法把 `workflow_synced` 覆盖为 `true`；写回同时校验数据库有效租约。分析或检查点的瞬时基础设施错误按逻辑步骤最多重试一次，并在 `attempts` 追加 `infra_error` / `completed` 记录；准备时限过期时直接阻断。
+- **T04 情报、版本与源码分析**：`src/datacon/cases.py` 读取本地案例注册表；`src/datacon/agents/analysis.py` 读取离线公告、校验来源与摘要、解析固定 Git 提交、生成 diff、事实 / 假设和证据引用，并计算稳定计划摘要；根因 hypothesis 由实际 ASan 签名、源码路径和函数派生，不硬编码 B01 文本；`src/datacon/tools/source.py` 用受限 Git 命令和 Tree-sitter 提取目标函数与调用点。模型是可选的类型化端口，默认离线运行，真实 LLM 调用不是本批验收条件。
 - 合法 source 请求返回唯一 `job_id` 和 `QUEUED`。结构合法的 binary 请求在提交时归档为 `BLOCKED`，原因码 `UNSUPPORTED_TARGET`，不会进入 Supervisor。省略预算时应用 SRS 默认值。
 - 非法 CVE 格式、超出上限的预算、未知字段、重复 JSON 键和其他结构错误返回退出码 `2`，并在连接数据库前拒绝，不产生任务。
 - **B03 准入**：`B03-admission.json` / `B03-admission.md` 记录公开候选 `CVE-2019-13224` 的公告、修复提交、许可、离线构建、共享 harness 和 ASan 计划。状态为 `conditional_admission`；真实案例执行与发布验收按任务顺序留到 T05/T08。
@@ -113,7 +113,7 @@ uv run datacon status "$job"   # state=READY，review_state.decision=approve
 
 - `schema_version` 必须为整数 `1`。
 - `cve_id` 必须匹配 `CVE-YYYY-NNNN`；`target.kind` 枚举为 `source|binary`。
-- `target.case_id` 必须关联 `tests/fixtures/cases/registry.json` 中登记的合成案例。当前登记 `fixture-c-parser` 和 `fixture-c-parser-clean`，两者都关联 `CVE-2099-0001`。
+- `target.case_id` 必须关联案例注册表中登记的合成案例。源码树中的 `src/datacon/data/cases/registry.json` 会作为 wheel 内的 `datacon/data/cases/registry.json` 发布；`tests/fixtures/cases/registry.json` 是同一测试基线。当前登记 `fixture-c-parser` 和 `fixture-c-parser-clean`，两者都关联 `CVE-2099-0001`。设置 `DATACON_CASE_ROOT` 可覆盖默认目录。
 - 预算字段可省略；省略时使用下列 SRS 默认值。每个字段必须是正整数且不得超过对应默认值；`replay_seconds` 不得大于 `execute_seconds`。
 
 | 字段 | 默认值/上限 |
@@ -132,8 +132,8 @@ uv run datacon status "$job"   # state=READY，review_state.decision=approve
 
 `status` 的 `pending_plan` 是冻结计划本身，包含：
 
-- `plan_digest`：对规范化字段计算的 `sha256`；`summary`：案例、双版本、修改路径、事实 / 假设数量、输入、预期退出码、ASan 签名、预算、隔离策略和情报摘要；`plan`：完整计划；`created_at`。`case_config_digest` 绑定案例注册项、材料摘要、镜像、`platform`、`toolchain` 与 `asan_options`，任一变化都会改变计划摘要。
-- 双版本完整 Git 对象 ID、仓库来源、bundle 与补丁摘要、依赖锁、镜像摘要、构建配方、harness、候选与正常输入。
+- `plan_digest`：对规范化字段计算的 `sha256`；`summary`：案例、双版本、修改路径、事实 / 假设数量、输入、预期退出码、`platform`、`toolchain`、`asan_options`、ASan 签名、预算、隔离策略和情报摘要；`plan`：完整计划；`created_at`。`case_config_digest` 绑定案例注册项、材料摘要、镜像、`platform`、`toolchain` 与 `asan_options`，任一变化都会改变计划摘要。
+- 双版本完整 Git 对象 ID、仓库来源、bundle 与补丁摘要、依赖锁、镜像摘要、`platform`、`toolchain`、`asan_options`、构建配方、harness、候选与正常输入。T05 从计划的这些字段读取执行环境参数，不需要依赖可变的注册表状态。
 - `expected_exit`、目标 ASan 签名、请求预算、隔离策略（`network=none`、非 root、只读根文件系统、`cap_drop=ALL`、`no_new_privileges`、seccomp）。
 - 情报来源、采集时间、内容摘要与来源 URL 列表。
 - `analysis`：diff 摘要、修改路径、Tree-sitter 符号 / 调用点、逐条 `fact|hypothesis`、置信级别和证据引用；`analysis_digest` 绑定该分析。
@@ -151,6 +151,8 @@ uv run datacon status "$job"   # state=READY，review_state.decision=approve
 - 待审时进程退出：检查点停在 `await_review` 中断，重新启动只读取既有计划，不会生成第二份。
 - 审核决议已入库但工作流尚未恢复：`review` 与任务状态在同一事务提交（`READY` 或 `BLOCKED`），检查点仍停在中断；下一次 `worker` 用 `Command(resume=...)` 恢复并同步检查点。计划与审核各只有一份有效记录。
 - 工具尝试按 `job_id/stage/step_key/attempt_no/generation` 记录；同一代次重复执行只更新该代次的行，旧代次不能覆盖新代次，审计事件只追加。
+- 可恢复基础设施错误使用类型化异常，不靠消息字符串匹配：`TransientSourceToolError`（Git 超时、子进程启动/终止或可恢复 I/O）转换为 `RetryableAnalysisError`，Supervisor / 检查点的瞬时错误使用 `RetryableWorkflowError`、`psycopg.OperationalError` / `InterfaceError` 等类型。缺件、摘要不符、来源冲突、契约错误、`AnalysisBlocked`、`StaleGeneration` 和 `PlanConflict` 不重试。
+- 每个逻辑步骤最多额外重试一次（attempt 1 → attempt 2）。重试前用数据库 `now()` 检查 `prepare_deadline_at`；已过期直接 `BLOCKED/DEADLINE_EXCEEDED`。`attempts` 追加记录 `step_key`、`attempt_no`、`generation` 与 `status=infra_error|completed`，不覆盖第一次记录；第二次仍失败才以 `FAILED/ANALYSIS_ERROR` 终止。检查点 `get_state` / `invoke` 的瞬时错误同样最多重试一次。
 
 ### 审核与恢复
 
@@ -181,18 +183,19 @@ uv run datacon status "$expire_job"
 
 ## 情报、版本与源码分析
 
-- 案例注册表 `tests/fixtures/cases/registry.json` 指向 `manifest.json`、`fixture-repo.bundle` 和 `advisory.json`。部署时可用 `DATACON_CASE_ROOT` 指向自己的注册目录；默认使用仓库内合成案例。
+- 默认案例注册表来自 `src/datacon/data/cases/registry.json`，以 wheel 内的 `datacon/data/cases/registry.json` 发布，并指向同目录的 `manifest.json`、`fixture-repo.bundle` 和 `advisory.json`；`tests/fixtures/cases/` 是测试基线镜像。部署时可用 `DATACON_CASE_ROOT` 指向自己的注册目录；安装后的 wheel 不设置该变量也能使用默认合成案例。
 - 情报只读离线快照：记录 `collected_at`、来源 URL 和快照 SHA-256。快照与注册表 / Git 提交不一致时阻断为 `SOURCE_CONFLICT`；缺失、篡改或摘要不符阻断为 `MATERIAL_MISSING`。
 - Git 通过只读 bare 仓库和固定命令模板读取：禁用全局 / 系统 Git 配置、hooks、外部 diff、textconv、子模块拉取和自由 shell。解析 `refs/heads/vulnerable` 与 `refs/heads/fixed` 的完整对象 ID；`manifest["versions"]` 指向的缺陷版 / 修复版源码材料也会按材料清单读取和校验摘要，并与 Git blob 逐字节比对，删除或篡改任一源码文件立即阻断。diff 只保留修改路径和摘要。
 - Tree-sitter C 解析器提取目标函数定义（两版）和 `manifest["harness"]` 指向的实际 harness 文件中的候选调用点，记录真实路径与行号。
-- 分析结果的每条 `fact` 必须有可解析的证据引用；证据引用会按 `git:commit`、`git:blob`、`git:diff`、`intel`、`material` 和 `source/<harness 实际路径>#L<行号>` 逐项解析到实际材料，而不是只做白名单成员检查。`hypothesis` 标注置信级别；伪造引用、事实缺证据或模型输出类型不符阻断为 `EVIDENCE_INVALID`。
-- 计划摘要绑定 `asan_options`、`platform` 和 `toolchain`；修改这些固定字段会改变 `case_config_digest` 与计划摘要。
+- 分析结果的每条 `fact` 必须有可解析的证据引用；证据引用会按 `git:commit`、`git:blob`、`git:diff`、`intel`、`material` 和 `source/<文件路径>#L<行号>` 逐项解析，而不是只做白名单成员检查：`git:blob` 必须存在于该提交的树中，`git:diff` 必须指向两个固定提交间的实际修改路径，`source/` 必须对应案例目录中存在的文件且行号在文件范围内，`material/` 与 `intel/` 必须绑定已读取的材料摘要。harness 的证据引用使用 `manifest["harness"]` 的实际路径。`hypothesis` 标注置信级别；伪造引用、事实缺证据或模型输出类型不符阻断为 `EVIDENCE_INVALID`。
+- 确定性 finding 只陈述可测量事实：diff 增删行数、两版函数定义行号、harness 实际调用行和公告提交。根因 hypothesis 由实际 `asan_signature.error`、`source_path` 和 `function` 派生，不再包含只适用于 B01 的 `string terminator` / `four-byte allocation` / 固定 `heap-buffer-overflow` 文本；换案例或修改签名会改变或移除该 hypothesis。
+- 计划自身携带 `asan_options`、`platform` 和 `toolchain`，并由 `case_config_digest` 与计划摘要绑定；修改任一固定字段都会改变计划摘要，批准后不能静默漂移。
 - 公告文本、源码注释、diff 和工具输出都只作为数据；分析器只调用 `git.resolve`、`git.diff`、`tree_sitter.extract`，不会因外部文本触发执行工具。
 - 模型是可选端口（`AnalysisModel` / `ModelSuggestion`）；默认离线替身不产生建议，测试用替身验证合法假设与伪造引用。真实 LLM 调用不属于本批验收条件。
 
 ## 合成案例与 B03
 
-`tests/fixtures/cases/manifest.json` 记录：
+`src/datacon/data/cases/manifest.json` 是随 wheel 发布的默认清单，`tests/fixtures/cases/manifest.json` 是测试基线镜像。两者记录：
 
 - B01 合成正例：缺陷版对 `inputs/candidate.txt` 触发 `heap-buffer-overflow`（`parse_token`，退出码 `86`），修复版正常；正常输入在两版均输出 `OK`。
 - B02 合成反例：`inputs/clean.txt` 未越界，两版均正常退出，预期 `NOT_REPRODUCED`。
@@ -219,14 +222,18 @@ uv run pytest -q tests/integration/test_migrations.py
 uv run pytest -q tests/integration/test_workflow_migrations.py
 uv run pytest -q tests/integration/test_worker_and_review.py
 uv run pytest -q tests/integration/test_recovery.py
+uv run pytest -q tests/integration/test_retry.py
 uv run pytest -q tests/integration/test_fixture_replay.py
+uv run pytest -q tests/contract/test_wheel.py
 ```
 
 - `tests/contract/test_request.py`、`test_plan.py`、`test_fixtures.py`：请求、计划摘要、案例材料与 B03 记录。
 - `test_agent_contracts.py`：`AgentInput` / `AgentOutput` / `Finding` 的字段、枚举、时间戳、事实证据和错误码。
-- `test_analysis.py`：从真实合成材料生成冻结计划、稳定摘要、事实 / 假设、Tree-sitter 提取、缺件 / 冲突 / 篡改 / 二进制 / 伪造引用 / 外部文本注入 / 可选模型替身；并覆盖源码材料删除与篡改、harness 改名后的实际证据路径、`asan_options` / `platform` / `toolchain` 摘要绑定，以及公告、源码注释、diff 和模型上下文的注入。
+- `test_analysis.py`：从真实合成材料生成冻结计划、稳定摘要、事实 / 假设、Tree-sitter 提取、缺件 / 冲突 / 篡改 / 二进制 / 伪造引用 / 外部文本注入 / 可选模型替身；并覆盖源码材料删除与篡改、harness 改名后的实际证据路径、签名变化后的 hypothesis、`asan_options` / `platform` / `toolchain` 摘要绑定、不可解析 ref（缺文件、越界行、缺失 Git 路径、未知材料 / 情报摘要）、文件范围内有效源码行，以及公告、源码注释、diff 和模型上下文的注入不改变 deterministic facts。
+- `tests/contract/test_wheel.py`：`uv build --wheel` 后解压到临时目录，在不设置 `DATACON_CASE_ROOT` 时校验默认 `fixture-c-parser`，再设置自定义目录校验覆盖生效。
 - `tests/integration/test_worker_and_review.py`：真实 PostgreSQL 中的计划冻结、待审查询、批准 / 拒绝 / 摘要不符 / 过期（含“过期 + 错误摘要”）、重复与冲突决议、worker 领取、binary 不被领取、过期后下一次 worker 同步。
 - `tests/integration/test_recovery.py`：待审退出后重启、审核已入库但图未恢复、审核在 `await_review` 窗口提交时旧 worker 不能 finalize、租约过期 / 新代次接管后的写回拒绝、`attempts` 按代次保留历史、阻断后 finalize、双连接单领取、检查点 `thread_id=job_id`、计划与审核各一份。
+- `tests/integration/test_retry.py`：瞬时分析错误重试一次后成功、持续瞬时错误只重试一次后 `FAILED`、非瞬时 `AnalysisBlocked` 不重试、重试前准备时限过期直接 `DEADLINE_EXCEEDED`，以及检查点瞬时错误重试一次。
 - `tests/integration/test_workflow_migrations.py`：001 旧任务在 002 增量迁移后保留，新表 / 列 / 索引存在，计划与审核每任务唯一，迁移可重复执行；003 在不丢数据的前提下把旧 `attempts` 唯一键升级为包含 `generation`。
 - `tests/integration/test_fixture_replay.py`：宿主 clang + ASan 的 B01/B02 合成回放，仍是 T01 材料回归，不是 T05 容器隔离验收。
 
@@ -245,11 +252,12 @@ src/datacon/
   agent_contracts.py    AgentInput / AgentOutput / Finding
   agents/analysis.py    离线情报、版本、diff、事实 / 假设与计划冻结
   tools/source.py       受限 Git 与 Tree-sitter
+  data/cases/           wheel 默认案例注册表与合成材料
 migrations/             001 任务表、002 工作流增量、003 attempts 代次键升级
 examples/               示例请求
-tests/contract/         请求、计划、Agent、分析、案例材料与 B03
-tests/integration/      真实 PostgreSQL CLI / 审核 / 恢复 / 迁移 / ASan 回放
-tests/fixtures/cases/   合成材料、Git bundle、公告快照、案例注册表与 B03
+tests/contract/         请求、计划、Agent、分析、wheel 与案例材料 / B03
+tests/integration/      真实 PostgreSQL CLI / 审核 / 恢复 / 重试 / 迁移 / ASan 回放
+tests/fixtures/cases/   测试基线镜像（合成材料、Git bundle、公告、注册表与 B03）
 .github/workflows/      PR CI
 ```
 
@@ -266,7 +274,7 @@ tests/fixtures/cases/   合成材料、Git bundle、公告快照、案例注册�
 
 ## CI
 
-`.github/workflows/ci.yml` 在 Pull Request 和 `main` 分支推送时运行：安装锁定依赖、启动固定 digest 的 PostgreSQL 17、按文件名顺序应用 `migrations/*.sql`、安装宿主 `clang` / LLVM symbolizer / patch，并执行完整 `pytest`（契约、Agent、分析、工作流恢复、真实 PostgreSQL、迁移和合成 ASan 回放）。`uv` 按 `requirements-ci.txt` 中的 wheel hash 安装；构建后端固定为 uv 自带的 `uv_build==0.12.7`，`uv sync --frozen` 不解析或安装 setuptools，CI 还会以 verbose 重装确认实际使用的是内置后端。第三方 Action 固定到完整提交 SHA，工作流只有 `contents: read` 权限。ASan smoke 使用 runner 的宿主 clang，锁定的 clang 19.1.7 镜像留给 T05 验证。
+`.github/workflows/ci.yml` 在 Pull Request 和 `main` 分支推送时运行：安装锁定依赖、启动固定 digest 的 PostgreSQL 17、按文件名顺序应用 `migrations/*.sql`、安装宿主 `clang` / LLVM symbolizer / patch，执行 wheel 构建 / 安装冒烟，并执行完整 `pytest`（契约、Agent、分析、工作流恢复、重试、真实 PostgreSQL、迁移和合成 ASan 回放）。`uv` 按 `requirements-ci.txt` 中的 wheel hash 安装；构建后端固定为 uv 自带的 `uv_build==0.12.7`，`uv sync --frozen` 不解析或安装 setuptools，CI 还会以 verbose 重装确认实际使用的是内置后端。第三方 Action 固定到完整提交 SHA，工作流只有 `contents: read` 权限。ASan smoke 使用 runner 的宿主 clang，锁定的 clang 19.1.7 镜像留给 T05 验证。
 
 ## 开发方式
 

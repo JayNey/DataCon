@@ -59,6 +59,13 @@ PLAN = {
     "revisions": {"vulnerable": "b" * 40, "fixed": "c" * 40},
     "dependencies_digest": "sha256:" + "f" * 64,
     "image_digest": "sha256:" + "0" * 64,
+    "platform": "linux/amd64",
+    "toolchain": {
+        "compiler": "clang",
+        "sanitizer": "address",
+        "pinned_image_version": "19.1.7",
+    },
+    "asan_options": "detect_leaks=0:halt_on_error=1",
     "build_recipe_digest": "sha256:" + "1" * 64,
     "harness_digest": "sha256:" + "2" * 64,
     "inputs": {"candidate": "sha256:" + "3" * 64, "normal": "sha256:" + "4" * 64},
@@ -90,6 +97,7 @@ PLAN = {
 
 EXPECTED = {
     "analysis_digest": analysis_digest(ANALYSIS),
+    "asan_options": "detect_leaks=0:halt_on_error=1",
     "asan_signature": {
         "error": "heap-buffer-overflow",
         "function": "parse_token",
@@ -119,6 +127,7 @@ EXPECTED = {
         "seccomp": "runtime/default",
     },
     "limits": DEFAULT_LIMITS,
+    "platform": "linux/amd64",
     "policy_version": "1",
     "repository": {
         "origin": "fixture://datacon/B01",
@@ -126,9 +135,14 @@ EXPECTED = {
         "patch_digest": "sha256:" + "e" * 64,
     },
     "revisions": {"vulnerable": "b" * 40, "fixed": "c" * 40},
+    "toolchain": {
+        "compiler": "clang",
+        "sanitizer": "address",
+        "pinned_image_version": "19.1.7",
+    },
 }
 
-EXPECTED_DIGEST = "sha256:79c2852b8b37249c1d3873f0cb47558ab4f98f5ab3c439e59954be77ddd31f5f"
+EXPECTED_DIGEST = "sha256:bc4a62de4573e6ec3adb5b792ce9b98cf60fd10f4a73ced5b662426f8707524d"
 
 
 def test_canonical_bytes_and_digest_are_frozen():
@@ -171,6 +185,9 @@ def test_non_ascii_values_are_encoded_as_utf8():
         lambda plan: plan["inputs"].__setitem__("candidate", "sha256:" + "6" * 64),
         lambda plan: plan["revisions"].__setitem__("fixed", "d" * 40),
         lambda plan: plan["limits"].__setitem__("cpu", 1),
+        lambda plan: plan.__setitem__("platform", "linux/arm64"),
+        lambda plan: plan["toolchain"].__setitem__("compiler", "gcc"),
+        lambda plan: plan.__setitem__("asan_options", "detect_leaks=1"),
         lambda plan: plan.__setitem__("policy_version", "2"),
         lambda plan: plan["isolation"].__setitem__("user", "1000:1000"),
         lambda plan: plan["repository"].__setitem__("patch_digest", "sha256:" + "7" * 64),
@@ -232,6 +249,12 @@ def test_digest_binds_materials_budget_policy_isolation_and_analysis(mutate):
         lambda plan: plan["limits"].__setitem__("execute_seconds", 9),
         lambda plan: plan["limits"].pop("pids"),
         lambda plan: plan.__setitem__("case_id", ""),
+        lambda plan: plan.pop("platform"),
+        lambda plan: plan.__setitem__("platform", ""),
+        lambda plan: plan.pop("asan_options"),
+        lambda plan: plan.__setitem__("asan_options", " "),
+        lambda plan: plan.__setitem__("toolchain", {}),
+        lambda plan: plan["toolchain"].__setitem__("ratio", 1.5),
         lambda plan: plan.__setitem__("policy_version", " "),
     ],
 )

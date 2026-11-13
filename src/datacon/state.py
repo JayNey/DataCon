@@ -127,6 +127,22 @@ def load_job(dsn: str, job_id: UUID) -> dict[str, Any] | None:
         ).fetchone()
 
 
+def prepare_deadline_passed(dsn: str, job_id: UUID, *, generation: int) -> bool:
+    """Return whether the prepare deadline passed, using the database clock."""
+    with _connect(dsn) as connection:
+        row = connection.execute(
+            "SELECT generation, (prepare_deadline_at IS NOT NULL "
+            "AND prepare_deadline_at <= now()) AS passed "
+            "FROM jobs WHERE job_id = %s",
+            (job_id,),
+        ).fetchone()
+        if row is None:
+            raise StateError("job does not exist")
+        if row["generation"] != generation:
+            raise StaleGeneration("execution generation is no longer current")
+        return row["passed"]
+
+
 def claim_next(dsn: str, worker_id: str, *, lease_seconds: int = LEASE_SECONDS) -> dict | None:
     if not isinstance(worker_id, str) or not worker_id.strip():
         raise StateError("worker_id must be non-empty")

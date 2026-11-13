@@ -21,7 +21,12 @@ from datacon.agent_contracts import (
     ModelSuggestion,
     validate_findings,
 )
-from datacon.cases import CaseConfigurationError, CaseDefinition, load_registry
+from datacon.cases import (
+    CaseConfigurationError,
+    CaseDefinition,
+    TransientCaseError,
+    load_registry,
+)
 from datacon.contracts import (
     analysis_digest,
     canonical_analysis_bytes,
@@ -31,6 +36,7 @@ from datacon.contracts import (
 from datacon.tools.source import (
     GitRepository,
     SourceToolError,
+    TransientSourceToolError,
     extract_symbols,
 )
 
@@ -45,6 +51,19 @@ class AnalysisBlocked(Exception):
         self.reason_code = reason_code
         self.message = message
         self.details = details or {}
+
+
+class RetryableAnalysisError(Exception):
+    """A recoverable infrastructure failure during analysis.
+
+    The Supervisor may retry this error once. Missing material, digest
+    mismatches, source conflicts and contract failures must use
+    ``AnalysisBlocked`` instead.
+    """
+
+    def __init__(self, message: str):
+        super().__init__(message)
+        self.message = message
 
 
 @dataclass(frozen=True)
@@ -70,6 +89,19 @@ def _material(
         )
     try:
         return case.read_material(relative, expected)
+    except TransientCaseError as error:
+        raise RetryableAnalysisError(error.message) from error
+    except CaseConfigurationError as error:
+        raise AnalysisBlocked(error.reason_code, error.message) from error
+
+
+def _read_pinned(
+    case: CaseDefinition, relative: str, expected: str | None, label: str
+) -> tuple[bytes, str]:
+    try:
+        return case.read_material(relative, expected)
+    except TransientCaseError as error:
+        raise RetryableAnalysisError(error.message) from error
     except CaseConfigurationError as error:
         raise AnalysisBlocked(error.reason_code, error.message) from error
 
@@ -175,6 +207,8 @@ def _deterministic_findings(
     fixed: str,
     source_path: str,
     harness_path: str,
+    function: str,
+    asan_error: str,
     added: int,
     removed: int,
     definitions: dict[str, list[dict[str, Any]]],
@@ -240,16 +274,16 @@ def _deterministic_findings(
         ),
         Finding(
             "hypothesis",
-            "The out-of-bounds write at the string terminator is the root cause of "
-            "the reported heap-buffer-overflow.",
-            "high",
+            f"The change to {source_path} may be related to the reported "
+            f"{asan_error} in {function}.",
+            "medium",
             (diff_ref, vulnerable_ref),
         ),
         Finding(
             "hypothesis",
-            "The fixed candidate input reaches the same call path without an "
-            "out-of-bounds write.",
-            "medium",
+            "The fixed candidate input reaches the same call path without a "
+            "sanitizer diagnostic.",
+            "low",
             (harness_ref, f"material/input/candidate/{candidate_digest}"),
         ),
     ]
@@ -259,46 +293,67 @@ def _deterministic_findings(
 def _evidence_ref_is_resolvable(
     reference: str,
     *,
+    case: CaseDefinition,
     vulnerable: str,
     fixed: str,
-    source_path: str,
-    harness_path: str,
-    call_lines: frozenset[int],
-    symbol_paths: dict[str, frozenset[str]],
+    changed_paths: tuple[str, ...],
+    git_paths: dict[str, frozenset[str]],
+    material_refs: dict[str, tuple[str, str]],
     candidate_digest: str,
     advisory_digest: str,
 ) -> bool:
-    """Check an evidence reference against the artifacts it names."""
+    """Resolve an evidence reference against the artifact it names.
+
+    Membership in ``evidence_refs`` is not enough: each reference must name an
+    object that the deterministic tools can actually resolve.
+    """
     if reference.startswith("git:commit/"):
         return reference.removeprefix("git:commit/") in (vulnerable, fixed)
     if reference.startswith("git:blob/"):
         oid, separator, path = reference.removeprefix("git:blob/").partition("/")
-        if not separator:
+        if not separator or not path:
             return False
         if oid == vulnerable:
-            return path in symbol_paths["vulnerable"]
+            return path in git_paths["vulnerable"]
         if oid == fixed:
-            return path in symbol_paths["fixed"]
+            return path in git_paths["fixed"]
         return False
     if reference.startswith("git:diff/"):
-        return reference == f"git:diff/{vulnerable}..{fixed}/{source_path}"
+        rest = reference.removeprefix("git:diff/")
+        pair, separator, path = rest.partition("/")
+        return (
+            bool(separator)
+            and bool(path)
+            and pair == f"{vulnerable}..{fixed}"
+            and path in changed_paths
+        )
     if reference.startswith("intel/"):
         return reference == f"intel/{advisory_digest}"
     if reference.startswith("material/input/candidate/"):
         return reference == f"material/input/candidate/{candidate_digest}"
-    if reference in {
-        "material/harness",
-        "material/build_recipe",
-        "material/dependencies",
-        "material/patch",
-        "material/input/normal",
-    }:
-        return True
+    if reference.startswith("material/"):
+        pinned = material_refs.get(reference)
+        return pinned is not None and jsonutil.is_digest(pinned[1])
     if reference.startswith("source/"):
-        path, separator, line_text = reference.removeprefix("source/").partition("#L")
-        if not separator or not line_text.isdigit():
+        path, separator, line_text = reference.removeprefix("source/").rpartition(
+            "#L"
+        )
+        if not separator or not path or not line_text.isdigit():
             return False
-        return path == harness_path and int(line_text) in call_lines
+        line = int(line_text)
+        if line < 1:
+            return False
+        try:
+            safe_path = jsonutil.safe_relative_path(path, "evidence source path")
+        except ValueError:
+            return False
+        try:
+            data, _ = case.read_material(safe_path, None)
+        except TransientCaseError as error:
+            raise RetryableAnalysisError(error.message) from error
+        except CaseConfigurationError:
+            return False
+        return line <= len(data.splitlines())
     return False
 
 
@@ -318,6 +373,8 @@ def analyze_case(
     try:
         registry = load_registry(case_root)
         case = registry.case(request["target"]["case_id"])
+    except TransientCaseError as error:
+        raise RetryableAnalysisError(error.message) from error
     except CaseConfigurationError as error:
         raise AnalysisBlocked(error.reason_code, error.message) from error
     if case.cve_id != request["cve_id"]:
@@ -338,6 +395,10 @@ def analyze_case(
     source_path = jsonutil.safe_relative_path(
         repository["source_path"], "repository.source_path"
     )
+    try:
+        harness_rel = jsonutil.safe_relative_path(manifest["harness"], "harness")
+    except ValueError as error:
+        raise AnalysisBlocked("MATERIAL_MISSING", str(error)) from error
 
     harness, harness_digest = _material(
         case, materials, manifest["harness"], "harness"
@@ -366,11 +427,11 @@ def analyze_case(
 
     try:
         bundle_path = case.material(repository["bundle"])
-        _, bundle_digest = case.read_material(
-            repository["bundle"], repository["bundle_digest"]
-        )
     except CaseConfigurationError as error:
         raise AnalysisBlocked(error.reason_code, error.message) from error
+    _, bundle_digest = _read_pinned(
+        case, repository["bundle"], repository["bundle_digest"], "repository bundle"
+    )
 
     tool_calls: list[dict[str, Any]] = []
 
@@ -386,6 +447,7 @@ def analyze_case(
             recorder(tool_id, step_key, params, digest)
 
     vulnerable = fixed = ""
+    git_paths: dict[str, frozenset[str]] = {}
     definitions: dict[str, list[dict[str, Any]]] = {}
     call_sites: list[dict[str, Any]] = []
     diff_digest = ""
@@ -416,6 +478,21 @@ def analyze_case(
                 "git.resolve:fixed",
                 {"ref": repository["refs"]["fixed"]},
                 jsonutil.digest_json({"commit": fixed}),
+            )
+            git_paths = {
+                "vulnerable": git.list_paths(vulnerable),
+                "fixed": git.list_paths(fixed),
+            }
+            record(
+                "git.resolve",
+                "git.resolve:trees",
+                {"vulnerable": vulnerable, "fixed": fixed},
+                jsonutil.digest_json(
+                    {
+                        role: sorted(paths)
+                        for role, paths in git_paths.items()
+                    }
+                ),
             )
             vulnerable_source = git.read_blob(vulnerable, source_path)
             fixed_source = git.read_blob(fixed, source_path)
@@ -482,8 +559,12 @@ def analyze_case(
                     }
                 ),
             )
+    except TransientSourceToolError as error:
+        raise RetryableAnalysisError(error.message) from error
     except SourceToolError as error:
         raise AnalysisBlocked("MATERIAL_MISSING", error.message) from error
+    except TransientCaseError as error:
+        raise RetryableAnalysisError(error.message) from error
     except CaseConfigurationError as error:
         raise AnalysisBlocked(error.reason_code, error.message) from error
 
@@ -501,12 +582,12 @@ def analyze_case(
             "SOURCE_CONFLICT", "the patch does not change the analysed source path"
         )
 
-    try:
-        advisory_bytes, advisory_digest = case.read_material(
-            advisory_entry["path"], advisory_entry["digest"]
-        )
-    except CaseConfigurationError as error:
-        raise AnalysisBlocked(error.reason_code, error.message) from error
+    advisory_bytes, advisory_digest = _read_pinned(
+        case,
+        advisory_entry["path"],
+        advisory_entry["digest"],
+        "advisory snapshot",
+    )
     advisory = _advisory(
         case,
         advisory_bytes,
@@ -530,7 +611,9 @@ def analyze_case(
         vulnerable=vulnerable,
         fixed=fixed,
         source_path=source_path,
-        harness_path=manifest["harness"],
+        harness_path=harness_rel,
+        function=manifest["asan_signature"]["function"],
+        asan_error=manifest["asan_signature"]["error"],
         added=added,
         removed=removed,
         definitions=definitions,
@@ -538,27 +621,32 @@ def analyze_case(
         candidate_digest=candidate_digest,
         intel_ref=f"intel/{advisory_digest}",
     )
-    symbol_paths = {
-        "vulnerable": frozenset(
-            {source_path} | {symbol["path"] for symbol in definitions["vulnerable"]}
+    material_refs = {
+        "material/harness": (manifest["harness"], harness_digest),
+        "material/build_recipe": (manifest["build_recipe"], build_recipe_digest),
+        "material/dependencies": (
+            manifest["dependencies"],
+            dependencies_digest,
         ),
-        "fixed": frozenset(
-            {source_path} | {symbol["path"] for symbol in definitions["fixed"]}
+        "material/patch": (repository["patch"], patch_digest),
+        "material/input/normal": (normal_rel, normal_digest),
+        f"material/input/candidate/{candidate_digest}": (
+            candidate_rel,
+            candidate_digest,
         ),
     }
-    call_lines = frozenset(symbol["start_line"] for symbol in call_sites)
 
     def resolve_all(candidates: list[Finding]) -> None:
         for finding in candidates:
             for reference in finding.evidence_refs:
                 if not _evidence_ref_is_resolvable(
                     reference,
+                    case=case,
                     vulnerable=vulnerable,
                     fixed=fixed,
-                    source_path=source_path,
-                    harness_path=manifest["harness"],
-                    call_lines=call_lines,
-                    symbol_paths=symbol_paths,
+                    changed_paths=changed_paths,
+                    git_paths=git_paths,
+                    material_refs=material_refs,
                     candidate_digest=candidate_digest,
                     advisory_digest=advisory_digest,
                 ):
@@ -665,6 +753,9 @@ def analyze_case(
         "revisions": {"vulnerable": vulnerable, "fixed": fixed},
         "dependencies_digest": dependencies_digest,
         "image_digest": image_digest,
+        "platform": platform,
+        "toolchain": dict(toolchain),
+        "asan_options": asan_options,
         "build_recipe_digest": build_recipe_digest,
         "harness_digest": harness_digest,
         "inputs": {"candidate": candidate_digest, "normal": normal_digest},

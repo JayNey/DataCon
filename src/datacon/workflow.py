@@ -9,13 +9,38 @@ import time
 from typing import Any, TypedDict
 from uuid import UUID
 
+import psycopg
 from langgraph.checkpoint.postgres import PostgresSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, interrupt
 
 from datacon import jsonutil
 from datacon import state as state_store
-from datacon.agents.analysis import AnalysisBlocked, analyze_case
+from datacon.agents.analysis import (
+    AnalysisBlocked,
+    RetryableAnalysisError,
+    analyze_case,
+)
+from datacon.cases import TransientCaseError
+from datacon.tools.source import TransientSourceToolError
+
+
+class RetryableWorkflowError(RuntimeError):
+    """A recoverable Supervisor or checkpoint infrastructure failure."""
+
+
+_RETRYABLE_WORKFLOW_ERRORS = (
+    RetryableWorkflowError,
+    psycopg.OperationalError,
+    psycopg.InterfaceError,
+    ConnectionError,
+    TimeoutError,
+    OSError,
+)
+
+
+def _is_retryable_workflow_error(error: BaseException) -> bool:
+    return isinstance(error, _RETRYABLE_WORKFLOW_ERRORS)
 
 
 class SupervisorState(TypedDict):
@@ -63,8 +88,9 @@ def build_graph(
             )
             return {"plan_digest": existing["plan_digest"]}
 
-        deadline = job["prepare_deadline_at"]
-        if deadline is not None and deadline <= datetime.now(timezone.utc):
+        if state_store.prepare_deadline_passed(
+            dsn, job_id, generation=job["generation"]
+        ):
             state_store.block_job(
                 dsn,
                 job_id,
@@ -74,47 +100,135 @@ def build_graph(
             )
             return {}
 
-        def recorder(
-            tool_id: str, step_key: str, params: dict[str, Any], result_digest: str
-        ) -> None:
-            state_store.record_attempt(
+        def recorder(attempt_no: int):
+            def record_tool(
+                tool_id: str,
+                step_key: str,
+                params: dict[str, Any],
+                result_digest: str,
+            ) -> None:
+                state_store.record_attempt(
+                    dsn,
+                    job_id,
+                    stage="prepare",
+                    step_key=step_key,
+                    attempt_no=attempt_no,
+                    generation=job["generation"],
+                    input_digest=jsonutil.digest_json(params),
+                    status="completed",
+                    result={"tool_id": tool_id, "result_digest": result_digest},
+                )
+
+            return record_tool
+
+        def retry_or_stop(attempt_no: int, error: BaseException) -> bool:
+            recorded = state_store.record_attempt(
                 dsn,
                 job_id,
                 stage="prepare",
-                step_key=step_key,
-                attempt_no=1,
+                step_key="analysis",
+                attempt_no=attempt_no,
                 generation=job["generation"],
-                input_digest=jsonutil.digest_json(params),
-                status="completed",
-                result={"tool_id": tool_id, "result_digest": result_digest},
+                input_digest=jsonutil.digest_json(job["request"]),
+                status="infra_error",
+                result={"error": type(error).__name__},
             )
+            if not recorded:
+                raise state_store.StaleGeneration(
+                    "the worker lease was lost before the retry"
+                )
+            if attempt_no >= 2:
+                state_store.block_job(
+                    dsn,
+                    job_id,
+                    generation=job["generation"],
+                    reason_code="ANALYSIS_ERROR",
+                    message=(
+                        "analysis failed after one retry with "
+                        f"{type(error).__name__}"
+                    ),
+                    state="FAILED",
+                    event_type="failed",
+                )
+                return False
+            if state_store.prepare_deadline_passed(
+                dsn, job_id, generation=job["generation"]
+            ):
+                state_store.block_job(
+                    dsn,
+                    job_id,
+                    generation=job["generation"],
+                    reason_code="DEADLINE_EXCEEDED",
+                    message="preparation deadline passed before the analysis retry",
+                )
+                return False
+            return True
 
-        try:
-            analyzed = analyze_case(
-                job["request"], case_root=case_root, recorder=recorder
-            )
-        except AnalysisBlocked as error:
-            state_store.block_job(
-                dsn,
-                job_id,
-                generation=job["generation"],
-                reason_code=error.reason_code,
-                message=error.message,
-            )
-            return {}
-        except state_store.StaleGeneration:
-            raise
-        except Exception as error:  # noqa: BLE001 - sanitized below
-            state_store.block_job(
-                dsn,
-                job_id,
-                generation=job["generation"],
-                reason_code="ANALYSIS_ERROR",
-                message=f"analysis failed with {type(error).__name__}",
-                state="FAILED",
-                event_type="failed",
-            )
-            return {}
+        analyzed = None
+        attempt_no = 1
+        while analyzed is None:
+            try:
+                analyzed = analyze_case(
+                    job["request"],
+                    case_root=case_root,
+                    recorder=recorder(attempt_no),
+                )
+            except state_store.StaleGeneration:
+                raise
+            except AnalysisBlocked as error:
+                state_store.block_job(
+                    dsn,
+                    job_id,
+                    generation=job["generation"],
+                    reason_code=error.reason_code,
+                    message=error.message,
+                )
+                return {}
+            except (
+                RetryableAnalysisError,
+                TransientSourceToolError,
+                TransientCaseError,
+            ) as error:
+                if not retry_or_stop(attempt_no, error):
+                    return {}
+                attempt_no += 1
+                continue
+            except (
+                psycopg.OperationalError,
+                psycopg.InterfaceError,
+                ConnectionError,
+                TimeoutError,
+                OSError,
+            ) as error:
+                if not retry_or_stop(attempt_no, error):
+                    return {}
+                attempt_no += 1
+                continue
+            except Exception as error:  # noqa: BLE001 - sanitized below
+                state_store.block_job(
+                    dsn,
+                    job_id,
+                    generation=job["generation"],
+                    reason_code="ANALYSIS_ERROR",
+                    message=f"analysis failed with {type(error).__name__}",
+                    state="FAILED",
+                    event_type="failed",
+                )
+                return {}
+            try:
+                state_store.record_attempt(
+                    dsn,
+                    job_id,
+                    stage="prepare",
+                    step_key="analysis",
+                    attempt_no=attempt_no,
+                    generation=job["generation"],
+                    input_digest=jsonutil.digest_json(job["request"]),
+                    status="completed",
+                    result={"plan_digest": analyzed.plan_digest},
+                )
+            except (state_store.StateError, psycopg.Error):
+                pass
 
         try:
             state_store.freeze_plan(
@@ -142,7 +256,7 @@ def build_graph(
                 job_id,
                 stage="prepare",
                 step_key="plan",
-                attempt_no=1,
+                attempt_no=attempt_no,
                 generation=job["generation"],
                 input_digest=analyzed.plan["analysis_digest"],
                 status="completed",
@@ -278,44 +392,100 @@ def _process_claim(graph, dsn: str, claimed: dict[str, Any]) -> dict[str, Any]:
         "state_version": claimed["state_version"],
         "plan_digest": None,
     }
-    try:
-        snapshot = graph.get_state(config)
-        if snapshot.next:
-            if snapshot.interrupts:
-                graph.invoke(
-                    Command(
-                        resume={"job_id": job_text, "source": "worker"},
-                        update={
-                            "generation": generation,
-                            "stage": claimed["stage"] or "prepare",
-                            "state_version": claimed["state_version"],
-                        },
-                    ),
-                    config,
-                )
+    stage = claimed["stage"] or "prepare"
+    graph_failure: BaseException | None = None
+    attempt_no = 1
+    while attempt_no <= 2:
+        try:
+            snapshot = graph.get_state(config)
+            if snapshot.next:
+                if snapshot.interrupts:
+                    graph.invoke(
+                        Command(
+                            resume={"job_id": job_text, "source": "worker"},
+                            update={
+                                "generation": generation,
+                                "stage": stage,
+                                "state_version": claimed["state_version"],
+                            },
+                        ),
+                        config,
+                    )
+                else:
+                    graph.invoke(
+                        Command(
+                            update={
+                                "generation": generation,
+                                "stage": stage,
+                                "state_version": claimed["state_version"],
+                            }
+                        ),
+                        config,
+                    )
             else:
-                graph.invoke(
-                    Command(
-                        update={
-                            "generation": generation,
-                            "stage": claimed["stage"] or "prepare",
-                            "state_version": claimed["state_version"],
-                        }
-                    ),
-                    config,
+                graph.invoke(initial, config)
+            graph_failure = None
+            break
+        except state_store.StaleGeneration:
+            graph_failure = None
+            break
+        except Exception as error:  # noqa: BLE001 - classified below
+            graph_failure = error
+            if not _is_retryable_workflow_error(error):
+                break
+            try:
+                state_store.record_attempt(
+                    dsn,
+                    job_id,
+                    stage=stage,
+                    step_key="workflow",
+                    attempt_no=attempt_no,
+                    generation=generation,
+                    input_digest=None,
+                    status="infra_error",
+                    result={"error": type(error).__name__},
                 )
-        else:
-            graph.invoke(initial, config)
-    except state_store.StaleGeneration:
-        pass
-    except Exception as error:  # noqa: BLE001 - do not leak connection details
+            except (state_store.StateError, psycopg.Error):
+                pass
+            if attempt_no >= 2:
+                break
+            if stage == "prepare":
+                try:
+                    expired = state_store.prepare_deadline_passed(
+                        dsn, job_id, generation=generation
+                    )
+                except state_store.StaleGeneration:
+                    graph_failure = None
+                    break
+                except psycopg.Error:
+                    graph_failure = error
+                    break
+                if expired:
+                    try:
+                        state_store.block_job(
+                            dsn,
+                            job_id,
+                            generation=generation,
+                            reason_code="DEADLINE_EXCEEDED",
+                            message=(
+                                "preparation deadline passed before the "
+                                "workflow retry"
+                            ),
+                        )
+                    except state_store.StateError:
+                        pass
+                    graph_failure = None
+                    break
+            attempt_no += 1
+
+    if graph_failure is not None:
         try:
             state_store.block_job(
                 dsn,
                 job_id,
                 generation=generation,
                 reason_code="ANALYSIS_ERROR",
-                message=f"workflow failed with {type(error).__name__}",
+                message=f"workflow failed with {type(graph_failure).__name__}",
                 state="FAILED",
                 event_type="failed",
             )
@@ -327,8 +497,18 @@ def _process_claim(graph, dsn: str, claimed: dict[str, Any]) -> dict[str, Any]:
     except state_store.StateError:
         pass
     job = state_store.load_job(dsn, job_id)
-    snapshot = graph.get_state(config)
-    workflow = "interrupted" if snapshot.interrupts else "completed"
+    snapshot = None
+    for attempt in (1, 2):
+        try:
+            snapshot = graph.get_state(config)
+            break
+        except Exception as error:  # noqa: BLE001 - the job record is authoritative
+            if attempt == 2 or not _is_retryable_workflow_error(error):
+                break
+    if snapshot is None:
+        workflow = "unknown"
+    else:
+        workflow = "interrupted" if snapshot.interrupts else "completed"
     return {
         "processed": 1,
         "job_id": job_text,

@@ -36,6 +36,9 @@ _PLAN_FIELDS = frozenset(
         "revisions",
         "dependencies_digest",
         "image_digest",
+        "platform",
+        "toolchain",
+        "asan_options",
         "build_recipe_digest",
         "harness_digest",
         "inputs",
@@ -397,6 +400,29 @@ def _expected_exit(value: Any) -> dict[str, int]:
     return result
 
 
+def _toolchain_value(value: Any, label: str) -> Any:
+    """Validate the case toolchain as a small, JSON-safe object graph."""
+    if value is None or type(value) in (str, bool, int):
+        return value
+    if isinstance(value, float):
+        raise ValueError(f"{label} must not contain a floating-point value")
+    if isinstance(value, list):
+        return [
+            _toolchain_value(item, f"{label}[{index}]")
+            for index, item in enumerate(value)
+        ]
+    if isinstance(value, dict):
+        if not value:
+            raise ValueError(f"{label} must not be empty")
+        result = {}
+        for key, item in value.items():
+            if not isinstance(key, str) or not key.strip():
+                raise ValueError(f"{label} keys must be non-empty strings")
+            result[key] = _toolchain_value(item, f"{label}.{key}")
+        return result
+    raise ValueError(f"{label} contains an unsupported value")
+
+
 def _normalize_plan(plan: Mapping[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
     _object(plan, required=set(_PLAN_FIELDS))
     case_id = _text(plan["case_id"], label="case_id")
@@ -437,6 +463,10 @@ def _normalize_plan(plan: Mapping[str, Any]) -> tuple[dict[str, Any], dict[str, 
         "source": _text(signature["source"], label="asan_signature.source"),
     }
 
+    platform = _text(plan["platform"], label="platform")
+    toolchain = _toolchain_value(plan["toolchain"], "toolchain")
+    asan_options = _text(plan["asan_options"], label="asan_options")
+
     analysis = _normalize_analysis(plan["analysis"])
     computed_analysis_digest = (
         "sha256:" + hashlib.sha256(jsonutil.canonical_bytes(analysis)).hexdigest()
@@ -467,6 +497,9 @@ def _normalize_plan(plan: Mapping[str, Any]) -> tuple[dict[str, Any], dict[str, 
             plan["dependencies_digest"], label="dependencies_digest"
         ),
         "image_digest": _digest(plan["image_digest"], label="image_digest"),
+        "platform": platform,
+        "toolchain": toolchain,
+        "asan_options": asan_options,
         "build_recipe_digest": _digest(
             plan["build_recipe_digest"], label="build_recipe_digest"
         ),
@@ -512,6 +545,9 @@ def plan_summary(plan: Mapping[str, Any]) -> dict[str, Any]:
         "findings": {"facts": facts, "hypotheses": hypotheses},
         "inputs": normalized["inputs"],
         "expected_exit": normalized["expected_exit"],
+        "platform": normalized["platform"],
+        "toolchain": normalized["toolchain"],
+        "asan_options": normalized["asan_options"],
         "asan_signature": normalized["asan_signature"],
         "limits": normalized["limits"],
         "isolation": normalized["isolation"],

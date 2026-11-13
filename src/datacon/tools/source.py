@@ -12,6 +12,7 @@ from datacon import jsonutil
 
 MAX_SOURCE_BYTES = 4 * 1024 * 1024
 MAX_DIFF_BYTES = 8 * 1024 * 1024
+MAX_TREE_PATHS = 100_000
 _REF = re.compile(r"refs/(?:heads|tags)/[A-Za-z0-9][A-Za-z0-9._/-]*")
 _OID = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
 
@@ -23,6 +24,15 @@ class SourceToolError(ValueError):
         super().__init__(message)
         self.tool_id = tool_id
         self.message = message
+
+
+class TransientSourceToolError(SourceToolError):
+    """A Git call failed in a way that may succeed on one more attempt.
+
+    Missing files, unsafe refs and semantic Git errors remain
+    ``SourceToolError``. Timeouts, process failures and transient I/O use this
+    subclass so the Supervisor can retry instead of blocking the job.
+    """
 
 
 @dataclass(frozen=True)
@@ -101,15 +111,35 @@ class GitRepository:
             ],
         ]
         for arguments in commands:
-            result = subprocess.run(
-                [*base, *arguments],
-                capture_output=True,
-                text=True,
-                timeout=30,
-                env=environment,
-            )
-            if result.returncode != 0:
+            try:
+                result = subprocess.run(
+                    [*base, *arguments],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                    env=environment,
+                )
+            except subprocess.TimeoutExpired as error:
+                raise TransientSourceToolError(
+                    "git.resolve", f"git {arguments[0]} timed out"
+                ) from error
+            except (FileNotFoundError, PermissionError) as error:
                 raise SourceToolError(
+                    "git.resolve",
+                    f"git {arguments[0]} could not start: {type(error).__name__}",
+                ) from error
+            except OSError as error:
+                raise TransientSourceToolError(
+                    "git.resolve",
+                    f"git {arguments[0]} could not start: {type(error).__name__}",
+                ) from error
+            if result.returncode != 0:
+                error_type = (
+                    TransientSourceToolError
+                    if result.returncode < 0
+                    else SourceToolError
+                )
+                raise error_type(
                     "git.resolve",
                     f"git {arguments[0]} failed: {result.stderr.strip()[:500]}",
                 )
@@ -132,15 +162,35 @@ class GitRepository:
             "-C",
             str(self.path),
         ]
-        result = subprocess.run(
-            [*command, *arguments],
-            capture_output=True,
-            timeout=30,
-            env=environment,
-        )
+        try:
+            result = subprocess.run(
+                [*command, *arguments],
+                capture_output=True,
+                timeout=30,
+                env=environment,
+            )
+        except subprocess.TimeoutExpired as error:
+            raise TransientSourceToolError(
+                "git.resolve", f"git {arguments[0]} timed out"
+            ) from error
+        except (FileNotFoundError, PermissionError) as error:
+            raise SourceToolError(
+                "git.resolve",
+                f"git {arguments[0]} could not start: {type(error).__name__}",
+            ) from error
+        except OSError as error:
+            raise TransientSourceToolError(
+                "git.resolve",
+                f"git {arguments[0]} could not start: {type(error).__name__}",
+            ) from error
         if result.returncode != 0:
             message = result.stderr.decode("utf-8", "replace").strip()[:500]
-            raise SourceToolError(
+            error_type = (
+                TransientSourceToolError
+                if result.returncode < 0
+                else SourceToolError
+            )
+            raise error_type(
                 "git.resolve", f"git {arguments[0]} failed: {message}"
             )
         return result.stdout
@@ -179,6 +229,33 @@ class GitRepository:
         if len(data) > MAX_SOURCE_BYTES:
             raise SourceToolError("git.resolve", "source file exceeds the analysis cap")
         return data
+
+    def list_paths(self, commit: str) -> frozenset[str]:
+        """Return every file path in a commit so evidence refs can be resolved."""
+        if not _OID.fullmatch(commit):
+            raise SourceToolError("git.resolve", "commit must be a full object ID")
+        output = self._run("ls-tree", "-r", "-z", commit, "--")
+        paths = set()
+        for line in output.decode("utf-8", "strict").split("\x00"):
+            if not line:
+                continue
+            metadata, separator, raw = line.partition("\t")
+            if not separator:
+                raise SourceToolError(
+                    "git.resolve", "repository tree entry is malformed"
+                )
+            fields = metadata.split()
+            if len(fields) != 3:
+                raise SourceToolError(
+                    "git.resolve", "repository tree entry is malformed"
+                )
+            _, object_type, _ = fields
+            if object_type != "blob":
+                continue
+            paths.add(jsonutil.safe_relative_path(raw, "repository path"))
+        if len(paths) > MAX_TREE_PATHS:
+            raise SourceToolError("git.resolve", "repository tree is too large")
+        return frozenset(paths)
 
     def diff(self, vulnerable: str, fixed: str) -> GitDiff:
         for oid in (vulnerable, fixed):
