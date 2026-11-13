@@ -270,3 +270,12 @@ def test_both_revisions_must_use_the_same_git_object_format():
     changed["revisions"]["vulnerable"] = "b" * 64
     with pytest.raises(ValueError):
         plan_digest(changed)
+
+
+def test_hypothesis_requires_evidence_in_the_plan():
+    changed = deepcopy(PLAN)
+    changed["analysis"]["findings"][1]["evidence_refs"] = []
+    with pytest.raises(ValueError, match="evidence reference"):
+        analysis_digest(changed["analysis"])
+    with pytest.raises(ValueError, match="evidence reference"):
+        plan_digest(changed)

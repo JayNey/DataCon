@@ -189,9 +189,107 @@ def test_transient_workflow_error_retries_once(
         "SELECT attempt_no, status FROM attempts "
         "WHERE job_id = %s AND step_key = 'workflow' ORDER BY attempt_no",
         (UUID(job["job_id"]),),
-    ).fetchall() == [(1, "infra_error")]
+    ).fetchall() == [(1, "infra_error"), (2, "completed")]
     assert scalar(
         isolated_database,
         "SELECT count(*) FROM jobs WHERE job_id = %s AND state = 'FAILED'",
         (UUID(job["job_id"]),),
     ) == 0
+
+
+def test_workflow_retry_reuses_completed_analysis_and_keeps_history(
+    isolated_database, tmp_path, monkeypatch
+):
+    job = queue_job(isolated_database, tmp_path)
+    analysis_calls = []
+
+    def flaky_analysis(request, **kwargs):
+        analysis_calls.append(request)
+        if len(analysis_calls) == 1:
+            raise RetryableAnalysisError("first analysis attempt timed out")
+        return real_analyze_case(request, **kwargs)
+
+    original_freeze = workflow.state_store.freeze_plan
+    freeze_calls = []
+
+    def flaky_freeze(*args, **kwargs):
+        freeze_calls.append(1)
+        if len(freeze_calls) == 1:
+            raise psycopg.OperationalError("checkpoint connection reset")
+        return original_freeze(*args, **kwargs)
+
+    monkeypatch.setattr(workflow, "analyze_case", flaky_analysis)
+    monkeypatch.setattr(workflow.state_store, "freeze_plan", flaky_freeze)
+
+    result = workflow.run_worker(isolated_database.dsn, once=True)
+
+    job_uuid = UUID(job["job_id"])
+    assert len(analysis_calls) == 2, "analysis must not run a third time"
+    assert len(freeze_calls) == 2
+    assert analysis_attempts(isolated_database, job["job_id"]) == [
+        (1, "infra_error"),
+        (2, "completed"),
+    ]
+    assert scalar(
+        isolated_database,
+        "SELECT count(*) FROM attempts WHERE job_id = %s "
+        "AND step_key = 'analysis' AND attempt_no = 1 "
+        "AND status = 'infra_error'",
+        (job_uuid,),
+    ) == 1, "the attempt 1 infra_error must not be overwritten"
+    assert isolated_database.connection.execute(
+        "SELECT attempt_no, status FROM attempts "
+        "WHERE job_id = %s AND step_key = 'workflow' ORDER BY attempt_no",
+        (job_uuid,),
+    ).fetchall() == [(1, "infra_error"), (2, "completed")]
+    assert result["state"] == "AWAITING_REVIEW"
+    assert scalar(
+        isolated_database,
+        "SELECT count(*) FROM plans WHERE job_id = %s",
+        (job_uuid,),
+    ) == 1
+    assert scalar(
+        isolated_database,
+        "SELECT count(*) FROM jobs WHERE job_id = %s AND state = 'FAILED'",
+        (job_uuid,),
+    ) == 0
+
+
+def test_workflow_retry_after_freeze_failure_records_completion(
+    isolated_database, tmp_path, monkeypatch
+):
+    job = queue_job(isolated_database, tmp_path)
+    analysis_calls = []
+
+    def counting_analysis(request, **kwargs):
+        analysis_calls.append(request)
+        return real_analyze_case(request, **kwargs)
+
+    original_freeze = workflow.state_store.freeze_plan
+    freeze_calls = []
+
+    def flaky_freeze(*args, **kwargs):
+        freeze_calls.append(1)
+        if len(freeze_calls) == 1:
+            raise psycopg.OperationalError("checkpoint connection reset")
+        return original_freeze(*args, **kwargs)
+
+    monkeypatch.setattr(workflow, "analyze_case", counting_analysis)
+    monkeypatch.setattr(workflow.state_store, "freeze_plan", flaky_freeze)
+
+    result = workflow.run_worker(isolated_database.dsn, once=True)
+
+    job_uuid = UUID(job["job_id"])
+    assert len(analysis_calls) == 1, "the retry must reuse the analysis draft"
+    assert analysis_attempts(isolated_database, job["job_id"]) == [(1, "completed")]
+    assert isolated_database.connection.execute(
+        "SELECT attempt_no, status FROM attempts "
+        "WHERE job_id = %s AND step_key = 'workflow' ORDER BY attempt_no",
+        (job_uuid,),
+    ).fetchall() == [(1, "infra_error"), (2, "completed")]
+    assert result["state"] == "AWAITING_REVIEW"
+    assert scalar(
+        isolated_database,
+        "SELECT count(*) FROM plans WHERE job_id = %s",
+        (job_uuid,),
+    ) == 1

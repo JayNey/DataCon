@@ -79,9 +79,11 @@ def test_finding_contract_rejects_unknown_enums_and_empty_text():
         )
 
 
-def test_findings_require_resolvable_evidence_for_facts():
+def test_findings_require_resolvable_evidence():
     fact = Finding("fact", "parse_token is patched", "high", (EVIDENCE,))
-    hypothesis = Finding("hypothesis", "the write is the root cause", "medium", ())
+    hypothesis = Finding(
+        "hypothesis", "the write is the root cause", "medium", (EVIDENCE,)
+    )
 
     assert validate_findings([fact, hypothesis], {EVIDENCE}) == (fact, hypothesis)
 
@@ -91,12 +93,29 @@ def test_findings_require_resolvable_evidence_for_facts():
         )
     with pytest.raises(ContractError):
         validate_findings(
+            [Finding("hypothesis", "unsupported inference", "low", ())],
+            {EVIDENCE},
+        )
+    with pytest.raises(ContractError):
+        validate_findings(
             [Finding("fact", "forged", "high", ("git:commit/" + "b" * 40,))],
             {EVIDENCE},
         )
     with pytest.raises(ContractError):
         validate_findings(
             [Finding("hypothesis", "bad ref", "low", ("intel/\x00",))], {EVIDENCE}
+        )
+
+
+def test_hypothesis_without_evidence_is_rejected_by_the_wire_contract():
+    with pytest.raises(ContractError):
+        Finding.from_mapping(
+            {
+                "kind": "hypothesis",
+                "statement": "a hypothesis with no evidence",
+                "confidence": "low",
+                "evidence_refs": [],
+            }
         )
 
 

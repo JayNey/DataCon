@@ -145,14 +145,15 @@ uv run datacon status "$job"   # state=READY，review_state.decision=approve
 ## Supervisor、恢复与租约
 
 - LangGraph 图是 `prepare → await_review → END`，检查点表由 `langgraph-checkpoint-postgres` 管理，`thread_id` 为 `job_id`。PostgreSQL 业务记录是状态与审核结果的唯一依据；检查点只表示调度位置。
-- `worker` 用 `SELECT ... FOR UPDATE SKIP LOCKED` 领取 `QUEUED`、过期 `PREPARING`、未同步的 `AWAITING_REVIEW` / `READY` / `BLOCKED` 任务，增加 `generation` 并写入有期限的租约。`freeze_plan`、`block_job`、`record_attempt` 和 `finalize_workflow` 只在 `generation` 与数据库 `now()` 判定仍有效的租约同时匹配时写入；租约过期后旧 worker 的写回被拒绝，`finalize_workflow` 返回 `False` 且不清空租约。
+- `worker` 用 `SELECT ... FOR UPDATE SKIP LOCKED` 领取 `QUEUED`、过期 `PREPARING`、未同步的 `AWAITING_REVIEW` / `READY` / `BLOCKED` 任务，增加 `generation` 并写入有期限的租约。计划冻结前被 `block_job` 阻断的任务，即使还没有 plan，只要 `workflow_synced=false` 且租约过期也会被重新领取并同步；binary 任务在提交时即为 `workflow_synced=true`，不会被领取。`freeze_plan`、`block_job`、`record_attempt` 和 `finalize_workflow` 只在 `generation` 与数据库 `now()` 判定仍有效的租约同时匹配时写入；租约过期后旧 worker 的写回被拒绝，`finalize_workflow` 返回 `False` 且不清空租约。
 - 审核批准 / 拒绝或审核过期在同一事务中增加 `generation` 并清空租约。因此在 `await_review` 读取 `review=None` 后提交的审核会使旧 worker 的 finalize 失败：`workflow_synced` 保持 `false`，下一次 `worker` 以新代次恢复检查点后才置为 `true`。`block_job` 故意保留租约，由同代次的 `finalize_workflow` 清空，保证 `BLOCKED` 任务也能同步。
-- 准备阶段固定 `prepare_deadline_at`；计划冻结时固定 `review_deadline_at`；执行期限在 T05 首次执行领取时固定。
+- 准备阶段固定 `prepare_deadline_at`；计划冻结时由数据库 `now() + interval '24 hours'` 固定 `review_deadline_at`，不使用 worker 进程时钟；执行期限在 T05 首次执行领取时固定。`freeze_plan` 在锁定任务后再次用数据库时钟检查准备期限，分析期间过期则不写计划并阻断为 `BLOCKED/DEADLINE_EXCEEDED`。
 - 待审时进程退出：检查点停在 `await_review` 中断，重新启动只读取既有计划，不会生成第二份。
 - 审核决议已入库但工作流尚未恢复：`review` 与任务状态在同一事务提交（`READY` 或 `BLOCKED`），检查点仍停在中断；下一次 `worker` 用 `Command(resume=...)` 恢复并同步检查点。计划与审核各只有一份有效记录。
+- 图在冻结计划后、`finalize_workflow` 前退出且重启时仍待审：恢复的 worker 结束本次调度而不叠加第二个中断，任务保持 `AWAITING_REVIEW` 并完成同步；之后的批准、拒绝或审核过期由业务记录重新置为未同步，下一次 worker 正常收敛，不会出现 `InvalidUpdateError` 或误判 `FAILED`。
 - 工具尝试按 `job_id/stage/step_key/attempt_no/generation` 记录；同一代次重复执行只更新该代次的行，旧代次不能覆盖新代次，审计事件只追加。
 - 可恢复基础设施错误使用类型化异常，不靠消息字符串匹配：`TransientSourceToolError`（Git 超时、子进程启动/终止或可恢复 I/O）转换为 `RetryableAnalysisError`，Supervisor / 检查点的瞬时错误使用 `RetryableWorkflowError`、`psycopg.OperationalError` / `InterfaceError` 等类型。缺件、摘要不符、来源冲突、契约错误、`AnalysisBlocked`、`StaleGeneration` 和 `PlanConflict` 不重试。
-- 每个逻辑步骤最多额外重试一次（attempt 1 → attempt 2）。重试前用数据库 `now()` 检查 `prepare_deadline_at`；已过期直接 `BLOCKED/DEADLINE_EXCEEDED`。`attempts` 追加记录 `step_key`、`attempt_no`、`generation` 与 `status=infra_error|completed`，不覆盖第一次记录；第二次仍失败才以 `FAILED/ANALYSIS_ERROR` 终止。检查点 `get_state` / `invoke` 的瞬时错误同样最多重试一次。
+- 每个逻辑步骤最多额外重试一次（attempt 1 → attempt 2）。重试前用数据库 `now()` 检查 `prepare_deadline_at`；已过期直接 `BLOCKED/DEADLINE_EXCEEDED`。分析成功后的计划草稿随 `attempts` 持久化；workflow 级重试在冻结计划失败时复用该草稿，不会第三次执行分析，也不会用同 attempt_no 的 `completed` 覆盖第一次的 `infra_error`。`attempts` 追加记录 `step_key`、`attempt_no`、`generation` 与 `status=infra_error|completed`；workflow 重试成功时补记 `completed`，第二次仍失败才以 `FAILED/ANALYSIS_ERROR` 终止。检查点 `get_state` / `invoke` 的瞬时错误同样最多重试一次。
 
 ### 审核与恢复
 
@@ -187,7 +188,7 @@ uv run datacon status "$expire_job"
 - 情报只读离线快照：记录 `collected_at`、来源 URL 和快照 SHA-256。快照与注册表 / Git 提交不一致时阻断为 `SOURCE_CONFLICT`；缺失、篡改或摘要不符阻断为 `MATERIAL_MISSING`。
 - Git 通过只读 bare 仓库和固定命令模板读取：禁用全局 / 系统 Git 配置、hooks、外部 diff、textconv、子模块拉取和自由 shell。解析 `refs/heads/vulnerable` 与 `refs/heads/fixed` 的完整对象 ID；`manifest["versions"]` 指向的缺陷版 / 修复版源码材料也会按材料清单读取和校验摘要，并与 Git blob 逐字节比对，删除或篡改任一源码文件立即阻断。diff 只保留修改路径和摘要。
 - Tree-sitter C 解析器提取目标函数定义（两版）和 `manifest["harness"]` 指向的实际 harness 文件中的候选调用点，记录真实路径与行号。
-- 分析结果的每条 `fact` 必须有可解析的证据引用；证据引用会按 `git:commit`、`git:blob`、`git:diff`、`intel`、`material` 和 `source/<文件路径>#L<行号>` 逐项解析，而不是只做白名单成员检查：`git:blob` 必须存在于该提交的树中，`git:diff` 必须指向两个固定提交间的实际修改路径，`source/` 必须对应案例目录中存在的文件且行号在文件范围内，`material/` 与 `intel/` 必须绑定已读取的材料摘要。harness 的证据引用使用 `manifest["harness"]` 的实际路径。`hypothesis` 标注置信级别；伪造引用、事实缺证据或模型输出类型不符阻断为 `EVIDENCE_INVALID`。
+- 分析结果的每条 `fact` 和 `hypothesis` 都必须有可解析的证据引用，`hypothesis` 另需置信级别；证据引用会按 `git:commit`、`git:blob`、`git:diff`、`intel`、`material` 和 `source/<文件路径>#L<行号>` 逐项解析，而不是只做白名单成员检查：`git:blob` 必须存在于该提交的树中，`git:diff` 必须指向两个固定提交间的实际修改路径，`source/` 必须对应案例目录中存在的文件且行号在文件范围内，`material/` 与 `intel/` 必须绑定已读取的材料摘要。harness 的证据引用使用 `manifest["harness"]` 的实际路径。伪造引用、任一 finding 缺证据或模型输出类型不符阻断为 `EVIDENCE_INVALID`。
 - 确定性 finding 只陈述可测量事实：diff 增删行数、两版函数定义行号、harness 实际调用行和公告提交。根因 hypothesis 由实际 `asan_signature.error`、`source_path` 和 `function` 派生，不再包含只适用于 B01 的 `string terminator` / `four-byte allocation` / 固定 `heap-buffer-overflow` 文本；换案例或修改签名会改变或移除该 hypothesis。
 - 计划自身携带 `asan_options`、`platform` 和 `toolchain`，并由 `case_config_digest` 与计划摘要绑定；修改任一固定字段都会改变计划摘要，批准后不能静默漂移。
 - 公告文本、源码注释、diff 和工具输出都只作为数据；分析器只调用 `git.resolve`、`git.diff`、`tree_sitter.extract`，不会因外部文本触发执行工具。
@@ -222,18 +223,22 @@ uv run pytest -q tests/integration/test_migrations.py
 uv run pytest -q tests/integration/test_workflow_migrations.py
 uv run pytest -q tests/integration/test_worker_and_review.py
 uv run pytest -q tests/integration/test_recovery.py
+uv run pytest -q tests/integration/test_finalize_crash_recovery.py
+uv run pytest -q tests/integration/test_prepare_deadlines.py
 uv run pytest -q tests/integration/test_retry.py
 uv run pytest -q tests/integration/test_fixture_replay.py
 uv run pytest -q tests/contract/test_wheel.py
 ```
 
 - `tests/contract/test_request.py`、`test_plan.py`、`test_fixtures.py`：请求、计划摘要、案例材料与 B03 记录。
-- `test_agent_contracts.py`：`AgentInput` / `AgentOutput` / `Finding` 的字段、枚举、时间戳、事实证据和错误码。
-- `test_analysis.py`：从真实合成材料生成冻结计划、稳定摘要、事实 / 假设、Tree-sitter 提取、缺件 / 冲突 / 篡改 / 二进制 / 伪造引用 / 外部文本注入 / 可选模型替身；并覆盖源码材料删除与篡改、harness 改名后的实际证据路径、签名变化后的 hypothesis、`asan_options` / `platform` / `toolchain` 摘要绑定、不可解析 ref（缺文件、越界行、缺失 Git 路径、未知材料 / 情报摘要）、文件范围内有效源码行，以及公告、源码注释、diff 和模型上下文的注入不改变 deterministic facts。
+- `test_agent_contracts.py`：`AgentInput` / `AgentOutput` / `Finding` 的字段、枚举、时间戳、事实与假设的证据要求、可解析引用和错误码。
+- `test_analysis.py`：从真实合成材料生成冻结计划、稳定摘要、事实 / 假设、Tree-sitter 提取、缺件 / 冲突 / 篡改 / 二进制 / 伪造引用 / 外部文本注入 / 可选模型替身；并覆盖源码材料删除与篡改、harness 改名后的实际证据路径、签名变化后的 hypothesis、`asan_options` / `platform` / `toolchain` 摘要绑定、不可解析 ref（缺文件、越界行、缺失 Git 路径、未知材料 / 情报摘要）、文件范围内有效源码行、缺证据假设、Git 超时分类，以及公告、源码注释、diff 和模型上下文的注入不改变 deterministic facts。
 - `tests/contract/test_wheel.py`：`uv build --wheel` 后解压到临时目录，在不设置 `DATACON_CASE_ROOT` 时校验默认 `fixture-c-parser`，再设置自定义目录校验覆盖生效。
 - `tests/integration/test_worker_and_review.py`：真实 PostgreSQL 中的计划冻结、待审查询、批准 / 拒绝 / 摘要不符 / 过期（含“过期 + 错误摘要”）、重复与冲突决议、worker 领取、binary 不被领取、过期后下一次 worker 同步。
-- `tests/integration/test_recovery.py`：待审退出后重启、审核已入库但图未恢复、审核在 `await_review` 窗口提交时旧 worker 不能 finalize、租约过期 / 新代次接管后的写回拒绝、`attempts` 按代次保留历史、阻断后 finalize、双连接单领取、检查点 `thread_id=job_id`、计划与审核各一份。
-- `tests/integration/test_retry.py`：瞬时分析错误重试一次后成功、持续瞬时错误只重试一次后 `FAILED`、非瞬时 `AnalysisBlocked` 不重试、重试前准备时限过期直接 `DEADLINE_EXCEEDED`，以及检查点瞬时错误重试一次。
+- `tests/integration/test_recovery.py`：待审退出后重启、审核已入库但图未恢复、审核在 `await_review` 窗口提交时旧 worker 不能 finalize、租约过期 / 新代次接管后的写回拒绝、`attempts` 按代次保留历史、阻断后 finalize、计划冻结前 `BLOCKED` 且在 finalize 前退出后的领取与同步、双连接单领取、检查点 `thread_id=job_id`、计划与审核各一份。
+- `tests/integration/test_finalize_crash_recovery.py`：冻结计划后、finalize 前退出时，重启仍待审以及随后批准 / 拒绝 / 审核过期的收敛；检查点可读、无第二个中断、无 `FAILED`，旧代次 finalize 仍被拒绝。
+- `tests/integration/test_prepare_deadlines.py`：进程时钟前后偏移时审核窗口仍由数据库时钟生成；`freeze_plan` 与 `ensure_awaiting_review` 两处都覆盖；分析期间准备期限过期时不写计划并阻断。
+- `tests/integration/test_retry.py`：瞬时分析错误重试一次后成功、持续瞬时错误只重试一次后 `FAILED`、非瞬时 `AnalysisBlocked` 不重试、重试前准备时限过期直接 `DEADLINE_EXCEEDED`、检查点瞬时错误重试一次，以及 workflow 级重试复用已持久化分析草稿且保留 `infra_error` 审计记录。
 - `tests/integration/test_workflow_migrations.py`：001 旧任务在 002 增量迁移后保留，新表 / 列 / 索引存在，计划与审核每任务唯一，迁移可重复执行；003 在不丢数据的前提下把旧 `attempts` 唯一键升级为包含 `generation`。
 - `tests/integration/test_fixture_replay.py`：宿主 clang + ASan 的 B01/B02 合成回放，仍是 T01 材料回归，不是 T05 容器隔离验收。
 

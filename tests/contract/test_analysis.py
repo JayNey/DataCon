@@ -525,6 +525,56 @@ def test_git_tool_failures_are_classified_by_type(
         analyze_case(request(), case_root=case_root)
 
 
+@pytest.mark.parametrize("command", ["rev-parse", "cat-file"])
+def test_transient_git_resolution_failures_are_retryable(
+    case_root, monkeypatch, command
+):
+    original = analysis_module.GitRepository._run
+
+    def transient(self, *arguments, **kwargs):
+        if arguments and arguments[0] == command:
+            raise TransientSourceToolError(
+                "git.resolve", f"git {command} timed out"
+            )
+        return original(self, *arguments, **kwargs)
+
+    monkeypatch.setattr(analysis_module.GitRepository, "_run", transient)
+    with pytest.raises(RetryableAnalysisError):
+        analyze_case(request(), case_root=case_root)
+
+
+@pytest.mark.parametrize("command", ["diff", "ls-tree"])
+def test_transient_diff_and_tree_failures_are_retryable(
+    case_root, monkeypatch, command
+):
+    original = analysis_module.GitRepository._run
+
+    def transient(self, *arguments, **kwargs):
+        if arguments and arguments[0] == command:
+            raise TransientSourceToolError(
+                "git.resolve", f"git {command} timed out"
+            )
+        return original(self, *arguments, **kwargs)
+
+    monkeypatch.setattr(analysis_module.GitRepository, "_run", transient)
+    with pytest.raises(RetryableAnalysisError):
+        analyze_case(request(), case_root=case_root)
+
+
+def test_semantic_git_resolution_error_stays_blocked(case_root, monkeypatch):
+    original = analysis_module.GitRepository._run
+
+    def missing(self, *arguments, **kwargs):
+        if arguments and arguments[0] == "rev-parse":
+            raise SourceToolError("git.resolve", "unknown revision")
+        return original(self, *arguments, **kwargs)
+
+    monkeypatch.setattr(analysis_module.GitRepository, "_run", missing)
+    with pytest.raises(AnalysisBlocked) as caught:
+        analyze_case(request(), case_root=case_root)
+    assert caught.value.reason_code == "MATERIAL_MISSING"
+
+
 def test_forged_model_evidence_is_rejected(case_root):
     forged = Finding(
         "fact",
@@ -539,6 +589,17 @@ def test_forged_model_evidence_is_rejected(case_root):
 
 def test_fact_from_model_needs_evidence(case_root):
     unsupported = Finding("fact", "the fix is present", "high", ())
+    with pytest.raises(AnalysisBlocked) as caught:
+        analyze_case(
+            request(), case_root=case_root, model=StubModel([unsupported])
+        )
+    assert caught.value.reason_code == "EVIDENCE_INVALID"
+
+
+def test_hypothesis_from_model_needs_evidence(case_root):
+    unsupported = Finding(
+        "hypothesis", "a hypothesis with no evidence", "low", ()
+    )
     with pytest.raises(AnalysisBlocked) as caught:
         analyze_case(
             request(), case_root=case_root, model=StubModel([unsupported])

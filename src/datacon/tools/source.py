@@ -200,6 +200,8 @@ class GitRepository:
             raise SourceToolError("git.resolve", "revision ref is not allowed")
         try:
             output = self._run("rev-parse", "--verify", f"{ref}^{{commit}}")
+        except TransientSourceToolError:
+            raise
         except SourceToolError as error:
             raise SourceToolError(
                 "git.resolve", f"commit for {ref} is missing"
@@ -222,6 +224,8 @@ class GitRepository:
             raise SourceToolError("git.resolve", "source path must not contain ':'")
         try:
             data = self._run("cat-file", "blob", f"{commit}:{safe}")
+        except TransientSourceToolError:
+            raise
         except SourceToolError as error:
             raise SourceToolError(
                 "git.resolve", f"path {safe} is missing from commit {commit}"

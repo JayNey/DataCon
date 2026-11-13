@@ -1,4 +1,3 @@
-from datetime import datetime, timedelta, timezone
 import threading
 import uuid
 
@@ -156,7 +155,6 @@ def test_old_worker_generation_cannot_write(isolated_database, tmp_path):
             plan={"case_id": "stale"},
             plan_digest="sha256:" + "1" * 64,
             summary={},
-            review_deadline=datetime.now(timezone.utc) + timedelta(hours=24),
         )
     assert scalar(
         isolated_database, "SELECT count(*) FROM plans WHERE job_id = %s", (job_uuid,)
@@ -294,7 +292,6 @@ def test_reject_during_await_review_does_not_sync_old_worker(
 def test_stale_attempt_and_lease_writes_rejected(isolated_database, tmp_path):
     job = submit(isolated_database.dsn, write_request(tmp_path))
     job_uuid = uuid.UUID(job["job_id"])
-    deadline = datetime.now(timezone.utc) + timedelta(hours=24)
 
     first = state.claim_next(isolated_database.dsn, "worker-a")
     assert first is not None
@@ -315,7 +312,6 @@ def test_stale_attempt_and_lease_writes_rejected(isolated_database, tmp_path):
             plan={"case_id": "stale"},
             plan_digest="sha256:" + "1" * 64,
             summary={},
-            review_deadline=deadline,
         )
     with pytest.raises(state.StaleGeneration):
         state.block_job(
@@ -330,7 +326,6 @@ def test_stale_attempt_and_lease_writes_rejected(isolated_database, tmp_path):
             isolated_database.dsn,
             job_uuid,
             generation=1,
-            review_deadline=deadline,
         )
     assert state.finalize_workflow(isolated_database.dsn, job_uuid, 1) is False
     assert scalar(
@@ -375,7 +370,6 @@ def test_stale_attempt_and_lease_writes_rejected(isolated_database, tmp_path):
             plan={"case_id": "stale"},
             plan_digest="sha256:" + "1" * 64,
             summary={},
-            review_deadline=deadline,
         )
     with pytest.raises(state.StaleGeneration):
         state.block_job(
@@ -533,3 +527,59 @@ def test_no_double_claim_under_two_connections(isolated_database, tmp_path):
         "SELECT generation FROM jobs WHERE job_id = %s",
         (uuid.UUID(job["job_id"]),),
     ) == 1
+
+
+def test_block_before_plan_is_recovered_after_lease_expiry(
+    isolated_database, tmp_path
+):
+    job = submit(isolated_database.dsn, write_request(tmp_path))
+    job_uuid = uuid.UUID(job["job_id"])
+
+    claimed = state.claim_next(isolated_database.dsn, "worker-a")
+    assert claimed is not None
+    assert claimed["generation"] == 1
+    state.block_job(
+        isolated_database.dsn,
+        job_uuid,
+        generation=claimed["generation"],
+        reason_code="MATERIAL_MISSING",
+        message="required source is missing before a plan exists",
+    )
+    assert scalar(
+        isolated_database,
+        "SELECT count(*) FROM plans WHERE job_id = %s",
+        (job_uuid,),
+    ) == 0
+    crashed = isolated_database.connection.execute(
+        "SELECT state, workflow_synced, lease_owner IS NOT NULL FROM jobs "
+        "WHERE job_id = %s",
+        (job_uuid,),
+    ).fetchone()
+    assert crashed == ("BLOCKED", False, True)
+
+    # The worker exited after block_job but before finalize_workflow, so the
+    # synced flag stays false until the lease expires and a worker retries.
+    isolated_database.connection.execute(
+        "UPDATE jobs SET lease_expires_at = now() - interval '1 second' "
+        "WHERE job_id = %s",
+        (job_uuid,),
+    )
+    result = workflow.run_worker(isolated_database.dsn, once=True)
+    assert result["processed"] == 1
+    assert result["state"] == "BLOCKED"
+    assert result["workflow"] == "completed"
+
+    current = state.load_job(isolated_database.dsn, job_uuid)
+    assert current["state"] == "BLOCKED"
+    assert current["reason_code"] == "MATERIAL_MISSING"
+    assert current["workflow_synced"] is True
+    assert current["lease_owner"] is None
+    assert current["lease_expires_at"] is None
+    assert scalar(
+        isolated_database,
+        "SELECT count(*) FROM plans WHERE job_id = %s",
+        (job_uuid,),
+    ) == 0
+    snapshot = checkpoint_snapshot(isolated_database, job["job_id"])
+    assert snapshot.next == ()
+    assert not snapshot.interrupts

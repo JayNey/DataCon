@@ -62,8 +62,10 @@ class Finding:
             if not isinstance(refs, list):
                 raise ContractError("finding.evidence_refs must be a list")
             evidence_refs = tuple(_ref(ref) for ref in refs)
-            if kind == "fact" and not evidence_refs:
-                raise ContractError("a fact requires at least one evidence reference")
+            if not evidence_refs:
+                raise ContractError(
+                    "a finding requires at least one evidence reference"
+                )
             return cls(kind, statement, confidence, evidence_refs)
         except ContractError:
             raise
@@ -103,7 +105,7 @@ class AnalysisModel:
 def validate_findings(
     findings: Iterable[Finding], allowed_refs: set[str] | frozenset[str]
 ) -> tuple[Finding, ...]:
-    """Validate evidence references; facts may not rest on missing evidence."""
+    """Validate evidence references; no finding may rest on missing evidence."""
     validated: list[Finding] = []
     for finding in findings:
         if not isinstance(finding, Finding):
@@ -116,8 +118,10 @@ def validate_findings(
             _text(finding.statement, "finding.statement")
         except ValueError as error:
             raise ContractError(str(error)) from error
-        if finding.kind == "fact" and not finding.evidence_refs:
-            raise ContractError("a fact requires at least one evidence reference")
+        if not finding.evidence_refs:
+            raise ContractError(
+                "a finding requires at least one evidence reference"
+            )
         for reference in finding.evidence_refs:
             try:
                 _ref(reference)

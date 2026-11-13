@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
 import uuid
 from typing import Any
 from uuid import UUID
@@ -73,7 +72,7 @@ def _locked_job(
     """
     job = connection.execute(
         "SELECT state, generation, lease_owner, lease_expires_at, "
-        "state_version, now() AS db_now "
+        "prepare_deadline_at, state_version, now() AS db_now "
         "FROM jobs WHERE job_id = %s FOR UPDATE",
         (job_id,),
     ).fetchone()
@@ -159,8 +158,7 @@ def claim_next(dsn: str, worker_id: str, *, lease_seconds: int = LEASE_SECONDS) 
                OR (workflow_synced = false AND state IN ('AWAITING_REVIEW', 'READY')
                    AND (lease_expires_at IS NULL OR lease_expires_at <= now()))
                OR (workflow_synced = false AND state = 'BLOCKED'
-                   AND (lease_expires_at IS NULL OR lease_expires_at <= now())
-                   AND EXISTS (SELECT 1 FROM plans p WHERE p.job_id = jobs.job_id))
+                   AND (lease_expires_at IS NULL OR lease_expires_at <= now()))
                OR (state = 'AWAITING_REVIEW'
                    AND review_deadline_at IS NOT NULL
                    AND review_deadline_at <= now()
@@ -231,10 +229,15 @@ def freeze_plan(
     plan: dict[str, Any],
     plan_digest: str,
     summary: dict[str, Any],
-    review_deadline: datetime,
-) -> None:
-    if review_deadline.tzinfo is None:
-        raise StateError("review deadline must be timezone-aware")
+) -> bool:
+    """Freeze one plan unless the database clock says preparation expired.
+
+    The review window is computed from the database clock inside this
+    transaction, so a skewed worker process clock cannot lengthen or shorten
+    the 24 hour window. The prepare deadline is re-checked after locking the
+    job, which closes the window between the caller's last check and the plan
+    write.
+    """
     with _connect(dsn) as connection:
         job = _locked_job(connection, job_id, generation=generation)
         existing = connection.execute(
@@ -243,9 +246,37 @@ def freeze_plan(
         if existing is not None:
             if existing["plan_digest"] != plan_digest:
                 raise PlanConflict("a different plan is already frozen")
-            return
+            return True
         if job["state"] not in ("PREPARING", "AWAITING_REVIEW"):
             raise StateError(f"cannot freeze a plan while the job is {job['state']}")
+        if (
+            job["prepare_deadline_at"] is not None
+            and job["prepare_deadline_at"] <= job["db_now"]
+        ):
+            connection.execute(
+                "UPDATE jobs SET state = 'BLOCKED', stage = 'blocked', "
+                "reason_code = 'DEADLINE_EXCEEDED', last_error = %s, "
+                "state_version = state_version + 1, workflow_synced = false, "
+                "updated_at = now() "
+                "WHERE job_id = %s AND generation = %s",
+                (
+                    "preparation deadline passed before the plan was frozen",
+                    job_id,
+                    generation,
+                ),
+            )
+            _audit(
+                connection,
+                job_id,
+                "blocked",
+                stage="blocked",
+                reason_code="DEADLINE_EXCEEDED",
+                detail={
+                    "message": "preparation deadline passed before the plan was frozen",
+                    "generation": generation,
+                },
+            )
+            return False
         connection.execute(
             "INSERT INTO plans (plan_id, job_id, plan_digest, plan, summary) "
             "VALUES (%s, %s, %s, %s, %s)",
@@ -253,13 +284,14 @@ def freeze_plan(
         )
         updated = connection.execute(
             "UPDATE jobs SET state = 'AWAITING_REVIEW', stage = 'review', "
-            "review_deadline_at = %s, state_version = state_version + 1, "
+            "review_deadline_at = now() + make_interval(hours => %s), "
+            "state_version = state_version + 1, "
             "workflow_synced = false, updated_at = now() "
             "WHERE job_id = %s AND generation = %s "
             "AND state IN ('PREPARING', 'AWAITING_REVIEW') "
             "AND lease_expires_at IS NOT NULL AND lease_expires_at > now() "
             "RETURNING job_id",
-            (review_deadline, job_id, generation),
+            (REVIEW_WINDOW_HOURS, job_id, generation),
         ).fetchone()
         if updated is None:
             raise StaleGeneration("job changed while freezing the plan")
@@ -270,11 +302,10 @@ def freeze_plan(
             stage="review",
             detail={"plan_digest": plan_digest, "generation": generation},
         )
+        return True
 
 
-def ensure_awaiting_review(
-    dsn: str, job_id: UUID, *, generation: int, review_deadline: datetime
-) -> None:
+def ensure_awaiting_review(dsn: str, job_id: UUID, *, generation: int) -> None:
     """Reconcile a job that has a frozen plan but is still PREPARING."""
     with _connect(dsn) as connection:
         job = _locked_job(connection, job_id, generation=generation)
@@ -282,12 +313,13 @@ def ensure_awaiting_review(
             return
         connection.execute(
             "UPDATE jobs SET state = 'AWAITING_REVIEW', stage = 'review', "
-            "review_deadline_at = COALESCE(review_deadline_at, %s), "
+            "review_deadline_at = COALESCE("
+            "review_deadline_at, now() + make_interval(hours => %s)), "
             "state_version = state_version + 1, workflow_synced = false, "
             "updated_at = now() "
             "WHERE job_id = %s AND generation = %s AND state = 'PREPARING' "
             "AND lease_expires_at IS NOT NULL AND lease_expires_at > now()",
-            (review_deadline, job_id, generation),
+            (REVIEW_WINDOW_HOURS, job_id, generation),
         )
 
 
@@ -377,6 +409,34 @@ def record_attempt(
             ),
         )
         return cursor.rowcount > 0
+
+
+def analysis_progress(
+    dsn: str, job_id: UUID, *, generation: int
+) -> dict[str, Any]:
+    """Return the auditable analysis attempts for one execution generation.
+
+    ``completed`` carries the persisted plan draft so a workflow-level retry
+    can freeze it without running analysis for a third time. Older rows that
+    only stored a plan digest remain visible in ``max_attempt`` but are not
+    reused.
+    """
+    with _connect(dsn) as connection:
+        rows = connection.execute(
+            "SELECT attempt_no, status, result FROM attempts "
+            "WHERE job_id = %s AND stage = 'prepare' AND step_key = 'analysis' "
+            "AND generation = %s ORDER BY attempt_no",
+            (job_id, generation),
+        ).fetchall()
+    completed = None
+    for row in reversed(rows):
+        if row["status"] == "completed" and isinstance(row["result"], dict):
+            completed = row["result"]
+            break
+    return {
+        "max_attempt": rows[-1]["attempt_no"] if rows else 0,
+        "completed": completed,
+    }
 
 
 def finalize_workflow(dsn: str, job_id: UUID, generation: int) -> bool:

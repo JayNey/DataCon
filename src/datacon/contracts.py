@@ -252,8 +252,8 @@ def _normalize_finding(value: Any) -> dict[str, Any]:
     if not isinstance(refs, list):
         raise ValueError("finding.evidence_refs must be a list")
     evidence_refs = sorted({_evidence_ref(ref) for ref in refs})
-    if kind == "fact" and not evidence_refs:
-        raise ValueError("a fact requires at least one evidence reference")
+    if not evidence_refs:
+        raise ValueError("a finding requires at least one evidence reference")
     return {
         "kind": kind,
         "statement": statement,
