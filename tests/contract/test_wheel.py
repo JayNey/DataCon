@@ -87,6 +87,32 @@ print("wheel-smoke-ok")
 """
 
 
+ANALYZE = """
+import json
+import os
+import sys
+
+import datacon
+
+package_dir = os.path.dirname(os.path.realpath(datacon.__file__))
+assert package_dir == os.path.join(sys.argv[1], "datacon"), package_dir
+assert "DATACON_CASE_ROOT" not in os.environ
+
+from datacon.agents.analysis import analyze_case
+from datacon.contracts import DEFAULT_LIMITS, parse_request
+
+body = json.loads(sys.argv[2])
+body["limits"] = dict(DEFAULT_LIMITS)
+request = parse_request(json.dumps(body))
+result = analyze_case(request)
+assert result.plan_digest.startswith("sha256:"), result.plan_digest
+assert result.plan["case_id"] == "fixture-c-parser", result.plan["case_id"]
+assert result.findings, "the packaged case must produce findings"
+assert result.plan["repository"]["bundle_digest"].startswith("sha256:")
+print("wheel-analyze-ok")
+"""
+
+
 def test_packaged_default_case_data_matches_test_fixtures():
     package = Path(case_registry.DEFAULT_CASE_ROOT)
     assert package.is_dir()
@@ -109,6 +135,13 @@ def test_wheel_install_has_default_case_registry(tmp_path):
         "datacon/data/cases/vulnerable/parser.c",
         "datacon/data/cases/fixed/parser.c",
         "datacon/data/cases/harness.c",
+        "datacon/data/cases/fixture-repo.bundle",
+        "datacon/data/cases/fix.patch",
+        "datacon/data/cases/build.sh",
+        "datacon/data/cases/dependencies.lock",
+        "datacon/data/cases/inputs/candidate.txt",
+        "datacon/data/cases/inputs/clean.txt",
+        "datacon/data/cases/inputs/normal.txt",
     ):
         assert relative in names, relative
 
@@ -138,3 +171,29 @@ def test_wheel_install_has_default_case_registry(tmp_path):
     )
     assert result.returncode == 0, result.stdout + result.stderr
     assert "wheel-smoke-ok" in result.stdout
+
+
+def test_wheel_install_can_analyze_the_default_case(tmp_path):
+    wheel = build_wheel(tmp_path / "wheel")
+    site = tmp_path / "site"
+    extract_wheel(wheel, site)
+
+    env = os.environ.copy()
+    env.pop("DATACON_CASE_ROOT", None)
+    env["PYTHONPATH"] = str(site)
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            ANALYZE,
+            str(site),
+            json.dumps(request_body("fixture-c-parser")),
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=120,
+        env=env,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "wheel-analyze-ok" in result.stdout
