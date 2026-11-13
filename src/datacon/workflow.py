@@ -719,8 +719,8 @@ def _process_claim(graph, dsn: str, claimed: dict[str, Any]) -> dict[str, Any]:
                 except state_store.StaleGeneration:
                     graph_failure = None
                     break
-                except psycopg.Error:
-                    graph_failure = error
+                except psycopg.Error as deadline_error:
+                    graph_failure = deadline_error
                     break
                 if expired:
                     try:
@@ -748,9 +748,10 @@ def _process_claim(graph, dsn: str, claimed: dict[str, Any]) -> dict[str, Any]:
     if graph_failure is not None and not stop_finalize:
         # The business record is authoritative. A checkpoint, resume or
         # scheduling failure must never rewrite a committed READY/BLOCKED
-        # review (or an awaiting-review plan) as FAILED; only a PREPARING job
-        # without a committed review is an analysis failure. If the business
-        # state cannot even be read, do not guess.
+        # review (or an awaiting-review plan) as FAILED. Escaped failures are
+        # not analysis failures: ``prepare`` handles AnalysisBlocked and
+        # analysis exceptions inside the node. If the business state cannot
+        # even be read, do not guess.
         unreadable = object()
         try:
             current = state_store.load_job(dsn, job_id)
@@ -773,20 +774,26 @@ def _process_claim(graph, dsn: str, claimed: dict[str, Any]) -> dict[str, Any]:
             except (state_store.StateError, psycopg.Error):
                 pass
         else:
+            # A PREPARING job whose graph failed outside an analysis step is
+            # only an infrastructure/scheduling failure. Keep the job
+            # PREPARING with workflow_synced=false and let the lease expire so
+            # a later generation retries; never write
+            # FAILED/ANALYSIS_ERROR here.
             try:
-                state_store.block_job(
+                state_store.record_attempt(
                     dsn,
                     job_id,
+                    stage=stage,
+                    step_key="workflow",
+                    attempt_no=attempt_no,
                     generation=generation,
-                    reason_code="ANALYSIS_ERROR",
-                    message=f"workflow failed with {type(graph_failure).__name__}",
-                    state="FAILED",
-                    event_type="failed",
+                    input_digest=None,
+                    status="infra_error",
+                    result={"error": type(graph_failure).__name__},
                 )
             except (state_store.StateError, psycopg.Error):
-                # Keep PREPARING when the fail-closed marker cannot be
-                # written; the attempt history already fences a retry.
                 pass
+            stop_finalize = True
 
     if not business_authoritative and not stop_finalize:
         try:

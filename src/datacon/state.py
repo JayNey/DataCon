@@ -15,6 +15,7 @@ from datacon import jsonutil
 
 REVIEW_WINDOW_HOURS = 24
 LEASE_SECONDS = 300
+ATTEMPT_STATUSES = frozenset({"started", "completed", "infra_error"})
 
 
 class StateError(RuntimeError):
@@ -158,10 +159,14 @@ def claim_next(dsn: str, worker_id: str, *, lease_seconds: int = LEASE_SECONDS) 
                OR (workflow_synced = false AND state IN ('AWAITING_REVIEW', 'READY')
                    AND (lease_expires_at IS NULL OR lease_expires_at <= now()))
                OR (workflow_synced = false AND state = 'BLOCKED'
+                   AND reason_code IS DISTINCT FROM 'UNSUPPORTED_TARGET'
                    AND (lease_expires_at IS NULL OR lease_expires_at <= now()))
                OR (state = 'AWAITING_REVIEW'
                    AND review_deadline_at IS NOT NULL
                    AND review_deadline_at <= now()
+                   AND (lease_expires_at IS NULL OR lease_expires_at <= now()))
+               OR (state = 'AWAITING_REVIEW'
+                   AND review_deadline_at IS NULL
                    AND (lease_expires_at IS NULL OR lease_expires_at <= now()))
             ORDER BY submitted_at
             FOR UPDATE SKIP LOCKED
@@ -371,17 +376,21 @@ def record_attempt(
     """Persist one attempt row, returning False when the write was not applied.
 
     ``False`` means the caller no longer owns the generation/lease, or the
-    upsert was rejected because the row is already ``completed`` and the new
-    status would downgrade it. Callers must not treat that as success.
+    upsert was rejected because the row is already ``completed``. Callers must
+    not treat that as success. Only the documented statuses are accepted; an
+    unknown status is a contract error and raises ``StateError``.
 
-    A committed ``completed`` row is terminal: a later ``started`` or
-    ``infra_error`` write for the same ``(job_id, stage, step_key, attempt_no,
-    generation)`` is rejected. Re-writing ``completed`` (for example when a
-    client retries after a connection reset that happened after commit) is
-    still applied and remains idempotent.
+    A committed ``completed`` row is terminal: a later ``started`` /
+    ``infra_error`` / unknown-status write, or a ``completed`` write with a
+    different result, for the same ``(job_id, stage, step_key, attempt_no,
+    generation)`` is rejected. Re-writing the identical ``completed`` row (for
+    example when a client retries after a connection reset that happened after
+    commit) is still applied and remains idempotent.
     """
     if not stage or not step_key:
         raise StateError("attempt requires stage and step_key")
+    if not isinstance(status, str) or status not in ATTEMPT_STATUSES:
+        raise StateError("attempt status is invalid")
     with _connect(dsn) as connection:
         job = connection.execute(
             "SELECT generation, lease_expires_at, now() AS db_now "
@@ -408,8 +417,9 @@ def record_attempt(
                 status = EXCLUDED.status,
                 result = EXCLUDED.result,
                 finished_at = EXCLUDED.finished_at
-            WHERE NOT (attempts.status = 'completed'
-                       AND EXCLUDED.status IN ('started', 'infra_error'))
+            WHERE attempts.status <> 'completed'
+               OR (EXCLUDED.status = 'completed'
+                   AND attempts.result IS NOT DISTINCT FROM EXCLUDED.result)
             """,
             (
                 uuid.uuid4(),
@@ -521,6 +531,22 @@ def record_review(
                 and existing["decision"] == decision
                 and existing["reviewer_id"] == reviewer_id
             )
+            if not same:
+                _audit(
+                    connection,
+                    job_id,
+                    "review_refused",
+                    stage="review",
+                    reason_code="REVIEW_CONFLICT",
+                    detail={
+                        "decision": decision,
+                        "reviewer_id": reviewer_id,
+                        "requested_digest": plan_digest,
+                        "recorded_decision": existing["decision"],
+                        "recorded_reviewer_id": existing["reviewer_id"],
+                        "recorded_digest": existing["plan_digest"],
+                    },
+                )
             return ReviewOutcome(
                 "idempotent" if same else "conflict",
                 state=job["state"],
@@ -533,19 +559,50 @@ def record_review(
                 message=None if same else "a different review decision is recorded",
             )
         if job["state"] == "BLOCKED" and job["reason_code"] == "REVIEW_EXPIRED":
+            _audit(
+                connection,
+                job_id,
+                "review_refused",
+                stage="review",
+                reason_code="REVIEW_EXPIRED",
+                detail={
+                    "decision": decision,
+                    "reviewer_id": reviewer_id,
+                    "requested_digest": plan_digest,
+                },
+            )
             return ReviewOutcome(
                 "expired", state=job["state"], message="the review window expired"
             )
         if job["state"] != "AWAITING_REVIEW":
+            _audit(
+                connection,
+                job_id,
+                "review_refused",
+                stage="review",
+                reason_code="INVALID_STATE",
+                detail={
+                    "decision": decision,
+                    "reviewer_id": reviewer_id,
+                    "requested_digest": plan_digest,
+                    "state": job["state"],
+                },
+            )
             return ReviewOutcome(
                 "invalid_state",
                 state=job["state"],
                 message=f"job is {job['state']}, not AWAITING_REVIEW",
             )
-        expired = connection.execute(
-            "SELECT (%s IS NOT NULL AND %s <= now()) AS expired",
-            (job["review_deadline_at"], job["review_deadline_at"]),
-        ).fetchone()["expired"]
+        if job["review_deadline_at"] is None:
+            # A legacy/partially migrated row has no review window. Fail
+            # closed instead of raising an indeterminate-type database error
+            # or letting the row sit in AWAITING_REVIEW forever.
+            expired = True
+        else:
+            expired = connection.execute(
+                "SELECT %s <= now() AS expired",
+                (job["review_deadline_at"],),
+            ).fetchone()["expired"]
         if expired:
             updated = connection.execute(
                 "UPDATE jobs SET state = 'BLOCKED', stage = 'blocked', "
@@ -569,7 +626,12 @@ def record_review(
                 "review_expired",
                 stage="blocked",
                 reason_code="REVIEW_EXPIRED",
-                detail={"plan_digest": plan_digest},
+                detail={
+                    "requested_digest": plan_digest,
+                    "plan_digest": (
+                        plan["plan_digest"] if plan is not None else None
+                    ),
+                },
             )
             return ReviewOutcome(
                 "expired",
@@ -577,10 +639,36 @@ def record_review(
                 message="the review window expired",
             )
         if plan is None:
+            _audit(
+                connection,
+                job_id,
+                "review_refused",
+                stage="review",
+                reason_code="INVALID_STATE",
+                detail={
+                    "decision": decision,
+                    "reviewer_id": reviewer_id,
+                    "requested_digest": plan_digest,
+                    "state": job["state"],
+                },
+            )
             return ReviewOutcome(
                 "invalid_state", state=job["state"], message="no plan is pending"
             )
         if plan_digest != plan["plan_digest"]:
+            _audit(
+                connection,
+                job_id,
+                "review_refused",
+                stage="review",
+                reason_code="PLAN_MISMATCH",
+                detail={
+                    "decision": decision,
+                    "reviewer_id": reviewer_id,
+                    "requested_digest": plan_digest,
+                    "frozen_digest": plan["plan_digest"],
+                },
+            )
             return ReviewOutcome(
                 "plan_mismatch",
                 state=job["state"],
@@ -673,8 +761,8 @@ def expire_review(dsn: str, job_id: UUID, generation: int) -> bool:
         ):
             raise StaleGeneration("the worker lease is no longer active")
         if (
-            job["review_deadline_at"] is None
-            or job["review_deadline_at"] > job["db_now"]
+            job["review_deadline_at"] is not None
+            and job["review_deadline_at"] > job["db_now"]
         ):
             return False
         connection.execute(

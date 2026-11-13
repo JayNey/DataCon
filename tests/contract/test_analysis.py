@@ -53,6 +53,13 @@ def write_json(path, document):
     path.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
 
 
+def set_manifest_path(manifest, path, value):
+    current = manifest
+    for key in path[:-1]:
+        current = current[key]
+    current[path[-1]] = value
+
+
 def deterministic_facts(result):
     return [
         finding
@@ -226,6 +233,115 @@ def test_malformed_manifest_is_analysis_blocked(case_root, field):
     assert caught.value.reason_code == "MATERIAL_MISSING"
     assert field in caught.value.message
     assert "KeyError" not in caught.value.message
+
+
+@pytest.mark.parametrize("value", [None, True, 1, [], {}, "B01"])
+def test_malformed_manifest_cases_type_is_analysis_blocked(case_root, value):
+    """The manifest case index itself must be a non-empty object."""
+    manifest_path = case_root / "manifest.json"
+    manifest = read_json(manifest_path)
+    manifest["cases"] = value
+    write_json(manifest_path, manifest)
+
+    with pytest.raises(AnalysisBlocked) as caught:
+        analyze_case(request(), case_root=case_root)
+
+    assert caught.value.reason_code == "MATERIAL_MISSING"
+    assert "cases" in caught.value.message
+    assert "TypeError" not in caught.value.message
+
+
+@pytest.mark.parametrize("name", ["registry.json", "manifest.json"])
+def test_non_file_registry_component_is_analysis_blocked(case_root, name):
+    """A directory in place of registry/manifest is a repairable material error."""
+    target = case_root / name
+    target.unlink()
+    target.mkdir()
+
+    with pytest.raises(AnalysisBlocked) as caught:
+        analyze_case(request(), case_root=case_root)
+
+    assert caught.value.reason_code == "MATERIAL_MISSING"
+    assert "readable file" in caught.value.message
+    assert "Is a directory" not in caught.value.message
+
+
+@pytest.mark.parametrize(
+    ("path", "value"),
+    [
+        (("versions",), None),
+        (("materials",), []),
+        (("cases", "B01", "inputs"), []),
+        (("cases", "B01", "expected_exit"), None),
+    ],
+)
+def test_wrong_typed_manifest_fields_are_analysis_blocked(case_root, path, value):
+    """README promises wrong-typed plan fields are MATERIAL_MISSING too."""
+    manifest_path = case_root / "manifest.json"
+    manifest = read_json(manifest_path)
+    set_manifest_path(manifest, path, value)
+    write_json(manifest_path, manifest)
+
+    with pytest.raises(AnalysisBlocked) as caught:
+        analyze_case(request(), case_root=case_root)
+
+    assert caught.value.reason_code == "MATERIAL_MISSING"
+    assert path[-1] in caught.value.message
+
+
+@pytest.mark.parametrize("name", ["registry.json", "manifest.json"])
+def test_non_utf8_case_json_is_analysis_blocked(case_root, name):
+    """Non-UTF-8 JSON is a material error, not an uncaught UnicodeDecodeError."""
+    (case_root / name).write_bytes(b'{"schema_version":1,"x":"\xff"}')
+
+    with pytest.raises(AnalysisBlocked) as caught:
+        analyze_case(request(), case_root=case_root)
+
+    assert caught.value.reason_code == "MATERIAL_MISSING"
+    assert "UTF-8" in caught.value.message
+    assert "UnicodeDecodeError" not in caught.value.message
+
+
+@pytest.mark.parametrize("value", ["x", [1, 2], 5, True])
+def test_malformed_registry_isolation_is_analysis_blocked(case_root, value):
+    """A non-object isolation policy must fail closed before plan validation."""
+    registry_path = case_root / "registry.json"
+    registry = read_json(registry_path)
+    registry["isolation"] = value
+    write_json(registry_path, registry)
+
+    with pytest.raises(AnalysisBlocked) as caught:
+        analyze_case(request(), case_root=case_root)
+
+    assert caught.value.reason_code == "MATERIAL_MISSING"
+    assert "isolation" in caught.value.message
+    assert "TypeError" not in caught.value.message
+
+
+def test_non_utf8_git_tree_path_is_a_source_error(monkeypatch):
+    repo = analysis_module.GitRepository(Path("/nonexistent"), Path("/nonexistent"))
+
+    def fake_run(self, *arguments, **kwargs):
+        return b"100644 blob " + b"a" * 40 + b"\tbad_\xff.c\x00"
+
+    monkeypatch.setattr(analysis_module.GitRepository, "_run", fake_run)
+    with pytest.raises(SourceToolError) as caught:
+        repo.list_paths("a" * 40)
+    assert "non-UTF-8" in str(caught.value)
+
+
+def test_non_utf8_git_diff_path_is_a_source_error(monkeypatch):
+    repo = analysis_module.GitRepository(Path("/nonexistent"), Path("/nonexistent"))
+
+    def fake_run(self, *arguments, **kwargs):
+        if "--name-only" in arguments:
+            return b"bad_\xff.c\n"
+        return b"diff --git a/parser.c b/parser.c\n"
+
+    monkeypatch.setattr(analysis_module.GitRepository, "_run", fake_run)
+    with pytest.raises(SourceToolError) as caught:
+        repo.diff("a" * 40, "b" * 40)
+    assert "non-UTF-8" in str(caught.value)
 
 
 @pytest.mark.parametrize("relative", ["vulnerable/parser.c", "fixed/parser.c"])

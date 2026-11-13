@@ -2,6 +2,7 @@ import json
 from uuid import UUID, uuid4
 
 import pytest
+from psycopg.types.json import Jsonb
 
 from support import (
     cli,
@@ -432,6 +433,211 @@ def test_malformed_manifest_blocks_as_material_missing(
     ) == 0
 
 
+@pytest.mark.parametrize(
+    "value",
+    [None, True, 1, [], {}],
+    ids=["none", "true", "int", "list", "empty-dict"],
+)
+def test_malformed_manifest_cases_type_blocks_as_material_missing(
+    isolated_database, tmp_path, value
+):
+    """A wrong-typed manifest case index must be a repairable MATERIAL_MISSING.
+
+    ``submit`` must fail with exit code 2 instead of a TypeError traceback, and
+    a worker that sees the broken registry after submission must block the job
+    rather than writing terminal FAILED/ANALYSIS_ERROR.
+    """
+    case_root = copy_cases(tmp_path)
+    manifest_path = case_root / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["cases"] = value
+    manifest_path.write_text(
+        json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
+    )
+
+    request = write_request(tmp_path)
+    submitted = cli(
+        "submit",
+        "--request",
+        str(request),
+        env_extra={"DATACON_CASE_ROOT": str(case_root)},
+    )
+    assert submitted.returncode == 2, submitted.stderr
+    assert json.loads(submitted.stderr)["reason_code"] == "INVALID_REQUEST"
+
+    job = queue_job(isolated_database, tmp_path)
+    result = worker(
+        isolated_database.dsn,
+        env_extra={"DATACON_CASE_ROOT": str(case_root)},
+    )
+
+    assert result["processed"] == 1
+    assert result["state"] == "BLOCKED"
+    current = status(isolated_database.dsn, job["job_id"])
+    assert current["state"] == "BLOCKED"
+    assert current["state"] != "FAILED"
+    assert current["reason_code"] == "MATERIAL_MISSING"
+    assert current["pending_plan"] is None
+    assert "TypeError" not in (current["last_error"] or "")
+    assert "cases" in (current["last_error"] or "")
+    assert scalar(
+        isolated_database,
+        "SELECT count(*) FROM plans WHERE job_id = %s",
+        (UUID(job["job_id"]),),
+    ) == 0
+    assert scalar(
+        isolated_database,
+        "SELECT count(*) FROM jobs WHERE job_id = %s AND state = 'FAILED'",
+        (UUID(job["job_id"]),),
+    ) == 0
+
+
+def test_non_utf8_registry_blocks_as_material_missing(
+    isolated_database, tmp_path
+):
+    """Invalid UTF-8 is a repairable material error, never terminal FAILED."""
+    case_root = copy_cases(tmp_path)
+    (case_root / "registry.json").write_bytes(b'{"schema_version":1,"x":"\xff"}')
+
+    job = queue_job(isolated_database, tmp_path)
+    result = worker(
+        isolated_database.dsn,
+        env_extra={"DATACON_CASE_ROOT": str(case_root)},
+    )
+
+    assert result["processed"] == 1
+    assert result["state"] == "BLOCKED"
+    current = status(isolated_database.dsn, job["job_id"])
+    assert current["state"] == "BLOCKED"
+    assert current["reason_code"] == "MATERIAL_MISSING"
+    assert "UTF-8" in (current["last_error"] or "")
+    assert "UnicodeDecodeError" not in (current["last_error"] or "")
+    assert current["pending_plan"] is None
+    assert scalar(
+        isolated_database,
+        "SELECT count(*) FROM plans WHERE job_id = %s",
+        (UUID(job["job_id"]),),
+    ) == 0
+    assert scalar(
+        isolated_database,
+        "SELECT count(*) FROM jobs WHERE job_id = %s AND state = 'FAILED'",
+        (UUID(job["job_id"]),),
+    ) == 0
+
+
+def test_manifest_path_is_directory_blocks_as_material_missing(
+    isolated_database, tmp_path
+):
+    """A directory at manifest.json is a material problem, not a transient FAILED."""
+    case_root = copy_cases(tmp_path)
+    manifest_path = case_root / "manifest.json"
+    manifest_path.unlink()
+    manifest_path.mkdir()
+
+    request = write_request(tmp_path)
+    submitted = cli(
+        "submit",
+        "--request",
+        str(request),
+        env_extra={"DATACON_CASE_ROOT": str(case_root)},
+    )
+    assert submitted.returncode == 2, submitted.stderr
+    assert submitted.stdout == ""
+    assert json.loads(submitted.stderr)["reason_code"] == "INVALID_REQUEST"
+    assert "Traceback" not in submitted.stderr
+
+    job = queue_job(isolated_database, tmp_path)
+    result = worker(
+        isolated_database.dsn,
+        env_extra={"DATACON_CASE_ROOT": str(case_root)},
+    )
+
+    assert result["processed"] == 1
+    assert result["state"] == "BLOCKED"
+    current = status(isolated_database.dsn, job["job_id"])
+    assert current["state"] == "BLOCKED"
+    assert current["reason_code"] == "MATERIAL_MISSING"
+    assert current["pending_plan"] is None
+    assert "Is a directory" not in (current["last_error"] or "")
+    assert "Traceback" not in (current["last_error"] or "")
+    assert scalar(
+        isolated_database,
+        "SELECT count(*) FROM plans WHERE job_id = %s",
+        (UUID(job["job_id"]),),
+    ) == 0
+    assert scalar(
+        isolated_database,
+        "SELECT count(*) FROM jobs WHERE job_id = %s AND state = 'FAILED'",
+        (UUID(job["job_id"]),),
+    ) == 0
+
+
+def test_review_with_null_deadline_expires_without_db_error(
+    isolated_database, tmp_path
+):
+    """A legacy AWAITING_REVIEW row without a deadline fails closed."""
+    job = queue_job(isolated_database, tmp_path)
+    worker(isolated_database.dsn)
+    digest = status(isolated_database.dsn, job["job_id"])["pending_plan"][
+        "plan_digest"
+    ]
+    isolated_database.connection.execute(
+        "UPDATE jobs SET review_deadline_at = NULL WHERE job_id = %s",
+        (UUID(job["job_id"]),),
+    )
+
+    expired = review(
+        isolated_database.dsn,
+        job["job_id"],
+        digest,
+        "approve",
+        env_extra={"DATACON_OPERATOR_ID": "reviewer-1"},
+    )
+    assert expired.returncode == 3, expired.stderr
+    assert json.loads(expired.stderr)["reason_code"] == "REVIEW_EXPIRED"
+
+    current = status(isolated_database.dsn, job["job_id"])
+    assert current["state"] == "BLOCKED"
+    assert current["reason_code"] == "REVIEW_EXPIRED"
+    assert current["review_state"] is None
+    assert current["pending_plan"]["plan_digest"] == digest
+    assert scalar(
+        isolated_database,
+        "SELECT count(*) FROM reviews WHERE job_id = %s",
+        (UUID(job["job_id"]),),
+    ) == 0
+
+
+def test_worker_expires_null_deadline_review(isolated_database, tmp_path):
+    """A synced legacy AWAITING_REVIEW row must still be reclaimable."""
+    job = queue_job(isolated_database, tmp_path)
+    worker(isolated_database.dsn)
+    isolated_database.connection.execute(
+        "UPDATE jobs SET review_deadline_at = NULL WHERE job_id = %s",
+        (UUID(job["job_id"]),),
+    )
+
+    expired = worker(isolated_database.dsn)
+    assert expired["processed"] == 1
+    assert expired["state"] == "BLOCKED"
+    current = status(isolated_database.dsn, job["job_id"])
+    assert current["reason_code"] == "REVIEW_EXPIRED"
+    assert scalar(
+        isolated_database,
+        "SELECT workflow_synced FROM jobs WHERE job_id = %s",
+        (UUID(job["job_id"]),),
+    ) is False
+
+    synced = worker(isolated_database.dsn)
+    assert synced["processed"] == 1
+    assert synced["state"] == "BLOCKED"
+    assert scalar(
+        isolated_database,
+        "SELECT workflow_synced FROM jobs WHERE job_id = %s",
+        (UUID(job["job_id"]),),
+    ) is True
+
+
 def test_binary_job_is_never_claimed_by_the_worker(isolated_database, tmp_path):
     request = tmp_path / "binary.json"
     request.write_text(
@@ -448,6 +654,39 @@ def test_binary_job_is_never_claimed_by_the_worker(isolated_database, tmp_path):
     assert current["reason_code"] == "UNSUPPORTED_TARGET"
     assert current["stage"] is None
     assert current["pending_plan"] is None
+
+
+def test_legacy_binary_blocked_job_is_not_claimed(isolated_database):
+    """A row inserted by the old binary after 002/004 must stay unclaimed."""
+    job_id = uuid4()
+    isolated_database.connection.execute(
+        "INSERT INTO jobs (job_id, request, state, reason_code) "
+        "VALUES (%s, %s, 'BLOCKED', 'UNSUPPORTED_TARGET')",
+        (
+            job_id,
+            Jsonb(
+                {
+                    "schema_version": 1,
+                    "cve_id": "CVE-2099-0001",
+                    "target": {
+                        "kind": "binary",
+                        "case_id": "fixture-c-parser",
+                        "goal": "legacy binary row",
+                    },
+                }
+            ),
+        ),
+    )
+
+    result = worker(isolated_database.dsn)
+    assert result["processed"] == 0
+    row = isolated_database.connection.execute(
+        "SELECT state, reason_code, generation, workflow_synced, "
+        "lease_owner, lease_expires_at FROM jobs WHERE job_id = %s",
+        (job_id,),
+    ).fetchone()
+    assert row == ("BLOCKED", "UNSUPPORTED_TARGET", 0, False, None, None)
+    assert status(isolated_database.dsn, str(job_id))["pending_plan"] is None
 
 
 def test_worker_requires_database_configuration():

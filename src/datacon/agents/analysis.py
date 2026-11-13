@@ -382,6 +382,12 @@ def analyze_case(
             "INVALID_REQUEST", "request cve_id does not match the registered case"
         )
 
+    isolation = registry.document.get("isolation") or {}
+    if not isinstance(isolation, dict):
+        raise AnalysisBlocked(
+            "MATERIAL_MISSING", "case registry isolation must be an object"
+        )
+
     manifest = case.manifest
     manifest_case = case.manifest_case
     materials = manifest.get("materials")
@@ -766,7 +772,7 @@ def analyze_case(
             "source": manifest["asan_signature"]["source"],
         },
         "limits": dict(request["limits"]),
-        "isolation": dict((registry.document.get("isolation") or {})),
+        "isolation": dict(isolation),
         "intel": {
             "snapshot": advisory_entry["path"],
             "collected_at": advisory["collected_at"],

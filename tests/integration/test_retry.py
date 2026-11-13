@@ -1250,6 +1250,41 @@ def test_record_attempt_rejects_downgrading_a_completed_row(
         status="completed",
         result={"plan_digest": "sha256:" + "1" * 64},
     ) is True
+    # A different completed result is not an idempotent rewrite.
+    assert state.record_attempt(
+        isolated_database.dsn,
+        job_uuid,
+        stage="prepare",
+        step_key="analysis",
+        attempt_no=1,
+        generation=generation,
+        input_digest=None,
+        status="completed",
+        result={"plan_digest": "sha256:" + "2" * 64},
+    ) is False
+    # Unknown statuses are contract errors, not silent downgrades.
+    with pytest.raises(state.StateError):
+        state.record_attempt(
+            isolated_database.dsn,
+            job_uuid,
+            stage="prepare",
+            step_key="analysis",
+            attempt_no=1,
+            generation=generation,
+            input_digest=None,
+            status="failed",
+            result={"error": "not-a-real-status"},
+        )
+    row = isolated_database.connection.execute(
+        "SELECT status, result FROM attempts WHERE job_id = %s "
+        "AND stage = 'prepare' AND step_key = 'analysis' AND attempt_no = 1 "
+        "AND generation = %s",
+        (job_uuid, generation),
+    ).fetchone()
+    assert row == (
+        "completed",
+        {"plan_digest": "sha256:" + "1" * 64},
+    )
 
 
 def test_unwritable_block_keeps_preparing_without_a_third_analysis(
@@ -1320,8 +1355,8 @@ def test_unwritable_block_keeps_preparing_without_a_third_analysis(
     ) == 0
     current = state.load_job(isolated_database.dsn, job_uuid)
     assert current["state"] == "PREPARING"
-    assert current["workflow_synced"] is True
-    assert current["lease_owner"] is None
+    assert current["workflow_synced"] is False
+    assert current["lease_owner"] is not None
     # A later claim runs against a fresh generation; this generation never
     # ran a third analysis.
     assert len(
@@ -1336,6 +1371,11 @@ def test_unwritable_block_keeps_preparing_without_a_third_analysis(
     ) == 2
     monkeypatch.setattr(workflow.state_store, "block_job", real_block)
     monkeypatch.setattr(workflow.state_store, "record_attempt", real_record)
+    isolated_database.connection.execute(
+        "UPDATE jobs SET lease_expires_at = now() - interval '1 second' "
+        "WHERE job_id = %s",
+        (job_uuid,),
+    )
     recovered = workflow.run_worker(isolated_database.dsn, once=True)
     assert recovered["state"] == "AWAITING_REVIEW"
     assert scalar(
@@ -1343,3 +1383,213 @@ def test_unwritable_block_keeps_preparing_without_a_third_analysis(
         "SELECT count(*) FROM plans WHERE job_id = %s",
         (job_uuid,),
     ) == 1
+
+
+def test_persistent_freeze_error_keeps_preparing_and_recovers(
+    isolated_database, tmp_path, monkeypatch
+):
+    """A DB/checkpoint failure while freezing is not an analysis failure.
+
+    The analysis has already completed, but the plan cannot be frozen twice.
+    The job must stay PREPARING with workflow_synced=false and a live lease;
+    the next generation retries and freezes the plan instead of the job
+    becoming terminal FAILED/ANALYSIS_ERROR.
+    """
+    job = queue_job(isolated_database, tmp_path)
+    job_uuid = UUID(job["job_id"])
+    analysis_calls = []
+
+    def counting_analysis(request, **kwargs):
+        analysis_calls.append(request)
+        return real_analyze_case(request, **kwargs)
+
+    def failing_freeze(*args, **kwargs):
+        raise psycopg.OperationalError("connection reset while freezing")
+
+    real_freeze = state.freeze_plan
+    monkeypatch.setattr(workflow, "analyze_case", counting_analysis)
+    monkeypatch.setattr(workflow.state_store, "freeze_plan", failing_freeze)
+
+    result = workflow.run_worker(isolated_database.dsn, once=True)
+
+    assert result["state"] == "PREPARING"
+    assert len(analysis_calls) == 1
+    current = state.load_job(isolated_database.dsn, job_uuid)
+    assert current["state"] == "PREPARING"
+    assert current["workflow_synced"] is False
+    assert current["lease_owner"] is not None
+    assert current["reason_code"] is None
+    assert scalar(
+        isolated_database,
+        "SELECT count(*) FROM jobs WHERE job_id = %s AND state = 'FAILED'",
+        (job_uuid,),
+    ) == 0
+    assert scalar(
+        isolated_database,
+        "SELECT count(*) FROM plans WHERE job_id = %s",
+        (job_uuid,),
+    ) == 0
+    assert analysis_attempts(isolated_database, job["job_id"]) == [
+        (1, "completed")
+    ]
+
+    # The later generation retries preparation and freezes exactly one plan.
+    monkeypatch.setattr(workflow.state_store, "freeze_plan", real_freeze)
+    isolated_database.connection.execute(
+        "UPDATE jobs SET lease_expires_at = now() - interval '1 second' "
+        "WHERE job_id = %s",
+        (job_uuid,),
+    )
+    recovered = workflow.run_worker(isolated_database.dsn, once=True)
+
+    assert recovered["state"] == "AWAITING_REVIEW"
+    assert len(analysis_calls) == 2
+    assert scalar(
+        isolated_database,
+        "SELECT count(*) FROM plans WHERE job_id = %s",
+        (job_uuid,),
+    ) == 1
+    current = state.load_job(isolated_database.dsn, job_uuid)
+    assert current["state"] == "AWAITING_REVIEW"
+    assert current["workflow_synced"] is True
+    assert scalar(
+        isolated_database,
+        "SELECT count(*) FROM jobs WHERE job_id = %s AND state = 'FAILED'",
+        (job_uuid,),
+    ) == 0
+
+
+def test_persistent_checkpoint_read_error_keeps_preparing(
+    isolated_database, tmp_path, monkeypatch
+):
+    """A checkpoint read failure must not become FAILED/ANALYSIS_ERROR.
+
+    No analysis has run yet; the escaped ``get_state`` error is a
+    checkpoint/infrastructure failure. The job must remain claimable after
+    the lease expires and then converge normally.
+    """
+    job = queue_job(isolated_database, tmp_path)
+    job_uuid = UUID(job["job_id"])
+    real_build_graph = workflow.build_graph
+    analysis_calls = []
+
+    def counting_analysis(request, **kwargs):
+        analysis_calls.append(request)
+        return real_analyze_case(request, **kwargs)
+
+    class BrokenGraph:
+        def get_state(self, config):
+            raise psycopg.OperationalError("checkpoint read failed")
+
+    monkeypatch.setattr(
+        workflow, "build_graph", lambda *args, **kwargs: BrokenGraph()
+    )
+    monkeypatch.setattr(workflow, "analyze_case", counting_analysis)
+
+    result = workflow.run_worker(isolated_database.dsn, once=True)
+
+    assert result["state"] == "PREPARING"
+    assert analysis_calls == []
+    current = state.load_job(isolated_database.dsn, job_uuid)
+    assert current["state"] == "PREPARING"
+    assert current["workflow_synced"] is False
+    assert current["lease_owner"] is not None
+    assert scalar(
+        isolated_database,
+        "SELECT count(*) FROM jobs WHERE job_id = %s AND state = 'FAILED'",
+        (job_uuid,),
+    ) == 0
+    assert scalar(
+        isolated_database,
+        "SELECT count(*) FROM attempts WHERE job_id = %s "
+        "AND step_key = 'workflow' AND status = 'infra_error'",
+        (job_uuid,),
+    ) == 2
+
+    monkeypatch.setattr(workflow, "build_graph", real_build_graph)
+    isolated_database.connection.execute(
+        "UPDATE jobs SET lease_expires_at = now() - interval '1 second' "
+        "WHERE job_id = %s",
+        (job_uuid,),
+    )
+    recovered = workflow.run_worker(isolated_database.dsn, once=True)
+
+    assert recovered["state"] == "AWAITING_REVIEW"
+    assert len(analysis_calls) == 1
+    assert scalar(
+        isolated_database,
+        "SELECT count(*) FROM plans WHERE job_id = %s",
+        (job_uuid,),
+    ) == 1
+    current = state.load_job(isolated_database.dsn, job_uuid)
+    assert current["state"] == "AWAITING_REVIEW"
+    assert current["workflow_synced"] is True
+    assert scalar(
+        isolated_database,
+        "SELECT count(*) FROM jobs WHERE job_id = %s AND state = 'FAILED'",
+        (job_uuid,),
+    ) == 0
+
+
+def test_non_retryable_graph_error_keeps_preparing(
+    isolated_database, tmp_path, monkeypatch
+):
+    """A deterministic graph error is an infra failure, not an analysis failure."""
+    job = queue_job(isolated_database, tmp_path)
+    job_uuid = UUID(job["job_id"])
+    real_build_graph = workflow.build_graph
+    analysis_calls = []
+
+    def counting_analysis(request, **kwargs):
+        analysis_calls.append(request)
+        return real_analyze_case(request, **kwargs)
+
+    class BrokenGraph:
+        def get_state(self, config):
+            raise ValueError("graph checkpoint is inconsistent")
+
+    monkeypatch.setattr(
+        workflow, "build_graph", lambda *args, **kwargs: BrokenGraph()
+    )
+    monkeypatch.setattr(workflow, "analyze_case", counting_analysis)
+
+    result = workflow.run_worker(isolated_database.dsn, once=True)
+
+    assert result["state"] == "PREPARING"
+    assert analysis_calls == []
+    current = state.load_job(isolated_database.dsn, job_uuid)
+    assert current["state"] == "PREPARING"
+    assert current["reason_code"] is None
+    assert current["workflow_synced"] is False
+    assert current["lease_owner"] is not None
+    assert scalar(
+        isolated_database,
+        "SELECT count(*) FROM jobs WHERE job_id = %s AND state = 'FAILED'",
+        (job_uuid,),
+    ) == 0
+    assert isolated_database.connection.execute(
+        "SELECT attempt_no, status, result FROM attempts "
+        "WHERE job_id = %s AND step_key = 'workflow' ORDER BY attempt_no",
+        (job_uuid,),
+    ).fetchall() == [
+        (1, "infra_error", {"error": "ValueError"}),
+    ]
+
+    monkeypatch.setattr(workflow, "build_graph", real_build_graph)
+    isolated_database.connection.execute(
+        "UPDATE jobs SET lease_expires_at = now() - interval '1 second' "
+        "WHERE job_id = %s",
+        (job_uuid,),
+    )
+    recovered = workflow.run_worker(isolated_database.dsn, once=True)
+
+    assert recovered["state"] == "AWAITING_REVIEW"
+    assert len(analysis_calls) == 1
+    assert scalar(
+        isolated_database,
+        "SELECT count(*) FROM plans WHERE job_id = %s",
+        (job_uuid,),
+    ) == 1
+    current = state.load_job(isolated_database.dsn, job_uuid)
+    assert current["state"] == "AWAITING_REVIEW"
+    assert current["workflow_synced"] is True

@@ -12,6 +12,7 @@ ROOT = Path(__file__).resolve().parents[2]
 MIGRATION_001 = ROOT / "migrations" / "001_create_jobs.sql"
 MIGRATION_002 = ROOT / "migrations" / "002_workflow.sql"
 MIGRATION_003 = ROOT / "migrations" / "003_attempts_generation.sql"
+MIGRATION_004 = ROOT / "migrations" / "004_legacy_binary_sync.sql"
 
 
 def _relation_kind(connection, schema_name, relation_name):
@@ -271,6 +272,87 @@ def test_003_upgrades_attempts_unique_key_without_data_loss(postgres_dsn):
                     (uuid4(), job_id, Jsonb({"generation": 2})),
                 )
             connection.execute("ROLLBACK")
+        finally:
+            connection.rollback()
+            connection.execute(
+                sql.SQL("DROP SCHEMA IF EXISTS {} CASCADE").format(
+                    sql.Identifier(schema_name)
+                )
+            )
+
+
+def test_004_backfills_legacy_binary_and_is_rerunnable(postgres_dsn):
+    schema_name = f"datacon_binary_migration_{uuid4().hex}"
+    binary_id = uuid4()
+    source_id = uuid4()
+    binary_request = {
+        "schema_version": 1,
+        "cve_id": "CVE-2099-0001",
+        "target": {
+            "kind": "binary",
+            "case_id": "fixture-c-parser",
+            "goal": "legacy binary row",
+        },
+    }
+    source_request = {
+        "schema_version": 1,
+        "cve_id": "CVE-2099-0001",
+        "target": {
+            "kind": "source",
+            "case_id": "fixture-c-parser",
+            "goal": "legacy source row",
+        },
+    }
+    migration_001 = MIGRATION_001.read_text(encoding="utf-8")
+    migration_002 = MIGRATION_002.read_text(encoding="utf-8")
+    migration_003 = MIGRATION_003.read_text(encoding="utf-8")
+    migration_004 = MIGRATION_004.read_text(encoding="utf-8")
+
+    with psycopg.connect(
+        postgres_dsn, autocommit=True, connect_timeout=5
+    ) as connection:
+        connection.execute(
+            sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(schema_name))
+        )
+        try:
+            connection.execute(
+                sql.SQL("SET search_path TO {}").format(sql.Identifier(schema_name))
+            )
+            connection.execute(migration_001)
+            connection.execute(
+                "INSERT INTO jobs (job_id, request, state, reason_code) "
+                "VALUES (%s, %s, 'BLOCKED', 'UNSUPPORTED_TARGET')",
+                (binary_id, Jsonb(binary_request)),
+            )
+            connection.execute(
+                "INSERT INTO jobs (job_id, request, state) "
+                "VALUES (%s, %s, 'QUEUED')",
+                (source_id, Jsonb(source_request)),
+            )
+
+            for migration in (migration_002, migration_003, migration_004, migration_004):
+                connection.execute(migration)
+
+            rows = connection.execute(
+                "SELECT workflow_synced FROM jobs WHERE job_id = %s",
+                (binary_id,),
+            ).fetchall()
+            assert rows == [(True,)]
+            rows = connection.execute(
+                "SELECT workflow_synced FROM jobs WHERE job_id = %s",
+                (source_id,),
+            ).fetchall()
+            assert rows == [(False,)]
+
+            # A pre-migration binary row still satisfies the claim query's
+            # exclusion even if an operator applied 002 but not 004.
+            claimed = connection.execute(
+                "SELECT job_id FROM jobs WHERE job_id = %s "
+                "AND state = 'BLOCKED' "
+                "AND reason_code IS DISTINCT FROM 'UNSUPPORTED_TARGET'",
+                (binary_id,),
+            ).fetchall()
+            assert claimed == []
         finally:
             connection.rollback()
             connection.execute(

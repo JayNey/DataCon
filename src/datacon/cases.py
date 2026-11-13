@@ -252,8 +252,16 @@ def case_root(path: str | os.PathLike[str] | None = None) -> Path:
 
 
 def _load_json(path: Path, label: str) -> dict[str, Any]:
+    if not path.is_file():
+        raise CaseConfigurationError(
+            "MATERIAL_MISSING", f"{label} is not a readable file"
+        )
     try:
         text = path.read_text(encoding="utf-8")
+    except UnicodeError as error:
+        raise CaseConfigurationError(
+            "MATERIAL_MISSING", f"{label} is not valid UTF-8: {error}"
+        ) from error
     except (FileNotFoundError, PermissionError) as error:
         raise CaseConfigurationError(
             "MATERIAL_MISSING", f"{label} is not readable: {error}"
@@ -308,6 +316,12 @@ def load_registry(
     if manifest.get("schema_version") != 1:
         raise CaseConfigurationError(
             "MATERIAL_MISSING", "case manifest schema_version must be 1"
+        )
+    manifest_cases = manifest.get("cases")
+    if not isinstance(manifest_cases, dict) or not manifest_cases:
+        raise CaseConfigurationError(
+            "MATERIAL_MISSING",
+            "case manifest cases must be a non-empty object",
         )
     cases = document.get("cases")
     if not isinstance(cases, dict) or not cases:
@@ -369,7 +383,7 @@ def load_registry(
                 "MATERIAL_MISSING", f"case {case_id} is invalid: {error}"
             ) from error
 
-        if entry["benchmark_id"] not in manifest.get("cases", {}):
+        if entry["benchmark_id"] not in manifest_cases:
             raise CaseConfigurationError(
                 "MATERIAL_MISSING",
                 f"case {case_id} references unknown benchmark {entry['benchmark_id']}",

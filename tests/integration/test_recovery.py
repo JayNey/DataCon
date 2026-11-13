@@ -559,8 +559,8 @@ def test_attempts_unique_includes_generation(isolated_database, tmp_path):
     ).fetchall()
     assert rows == [(1, {"generation": 1}), (2, {"generation": 2})]
 
-    # Re-writing within the same generation updates that row instead of
-    # creating a third history row.
+    # Re-writing the same completed result within the same generation updates
+    # that row instead of creating a third history row.
     assert state.record_attempt(
         isolated_database.dsn,
         job_uuid,
@@ -569,8 +569,8 @@ def test_attempts_unique_includes_generation(isolated_database, tmp_path):
         attempt_no=1,
         generation=2,
         input_digest="sha256:" + "3" * 64,
-        status="failed",
-        result={"generation": 2, "retry": True},
+        status="completed",
+        result={"generation": 2},
     )
     rows = isolated_database.connection.execute(
         "SELECT generation, status FROM attempts WHERE job_id = %s "
@@ -578,7 +578,7 @@ def test_attempts_unique_includes_generation(isolated_database, tmp_path):
         "ORDER BY generation",
         (job_uuid,),
     ).fetchall()
-    assert rows == [(1, "completed"), (2, "failed")]
+    assert rows == [(1, "completed"), (2, "completed")]
 
 
 def test_finalize_after_block_succeeds(isolated_database, tmp_path):

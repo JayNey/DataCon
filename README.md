@@ -17,7 +17,7 @@ DataCon 是面向授权实验环境的 CVE 复现平台项目。它的目标是�
 
 - **T01 案例与测试基线**：`src/datacon/data/cases/` 随 wheel 发布 B01/B02 的缺陷版、修复版、正常与候选输入、构建配方、依赖快照、预期退出码和预期 ASan 签名；`tests/fixtures/cases/` 保留同一套测试基线。`manifest.json` 固定全部材料摘要；`fixture-repo.bundle` 是包含两个固定提交的只读 Git bundle；`advisory.json` 是离线公告快照；`registry.json` 把案例、材料、仓库和公告关联起来。
 - **T02 任务入口**：`src/datacon/contracts.py` 校验请求并计算稳定计划摘要；`src/datacon/cli.py` 实现 `submit`、`status`、`review` 和 `worker`；`migrations/001_create_jobs.sql` 创建任务表并为旧表补列。
-- **T03 持久化、Supervisor 与审核**：`migrations/002_workflow.sql` 增量增加计划、审核、尝试、审计和恢复字段，保留既有任务；`003_attempts_generation.sql` 安全升级旧 `attempts` 唯一键。`src/datacon/state.py` 以 PostgreSQL 业务记录决定状态、审核、代次与租约；`src/datacon/workflow.py` 用 LangGraph 编译 Supervisor，以 `thread_id=job_id` 保存检查点。`worker` 领取 `QUEUED`，生成并冻结计划，置为 `AWAITING_REVIEW`；`review` 在任务、计划摘要、操作者和 24 小时审核时限绑定下写入 `approve|reject`。批准原子地进入 `READY`，拒绝或过期进入 `BLOCKED`，恢复时从业务记录路由。审核和过期提交增加 `generation`，旧 worker 无法把 `workflow_synced` 覆盖为 `true`；任何状态写回（`freeze_plan`、`ensure_awaiting_review`、`block_job`、`expire_review`、`record_attempt`、`finalize_workflow`）同时校验数据库有效租约，审核过期写回也要求当前代次持有有效租约。分析或检查点的瞬时基础设施错误按逻辑步骤最多重试一次；`attempts` 在分析执行前先写入 `started` 占位，随后更新为 `completed` 或 `infra_error`；准备时限过期时直接阻断。
+- **T03 持久化、Supervisor 与审核**：`migrations/002_workflow.sql` 增量增加计划、审核、尝试、审计和恢复字段，保留既有任务；`003_attempts_generation.sql` 安全升级旧 `attempts` 唯一键；`004_legacy_binary_sync.sql` 回填旧 binary 任务的 `workflow_synced`。`src/datacon/state.py` 以 PostgreSQL 业务记录决定状态、审核、代次与租约；`src/datacon/workflow.py` 用 LangGraph 编译 Supervisor，以 `thread_id=job_id` 保存检查点。`worker` 领取 `QUEUED`，生成并冻结计划，置为 `AWAITING_REVIEW`；`review` 在任务、计划摘要、操作者和 24 小时审核时限绑定下写入 `approve|reject`。批准原子地进入 `READY`，拒绝或过期进入 `BLOCKED`，恢复时从业务记录路由。审核和过期提交增加 `generation`，旧 worker 无法把 `workflow_synced` 覆盖为 `true`；`freeze_plan`、`ensure_awaiting_review`、`block_job`、`expire_review`、`record_attempt` 和 `finalize_workflow` 只在 generation 与数据库有效租约同时匹配时写入；操作者 `record_review`（批准 / 拒绝 / 过期）不使用 worker 租约，由任务状态、计划摘要和审核时限围栏；成功决议在同一事务内增加 generation 并清空租约。分析或检查点的瞬时基础设施错误按逻辑步骤最多重试一次；`attempts` 在分析执行前先写入 `started` 占位，随后更新为 `completed` 或 `infra_error`；准备时限过期时直接阻断。
 - **T04 情报、版本与源码分析**：`src/datacon/cases.py` 读取本地案例注册表；`src/datacon/agents/analysis.py` 读取离线公告、校验来源与摘要、解析固定 Git 提交、生成 diff、事实 / 假设和证据引用，并计算稳定计划摘要；根因 hypothesis 由实际 ASan 签名、源码路径和函数派生，不硬编码 B01 文本；`src/datacon/tools/source.py` 用受限 Git 命令和 Tree-sitter 提取目标函数与调用点。模型是可选的类型化端口，默认离线运行，真实 LLM 调用不是本批验收条件。
 - 合法 source 请求返回唯一 `job_id` 和 `QUEUED`。结构合法的 binary 请求在提交时归档为 `BLOCKED`，原因码 `UNSUPPORTED_TARGET`，不会进入 Supervisor。省略预算时应用 SRS 默认值。
 - 非法 CVE 格式、超出上限的预算、未知字段、重复 JSON 键和其他结构错误返回退出码 `2`，并在连接数据库前拒绝，不产生任务。
@@ -60,7 +60,7 @@ for migration in migrations/*.sql; do
 done
 ```
 
-本机有 `psql` 时也可以逐个执行 `psql "$DATACON_DATABASE_URL" -f "$migration"`。三个迁移都可重复执行；`001`、`002` 只增量加列和表，不删除或回填 T01/T02 的任务；`003` 在不丢数据的前提下把旧 `002` 的 `attempts` 唯一键升级为包含 `generation` 的形状。
+本机有 `psql` 时也可以逐个执行 `psql "$DATACON_DATABASE_URL" -f "$migration"`。四个迁移都可重复执行；`001`、`002` 只增量加列和表，不删除 T01/T02 的任务；`003` 在不丢数据的前提下把旧 `002` 的 `attempts` 唯一键升级为包含 `generation` 的形状；`004` 只把旧 binary 任务的 `workflow_synced` 回填为 `true`。
 
 ### 3. 提交、生成计划、审核并查询 READY
 
@@ -105,7 +105,7 @@ uv run datacon status "$job"   # state=READY，review_state.decision=approve
 | `3` | 任务不存在、当前状态 / 权限 / 审核时限阻断操作 |
 | `1` | 数据库未配置或数据库操作失败 |
 
-审核命令的失败原因码包括 `PLAN_MISMATCH`、`REVIEW_CONFLICT`、`REVIEW_EXPIRED`、`INVALID_STATE` 和 `JOB_NOT_FOUND`。Supervisor 阻断原因包括 `MATERIAL_MISSING`、`SOURCE_CONFLICT`、`EVIDENCE_INVALID`、`UNSUPPORTED_TARGET`、`DEADLINE_EXCEEDED`、`REVIEW_REJECTED`、`REVIEW_EXPIRED` 和 `PLAN_MISMATCH`。
+审核命令的失败原因码包括 `PLAN_MISMATCH`、`REVIEW_CONFLICT`、`REVIEW_EXPIRED`、`INVALID_STATE` 和 `JOB_NOT_FOUND`；内部一致性错误使用 `REVIEW_ERROR`（退出码 `3`），数据库错误仍使用 `DATABASE_ERROR`（退出码 `1`）。Supervisor 阻断原因包括 `MATERIAL_MISSING`、`SOURCE_CONFLICT`、`EVIDENCE_INVALID`、`UNSUPPORTED_TARGET`、`DEADLINE_EXCEEDED`、`REVIEW_REJECTED`、`REVIEW_EXPIRED` 和 `PLAN_MISMATCH`；分析失败使用 `FAILED/ANALYSIS_ERROR`。
 
 ## 请求契约
 
@@ -145,14 +145,14 @@ uv run datacon status "$job"   # state=READY，review_state.decision=approve
 ## Supervisor、恢复与租约
 
 - LangGraph 图是 `prepare → await_review → END`，检查点表由 `langgraph-checkpoint-postgres` 管理，`thread_id` 为 `job_id`。PostgreSQL 业务记录是状态与审核结果的唯一依据；检查点只表示调度位置。
-- `worker` 用 `SELECT ... FOR UPDATE SKIP LOCKED` 领取 `QUEUED`、过期 `PREPARING`、未同步的 `AWAITING_REVIEW` / `READY` / `BLOCKED` 任务，增加 `generation` 并写入有期限的租约。计划冻结前被 `block_job` 阻断的任务，即使还没有 plan，只要 `workflow_synced=false` 且租约过期也会被重新领取并同步；binary 任务在提交时即为 `workflow_synced=true`，不会被领取。`freeze_plan`、`ensure_awaiting_review`、`block_job`、`expire_review`、`record_attempt` 和 `finalize_workflow` 只在 `generation` 与数据库 `now()` 判定仍有效的租约同时匹配时写入；租约过期后旧 worker 的写回被拒绝，`finalize_workflow` 返回 `False` 且不清空租约。`await_review` 在 `interrupt()` 恢复后仍使用本次领取的 claimed generation；重读到的任务代次已经变化时直接抛出 `StaleGeneration`，不写检查点或业务状态。
-- 审核批准 / 拒绝或审核过期在同一事务中增加 `generation` 并清空租约。因此在 `await_review` 读取 `review=None` 后提交的审核会使旧 worker 的 finalize 失败：`workflow_synced` 保持 `false`，下一次 `worker` 以新代次恢复检查点后才置为 `true`。`block_job` 故意保留租约，由同代次的 `finalize_workflow` 清空，保证 `BLOCKED` 任务也能同步。
-- 准备阶段固定 `prepare_deadline_at`；计划冻结时由数据库 `now() + interval '24 hours'` 固定 `review_deadline_at`，不使用 worker 进程时钟；执行期限在 T05 首次执行领取时固定。`freeze_plan` 在锁定任务后再次用数据库时钟检查准备期限，分析期间过期则不写计划并阻断为 `BLOCKED/DEADLINE_EXCEEDED`。
+- `worker` 用 `SELECT ... FOR UPDATE SKIP LOCKED` 领取 `QUEUED`、过期 `PREPARING`、未同步的 `AWAITING_REVIEW` / `READY` / `BLOCKED` 任务（`BLOCKED/UNSUPPORTED_TARGET` 除外），增加 `generation` 并写入有期限的租约。计划冻结前被 `block_job` 阻断的任务，即使还没有 plan，只要 `workflow_synced=false` 且租约过期也会被重新领取并同步；binary 任务在提交时即为 `workflow_synced=true`，`004` 回填旧 binary 的同一标志，且 `claim_next` 排除 `BLOCKED/UNSUPPORTED_TARGET`，因此 binary 不会被领取。`freeze_plan`、`ensure_awaiting_review`、`block_job`、`expire_review`、`record_attempt` 和 `finalize_workflow` 只在 `generation` 与数据库 `now()` 判定仍有效的租约同时匹配时写入；租约过期后旧 worker 的写回被拒绝，`finalize_workflow` 返回 `False` 且不清空租约。`await_review` 在 `interrupt()` 恢复后仍使用本次领取的 claimed generation；重读到的任务代次已经变化时直接抛出 `StaleGeneration`，不写检查点或业务状态。
+- 审核批准 / 拒绝或审核过期在同一事务中增加 `generation` 并清空租约。因此在 `await_review` 读取 `review=None` 后提交的审核会使旧 worker 的 finalize 失败：`workflow_synced` 保持 `false`，下一次 `worker` 以新代次恢复检查点后才置为 `true`。`block_job` 故意保留租约，由同代次的 `finalize_workflow` 清空，保证 `BLOCKED` 任务也能同步。审核冲突、摘要不符、非法状态和过期后的重复尝试以 `review_refused` 追加审计事件，不改变业务状态；首次过期以 `review_expired` 记录，审计 detail 同时保存调用方请求的摘要与冻结计划摘要。
+- 准备阶段固定 `prepare_deadline_at`；计划冻结时由数据库 `now() + interval '24 hours'` 固定 `review_deadline_at`，不使用 worker 进程时钟；执行期限在 T05 首次执行领取时固定。`freeze_plan` 在锁定任务后再次用数据库时钟检查准备期限，分析期间过期则不写计划并阻断为 `BLOCKED/DEADLINE_EXCEEDED`。旧数据中 `AWAITING_REVIEW` 但 `review_deadline_at` 为空的记录按“已过期”处理：审核请求返回 `REVIEW_EXPIRED`，worker 可领取并将其置为 `BLOCKED/REVIEW_EXPIRED`，不会因 NULL 参数类型错误或无法领取而永久停住。
 - 待审时进程退出：检查点停在 `await_review` 中断，重新启动只读取既有计划，不会生成第二份。
 - 审核决议已入库但工作流尚未恢复：`review` 与任务状态在同一事务提交（`READY` 或 `BLOCKED`），检查点仍停在中断；下一次 `worker` 用 `Command(resume=...)` 恢复并同步检查点。计划与审核各只有一份有效记录。resume 不再重复携带 `generation`/`stage`/`state_version` 更新：领取代次经运行配置传入图节点，节点只在成功完成时把代次写回检查点，因此一次 resume 即使重试也只写一次。
 - 图在冻结计划后、`finalize_workflow` 前退出且重启时仍待审：恢复的 worker 结束本次调度而不叠加第二个中断，任务保持 `AWAITING_REVIEW` 并完成同步；之后的批准、拒绝或审核过期由业务记录重新置为未同步，下一次 worker 正常收敛，不会出现 `InvalidUpdateError` 或误判 `FAILED`。
-- 恢复路径中的可重试数据库/检查点错误最多重试一次；业务记录是权威：已提交的 `READY`、`BLOCKED` 和待审计划不会因为调度或检查点异常被改写为 `FAILED`。重试仍失败的 `READY`/`BLOCKED` 任务保持原状态与 `workflow_synced=false`，租约到期后由新代次收敛；只有仍处于 `PREPARING`（没有已提交审核）的明确分析失败才进入 `FAILED/ANALYSIS_ERROR`。
-- 工具尝试按 `job_id/stage/step_key/attempt_no/generation` 记录；同一代次重复执行只更新该代次的行，旧代次不能覆盖新代次，审计事件只追加。`analysis` 步骤在调用 `analyze_case` 前先写入 `status=started` 占位，成功后就地用同一行更新为 `completed` 并保存 plan、plan_digest、summary，失败后更新为 `infra_error`。已提交的 `completed` 行是终态：后续 `infra_error`（或 `started`）不能覆盖它，重复写入 `completed` 仍幂等；状态无法写入时 `record_attempt` 返回 `False`，调用方必须停止该步骤，不能当成成功继续分析或冻结计划。`record_tool` 在工具审计行被拒绝时立即抛 `StaleGeneration`，分析在第一次失败的写回处停止；`plan` 步骤被拒绝时停止审核挂起；workflow 重试标记被拒绝时不记录 `completed` 并跳过 `finalize_workflow`，失败标记被拒绝时不再重试。`AnalysisBlocked` 或租约失效导致的提前停止不会把 `started` 行伪造成 `blocked` / `completed`；该行仍作为可审计的已消费尝试保留。
+- 恢复路径中的可重试数据库/检查点错误最多重试一次；业务记录是权威：已提交的 `READY`、`BLOCKED` 和待审计划不会因为调度或检查点异常被改写为 `FAILED`。重试仍失败的 `READY`/`BLOCKED` 任务保持原状态与 `workflow_synced=false`，租约到期后由新代次收敛；只有 `prepare` 节点内部的分析异常（含分析重试耗尽、分析步骤抛出未预期异常）或草稿/终态 block 写入耗尽才进入 `FAILED/ANALYSIS_ERROR`，`AnalysisBlocked` 按对应原因码进入 `BLOCKED`。逃逸到 `_process_claim` 的检查点、数据库或调度错误不是分析失败：任务保持 `PREPARING`、`workflow_synced=false` 并保留租约，由租约到期后的新代次重试，不会把已经成功并持久化的分析草稿写成终态 `FAILED`。旧数据中 `AWAITING_REVIEW` 但 `review_deadline_at` 为空的记录按已过期处理，审核请求和 worker 都能收敛。
+- 工具尝试按 `job_id/stage/step_key/attempt_no/generation` 记录；同一代次重复执行只更新该代次的行，旧代次不能覆盖新代次，审计事件只追加。`analysis` 步骤在调用 `analyze_case` 前先写入 `status=started` 占位，成功后就地用同一行更新为 `completed` 并保存 plan、plan_digest、summary，失败后更新为 `infra_error`。已提交的 `completed` 行是终态：后续任何非幂等的 `completed` 写入（包括 `infra_error`、`started`、未知状态，或 `completed` 但结果不同）都不能覆盖它，只有相同结果的 `completed` 重写仍幂等；未知状态直接作为契约错误拒绝。状态无法写入时 `record_attempt` 返回 `False`，调用方必须停止该步骤，不能当成成功继续分析或冻结计划。`record_tool` 在工具审计行被拒绝时立即抛 `StaleGeneration`，分析在第一次失败的写回处停止；`plan` 步骤被拒绝时停止审核挂起；workflow 重试标记被拒绝时不记录 `completed` 并跳过 `finalize_workflow`，失败标记被拒绝时不再重试。`AnalysisBlocked` 或租约失效导致的提前停止不会把 `started` 行伪造成 `blocked` / `completed`；该行仍作为可审计的已消费尝试保留。
 - 可恢复基础设施错误使用类型化异常，不靠消息字符串匹配：`TransientSourceToolError`（Git 超时、子进程启动/终止或可恢复 I/O）转换为 `RetryableAnalysisError`，Supervisor / 检查点的瞬时错误使用 `RetryableWorkflowError`、`psycopg.OperationalError` / `InterfaceError` 等类型。缺件、摘要不符、来源冲突、契约错误、`AnalysisBlocked`、`StaleGeneration` 和 `PlanConflict` 不重试。
 - 每个逻辑步骤最多额外重试一次（attempt 1 → attempt 2），同一执行代次内 `analyze_case` 实际执行最多两次。attempt 序号由已持久化记录（含 `started`）推导；即使记录失败状态的数据库写入本身失败，workflow 级重试也不会把该次执行当作没发生，更不会执行第三次分析。`prepare` 在 `max_attempt >= 2` 或存在 `phase=analysis_draft` 的失败记录时直接 fail closed（`FAILED/ANALYSIS_ERROR`），而不是只靠“没有 completed 草稿”判断。重试前用数据库 `now()` 检查 `prepare_deadline_at`；已过期直接 `BLOCKED/DEADLINE_EXCEEDED`。分析成功后的计划草稿随 `attempts` 持久化；草稿写入失败先做一次有界重试，仍失败则写 `infra_error`（`phase=analysis_draft`）并以 `FAILED/ANALYSIS_ERROR` 关闭；终态 `block_job` 同样做一次有界重试，仍写不进去时保留 `PREPARING` 交给 workflow 重试，重试依靠已持久化的 attempt / draft 标记 fail closed，不会再次执行分析。若服务端已提交 `completed` 草稿而客户端只收到连接错误，重试会读取并复用该草稿，绝不会用 `infra_error` 降级覆盖已提交的 `completed`。workflow 重试成功时补记 `completed`；检查点 `get_state` / `invoke` 的瞬时错误同样最多重试一次。
 
@@ -186,7 +186,7 @@ uv run datacon status "$expire_job"
 ## 情报、版本与源码分析
 
 - 默认案例注册表来自 `src/datacon/data/cases/registry.json`，以 wheel 内的 `datacon/data/cases/registry.json` 发布，并指向同目录的 `manifest.json`、`fixture-repo.bundle` 和 `advisory.json`；`tests/fixtures/cases/` 是测试基线镜像。部署时可用 `DATACON_CASE_ROOT` 指向自己的注册目录；安装后的 wheel 不设置该变量也能使用默认合成案例。
-- 情报只读离线快照：记录 `collected_at`、来源 URL 和快照 SHA-256。快照与注册表 / Git 提交不一致时阻断为 `SOURCE_CONFLICT`；缺失、篡改或摘要不符阻断为 `MATERIAL_MISSING`。清单结构错误（缺少或类型错误的 `versions`、`harness`、`asan_signature`、`materials`、`inputs`、`expected_exit` 等）也由 `cases.py` 在选定案例时校验并阻断为 `MATERIAL_MISSING`，不会落到不可领取的 `FAILED/ANALYSIS_ERROR`；已提交任务仍按“任务 → `BLOCKED`”收敛。
+- 情报只读离线快照：记录 `collected_at`、来源 URL 和快照 SHA-256。快照与注册表 / Git 提交不一致时阻断为 `SOURCE_CONFLICT`；缺失、篡改或摘要不符阻断为 `MATERIAL_MISSING`。清单结构错误（缺少或类型错误的 `cases`、`versions`、`harness`、`asan_signature`、`materials`、`inputs`、`expected_exit` 等）也由 `cases.py` 在选定案例时校验并阻断为 `MATERIAL_MISSING`，不会落到不可领取的 `FAILED/ANALYSIS_ERROR`；已提交任务仍按“任务 → `BLOCKED`”收敛。
 - Git 通过只读 bare 仓库和固定命令模板读取：禁用全局 / 系统 Git 配置、hooks、外部 diff、textconv、子模块拉取和自由 shell。解析 `refs/heads/vulnerable` 与 `refs/heads/fixed` 的完整对象 ID；`manifest["versions"]` 指向的缺陷版 / 修复版源码材料也会按材料清单读取和校验摘要，并与 Git blob 逐字节比对，删除或篡改任一源码文件立即阻断。diff 只保留修改路径和摘要。
 - Tree-sitter C 解析器提取目标函数定义（两版）和 `manifest["harness"]` 指向的实际 harness 文件中的候选调用点，记录真实路径与行号。
 - 分析结果的每条 `fact` 和 `hypothesis` 都必须有可解析的证据引用，`hypothesis` 另需置信级别；证据引用会按 `git:commit`、`git:blob`、`git:diff`、`intel`、`material` 和 `source/<文件路径>#L<行号>` 逐项解析，而不是只做白名单成员检查：`git:blob` 必须存在于该提交的树中，`git:diff` 必须指向两个固定提交间的实际修改路径，`source/` 必须对应案例目录中存在的文件且行号在文件范围内，`material/` 与 `intel/` 必须绑定已读取的材料摘要。harness 的证据引用使用 `manifest["harness"]` 的实际路径。伪造引用、任一 finding 缺证据或模型输出类型不符阻断为 `EVIDENCE_INVALID`。
@@ -224,6 +224,7 @@ uv run pytest -q tests/integration/test_migrations.py
 uv run pytest -q tests/integration/test_workflow_migrations.py
 uv run pytest -q tests/integration/test_worker_and_review.py
 uv run pytest -q tests/integration/test_recovery.py
+uv run pytest -q tests/integration/test_audit.py
 uv run pytest -q tests/integration/test_finalize_crash_recovery.py
 uv run pytest -q tests/integration/test_resume_retry.py
 uv run pytest -q tests/integration/test_prepare_deadlines.py
@@ -234,15 +235,16 @@ uv run pytest -q tests/contract/test_wheel.py
 
 - `tests/contract/test_request.py`、`test_plan.py`、`test_fixtures.py`：请求、计划摘要、案例材料与 B03 记录。
 - `test_agent_contracts.py`：`AgentInput` / `AgentOutput` / `Finding` 的字段、枚举、时间戳、事实与假设的证据要求、可解析引用和错误码。
-- `test_analysis.py`：从真实合成材料生成冻结计划、稳定摘要、事实 / 假设、Tree-sitter 提取、缺件 / 冲突 / 篡改 / 二进制 / 伪造引用 / 外部文本注入 / 可选模型替身；并覆盖源码材料删除与篡改、harness 改名后的实际证据路径、签名变化后的 hypothesis、`asan_options` / `platform` / `toolchain` 摘要绑定、不可解析 ref（缺文件、越界行、缺失 Git 路径、未知材料 / 情报摘要）、文件范围内有效源码行、缺证据假设、Git 超时分类、删除 `versions` / `harness` / `asan_signature` 时阻断为 `AnalysisBlocked(MATERIAL_MISSING)`，以及公告、源码注释、diff 和模型上下文的注入不改变 deterministic facts。
+- `test_analysis.py`：从真实合成材料生成冻结计划、稳定摘要、事实 / 假设、Tree-sitter 提取、缺件 / 冲突 / 篡改 / 二进制 / 伪造引用 / 外部文本注入 / 可选模型替身；并覆盖源码材料删除与篡改、harness 改名后的实际证据路径、签名变化后的 hypothesis、`asan_options` / `platform` / `toolchain` 摘要绑定、不可解析 ref（缺文件、越界行、缺失 Git 路径、未知材料 / 情报摘要）、文件范围内有效源码行、缺证据假设、Git 超时分类、删除 `versions` / `harness` / `asan_signature` 以及错误类型的 `cases` / `versions` / `materials` / `inputs` / `expected_exit`、非 UTF-8 的 registry / manifest / Git 路径、非对象 `isolation` 时阻断为 `AnalysisBlocked(MATERIAL_MISSING)`，以及公告、源码注释、diff 和模型上下文的注入不改变 deterministic facts。
 - `tests/contract/test_wheel.py`：`uv build --wheel` 后解压到临时目录，在不设置 `DATACON_CASE_ROOT` 时校验默认 `fixture-c-parser`，再设置自定义目录校验覆盖生效；断言 wheel 包含 registry / manifest / advisory、双版本源码、harness、`fixture-repo.bundle`、`fix.patch`、`build.sh`、`dependencies.lock` 和全部 inputs，并从解压后的 wheel 真实调用 `analyze_case` 生成计划与 findings。构建配置漏掉 bundle 时，打包断言和真实分析都会失败。
-- `tests/integration/test_worker_and_review.py`：真实 PostgreSQL 中的计划冻结、待审查询、批准 / 拒绝 / 摘要不符 / 过期（含“过期 + 错误摘要”）、重复与冲突决议、worker 领取、binary 不被领取、过期后下一次 worker 同步。
+- `tests/integration/test_worker_and_review.py`：真实 PostgreSQL 中的计划冻结、待审查询、批准 / 拒绝 / 摘要不符 / 过期（含“过期 + 错误摘要”）、重复与冲突决议、worker 领取、binary 不被领取、过期后下一次 worker 同步；错误类型的 `manifest["cases"]` 在 `submit` 阶段 exit 2、在 worker 阶段阻断为 `MATERIAL_MISSING`；`review_deadline_at` 为空的旧 `AWAITING_REVIEW` 记录由审核请求或 worker 收敛为 `BLOCKED/REVIEW_EXPIRED`。
+- `tests/integration/test_audit.py`：断言 claim、plan_frozen、review_recorded、review_expired、workflow_synchronized 审计事件及其 detail；摘要不符/冲突审核追加 `review_refused` 且不改变待审计划，过期审核审计同时记录请求摘要和冻结计划摘要。
 - `tests/integration/test_recovery.py`：待审退出后重启、审核已入库但图未恢复、审核在 `await_review` 窗口提交时旧 worker 不能 finalize、租约过期 / 新代次接管后的写回拒绝（含 `expire_review` 必须有当前代次的有效租约，操作者审核过期路径不受租约影响）、`attempts` 按代次保留历史、阻断后 finalize、计划冻结前 `BLOCKED` 且在 finalize 前退出后的领取与同步、双连接单领取、两个完整 worker 的租约接管收敛（一个计划、无 `FAILED` / `InvalidUpdateError`、检查点仍对应新代次的待审状态）、检查点 `thread_id=job_id`、计划与审核各一份。
 - `tests/integration/test_finalize_crash_recovery.py`：冻结计划后、finalize 前退出时，重启仍待审以及随后批准 / 拒绝 / 审核过期的收敛；检查点可读、无第二个中断、无 `FAILED`，旧代次 finalize 仍被拒绝。
 - `tests/integration/test_resume_retry.py`：待审、已批准、已拒绝和 B1 crash-before-finalize 后夹一次可重试 DB 读取错误恢复；连续两次失败时 `READY`/`BLOCKED` 不被覆盖为 `FAILED`、保持 `workflow_synced=false` 并由租约过期后的新代次收敛；断言无 `InvalidUpdateError`、检查点可读且代次与业务记录一致。
 - `tests/integration/test_prepare_deadlines.py`：进程时钟前后偏移时审核窗口仍由数据库时钟生成；`freeze_plan` 与 `ensure_awaiting_review` 两处都覆盖；分析期间准备期限过期时不写计划并阻断。该测试只覆盖 workflow 的进程时钟偏移，`expire_review` 的租约 / 代次围栏由 `test_recovery.py` 用数据库时钟直接设置 `lease_expires_at` 覆盖。
-- `tests/integration/test_retry.py`：瞬时分析错误重试一次后成功、持续瞬时错误只重试一次后 `FAILED`、非瞬时 `AnalysisBlocked` 不重试、重试前准备时限过期直接 `DEADLINE_EXCEEDED`、检查点瞬时错误重试一次；workflow 级重试复用已持久化分析草稿且保留 `infra_error` 审计记录；草稿写入失败一次时有界重试并复用草稿、连续失败时 fail closed 且不出现第三次分析；分析前 `started` 占位使 `infra_error` 写入失败后仍按 attempt 2 重试、两次失败即 fail closed，草稿与 `block_job` 同时失败、或 `block_job` 始终写不进去时也不会出现第三次分析（后者保留 `PREPARING`）；服务端已提交的 `completed` 草稿不会被 `infra_error` 覆盖；`record_attempt` 返回 `False` 时停止分析（工具审计行、计划行、workflow 成功 / 失败标记分别覆盖）、不冻结计划、不 finalize 且不把任务改写成 `FAILED`，下一代次可收敛；已提交 `completed` 行拒绝降级；analysis 后 freeze 前退出时旧代次 `attempts` 保留、旧代次写回被拒绝、新代次重新分析并冻结唯一计划。
-- `tests/integration/test_workflow_migrations.py`：001 旧任务在 002 增量迁移后保留，新表 / 列 / 索引存在，计划与审核每任务唯一，迁移可重复执行；003 在不丢数据的前提下把旧 `attempts` 唯一键升级为包含 `generation`。
+- `tests/integration/test_retry.py`：瞬时分析错误重试一次后成功、持续瞬时错误只重试一次后 `FAILED`、非瞬时 `AnalysisBlocked` 不重试、重试前准备时限过期直接 `DEADLINE_EXCEEDED`、检查点瞬时错误重试一次；workflow 级重试复用已持久化分析草稿且保留 `infra_error` 审计记录；草稿写入失败一次时有界重试并复用草稿、连续失败时 fail closed 且不出现第三次分析；分析前 `started` 占位使 `infra_error` 写入失败后仍按 attempt 2 重试、两次失败即 fail closed，草稿与 `block_job` 同时失败、或 `block_job` 始终写不进去时也不会出现第三次分析（后者保留 `PREPARING`）；服务端已提交的 `completed` 草稿不会被 `infra_error` 覆盖；`record_attempt` 返回 `False` 时停止分析（工具审计行、计划行、workflow 成功 / 失败标记分别覆盖）、不 finalize 且不把任务改写成 `FAILED`；plan 行被拒绝时计划已经冻结，但不再挂起审核，下一代次复用该计划并收敛；已提交 `completed` 行拒绝降级、不同结果的 completed 重写和未知状态；analysis 后 freeze 前退出时旧代次 `attempts` 保留、旧代次写回被拒绝、新代次重新分析并冻结唯一计划；逃逸到 `_process_claim` 的持续 freeze / checkpoint 读取错误保持 `PREPARING`、保留租约且不写 `FAILED`，下一代次恢复并冻结计划。
+- `tests/integration/test_workflow_migrations.py`：001 旧任务在 002 增量迁移后保留，新表 / 列 / 索引存在，计划与审核每任务唯一，迁移可重复执行；003 在不丢数据的前提下把旧 `attempts` 唯一键升级为包含 `generation`；004 把旧 binary 的 `workflow_synced` 回填为 `true` 且可重复执行，worker 的 claim 查询排除 `UNSUPPORTED_TARGET`。
 - `tests/integration/test_fixture_replay.py`：宿主 clang + ASan 的 B01/B02 合成回放，仍是 T01 材料回归，不是 T05 容器隔离验收。
 
 未设置 `DATACON_TEST_DATABASE_URL` 时，PostgreSQL 用例跳过；契约、Agent 和分析用例仍离线运行。
@@ -261,7 +263,7 @@ src/datacon/
   agents/analysis.py    离线情报、版本、diff、事实 / 假设与计划冻结
   tools/source.py       受限 Git 与 Tree-sitter
   data/cases/           wheel 默认案例注册表与合成材料
-migrations/             001 任务表、002 工作流增量、003 attempts 代次键升级
+migrations/             001 任务表、002 工作流增量、003 attempts 代次键升级、004 旧 binary 回填
 examples/               示例请求
 tests/contract/         请求、计划、Agent、分析、wheel 与案例材料 / B03
 tests/integration/      真实 PostgreSQL CLI / 审核 / 恢复 / 重试 / 迁移 / ASan 回放

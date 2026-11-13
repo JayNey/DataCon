@@ -35,6 +35,14 @@ class TransientSourceToolError(SourceToolError):
     """
 
 
+def _decode_utf8(payload: bytes, *, tool_id: str, message: str) -> str:
+    """Decode Git path metadata, blocking non-UTF-8 trees as material errors."""
+    try:
+        return payload.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise SourceToolError(tool_id, message) from error
+
+
 @dataclass(frozen=True)
 class GitDiff:
     patch: bytes
@@ -116,6 +124,8 @@ class GitRepository:
                     [*base, *arguments],
                     capture_output=True,
                     text=True,
+                    encoding="utf-8",
+                    errors="replace",
                     timeout=30,
                     env=environment,
                 )
@@ -239,8 +249,13 @@ class GitRepository:
         if not _OID.fullmatch(commit):
             raise SourceToolError("git.resolve", "commit must be a full object ID")
         output = self._run("ls-tree", "-r", "-z", commit, "--")
+        tree = _decode_utf8(
+            output,
+            tool_id="git.resolve",
+            message="repository tree contains a non-UTF-8 path",
+        )
         paths = set()
-        for line in output.decode("utf-8", "strict").split("\x00"):
+        for line in tree.split("\x00"):
             if not line:
                 continue
             metadata, separator, raw = line.partition("\t")
@@ -256,7 +271,12 @@ class GitRepository:
             _, object_type, _ = fields
             if object_type != "blob":
                 continue
-            paths.add(jsonutil.safe_relative_path(raw, "repository path"))
+            try:
+                paths.add(jsonutil.safe_relative_path(raw, "repository path"))
+            except ValueError as error:
+                raise SourceToolError(
+                    "git.resolve", f"repository path is not allowed: {error}"
+                ) from error
         if len(paths) > MAX_TREE_PATHS:
             raise SourceToolError("git.resolve", "repository tree is too large")
         return frozenset(paths)
@@ -287,10 +307,20 @@ class GitRepository:
             fixed,
             "--",
         )
+        path_text = _decode_utf8(
+            names,
+            tool_id="git.diff",
+            message="changed paths contain a non-UTF-8 path",
+        )
         paths = []
-        for raw in names.decode("utf-8", "strict").splitlines():
+        for raw in path_text.splitlines():
             if raw:
-                paths.append(jsonutil.safe_relative_path(raw, "changed path"))
+                try:
+                    paths.append(jsonutil.safe_relative_path(raw, "changed path"))
+                except ValueError as error:
+                    raise SourceToolError(
+                        "git.diff", f"changed path is not allowed: {error}"
+                    ) from error
         if not paths:
             raise SourceToolError("git.diff", "the revisions have no changed paths")
         return GitDiff(
