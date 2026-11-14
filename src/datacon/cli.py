@@ -13,7 +13,7 @@ from uuid import UUID
 
 import psycopg
 
-from datacon import state, store, workflow
+from datacon import evidence, state, store, workflow
 from datacon.contracts import MAX_REQUEST_BYTES, InvalidRequest, parse_request
 
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
@@ -65,6 +65,21 @@ def _parser() -> argparse.ArgumentParser:
         help="process at most one claim and exit (used by local acceptance runs)",
     )
     worker.add_argument("--poll-seconds", type=float, default=2.0)
+    worker.add_argument(
+        "--prepare-only",
+        action="store_true",
+        help="stop after workflow/review reconciliation (keeps READY jobs unexecuted)",
+    )
+
+    export = commands.add_parser("export", help="export the archived evidence bundle")
+    export.add_argument("job_id")
+    export.add_argument("--out", required=True, type=Path)
+
+    verify = commands.add_parser(
+        "verify-bundle", help="verify an evidence bundle offline"
+    )
+    verify.add_argument("directory", type=Path)
+    verify.add_argument("--expected-digest", default=None)
     return parser
 
 
@@ -112,6 +127,8 @@ def _submit(args) -> int:
         result = store.submit(dsn, request, operator_id=operator)
     except psycopg.Error as error:
         return _error(1, "DATABASE_ERROR", _database_error_message(error))
+    except RuntimeError as error:
+        return _error(1, "INVALID_CONFIGURATION", str(error))
     print(json.dumps(result, ensure_ascii=False))
     return 0
 
@@ -181,11 +198,107 @@ def _worker(args) -> int:
         return _error(2, "INVALID_REQUEST", "poll_seconds must be positive")
     try:
         result = workflow.run_worker(
-            dsn, once=args.once, poll_seconds=args.poll_seconds
+            dsn,
+            once=args.once,
+            poll_seconds=args.poll_seconds,
+            execute=not args.prepare_only,
         )
     except psycopg.Error as error:
         return _error(1, "DATABASE_ERROR", _database_error_message(error))
+    except RuntimeError as error:
+        return _error(1, "INVALID_CONFIGURATION", str(error))
     print(json.dumps(result, ensure_ascii=False))
+    return 0
+
+
+def _export(args) -> int:
+    job_id = _parse_job_id(args.job_id)
+    if job_id is None:
+        return _error(2, "INVALID_REQUEST", "job_id must be a UUID")
+    dsn = _database_url()
+    if not dsn:
+        return _error(1, "DATABASE_NOT_CONFIGURED", "set DATACON_DATABASE_URL")
+    try:
+        job = state.load_job(dsn, job_id)
+    except psycopg.Error as error:
+        return _error(1, "DATABASE_ERROR", _database_error_message(error))
+    if job is None:
+        return _error(3, "JOB_NOT_FOUND", "job does not exist")
+    if (
+        job.get("evidence_status") != "archived"
+        or not job.get("evidence_path")
+        or not job.get("evidence_digest")
+    ):
+        return _error(
+            3,
+            "EVIDENCE_NOT_AVAILABLE",
+            "no archived evidence bundle is available for this job",
+        )
+    try:
+        verified = evidence.verify_bundle(job["evidence_path"])
+    except evidence.BundleError as error:
+        return _error(3, error.reason_code, error.message)
+    except OSError as error:
+        return _error(3, "EVIDENCE_NOT_AVAILABLE", str(error))
+    if verified.manifest_digest != job["evidence_digest"]:
+        return _error(
+            3,
+            "EVIDENCE_INTEGRITY_ERROR",
+            "the archived bundle digest does not match the trusted task record",
+        )
+    try:
+        exported = evidence.export_bundle(
+            verified.root,
+            args.out,
+            expected_manifest_digest=job["evidence_digest"],
+        )
+    except evidence.BundleError as error:
+        return _error(3, error.reason_code, error.message)
+    except OSError as error:
+        return _error(3, "EVIDENCE_NOT_AVAILABLE", str(error))
+    print(
+        json.dumps(
+            {
+                "job_id": str(job_id),
+                "out": str(exported.root),
+                "manifest_digest": exported.manifest_digest,
+                "files": len(exported.manifest["files"]),
+                "verdict": exported.manifest.get("verdict"),
+            },
+            ensure_ascii=False,
+        )
+    )
+    return 0
+
+
+def _verify_bundle(args) -> int:
+    expected = args.expected_digest
+    if expected is not None and not _DIGEST.fullmatch(expected):
+        return _error(2, "INVALID_REQUEST", "expected digest must be a sha256 digest")
+    try:
+        verified = evidence.verify_bundle(args.directory)
+    except evidence.BundleError as error:
+        return _error(3, error.reason_code, error.message)
+    except OSError as error:
+        return _error(3, "EVIDENCE_NOT_AVAILABLE", str(error))
+    if expected is not None and verified.manifest_digest != expected:
+        return _error(
+            3,
+            "EVIDENCE_INTEGRITY_ERROR",
+            "the bundle manifest digest does not match the expected digest",
+        )
+    print(
+        json.dumps(
+            {
+                "status": "valid",
+                "job_id": verified.manifest["job_id"],
+                "manifest_digest": verified.manifest_digest,
+                "files": len(verified.manifest["files"]),
+                "verdict": verified.manifest.get("verdict"),
+            },
+            ensure_ascii=False,
+        )
+    )
     return 0
 
 
@@ -199,4 +312,8 @@ def main(argv: list[str] | None = None) -> int:
         return _review(args)
     if args.command == "worker":
         return _worker(args)
+    if args.command == "export":
+        return _export(args)
+    if args.command == "verify-bundle":
+        return _verify_bundle(args)
     return _error(2, "INVALID_REQUEST", "unknown command")

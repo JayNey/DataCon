@@ -370,6 +370,7 @@ def _isolation(value: Any) -> dict[str, Any]:
             "no_new_privileges",
             "seccomp",
         },
+        optional={"seccomp_profile_digest"},
     )
     network = _text(value["network"], label="isolation.network")
     if network != "none":
@@ -392,7 +393,7 @@ def _isolation(value: Any) -> dict[str, Any]:
         raise ValueError(
             "isolation.seccomp must be runtime/default or docker/default"
         )
-    return {
+    normalized = {
         "network": network,
         "user": user,
         "read_only_root": True,
@@ -400,6 +401,11 @@ def _isolation(value: Any) -> dict[str, Any]:
         "no_new_privileges": True,
         "seccomp": seccomp,
     }
+    if "seccomp_profile_digest" in value:
+        normalized["seccomp_profile_digest"] = _digest(
+            value["seccomp_profile_digest"], label="isolation.seccomp_profile_digest"
+        )
+    return normalized
 
 
 def _intel(value: Any) -> dict[str, Any]:

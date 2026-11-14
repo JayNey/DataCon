@@ -143,6 +143,7 @@ def test_wheel_install_has_default_case_registry(tmp_path):
         "datacon/data/cases/inputs/candidate.txt",
         "datacon/data/cases/inputs/clean.txt",
         "datacon/data/cases/inputs/normal.txt",
+        "datacon/data/seccomp/default.json",
     ):
         assert relative in names, relative
 

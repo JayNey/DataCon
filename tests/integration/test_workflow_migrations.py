@@ -13,6 +13,7 @@ MIGRATION_001 = ROOT / "migrations" / "001_create_jobs.sql"
 MIGRATION_002 = ROOT / "migrations" / "002_workflow.sql"
 MIGRATION_003 = ROOT / "migrations" / "003_attempts_generation.sql"
 MIGRATION_004 = ROOT / "migrations" / "004_legacy_binary_sync.sql"
+MIGRATION_005 = ROOT / "migrations" / "005_execution_evidence.sql"
 
 
 def _relation_kind(connection, schema_name, relation_name):
@@ -360,3 +361,154 @@ def test_004_backfills_legacy_binary_and_is_rerunnable(postgres_dsn):
                     sql.Identifier(schema_name)
                 )
             )
+
+
+def test_005_execution_evidence_is_incremental_and_rerunnable(postgres_dsn):
+    schema_name = f"datacon_execution_migration_{uuid4().hex}"
+    job_id = uuid4()
+    request = {
+        "schema_version": 1,
+        "cve_id": "CVE-2099-0001",
+        "target": {
+            "kind": "source",
+            "case_id": "fixture-c-parser",
+            "goal": "execution migration",
+        },
+        "limits": {
+            "prepare_seconds": 600,
+            "execute_seconds": 1200,
+            "replay_seconds": 10,
+            "cpu": 2,
+            "memory_mib": 2048,
+            "pids": 128,
+            "scratch_mib": 512,
+        },
+    }
+    with psycopg.connect(
+        postgres_dsn, autocommit=True, connect_timeout=5
+    ) as connection:
+        connection.execute(
+            sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(schema_name))
+        )
+        try:
+            connection.execute(
+                sql.SQL("SET search_path TO {}").format(sql.Identifier(schema_name))
+            )
+            for migration in (
+                MIGRATION_001,
+                MIGRATION_002,
+                MIGRATION_003,
+                MIGRATION_004,
+                MIGRATION_005,
+            ):
+                connection.execute(migration.read_text(encoding="utf-8"))
+            connection.execute(
+                "INSERT INTO jobs (job_id, request, state) VALUES (%s, %s, 'READY')",
+                (job_id, Jsonb(request)),
+            )
+            # Re-running 005 must preserve the row and its new NULL metadata.
+            connection.execute(MIGRATION_005.read_text(encoding="utf-8"))
+            columns = {
+                row[0]
+                for row in connection.execute(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_schema = %s AND table_name = 'jobs'",
+                    (schema_name,),
+                ).fetchall()
+            }
+            assert {
+                "verdict",
+                "verdict_reason",
+                "evidence_digest",
+                "evidence_path",
+                "evidence_status",
+                "evidence_error",
+            } <= columns
+            assert connection.execute(
+                "SELECT count(*) FROM jobs WHERE job_id = %s", (job_id,)
+            ).fetchone()[0] == 1
+            connection.execute(
+                "UPDATE jobs SET verdict = 'REPRODUCED', "
+                "evidence_status = 'archived' WHERE job_id = %s",
+                (job_id,),
+            )
+            with pytest.raises(psycopg.errors.CheckViolation):
+                connection.execute(
+                    "UPDATE jobs SET verdict = 'MAYBE' WHERE job_id = %s",
+                    (job_id,),
+                )
+        finally:
+            connection.execute(
+                sql.SQL("DROP SCHEMA IF EXISTS {} CASCADE").format(
+                    sql.Identifier(schema_name)
+                )
+            )
+
+
+def test_005_migration_is_serialized_under_concurrency(postgres_dsn):
+    from concurrent.futures import ThreadPoolExecutor
+    import threading
+
+    schema_name = f"datacon_005_concurrent_{uuid4().hex}"
+    with psycopg.connect(
+        postgres_dsn, autocommit=True, connect_timeout=5
+    ) as admin:
+        admin.execute(
+            sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(schema_name))
+        )
+    try:
+        setup_dsn = postgres_dsn
+        with psycopg.connect(
+            postgres_dsn, autocommit=True, connect_timeout=5
+        ) as connection:
+            connection.execute(
+                sql.SQL("SET search_path TO {}").format(sql.Identifier(schema_name))
+            )
+            for migration in (
+                MIGRATION_001,
+                MIGRATION_002,
+                MIGRATION_003,
+                MIGRATION_004,
+            ):
+                connection.execute(migration.read_text(encoding="utf-8"))
+        barrier = threading.Barrier(2)
+
+        def apply():
+            with psycopg.connect(setup_dsn, autocommit=True, connect_timeout=10) as connection:
+                connection.execute(
+                    sql.SQL("SET search_path TO {}").format(
+                        sql.Identifier(schema_name)
+                    )
+                )
+                barrier.wait(timeout=20)
+                connection.execute(MIGRATION_005.read_text(encoding="utf-8"))
+                return "ok"
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(lambda _: apply(), range(2)))
+        assert results == ["ok", "ok"]
+        with psycopg.connect(postgres_dsn, autocommit=True) as connection:
+            connection.execute(
+                sql.SQL("SET search_path TO {}").format(sql.Identifier(schema_name))
+            )
+            assert _relation_kind(connection, schema_name, "jobs") is not None
+            assert connection.execute(
+                "SELECT count(*) FROM pg_constraint WHERE conrelid = 'jobs'::regclass "
+                "AND conname = 'jobs_verdict_check'"
+            ).fetchone()[0] == 1
+    finally:
+        with psycopg.connect(
+            postgres_dsn, autocommit=True, connect_timeout=5
+        ) as admin:
+            admin.execute(
+                sql.SQL("DROP SCHEMA IF EXISTS {} CASCADE").format(
+                    sql.Identifier(schema_name)
+                )
+            )
+
+
+def test_incremental_migrations_take_the_advisory_lock():
+    for migration in (MIGRATION_005, ROOT / "migrations" / "006_attempt_journal_provenance.sql"):
+        text = migration.read_text(encoding="utf-8")
+        assert "pg_advisory_xact_lock" in text, migration.name
+        assert text.index("pg_advisory_xact_lock") < text.index("ALTER TABLE")
