@@ -1,0 +1,62 @@
+{
+  "schema_version": 1,
+  "material_root": ".",
+  "manifest": "manifest.json",
+  "policy_version": "1",
+  "isolation": {
+    "network": "none",
+    "user": "65534:65534",
+    "read_only_root": true,
+    "cap_drop": ["ALL"],
+    "no_new_privileges": true,
+    "seccomp": "runtime/default"
+  },
+  "cases": {
+    "fixture-c-parser": {
+      "cve_id": "CVE-2099-0001",
+      "benchmark_id": "B01",
+      "repository": {
+        "origin": "fixture://datacon/B01",
+        "bundle": "fixture-repo.bundle",
+        "bundle_digest": "sha256:a220a3db0596a2b3ac2093676ede0e74bbd3209211ef45a0d6b0efbbb746d8a1",
+        "source_path": "parser.c",
+        "refs": {
+          "vulnerable": "refs/heads/vulnerable",
+          "fixed": "refs/heads/fixed"
+        },
+        "commits": {
+          "vulnerable": "07281ef141ece556cf9b0d37dd2233b6beceb566",
+          "fixed": "4c481b77b733d61b8946e0d3fada5be978cd611e"
+        },
+        "patch": "fix.patch"
+      },
+      "advisory": {
+        "path": "advisory.json",
+        "digest": "sha256:0ae4a1322297c7416970967cc3e6e511b1019341068dd21c448b120854adaf91"
+      }
+    },
+    "fixture-c-parser-clean": {
+      "cve_id": "CVE-2099-0001",
+      "benchmark_id": "B02",
+      "repository": {
+        "origin": "fixture://datacon/B02",
+        "bundle": "fixture-repo.bundle",
+        "bundle_digest": "sha256:a220a3db0596a2b3ac2093676ede0e74bbd3209211ef45a0d6b0efbbb746d8a1",
+        "source_path": "parser.c",
+        "refs": {
+          "vulnerable": "refs/heads/vulnerable",
+          "fixed": "refs/heads/fixed"
+        },
+        "commits": {
+          "vulnerable": "07281ef141ece556cf9b0d37dd2233b6beceb566",
+          "fixed": "4c481b77b733d61b8946e0d3fada5be978cd611e"
+        },
+        "patch": "fix.patch"
+      },
+      "advisory": {
+        "path": "advisory.json",
+        "digest": "sha256:0ae4a1322297c7416970967cc3e6e511b1019341068dd21c448b120854adaf91"
+      }
+    }
+  }
+}

@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "cve_id": "CVE-2099-0001",
+  "collected_at": "2026-01-02T00:00:00Z",
+  "summary": "Synthetic advisory for the offline B01/B02 parser case. The vulnerable revision writes the string terminator one byte past a four-byte allocation; the fixed revision allocates one additional byte. This snapshot is test data and is never fetched over the network.",
+  "sources": [
+    {
+      "name": "Synthetic NVD snapshot",
+      "url": "https://nvd.invalid/vuln/detail/CVE-2099-0001",
+      "published_at": "2026-01-01",
+      "vulnerable_commit": "07281ef141ece556cf9b0d37dd2233b6beceb566",
+      "fixed_commit": "4c481b77b733d61b8946e0d3fada5be978cd611e"
+    },
+    {
+      "name": "Synthetic vendor advisory",
+      "url": "https://vendor.invalid/advisories/CVE-2099-0001",
+      "published_at": "2026-01-02",
+      "vulnerable_commit": "07281ef141ece556cf9b0d37dd2233b6beceb566",
+      "fixed_commit": "4c481b77b733d61b8946e0d3fada5be978cd611e"
+    }
+  ],
+  "vulnerable_commit": "07281ef141ece556cf9b0d37dd2233b6beceb566",
+  "fixed_commit": "4c481b77b733d61b8946e0d3fada5be978cd611e"
+}

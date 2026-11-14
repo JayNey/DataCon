@@ -27,6 +27,7 @@ INVALID_UTF8_REQUEST = (
 )
 NAN_REQUEST = REQUEST.replace('"goal":"验证 ASan"', '"goal":NaN')
 INFINITY_REQUEST = REQUEST.replace('"goal":"验证 ASan"', '"goal":Infinity')
+OVERSIZED_REQUEST = REQUEST.replace('"goal":"验证 ASan"', '"goal":"' + "x" * 70000 + '"')
 DEFAULTS = {
     "prepare_seconds": 600,
     "execute_seconds": 1200,
@@ -38,12 +39,15 @@ DEFAULTS = {
 }
 
 
-def cli(*args, database_url=None):
+def cli(*args, database_url=None, env_extra=None):
     executable = Path(sys.executable).with_name("datacon")
     env = os.environ.copy()
     env.pop("DATACON_DATABASE_URL", None)
+    env.pop("DATACON_CASE_ROOT", None)
     if database_url is not None:
         env["DATACON_DATABASE_URL"] = database_url
+    if env_extra:
+        env.update(env_extra)
     return subprocess.run(
         [str(executable), *args],
         capture_output=True,
@@ -149,6 +153,7 @@ def test_binary_submit_is_archived_as_blocked(database, postgres_dsn, tmp_path):
         pytest.param(INVALID_UTF8_REQUEST, id="invalid-utf8"),
         pytest.param(NAN_REQUEST, id="nan"),
         pytest.param(INFINITY_REQUEST, id="infinity"),
+        pytest.param(OVERSIZED_REQUEST, id="oversized"),
     ],
 )
 def test_invalid_request_is_rejected_before_database_connection(
@@ -172,6 +177,47 @@ def test_invalid_request_is_rejected_before_database_connection(
     # Re-run against the reachable database to confirm rejection stays free of
     # side effects; the unreachable run above proves validation wins over I/O.
     reachable = cli("submit", "--request", str(request), database_url=postgres_dsn)
+    assert reachable.returncode == 2, reachable.stderr
+    assert json.loads(reachable.stderr)["reason_code"] == "INVALID_REQUEST"
+    assert database.execute("SELECT count(*) FROM jobs").fetchone()[0] == before
+
+
+def test_unresolvable_case_root_is_rejected_before_database_connection(
+    database, postgres_dsn, tmp_path
+):
+    """A symlink-loop case root is a request error, not an uncaught RuntimeError."""
+    request = tmp_path / "request.json"
+    request.write_text(REQUEST, encoding="utf-8")
+    loop_root = tmp_path / "caseloop"
+    loop_root.symlink_to("caseloop")
+    env_extra = {"DATACON_CASE_ROOT": str(loop_root)}
+    before = database.execute("SELECT count(*) FROM jobs").fetchone()[0]
+
+    result = cli(
+        "submit",
+        "--request",
+        str(request),
+        database_url=UNREACHABLE_DATABASE_URL,
+        env_extra=env_extra,
+    )
+
+    assert result.returncode == 2, result.stderr
+    assert result.stdout == ""
+    assert len(result.stderr.strip().splitlines()) == 1
+    payload = json.loads(result.stderr)
+    assert payload["reason_code"] == "INVALID_REQUEST"
+    assert "Traceback" not in result.stderr
+    assert "RuntimeError" not in result.stderr
+
+    # Re-run against the reachable database to confirm rejection has no side
+    # effects; the unreachable run above proves validation wins over I/O.
+    reachable = cli(
+        "submit",
+        "--request",
+        str(request),
+        database_url=postgres_dsn,
+        env_extra=env_extra,
+    )
     assert reachable.returncode == 2, reachable.stderr
     assert json.loads(reachable.stderr)["reason_code"] == "INVALID_REQUEST"
     assert database.execute("SELECT count(*) FROM jobs").fetchone()[0] == before

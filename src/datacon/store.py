@@ -7,6 +7,8 @@ from uuid import UUID, uuid4
 import psycopg
 from psycopg.types.json import Jsonb
 
+from datacon import state
+
 
 def initial_state(request: dict) -> tuple[str, str | None]:
     """Return the submit-time state and reason code for a valid request.
@@ -19,34 +21,27 @@ def initial_state(request: dict) -> tuple[str, str | None]:
     return "QUEUED", None
 
 
-def submit(dsn: str, request: dict) -> dict:
+def submit(dsn: str, request: dict, *, operator_id: str | None = None) -> dict:
     """Insert one job and return its identity and initial state."""
     job_id = uuid4()
-    state, reason_code = initial_state(request)
+    job_state, reason_code = initial_state(request)
     with psycopg.connect(dsn, connect_timeout=5) as connection:
         row = connection.execute(
-            "INSERT INTO jobs (job_id, request, state, reason_code) "
-            "VALUES (%s, %s, %s, %s) RETURNING state",
-            (job_id, Jsonb(request), state, reason_code),
+            "INSERT INTO jobs "
+            "(job_id, request, state, reason_code, operator_id, workflow_synced) "
+            "VALUES (%s, %s, %s, %s, %s, %s) RETURNING state",
+            (
+                job_id,
+                Jsonb(request),
+                job_state,
+                reason_code,
+                operator_id,
+                job_state == "BLOCKED",
+            ),
         ).fetchone()
     return {"job_id": str(job_id), "state": row[0]}
 
 
 def status(dsn: str, job_id: UUID) -> dict | None:
     """Read one job; return None when the identifier is unknown."""
-    with psycopg.connect(dsn, connect_timeout=5) as connection:
-        row = connection.execute(
-            "SELECT state, reason_code FROM jobs WHERE job_id = %s", (job_id,)
-        ).fetchone()
-    if row is None:
-        return None
-    return {
-        "job_id": str(job_id),
-        "state": row[0],
-        "stage": None,
-        "pending_plan": None,
-        "review_state": None,
-        "reason_code": row[1],
-        "last_error": None,
-        "evidence_refs": [],
-    }
+    return state.status(dsn, job_id)

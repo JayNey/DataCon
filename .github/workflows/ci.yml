@@ -58,25 +58,170 @@ jobs:
             echo "setuptools must not be resolved as the build backend" >&2
             exit 1
           fi
-      - name: Apply database migration
+      - name: Apply database migrations
         run: |
           uv run --frozen python - <<'PY'
           import os
+          import pathlib
           import psycopg
 
-          sql = open("migrations/001_create_jobs.sql", encoding="utf-8").read()
           with psycopg.connect(os.environ["DATACON_DATABASE_URL"], autocommit=True) as conn:
-              conn.execute(sql)
+              for migration in sorted(pathlib.Path("migrations").glob("*.sql")):
+                  conn.execute(migration.read_text(encoding="utf-8"))
           PY
       - name: Install host clang, LLVM symbolizer and patch
         run: |
           sudo apt-get update
           sudo apt-get install -y clang llvm patch
-      - name: Verify host ASan smoke toolchain
+      - name: Verify required CI database and toolchain
+        shell: bash
         run: |
-          # Local/CI smoke uses the runner's host clang. The pinned clang 19.1.7
-          # replay image is verified by the T05 task, not here.
+          set -euo pipefail
+          # A missing database or symbolizer must fail here, before pytest can
+          # turn the core PostgreSQL/ASan suites into skips.
+          if [[ -z "${DATACON_TEST_DATABASE_URL:-}" ]]; then
+            echo "DATACON_TEST_DATABASE_URL must be set in CI" >&2
+            exit 1
+          fi
+          for tool in clang llvm-symbolizer patch; do
+            if ! command -v "$tool" >/dev/null 2>&1; then
+              echo "required CI tool is missing: $tool" >&2
+              exit 1
+            fi
+          done
           clang --version
           llvm-symbolizer --version
-      - name: Run contract, PostgreSQL and ASan fixture tests
-        run: uv run --frozen pytest -q
+          patch --version
+      - name: Build wheel and verify packaged case data
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv build --wheel
+          wheel="$(ls -t dist/*.whl | head -n 1)"
+          python - "$wheel" <<'PY'
+          import sys
+          import zipfile
+
+          names = set(zipfile.ZipFile(sys.argv[1]).namelist())
+          required = [
+              "datacon/data/cases/registry.json",
+              "datacon/data/cases/manifest.json",
+              "datacon/data/cases/advisory.json",
+              "datacon/data/cases/vulnerable/parser.c",
+              "datacon/data/cases/fixed/parser.c",
+              "datacon/data/cases/harness.c",
+              "datacon/data/cases/fixture-repo.bundle",
+              "datacon/data/cases/fix.patch",
+              "datacon/data/cases/build.sh",
+              "datacon/data/cases/dependencies.lock",
+              "datacon/data/cases/inputs/candidate.txt",
+              "datacon/data/cases/inputs/clean.txt",
+              "datacon/data/cases/inputs/normal.txt",
+          ]
+          missing = [name for name in required if name not in names]
+          if missing:
+              raise SystemExit(f"wheel is missing case data: {missing}")
+          print("wheel case data ok")
+          PY
+      - name: Install wheel in a clean venv and exercise the entry point
+        shell: bash
+        run: |
+          set -euo pipefail
+          wheel="$(ls -t dist/*.whl | head -n 1)"
+          venv="$RUNNER_TEMP/datacon-venv"
+          rm -rf "$venv"
+          python -m venv "$venv"
+          "$venv/bin/python" -m pip install \
+            --no-index --no-deps --disable-pip-version-check "$wheel"
+          # Dependencies come from the locked project environment. The datacon
+          # package itself must come from the installed wheel, not from a
+          # PYTHONPATH pointing at an unpacked zip.
+          deps_site="$(uv run --frozen python -c \
+            'import sysconfig; print(sysconfig.get_paths()["purelib"])')"
+          export PYTHONPATH="$deps_site"
+          unset DATACON_CASE_ROOT
+          "$venv/bin/datacon" --help
+          "$venv/bin/python" - <<'PY'
+          import importlib.metadata as metadata
+          import json
+          import os
+          import sysconfig
+
+          import datacon
+
+          site = os.path.realpath(sysconfig.get_paths()["purelib"])
+          package_file = os.path.realpath(datacon.__file__)
+          assert package_file.startswith(site + os.sep), package_file
+
+          assert metadata.version("datacon") == "0.1.0"
+          requires = metadata.requires("datacon") or []
+          assert any(item.lower().startswith("psycopg") for item in requires), requires
+          entry_points = {
+              entry.name: entry.value
+              for entry in metadata.entry_points(group="console_scripts")
+          }
+          assert entry_points.get("datacon") == "datacon.cli:main", entry_points
+
+          from datacon.agents.analysis import analyze_case
+          from datacon.contracts import DEFAULT_LIMITS, parse_request
+
+          request = parse_request(
+              json.dumps(
+                  {
+                      "schema_version": 1,
+                      "cve_id": "CVE-2099-0001",
+                      "target": {
+                          "kind": "source",
+                          "case_id": "fixture-c-parser",
+                          "goal": "installed wheel smoke",
+                      },
+                      "limits": dict(DEFAULT_LIMITS),
+                  }
+              )
+          )
+          assert request["target"]["case_id"] == "fixture-c-parser"
+          analyzed = analyze_case(request)
+          assert analyzed.plan["case_id"] == "fixture-c-parser"
+          assert analyzed.plan_digest.startswith("sha256:")
+          print("installed wheel smoke ok")
+          PY
+      - name: Run test suites with zero skips
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          run_suite() {
+            local marker="$1"
+            local label="$2"
+            local report="$RUNNER_TEMP/${label}.xml"
+            uv run --frozen pytest -q -m "$marker" -rs --junitxml="$report"
+            uv run --frozen python - "$report" "$label" <<'PY'
+          import sys
+          import xml.etree.ElementTree as ET
+
+          path, label = sys.argv[1], sys.argv[2]
+          root = ET.parse(path).getroot()
+          suites = [root] if root.tag == "testsuite" else root.findall("testsuite")
+          total = sum(int(suite.get("tests", 0)) for suite in suites)
+          skipped = sum(int(suite.get("skipped", 0)) for suite in suites)
+          failures = sum(int(suite.get("failures", 0)) for suite in suites)
+          errors = sum(int(suite.get("errors", 0)) for suite in suites)
+          print(
+              f"{label}: total={total} skipped={skipped} "
+              f"failures={failures} errors={errors}"
+          )
+          if total == 0:
+              raise SystemExit(f"the {label} suite did not run any tests")
+          if skipped or failures or errors:
+              raise SystemExit(
+                  f"CI requires the {label} suite to pass with zero skips"
+              )
+          PY
+          }
+
+          # T03/T04 PostgreSQL, workflow and migration paths must actually run.
+          run_suite postgres postgres
+          # ASan frame/source assertions must actually run.
+          run_suite asan asan
+          # Contract, analysis, wheel and installed-entry-point checks.
+          run_suite "not postgres and not asan" contract

@@ -24,6 +24,14 @@ def test_defaults_are_filled_when_limits_are_omitted():
     assert parse_request(payload())["limits"] == DEFAULT_LIMITS
 
 
+def test_oversized_request_is_rejected_before_parsing():
+    oversized = payload(goal="x" * (64 * 1024))
+    with pytest.raises(InvalidRequest, match="exceeds"):
+        parse_request(oversized)
+    with pytest.raises(InvalidRequest, match="exceeds"):
+        parse_request(oversized.encode("utf-8"))
+
+
 def test_partial_limits_are_merged_with_defaults():
     request = parse_request(payload(limits={"execute_seconds": 5, "replay_seconds": 5}))
     assert request["limits"] == DEFAULT_LIMITS | {

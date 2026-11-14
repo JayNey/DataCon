@@ -11,6 +11,11 @@ pytestmark = pytest.mark.asan
 CASES = Path(__file__).resolve().parents[1] / "fixtures" / "cases"
 
 
+def _ci_environment() -> bool:
+    value = os.getenv("CI", "").strip().lower()
+    return value not in ("", "0", "false", "no")
+
+
 @pytest.fixture(scope="module")
 def manifest():
     return json.loads((CASES / "manifest.json").read_text(encoding="utf-8"))
@@ -20,7 +25,17 @@ def manifest():
 def compiler():
     executable = shutil.which(os.getenv("CC", "clang"))
     if executable is None:
+        if _ci_environment():
+            pytest.fail(
+                "CI requires clang for the synthetic ASan fixture replay; "
+                "the ASan suite must not be skipped"
+            )
         pytest.skip("clang is required for the synthetic ASan fixture replay")
+    if shutil.which("llvm-symbolizer") is None and _ci_environment():
+        pytest.fail(
+            "CI requires llvm-symbolizer for the ASan frame assertions; "
+            "the ASan suite must not be skipped"
+        )
     return executable
 
 
@@ -105,6 +120,12 @@ def test_b01_candidate_hits_the_expected_asan_signature(manifest, binaries, tmp_
     )
     if not symbolized:
         if shutil.which("llvm-symbolizer") is None:
+            if _ci_environment():
+                pytest.fail(
+                    "CI requires llvm-symbolizer so the ASan function/source "
+                    f"frames for {signature['function']} at "
+                    f"{signature['source']} are actually asserted"
+                )
             pytest.skip(
                 "ASan frames are not symbolized; install llvm-symbolizer to assert "
                 f"{signature['function']} at {signature['source']} (CI installs llvm)"

@@ -1,18 +1,22 @@
-"""CLI entry point for submitting and querying DataCon jobs."""
+"""CLI entry point for submitting, querying, reviewing and working DataCon jobs."""
 
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
 import os
+import re
 import sys
 from pathlib import Path
 from uuid import UUID
 
 import psycopg
 
-from datacon import store
-from datacon.contracts import InvalidRequest, parse_request
+from datacon import state, store, workflow
+from datacon.contracts import MAX_REQUEST_BYTES, InvalidRequest, parse_request
+
+_DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
 
 
 def _error(exit_code: int, reason_code: str, message: str) -> int:
@@ -48,6 +52,19 @@ def _parser() -> argparse.ArgumentParser:
 
     status = commands.add_parser("status", help="look up one job")
     status.add_argument("job_id")
+
+    review = commands.add_parser("review", help="record an operator review decision")
+    review.add_argument("job_id")
+    review.add_argument("--plan-digest", required=True)
+    review.add_argument("--decision", required=True, choices=("approve", "reject"))
+
+    worker = commands.add_parser("worker", help="claim and advance queued jobs")
+    worker.add_argument(
+        "--once",
+        action="store_true",
+        help="process at most one claim and exit (used by local acceptance runs)",
+    )
+    worker.add_argument("--poll-seconds", type=float, default=2.0)
     return parser
 
 
@@ -55,29 +72,54 @@ def _database_url() -> str | None:
     return os.getenv("DATACON_DATABASE_URL")
 
 
-def main(argv: list[str] | None = None) -> int:
-    args = _parser().parse_args(argv)
-
-    if args.command == "submit":
+def _operator_id() -> str:
+    value = os.getenv("DATACON_OPERATOR_ID")
+    if value is None:
         try:
-            request = parse_request(args.request.read_text(encoding="utf-8"))
-        except (InvalidRequest, UnicodeError, OSError) as error:
-            return _error(2, "INVALID_REQUEST", f"cannot read request: {error}")
-        dsn = _database_url()
-        if not dsn:
-            return _error(1, "DATABASE_NOT_CONFIGURED", "set DATACON_DATABASE_URL")
-        try:
-            result = store.submit(dsn, request)
-        except psycopg.Error as error:
-            return _error(1, "DATABASE_ERROR", _database_error_message(error))
-        print(json.dumps(result, ensure_ascii=False))
-        return 0
+            value = getpass.getuser()
+        except Exception:  # noqa: BLE001 - local identity fallback
+            value = "local-operator"
+    value = value.strip()
+    if not value or len(value) > 128:
+        raise ValueError("operator identity must be between 1 and 128 characters")
+    if any(character in value for character in "\x00\r\n"):
+        raise ValueError("operator identity contains control characters")
+    return value
 
+
+def _parse_job_id(value: str) -> UUID | None:
     try:
-        job_id = UUID(args.job_id)
+        return UUID(value)
     except (AttributeError, TypeError, ValueError):
-        return _error(2, "INVALID_REQUEST", "job_id must be a UUID")
+        return None
 
+
+def _submit(args) -> int:
+    try:
+        size = args.request.stat().st_size
+        if size > MAX_REQUEST_BYTES:
+            raise ValueError(
+                f"request payload exceeds {MAX_REQUEST_BYTES} bytes"
+            )
+        request = parse_request(args.request.read_text(encoding="utf-8"))
+        operator = _operator_id()
+    except (InvalidRequest, UnicodeError, OSError, ValueError) as error:
+        return _error(2, "INVALID_REQUEST", f"cannot read request: {error}")
+    dsn = _database_url()
+    if not dsn:
+        return _error(1, "DATABASE_NOT_CONFIGURED", "set DATACON_DATABASE_URL")
+    try:
+        result = store.submit(dsn, request, operator_id=operator)
+    except psycopg.Error as error:
+        return _error(1, "DATABASE_ERROR", _database_error_message(error))
+    print(json.dumps(result, ensure_ascii=False))
+    return 0
+
+
+def _status(args) -> int:
+    job_id = _parse_job_id(args.job_id)
+    if job_id is None:
+        return _error(2, "INVALID_REQUEST", "job_id must be a UUID")
     dsn = _database_url()
     if not dsn:
         return _error(1, "DATABASE_NOT_CONFIGURED", "set DATACON_DATABASE_URL")
@@ -89,3 +131,72 @@ def main(argv: list[str] | None = None) -> int:
         return _error(3, "JOB_NOT_FOUND", "job does not exist")
     print(json.dumps(result, ensure_ascii=False))
     return 0
+
+
+def _review(args) -> int:
+    job_id = _parse_job_id(args.job_id)
+    if job_id is None:
+        return _error(2, "INVALID_REQUEST", "job_id must be a UUID")
+    if not _DIGEST.fullmatch(args.plan_digest):
+        return _error(2, "INVALID_REQUEST", "plan_digest must be a sha256 digest")
+    try:
+        operator = _operator_id()
+    except ValueError as error:
+        return _error(2, "INVALID_REQUEST", str(error))
+    dsn = _database_url()
+    if not dsn:
+        return _error(1, "DATABASE_NOT_CONFIGURED", "set DATACON_DATABASE_URL")
+    try:
+        outcome = state.record_review(
+            dsn,
+            job_id,
+            plan_digest=args.plan_digest,
+            decision=args.decision,
+            reviewer_id=operator,
+        )
+    except psycopg.Error as error:
+        return _error(1, "DATABASE_ERROR", _database_error_message(error))
+    except state.StateError as error:
+        return _error(3, "REVIEW_ERROR", str(error))
+
+    if outcome.status in ("applied", "idempotent"):
+        payload = {
+            "job_id": str(job_id),
+            "state": outcome.state,
+            "decision": outcome.review["decision"] if outcome.review else args.decision,
+            "plan_digest": outcome.review["plan_digest"] if outcome.review else args.plan_digest,
+            "reviewer_id": outcome.review["reviewer_id"] if outcome.review else operator,
+            "idempotent": outcome.status == "idempotent",
+        }
+        print(json.dumps(payload, ensure_ascii=False))
+        return 0
+    return _error(3, outcome.reason_code, outcome.message or "review was not recorded")
+
+
+def _worker(args) -> int:
+    dsn = _database_url()
+    if not dsn:
+        return _error(1, "DATABASE_NOT_CONFIGURED", "set DATACON_DATABASE_URL")
+    if not (args.poll_seconds > 0):
+        return _error(2, "INVALID_REQUEST", "poll_seconds must be positive")
+    try:
+        result = workflow.run_worker(
+            dsn, once=args.once, poll_seconds=args.poll_seconds
+        )
+    except psycopg.Error as error:
+        return _error(1, "DATABASE_ERROR", _database_error_message(error))
+    print(json.dumps(result, ensure_ascii=False))
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _parser().parse_args(argv)
+    if args.command == "submit":
+        return _submit(args)
+    if args.command == "status":
+        return _status(args)
+    if args.command == "review":
+        return _review(args)
+    if args.command == "worker":
+        return _worker(args)
+    return _error(2, "INVALID_REQUEST", "unknown command")

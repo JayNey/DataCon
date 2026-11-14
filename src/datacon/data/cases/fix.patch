@@ -1,0 +1,21 @@
+--- a/parser.c
++++ b/parser.c
+@@ -4,17 +4,12 @@
+ 
+ enum { MAX_TOKEN = 4 };
+ 
+-/*
+- * B01 vulnerable revision: the terminator is written one byte past the
+- * MAX_TOKEN-byte allocation when the caller passes exactly MAX_TOKEN bytes.
+- * The fixed revision allocates MAX_TOKEN + 1.
+- */
+ char *parse_token(const char *input, size_t size)
+ {
+     if (size > MAX_TOKEN)
+         return NULL;
+ 
+-    char *token = malloc(MAX_TOKEN);
++    char *token = malloc(MAX_TOKEN + 1);
+     if (token == NULL)
+         return NULL;
+ 

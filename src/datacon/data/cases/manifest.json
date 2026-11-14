@@ -1,0 +1,91 @@
+{
+  "schema_version": 1,
+  "benchmark_set": "B01-B02",
+  "source_mode": "fixture",
+  "cve_id": "CVE-2099-0001",
+  "source": "https://github.com/JayNey/DataCon",
+  "license": "MIT",
+  "platform": "linux/amd64",
+  "image": "silkeh/clang:19-bookworm@sha256:f5ce959d91f059acf5a4b3f1c19f46713c4b2881c7d7cd1d5143ca1d1412277f",
+  "toolchain": {
+    "compiler": "clang",
+    "local_smoke": "host clang; version not pinned",
+    "sanitizer": "address",
+    "pinned_image_version": "19.1.7",
+    "pinned_image_verified_in": "T05",
+    "image_digest_verified_local": false
+  },
+  "versions": {
+    "vulnerable": "vulnerable/parser.c",
+    "fixed": "fixed/parser.c"
+  },
+  "patch": "fix.patch",
+  "dependencies": "dependencies.lock",
+  "build_recipe": "build.sh",
+  "harness": "harness.c",
+  "asan_options": "detect_leaks=0:halt_on_error=1:abort_on_error=0:exitcode=86",
+  "asan_signature": {
+    "error": "heap-buffer-overflow",
+    "operation": "WRITE",
+    "access_size": 1,
+    "function": "parse_token",
+    "source": "parser.c"
+  },
+  "limits": {
+    "prepare_seconds": 600,
+    "execute_seconds": 1200,
+    "replay_seconds": 10,
+    "cpu": 2,
+    "memory_mib": 2048,
+    "pids": 128,
+    "scratch_mib": 512
+  },
+  "cases": {
+    "B01": {
+      "case_id": "fixture-c-parser",
+      "description": "Vulnerable revision writes the terminator past a four-byte allocation; fixed revision completes normally.",
+      "inputs": {
+        "normal": "inputs/normal.txt",
+        "candidate": "inputs/candidate.txt"
+      },
+      "expected_exit": {
+        "normal": 0,
+        "candidate_clean": 0,
+        "candidate_asan": 86
+      },
+      "expected_stdout": {
+        "normal": "OK\n",
+        "candidate_clean": "ABCD\n"
+      },
+      "expected_verdict": "REPRODUCED"
+    },
+    "B02": {
+      "case_id": "fixture-c-parser-clean",
+      "description": "The candidate input stays within the vulnerable allocation, so both revisions complete normally.",
+      "inputs": {
+        "normal": "inputs/normal.txt",
+        "candidate": "inputs/clean.txt"
+      },
+      "expected_exit": {
+        "normal": 0,
+        "candidate_clean": 0
+      },
+      "expected_stdout": {
+        "normal": "OK\n",
+        "candidate_clean": "ABC\n"
+      },
+      "expected_verdict": "NOT_REPRODUCED"
+    }
+  },
+  "materials": {
+    "vulnerable/parser.c": "sha256:8a5b602d6c7ce71692e371cf8bc7c67aed3bea89c410f23c69f16b0ceaaa08e9",
+    "fixed/parser.c": "sha256:8107027975e47e90f5091f2ff5e53a2df2c2de3748eb0dcc9f429d59f30a3f5d",
+    "harness.c": "sha256:d37ae12cb384e94932fb80c103ecf5ffd0c406b3fe66ca7b308f45cc0e0c5724",
+    "build.sh": "sha256:4b7b67cdbe366f933485adcf5235eb351d92065109e15cbd0aec370f844136a2",
+    "fix.patch": "sha256:8b8dc1d2b56ee973cda8ebc7e5752cde9a498a3c2831c60cf5b80e5b6c6f947d",
+    "dependencies.lock": "sha256:a6f5703eb7429974154116d3245f73762120c3b69b1714a45dd8f79a1919d921",
+    "inputs/normal.txt": "sha256:a12b7cb43c9d9134b5bb1b35e9096b66775d9e92e7611d1cc92b02edd6782a87",
+    "inputs/candidate.txt": "sha256:7b7632005be0f36c5d1663a6c5ec4d13315589d65e1ef8687fb4b9866f9bc4b0",
+    "inputs/clean.txt": "sha256:8470d56547eea6236d7c81a644ce74670ca0bbda998e13c629ef6bb3f0d60b69"
+  }
+}
