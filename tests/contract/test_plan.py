@@ -8,6 +8,7 @@ from datacon.contracts import (
     analysis_digest,
     canonical_plan_bytes,
     plan_digest,
+    plan_summary,
 )
 
 ANALYSIS = {
@@ -72,6 +73,8 @@ PLAN = {
     "expected_exit": {"normal": 0, "candidate_clean": 0, "candidate_asan": 86},
     "asan_signature": {
         "error": "heap-buffer-overflow",
+        "operation": "WRITE",
+        "access_size": 1,
         "function": "parse_token",
         "source": "parser.c",
     },
@@ -100,6 +103,8 @@ EXPECTED = {
     "asan_options": "detect_leaks=0:halt_on_error=1",
     "asan_signature": {
         "error": "heap-buffer-overflow",
+        "operation": "WRITE",
+        "access_size": 1,
         "function": "parse_token",
         "source": "parser.c",
     },
@@ -142,7 +147,7 @@ EXPECTED = {
     },
 }
 
-EXPECTED_DIGEST = "sha256:bc4a62de4573e6ec3adb5b792ce9b98cf60fd10f4a73ced5b662426f8707524d"
+EXPECTED_DIGEST = "sha256:25bc06d1f504824a092f9d10a572b9784f4133fd07dec5c1b2926366d01b0867"
 
 
 def test_canonical_bytes_and_digest_are_frozen():
@@ -163,6 +168,65 @@ def test_canonical_bytes_and_digest_are_frozen():
         ).encode("utf-8")
     )
     assert plan_digest(reordered) == EXPECTED_DIGEST
+
+
+LEGACY_EXPECTED_DIGEST = (
+    "sha256:bc4a62de4573e6ec3adb5b792ce9b98cf60fd10f4a73ced5b662426f8707524d"
+)
+
+
+def test_plan_without_optional_asan_fields_remains_valid():
+    """Old frozen plans keep their digest; optional fields are not invented."""
+    legacy = deepcopy(PLAN)
+    del legacy["asan_signature"]["operation"]
+    del legacy["asan_signature"]["access_size"]
+
+    assert plan_digest(legacy) == LEGACY_EXPECTED_DIGEST
+    assert plan_summary(legacy)["asan_signature"] == {
+        "error": "heap-buffer-overflow",
+        "function": "parse_token",
+        "source": "parser.c",
+    }
+
+
+def test_plan_summary_carries_operation_and_access_size():
+    summary = plan_summary(PLAN)
+    assert summary["asan_signature"] == PLAN["asan_signature"]
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda plan: plan["asan_signature"].__setitem__("operation", "READ"),
+        lambda plan: plan["asan_signature"].__setitem__("access_size", 2),
+    ],
+)
+def test_digest_binds_asan_operation_and_access_size(mutate):
+    changed = deepcopy(PLAN)
+    mutate(changed)
+    assert plan_digest(changed) != plan_digest(PLAN)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("operation", "read"),
+        ("operation", ""),
+        ("operation", 1),
+        ("operation", True),
+        ("access_size", 0),
+        ("access_size", -1),
+        ("access_size", 1.0),
+        ("access_size", "1"),
+        ("access_size", True),
+        ("access_size", 2**31),
+    ],
+)
+def test_plan_rejects_invalid_asan_operation_and_access_size(field, value):
+    changed = deepcopy(PLAN)
+    changed["asan_signature"][field] = value
+    with pytest.raises(ValueError, match=f"asan_signature.{field}"):
+        plan_digest(changed)
 
 
 ANALYSIS_DIGEST = "sha256:45f59ba07c381c56c19e2e913f752256aa93b7cc2185288fd015b449420f8757"

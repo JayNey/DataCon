@@ -101,6 +101,17 @@ def _locked_job(
     return job
 
 
+def _review_window_closed(deadline: Any, decision_at: Any) -> bool:
+    """Return whether a decision at ``decision_at`` is no longer acceptable.
+
+    The deadline is inclusive: a decision at the exact deadline is already
+    too late. A missing deadline fails closed. ``record_review`` and
+    ``expire_review`` share this comparison so a boundary edit cannot silently
+    apply to only one of the two review paths.
+    """
+    return deadline is None or deadline <= decision_at
+
+
 def _audit(
     connection,
     job_id: UUID,
@@ -655,16 +666,11 @@ def record_review(
         decision_at = connection.execute(
             "SELECT clock_timestamp() AS db_now"
         ).fetchone()["db_now"]
-        if job["review_deadline_at"] is None:
-            # A legacy/partially migrated row has no review window. Fail
-            # closed instead of raising an indeterminate-type database error
-            # or letting the row sit in AWAITING_REVIEW forever.
-            expired = True
-        else:
-            # The deadline is inclusive: a decision at the exact deadline is
-            # already too late.
-            expired = job["review_deadline_at"] <= decision_at
-        if expired:
+        # A legacy/partially migrated row has no review window, and the
+        # shared predicate fails closed for it instead of raising an
+        # indeterminate-type database error or letting the row sit in
+        # AWAITING_REVIEW forever.
+        if _review_window_closed(job["review_deadline_at"], decision_at):
             updated = connection.execute(
                 "UPDATE jobs SET state = 'BLOCKED', stage = 'blocked', "
                 "reason_code = 'REVIEW_EXPIRED', last_error = %s, "
@@ -829,10 +835,7 @@ def expire_review(dsn: str, job_id: UUID, generation: int) -> bool:
             or job["lease_expires_at"] <= db_now
         ):
             raise StaleGeneration("the worker lease is no longer active")
-        if (
-            job["review_deadline_at"] is not None
-            and job["review_deadline_at"] > db_now
-        ):
+        if not _review_window_closed(job["review_deadline_at"], db_now):
             return False
         connection.execute(
             "UPDATE jobs SET state = 'BLOCKED', stage = 'blocked', "

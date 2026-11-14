@@ -207,6 +207,50 @@ def test_plan_is_traceable_frozen_and_stable(case_root):
     assert again.plan == result.plan
 
 
+def test_default_fixture_plan_freezes_the_full_asan_signature(case_root):
+    manifest = read_json(case_root / "manifest.json")
+    result = analyze_case(request(), case_root=case_root)
+
+    assert manifest["asan_signature"] == {
+        "error": "heap-buffer-overflow",
+        "operation": "WRITE",
+        "access_size": 1,
+        "function": "parse_token",
+        "source": "parser.c",
+    }
+    assert result.plan["asan_signature"] == manifest["asan_signature"]
+    assert result.summary["asan_signature"] == manifest["asan_signature"]
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("operation", "read"),
+        ("operation", ""),
+        ("operation", 1),
+        ("operation", True),
+        ("access_size", 0),
+        ("access_size", -1),
+        ("access_size", 1.0),
+        ("access_size", "1"),
+        ("access_size", True),
+    ],
+)
+def test_invalid_asan_operation_or_access_size_is_material_missing(
+    case_root, field, value
+):
+    manifest_path = case_root / "manifest.json"
+    manifest = read_json(manifest_path)
+    manifest["asan_signature"][field] = value
+    write_json(manifest_path, manifest)
+
+    with pytest.raises(AnalysisBlocked) as caught:
+        analyze_case(request(), case_root=case_root)
+
+    assert caught.value.reason_code == "MATERIAL_MISSING"
+    assert f"asan_signature.{field}" in caught.value.message
+
+
 def test_clean_case_uses_its_own_candidate_input(case_root):
     result = analyze_case(request("fixture-c-parser-clean"), case_root=case_root)
     assert result.plan["case_id"] == "fixture-c-parser-clean"

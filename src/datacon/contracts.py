@@ -67,6 +67,8 @@ _REVISIONS = frozenset({"vulnerable", "fixed", "harness"})
 _FINDING_KINDS = frozenset({"fact", "hypothesis"})
 _CONFIDENCE = frozenset({"low", "medium", "high"})
 _SECCOMP_PROFILES = frozenset({"runtime/default", "docker/default"})
+_ASAN_OPERATIONS = frozenset({"READ", "WRITE"})
+MAX_ACCESS_SIZE = 2**31 - 1
 _USER_ID = re.compile(r"(?:0|[1-9][0-9]{0,9})")
 _MAX_USER_ID = 2**32 - 1
 
@@ -497,12 +499,31 @@ def _normalize_plan(plan: Mapping[str, Any]) -> tuple[dict[str, Any], dict[str, 
     signature = _object(
         plan["asan_signature"],
         required={"error", "function", "source"},
+        optional={"operation", "access_size"},
     )
     asan_signature = {
         "error": _text(signature["error"], label="asan_signature.error"),
         "function": _text(signature["function"], label="asan_signature.function"),
         "source": _text(signature["source"], label="asan_signature.source"),
     }
+    if "operation" in signature:
+        operation = _text(
+            signature["operation"], label="asan_signature.operation"
+        )
+        if operation not in _ASAN_OPERATIONS:
+            raise ValueError("asan_signature.operation must be READ or WRITE")
+        asan_signature["operation"] = operation
+    if "access_size" in signature:
+        access_size = signature["access_size"]
+        if (
+            type(access_size) is not int
+            or not 1 <= access_size <= MAX_ACCESS_SIZE
+        ):
+            raise ValueError(
+                "asan_signature.access_size must be an integer between 1 "
+                f"and {MAX_ACCESS_SIZE}"
+            )
+        asan_signature["access_size"] = access_size
 
     platform = _text(plan["platform"], label="platform")
     toolchain = _toolchain_value(plan["toolchain"], "toolchain")

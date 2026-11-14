@@ -205,7 +205,7 @@ def test_approve_timestamps_are_actual_decision_times(
     assert audit_created_at >= released_at
 
 
-def test_review_deadline_equal_to_decision_time_is_expired(
+def test_review_deadline_in_the_past_is_expired(
     isolated_database, tmp_path
 ):
     job_uuid, digest = _awaiting_review(isolated_database, tmp_path)

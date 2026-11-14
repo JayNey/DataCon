@@ -817,6 +817,15 @@ def analyze_case(
             f"case configuration is not canonical JSON: {error}",
         ) from error
 
+    plan_signature = {
+        "error": manifest["asan_signature"]["error"],
+        "function": manifest["asan_signature"]["function"],
+        "source": manifest["asan_signature"]["source"],
+    }
+    for optional in ("operation", "access_size"):
+        if optional in manifest["asan_signature"]:
+            plan_signature[optional] = manifest["asan_signature"][optional]
+
     plan = {
         "case_id": case.case_id,
         "cve_id": case.cve_id,
@@ -836,11 +845,7 @@ def analyze_case(
         "harness_digest": harness_digest,
         "inputs": {"candidate": candidate_digest, "normal": normal_digest},
         "expected_exit": manifest_case["expected_exit"],
-        "asan_signature": {
-            "error": manifest["asan_signature"]["error"],
-            "function": manifest["asan_signature"]["function"],
-            "source": manifest["asan_signature"]["source"],
-        },
+        "asan_signature": plan_signature,
         "limits": dict(request["limits"]),
         "isolation": dict(isolation),
         "intel": {

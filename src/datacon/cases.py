@@ -26,6 +26,8 @@ _REPOSITORY_FIELDS = frozenset(
     {"origin", "bundle", "bundle_digest", "source_path", "refs", "commits", "patch"}
 )
 _SIGNATURE_FIELDS = frozenset({"error", "function", "source"})
+_ASAN_OPERATIONS = frozenset({"READ", "WRITE"})
+MAX_ACCESS_SIZE = 2**31 - 1
 MAX_SIGNATURE_TEXT = 512
 MAX_CASE_JSON_BYTES = 1024 * 1024
 MAX_MATERIAL_BYTES = 64 * 1024 * 1024
@@ -214,6 +216,19 @@ def _validate_manifest_for_case(
                     f"case manifest asan_signature.{field} must be at most "
                     f"{MAX_SIGNATURE_TEXT} characters"
                 )
+        if "operation" in signature:
+            operation = signature["operation"]
+            if type(operation) is not str or operation not in _ASAN_OPERATIONS:
+                raise ValueError(
+                    "case manifest asan_signature.operation must be READ or WRITE"
+                )
+        if "access_size" in signature:
+            jsonutil.require_int(
+                signature["access_size"],
+                "case manifest asan_signature.access_size",
+                minimum=1,
+                maximum=MAX_ACCESS_SIZE,
+            )
         image = jsonutil.require_text(
             manifest.get("image"), "case manifest image"
         )
