@@ -21,7 +21,7 @@ DataCon 是面向授权实验环境的 CVE 复现平台项目。它的目标是�
 - **T04 情报、版本与源码分析**：`src/datacon/cases.py` 读取本地案例注册表；`src/datacon/agents/analysis.py` 读取离线公告、校验来源与摘要、解析固定 Git 提交、生成 diff、事实 / 假设和证据引用，并计算稳定计划摘要；根因 hypothesis 由实际 ASan 签名、源码路径和函数派生，不硬编码 B01 文本；`src/datacon/tools/source.py` 用受限 Git 命令和 Tree-sitter 提取目标函数与调用点。模型是可选的类型化端口，默认离线运行，真实 LLM 调用不是本批验收条件。
 - 合法 source 请求返回唯一 `job_id` 和 `QUEUED`。结构合法的 binary 请求在提交时归档为 `BLOCKED`，原因码 `UNSUPPORTED_TARGET`，不会进入 Supervisor。省略预算时应用 SRS 默认值。
 - 非法 CVE 格式、超出上限的预算、未知字段、重复 JSON 键和其他结构错误返回退出码 `2`，并在连接数据库前拒绝，不产生任务。
-- **T05 隔离执行、构建和测试材料**：`migrations/005_execution_evidence.sql` 增加判定与证据字段；`src/datacon/execution.py` 在 `READY` 后代次领取、复用既有尝试并编排预检 / 探针 / 双版本构建 / 六次回放；`src/datacon/tools/sandbox.py` 以固定镜像构建一次性的非 root、断网、只读根、cap-drop、no-new-privileges、默认 seccomp 容器，验证并记录 CPU / 内存 / PID / 可写空间 / 超时 / 清理；`started` / `completed` / `infra_error` 尝试、磁盘工具日志和旧代次写回围栏支持工具结束、结果入库前退出的恢复。
+- **T05 隔离执行、构建和测试材料**：`migrations/005_execution_evidence.sql` 增加判定与证据字段；`src/datacon/execution.py` 在 `READY` 后代次领取、复用既有尝试并编排预检 / 探针 / 双版本构建 / 六次回放；`src/datacon/tools/sandbox.py` 以固定镜像构建一次性的非 root、断网、只读根、cap-drop、no-new-privileges、显式固定 seccomp profile 容器，验证并记录 CPU / 内存 / PID / 可写空间 / 超时 / 清理；`started` / `completed` / `infra_error` 尝试、磁盘工具日志和旧代次写回围栏支持工具结束、结果入库前退出的恢复。
 - **T06 验证、报告与证据**：`src/datacon/asan.py` 解析原始 ASan 日志与签名；`src/datacon/verdict.py` 按 SRS 优先级返回 `REPRODUCED`、`NOT_REPRODUCED` 或 `INCONCLUSIVE`；`src/datacon/evidence.py` 写出 `manifest.json`、`report.json`、`report.md`、计划、审核快照、构建产物 / 日志、原始诊断和元数据，并实现 `datacon export` 与离线 `datacon verify-bundle`。`status` 返回 `verdict`、`verdict_reason` 和证据可用性 / 归档错误。
 - **B03 准入**：`B03-admission.json` / `B03-admission.md` 记录公开候选 `CVE-2019-13224` 的公告、修复提交、许可、离线构建、共享 harness 和 ASan 计划。状态为 `conditional_admission`；真实案例执行与发布验收按任务顺序留到 T08。
 
@@ -66,7 +66,7 @@ for migration in migrations/*.sql; do
 done
 ```
 
-本机有 `psql` 时也可以逐个执行 `psql -v ON_ERROR_STOP=1 "$DATACON_DATABASE_URL" -f "$migration"`。五个迁移都可重复执行，但任一语句失败会立即中止并返回非 0；`001`、`002` 只增量加列和表，不删除 T01/T02 的任务；`003` 在不丢数据的前提下把旧 `002` 的 `attempts` 唯一键升级为包含 `generation` 的形状；`004` 只把旧 binary 任务的 `workflow_synced` 回填为 `true`；`005` 只增加 `verdict`、`verdict_reason` 和证据归档字段及约束，不改变既有任务。
+本机有 `psql` 时也可以逐个执行 `psql -v ON_ERROR_STOP=1 "$DATACON_DATABASE_URL" -f "$migration"`。六个迁移都可重复执行，但任一语句失败会立即中止并返回非 0；`001`、`002` 只增量加列和表，不删除 T01/T02 的任务；`003` 在不丢数据的前提下把旧 `002` 的 `attempts` 唯一键升级为包含 `generation` 的形状；`004` 只把旧 binary 任务的 `workflow_synced` 回填为 `true`；`005` 只增加 `verdict`、`verdict_reason` 和证据归档字段及约束；`006` 只增加可为空的 `attempts.attempt_token` 与索引，旧任务保持有效且不会被复用为无 provenance 的 journal。`005` / `006` 在事务开头取 `pg_advisory_xact_lock(hashtext('datacon:migrations'))`，并发执行同一迁移会串行等待，不会因 `ADD CONSTRAINT` 竞态失败。
 
 发布说明（迁移锁）：`002` 的 `CREATE INDEX` 会短暂阻塞写入，`003` 的 `ADD CONSTRAINT ... UNIQUE` 需要扫描并重写 `attempts` 的索引，在大型表上会持有强锁。对已有大量数据的部署应在维护窗口执行，或先评估“`CREATE UNIQUE INDEX CONCURRENTLY` + 以现有唯一索引挂接约束”的方案；`CONCURRENTLY` 不能在事务块内运行，也不能与当前按文件整段执行的迁移脚本混用。本仓库的合成数据集很小，不在迁移中自动切换，以免改变可审计的建表顺序。
 
@@ -153,7 +153,7 @@ uv run datacon verify-bundle ./evidence-export
 
 - `plan_digest`：对规范化字段计算的 `sha256`；`summary`：案例、双版本、修改路径、事实 / 假设数量、输入、预期退出码、`platform`、`toolchain`、`asan_options`、ASan 签名、预算、隔离策略和情报摘要；`plan`：完整计划；`created_at`。`case_config_digest` 绑定案例注册项、材料摘要、镜像、`platform`、`toolchain` 与 `asan_options`，任一变化都会改变计划摘要。
 - 双版本完整 Git 对象 ID、仓库来源、bundle 与补丁摘要、依赖锁、镜像摘要、`platform`、`toolchain`、`asan_options`、构建配方、harness、候选与正常输入。T05 从计划的这些字段读取执行环境参数，不需要依赖可变的注册表状态。
-- `expected_exit`、目标 ASan 签名（`error`、`operation`、`access_size`、`function`、`source`；`operation` / `access_size` 可选，存在时原样进入计划与摘要）、请求预算、隔离策略（`network=none`、只读根文件系统、`cap_drop=ALL`、`no_new_privileges`）。`user` 只接受非 root 的数字 `uid` 或 `uid:gid`（拒绝 `uid=0`、`gid=0`、`root`、带符号或前导零的形式）；`seccomp` 只接受 `runtime/default` 或 `docker/default`，`unconfined` 和空值都会被拒绝。计划摘要固定这些规范化后的值，非法 isolation 让计划校验失败并由分析层阻断为 `BLOCKED/MATERIAL_MISSING`。
+- `expected_exit`、目标 ASan 签名（`error`、`operation`、`access_size`、`function`、`source`；`operation` / `access_size` 可选，存在时原样进入计划与摘要）、请求预算、隔离策略（`network=none`、只读根文件系统、`cap_drop=ALL`、`no_new_privileges`）。`user` 只接受非 root 的数字 `uid` 或 `uid:gid`（拒绝 `uid=0`、`gid=0`、`root`、带符号或前导零的形式）；`seccomp` 只接受 `runtime/default` 或 `docker/default`，`unconfined` 和空值都会被拒绝；注册表还必须提供固定 profile 的 `seccomp_profile_digest`，缺失时分析层阻断为 `BLOCKED/MATERIAL_MISSING`，旧计划缺少该字段时执行器以 `POLICY_DENIED` 阻断。计划摘要固定这些规范化后的值，非法 isolation 让计划校验失败并由分析层阻断。
 - 情报来源、采集时间、内容摘要与来源 URL 列表。
 - `analysis`：diff 摘要、修改路径、Tree-sitter 符号 / 调用点、逐条 `fact|hypothesis`、置信级别和证据引用；`analysis_digest` 绑定该分析。
 
@@ -206,17 +206,19 @@ uv run datacon status "$expire_job"
 
 - `READY` 任务由 `worker` 领取并进入 `RUNNING`；审核记录必须为 `approve` 且计划摘要一致，冻结计划重新计算摘要，案例注册表、实际材料、Git 提交、bundle / patch / 依赖 / harness / 输入摘要、镜像摘要、`platform`、工具链、ASan 选项和策略版本逐项核对。任何漂移在启动容器前阻断为 `PLAN_MISMATCH`、`MATERIAL_MISSING` 或 `POLICY_DENIED`；执行预算不足（含归档预留）阻断为 `DEADLINE_EXCEEDED`。
 - 执行器先从获批计划物化只读材料：`build.sh`、`harness.c`、双版本源码、依赖锁、补丁、正常 / 候选输入；每个文件写出后重新校验 SHA-256。构建与回放命令均由固定模板生成，目标代码从不在宿主执行。
-- 探针容器使用与目标相同的隔离参数，检查：非 root UID、`network=none` 且无默认路由、只读根、只读材料、可写 `/work` + 有上限 `/tmp`、PID / 内存 / CPU cgroup 限制、默认 seccomp filter、无宿主 Docker socket。Docker inspect 还核对 `NetworkMode`、`ReadonlyRootfs`、`CapDrop=ALL`、`no-new-privileges`、PID / 内存 / CPU / tmpfs 总量和只读 bind。任一条件无法落实时阻断，不运行目标。
+- 探针容器使用与目标相同的隔离参数，检查：非 root UID、`network=none` 且无可路由的 IPv4 / IPv6 默认路由、无可用的非 loopback 接口、只读根、只读材料、可写 `/work` + 有上限 `/tmp`、PID / 内存 / CPU cgroup 限制（v2 优先，缺失时显式读取 v1；`max` / `unknown` 一律阻断）、`NoNewPrivs=1`、`CapEff=0`、`Seccomp=2` 且 filter 数可证、无宿主 Docker socket。Docker inspect 还核对 `NetworkMode`、`ReadonlyRootfs`、`CapDrop=ALL`、`no-new-privileges`、安全选项中的显式 seccomp profile、PID / 内存 / CPU / tmpfs 总量和**恰好声明过的**只读 bind。任一条件无法落实时阻断，不运行目标。
+- seccomp 不依赖 daemon 默认值：仓库内固定 `src/datacon/data/seccomp/default.json`（来自 moby `v27.3.1` 的 Docker 默认 profile，出处与许可见同目录 README），注册表 / 计划记录其 canonical JSON 摘要 `seccomp_profile_digest`；create 命令显式传 `--security-opt seccomp=<profile path>`，inspect 输出中的 profile 重新计算摘要并必须与计划一致。旧计划缺少该摘要时以 `POLICY_DENIED` 阻断，不回退到“默认 profile”。
 - 双版本各用新的 `silkeh/clang:19-bookworm@sha256:...` 容器构建；同一镜像、编译器参数（从审核过的构建配方提取）、ASan 选项和依赖摘要。构建产物、构建日志、命令和摘要写入证据；两次构建的镜像、配方和参数不一致时判定为不可比。
 - 每个版本先跑一次正常对照，再用同一候选输入分别回放两次，共六次；每次都是新的容器。记录退出码、超时、OOM / 配额事件、原始 stdout / stderr（含 ASan）和解析后的签名；容器停止后显式 `docker rm -f`，启动新代次前按 label 回收遗留容器。
-- 尝试按 `(job_id, stage='execute', step_key, attempt_no, generation)` 记录；每个逻辑步骤最多两次。工具完成后先把日志、产物和摘要原子写入 `DATACON_RUN_ROOT` 日志，再写 `completed` 尝试。进程在工具结束、结果入库前退出时，新代次校验旧日志和摘要后可复用，否则重试；旧代次的 `record_attempt` 因 generation 围栏失败。`DATACON_FAULT_AFTER_TOOL=build:vulnerable` 只用于端到端故障注入测试。
+- 尝试按 `(job_id, stage='execute', step_key, attempt_no, generation)` 记录。**每个逻辑步骤跨 generation 最多启动两次**（journal 复用不计入新启动，见下）；超过上限时不再执行目标，以 `RUN_INCOMPLETE` 收敛。工具完成后先把日志、产物和摘要原子写入 `DATACON_RUN_ROOT` 日志，再写 `completed` 尝试。进程在工具结束、结果入库前退出时，新代次只有在以下条件全部满足后才复用旧日志：存在同 `job_id/step/attempt_no/generation` 的数据库 `started`/`completed` 行、journal 的 job/generation/attempt/plan/input/container 字段与该行一致、一次性 `attempt_token` 一致、且 journal HMAC 用 `DATACON_RUN_ROOT` 之外的密钥验证通过；仅凭 run_root 文件不能决定复用。旧代次的 `record_attempt` 仍因 generation 围栏失败。`DATACON_FAULT_AFTER_TOOL=build:vulnerable` 只在 `DATACON_TEST_MODE=1` 时可用，否则 worker 在领取任务前以配置错误退出。
 
 ## 判定、报告与证据包（T06）
 
 - `src/datacon/asan.py` 从原始 ASan 日志提取错误类别、`READ/WRITE`、访问大小、故障函数和源码路径；签名匹配支持源码路径后缀。缺帧、截断或不可符号化记录不会晋升为事实。
 - `src/datacon/verdict.py` 严格按 SRS 优先级判定：必要回放缺失、正常对照异常、间歇触发、其他崩溃、超时 / 资源耗尽、证据不可比或日志截断 -> `INCONCLUSIVE`；缺陷版两次命中审核签署名且修复版两次干净 -> `REPRODUCED`；两者候选均干净 -> `NOT_REPRODUCED`；修复版仍命中或其余完整组合 -> `INCONCLUSIVE`。退出码、信号或模型建议本身不构成复现证据。
-- `report.json` 记录目标、状态、原因、双版本提交、镜像 / 工具链 / 编译参数、预算、种子摘要、逐次回放、判定规则与证据引用；`report.md` 从同一结构渲染。证据目录还包含 `manifest.json`、计划、审核快照、探针、构建产物 / 日志、原始 stdout / stderr 和元数据。
-- 清单逐个文件记录相对路径、角色、字节数和 SHA-256；校验器拒绝缺失、额外文件、摘要不符、重复条目、绝对路径、父路径、反斜杠、符号链接和特殊文件。`export` 先校验归档包和数据库中的清单摘要，再复制到新目录并再次校验，不覆盖非空目标。归档写入失败时任务进入 `FAILED/EVIDENCE_WRITE_FAILED`，`status.evidence.error` 保留原因；阻断或中途失败也会尽量保存已有材料。
+- `report.json` 记录目标、状态、原因、双版本提交、镜像 / 工具链 / 编译参数、预算、种子摘要、逐次回放、判定规则与证据引用；`report.md` 从同一结构渲染。证据目录还包含 `manifest.json`、计划、审核快照、探针、构建产物 / 日志、原始 stdout / stderr 和元数据。原始日志只保存为文件；`report.json`、`metadata/execution.json` 和数据库尝试行只保存摘要、字节数、截断标志与短预览，避免重复放大日志。
+- 清单逐个文件记录相对路径、角色、字节数和 SHA-256；校验器拒绝缺失、额外文件、摘要不符、重复条目、绝对路径、父路径、反斜杠、Windows drive / UNC 路径、符号链接和特殊文件。`verify_bundle` 还重新计算计划摘要、要求审核为 `approve` 且绑定同一计划、核对 manifest / report 的 verdict 与 reason，并对 `REPRODUCED` / `NOT_REPRODUCED` / `INCONCLUSIVE` 要求完整的探针、双版本构建和六组回放证据；`BLOCKED` / `FAILED` 允许最小证据集。归档前会先对暂存目录执行同一校验，未通过时任务以 `FAILED/EVIDENCE_WRITE_FAILED` 收敛且不发布证据。
+- 注意：上述校验证明的是**证据包内部一致性、完整性和与计划 / 审核的绑定**，不是作者身份、真实性或数字签名。能重写整个证据目录和数据库记录的一方仍可伪造一套自洽材料；本仓库当前不提供签名或外部时间戳。`export` 先校验归档包和数据库中的清单摘要，再复制到新目录并再次校验，不覆盖非空目标。归档写入失败时任务进入 `FAILED/EVIDENCE_WRITE_FAILED`，`status.evidence.error` 保留原因；阻断或中途失败也会尽量保存已有材料。
 - 证据包默认写入私有 `DATACON_EVIDENCE_ROOT`（默认 `.datacon/evidence`）；运行日志与工作目录默认在 `DATACON_RUN_ROOT`（默认 `.datacon/runs`）。二者已由 `.gitignore` 排除，不应提交真实案例输入、诊断或证据。
 
 ## 情报、版本与源码分析
@@ -289,10 +291,10 @@ T05/T06 的真实 Linux 门禁是 `-m docker`：使用固定 clang 镜像、真�
 - `tests/integration/test_retry.py`：瞬时分析错误重试一次后成功、持续瞬时错误只重试一次后 `FAILED`、非瞬时 `AnalysisBlocked` 不重试、重试前准备时限过期直接 `DEADLINE_EXCEEDED`、检查点瞬时错误重试一次；workflow 级重试复用已持久化分析草稿且保留 `infra_error` 审计记录；草稿写入失败一次时有界重试并复用草稿、连续失败时 fail closed 且不出现第三次分析；分析前 `started` 占位使 `infra_error` 写入失败后仍按 attempt 2 重试、两次失败即 fail closed，草稿与 `block_job` 同时失败、或 `block_job` 始终写不进去时也不会出现第三次分析（后者保留 `PREPARING`）；服务端已提交的 `completed` 草稿不会被 `infra_error` 覆盖；`record_attempt` 返回 `False` 时停止分析（工具审计行、计划行、workflow 成功 / 失败标记分别覆盖）、不 finalize 且不把任务改写成 `FAILED`；plan 行被拒绝时计划已经冻结，但不再挂起审核，下一代次复用该计划并收敛；已提交 `completed` 行拒绝降级、不同结果的 completed 重写和未知状态；analysis 后 freeze 前退出时旧代次 `attempts` 保留、旧代次写回被拒绝、新代次重新分析并冻结唯一计划；逃逸到 `_process_claim` 的持续 freeze / checkpoint 读取错误保持 `PREPARING`、保留租约且不写 `FAILED`，下一代次恢复并冻结计划。
 - `tests/integration/test_workflow_migrations.py`：001 旧任务在 002 增量迁移后保留，新表 / 列 / 索引存在，计划与审核每任务唯一，迁移可重复执行；003 在不丢数据的前提下把旧 `attempts` 唯一键升级为包含 `generation`；004 把旧 binary 的 `workflow_synced` 回填为 `true` 且可重复执行，worker 的 claim 查询排除 `UNSUPPORTED_TARGET`。
 - `tests/contract/test_verdict.py`：ASan 签名解析与 SRS 判定优先级的表驱动用例：正例、正常候选、修复版仍命中、间歇、缺回放、超时 / 资源限制、对照失败、其他崩溃、不可比和日志截断。
-- `tests/contract/test_evidence.py`：清单往返、缺失 / 额外 / 改写 / 符号链接 / 绝对或父路径 / 重复条目 / 畸形清单、导出目标非空和复制后复验。
-- `tests/contract/test_sandbox_policy.py`：Docker create 参数和 inspect 校验；非 root、断网、只读根、cap-drop、no-new-privileges、默认 seccomp、CPU / 内存 / PID / tmpfs 及只读 bind。
-- `tests/integration/test_execution.py`：PostgreSQL + 类型化 fake sandbox 分支：`REPRODUCED` / `NOT_REPRODUCED`、探针失败、计划 / 材料漂移、超时和缺证 `INCONCLUSIVE`、归档失败可见、代次接管复用日志、旧代次写回拒绝，以及 `export` / `verify-bundle`。
-- `tests/e2e/test_mvp_docker.py`：真实 Linux Docker 的 MVP-01 正例六次回放与证据导出、MVP-02 正常候选、MVP-03 拒绝 / 恢复（工具结束、结果入库前退出）、MVP-04 探针限制、容器清理、篡改和额外文件验包失败。
+- `tests/contract/test_evidence.py`：清单往返、缺失 / 额外 / 改写 / 符号链接 / 绝对、父路径、反斜杠、Windows drive / UNC 路径 / 重复条目 / 畸形清单；语义校验覆盖 manifest / report verdict 与 reason、重新计算计划摘要、审核决定与计划绑定、0/5 与未知 / 重复回放、完整六次回放、`BLOCKED` / `FAILED` 最小证据；导出覆盖 expected digest、源目录在 verify 与 copy 之间被替换、空目标目录、bundle 内目标和复制后复验。
+- `tests/contract/test_sandbox_policy.py`：Docker create 参数和 inspect 校验；非 root、断网、只读根、cap-drop、no-new-privileges、显式 seccomp profile 与摘要、CPU / 内存 / PID / tmpfs、bind 白名单，以及 cgroup v1/v2、`max` / `unknown`、网络 links / IPv6 路由和 `NoNewPrivs` / `CapEff` 探针判定；还覆盖 create 后 inspect / 校验失败时删除容器。
+- `tests/integration/test_execution.py`：PostgreSQL + 类型化 fake sandbox 分支：`REPRODUCED` / `NOT_REPRODUCED`、探针失败、计划 / 材料漂移、超时和缺证 `INCONCLUSIVE`、归档前校验与失败可见、大日志不重复入库、journal 无 DB provenance / 错误 token / 错误 generation 时拒绝复用、completed attempt 输入摘要不匹配时重跑、跨 generation 尝试上限、ARCHIVING 崩溃后 archive-only 恢复且不启动容器、`material_root` 子目录、旧计划缺 seccomp 摘要阻断、两个 worker 并发 claim READY 只有一个成功、fault 注入的生产保护，以及 `export` / `verify-bundle`。
+- `tests/e2e/test_mvp_docker.py`：真实 Linux Docker 的 MVP-01 正例六次回放与证据导出、MVP-02 正常候选、MVP-03 拒绝 / 恢复（工具结束、结果入库前退出）、MVP-04 单控制漂移负例（缺只读根 / root 用户 / bridge 网络 / 缺 no-new-privileges / 缺或 unconfined seccomp / 缺 PID、内存、CPU、tmpfs 上限）、容器清理、篡改和额外文件验包失败。每个负例都断言按 label 无遗留容器。
 - `tests/integration/test_fixture_replay.py`：宿主 clang + ASan 的 B01/B02 合成回放，仍是 T01 材料回归，不是 T05 容器隔离验收。
 
 本地未设置 `DATACON_TEST_DATABASE_URL` 时，PostgreSQL 用例显式跳过；契约、Agent 和分析用例仍离线运行。`CI=true` 时缺少数据库会直接失败，而不是跳过。
@@ -316,7 +318,8 @@ src/datacon/
   tools/source.py       受限 Git 与 Tree-sitter
   tools/sandbox.py      一次性 Docker 隔离探针、构建与回放
   data/cases/           wheel 默认案例注册表与合成材料
-migrations/             001 任务表、002 工作流增量、003 attempts 代次键升级、004 旧 binary 回填、005 判定 / 证据
+  data/seccomp/         固定 seccomp profile（计划记录其 canonical 摘要）
+migrations/             001 任务表、002 工作流增量、003 attempts 代次键升级、004 旧 binary 回填、005 判定 / 证据、006 journal provenance token
 examples/               示例请求
 tests/contract/         请求、计划、Agent、分析、判定、证据、沙箱策略、wheel 与案例材料 / B03
 tests/integration/      真实 PostgreSQL CLI / 审核 / 恢复 / 重试 / 迁移 / 执行 / ASan 回放
@@ -334,8 +337,9 @@ T07–T08 仍不包含在本批：真实公开 CVE 的发布验收、控制面�
 - `.datacon/`、`.env`、运行产物和证据目录由 `.gitignore` 排除。
 - 仓库不包含数据库凭证、真实案例输入、完整诊断或实验日志。CI 的 PostgreSQL service 只在隔离的 runner 上以 `POSTGRES_HOST_AUTH_METHOD=trust` 启动，连接串不含口令；该 trust 配置不得复用于共享或生产数据库。本地 Docker 示例也不提供默认口令，必须显式设置 `DATACON_DB_PASSWORD`。
 - 合成案例只用于离线回归；真实案例的准入与使用边界见 B03 记录。公告、源码、diff 和工具输出按不可信输入处理。
-- 目标容器使用 `--network none`、非 root、只读根、`cap-drop ALL`、`no-new-privileges`、默认 seccomp，仅挂载只读材料和有上限的 tmpfs；凭证、控制面数据库连接和 Docker socket 不进入容器。探针失败时不执行目标，任务以 `POLICY_DENIED` 阻断。
-- `DATACON_FAULT_AFTER_TOOL` 是仅供故障注入测试使用的环境变量，会令 worker 在工具日志落盘后、数据库结果写入前退出；不要在生产 worker 上设置。
+- 目标容器使用 `--network none`、非 root、只读根、`cap-drop ALL`、`no-new-privileges`、显式固定 seccomp profile，仅挂载计划声明的只读材料和有上限的 tmpfs；凭证、控制面数据库连接和 Docker socket 不进入容器。探针失败时不执行目标，任务以 `POLICY_DENIED` 阻断。
+- `DATACON_RUN_ROOT` 下的文件按不可信输入处理：`run_root` 目录仍以 0700 创建并校验所有者，但仅凭其中的 journal / 日志不能触发复用或决定最终 verdict。复用必须同时满足数据库 attempt 行、一次性 token 与 run_root 之外密钥的 HMAC；无法证明时重新执行或 fail closed。
+- `DATACON_FAULT_AFTER_TOOL` 是仅供故障注入测试使用的环境变量，会令 worker 在工具日志落盘后、数据库结果写入前退出；它要求同时设置 `DATACON_TEST_MODE=1`，否则 worker 在领取任务前直接以 `INVALID_CONFIGURATION` 退出。不要在生产 worker 上设置。
 - 操作者身份来自 `DATACON_OPERATOR_ID`（未设置时使用本机用户）；它是本地单用户边界，不是多租户身份认证。
 
 ## CI

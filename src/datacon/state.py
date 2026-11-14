@@ -19,6 +19,10 @@ REVIEW_WINDOW_HOURS = 24
 # heartbeat can extend this later; the lease is never shorter than the budget.
 LEASE_SECONDS = 600
 ATTEMPT_STATUSES = frozenset({"started", "completed", "infra_error"})
+# Attempt results are structured metadata, not a second copy of raw logs.
+# Keeping them bounded prevents a chatty tool from bloating PostgreSQL or
+# turning a journal row into an unbounded trust source.
+MAX_ATTEMPT_RESULT_BYTES = 512 * 1024
 
 
 class StateError(RuntimeError):
@@ -473,6 +477,7 @@ def record_attempt(
     status: str,
     result: dict[str, Any] | list[Any] | None = None,
     container_id: str | None = None,
+    attempt_token: str | None = None,
 ) -> bool:
     """Persist one attempt row, returning False when the write was not applied.
 
@@ -492,6 +497,16 @@ def record_attempt(
         raise StateError("attempt requires stage and step_key")
     if not isinstance(status, str) or status not in ATTEMPT_STATUSES:
         raise StateError("attempt status is invalid")
+    if result is not None:
+        try:
+            encoded_result = jsonutil.canonical_bytes(result)
+        except (TypeError, ValueError, UnicodeError) as error:
+            raise StateError(f"attempt result is not canonical JSON: {error}") from error
+        if len(encoded_result) > MAX_ATTEMPT_RESULT_BYTES:
+            raise StateError(
+                "attempt result exceeds the "
+                f"{MAX_ATTEMPT_RESULT_BYTES} byte metadata cap"
+            )
     with _connect(dsn) as connection:
         job = connection.execute(
             "SELECT generation, lease_expires_at "
@@ -515,17 +530,19 @@ def record_attempt(
             """
             INSERT INTO attempts
                 (attempt_id, job_id, stage, step_key, attempt_no, generation,
-                 container_id, input_digest, status, result, finished_at)
+                 container_id, input_digest, status, result, finished_at,
+                 attempt_token)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
                     CASE WHEN %s = 'started' THEN NULL
-                         ELSE clock_timestamp() END)
+                         ELSE clock_timestamp() END, %s)
             ON CONFLICT (job_id, stage, step_key, attempt_no, generation)
             DO UPDATE
             SET container_id = EXCLUDED.container_id,
                 input_digest = EXCLUDED.input_digest,
                 status = EXCLUDED.status,
                 result = EXCLUDED.result,
-                finished_at = EXCLUDED.finished_at
+                finished_at = EXCLUDED.finished_at,
+                attempt_token = COALESCE(EXCLUDED.attempt_token, attempts.attempt_token)
             WHERE attempts.status <> 'completed'
                OR (EXCLUDED.status = 'completed'
                    AND attempts.result IS NOT DISTINCT FROM EXCLUDED.result)
@@ -542,6 +559,7 @@ def record_attempt(
                 status,
                 Jsonb(result) if result is not None else None,
                 status,
+                attempt_token,
             ),
         )
         return cursor.rowcount > 0
@@ -619,13 +637,17 @@ def mark_archiving(dsn: str, job_id: UUID, *, generation: int) -> bool:
     """Move a live RUNNING generation into the bounded archive phase."""
     with _connect(dsn) as connection:
         job = _locked_job(connection, job_id, generation=generation)
-        if job["state"] == "ARCHIVING":
-            return True
-        if job["state"] != "RUNNING":
+        if job["state"] not in ("RUNNING", "ARCHIVING"):
             raise StateError(f"cannot archive a job while it is {job['state']}")
         updated = connection.execute(
             "UPDATE jobs SET state = 'ARCHIVING', stage = 'archive', "
-            "state_version = state_version + 1, updated_at = clock_timestamp() "
+            "state_version = state_version + 1, updated_at = clock_timestamp(), "
+            # The archive phase is bounded but must outlive the lease left by
+            # the execution phase. Reserve at least 60 seconds (which already
+            # covers the maximum 10%/60s archive reserve), so finish_execution
+            # cannot fail merely because the execute deadline has passed.
+            "lease_expires_at = GREATEST("
+            "lease_expires_at, clock_timestamp() + interval '60 seconds') "
             "WHERE job_id = %s AND generation = %s "
             "AND lease_expires_at IS NOT NULL "
             "AND lease_expires_at > clock_timestamp() RETURNING job_id",
@@ -736,11 +758,56 @@ def attempts_for_step(
 ) -> list[dict[str, Any]]:
     with _connect(dsn) as connection:
         return connection.execute(
-            "SELECT attempt_no, container_id, input_digest, status, result, "
-            "started_at, finished_at FROM attempts "
+            "SELECT attempt_no, generation, container_id, input_digest, "
+            "status, result, attempt_token, started_at, finished_at "
+            "FROM attempts "
             "WHERE job_id = %s AND stage = %s AND step_key = %s "
             "AND generation = %s ORDER BY attempt_no",
             (job_id, stage, step_key, generation),
+        ).fetchall()
+
+
+def attempts_for_step_across_generations(
+    dsn: str,
+    job_id: UUID,
+    *,
+    stage: str,
+    step_key: str,
+) -> list[dict[str, Any]]:
+    """Return every durable attempt for a logical step, newest first.
+
+    Journal adoption (EXE-01) must start from database provenance, so this
+    query includes the generation and one-time token that the journal has to
+    match. It is also the source of the cross-generation attempt bound.
+    """
+    with _connect(dsn) as connection:
+        return connection.execute(
+            "SELECT attempt_no, generation, container_id, input_digest, "
+            "status, result, attempt_token, started_at, finished_at "
+            "FROM attempts "
+            "WHERE job_id = %s AND stage = %s AND step_key = %s "
+            "ORDER BY generation DESC, attempt_no DESC",
+            (job_id, stage, step_key),
+        ).fetchall()
+
+
+def execution_attempts_across_generations(
+    dsn: str, job_id: UUID
+) -> list[dict[str, Any]]:
+    """Return all execute attempts, newest generation first.
+
+    Archive-only recovery has no current-generation rows yet: the claim after
+    a crash advances the generation. Provenance for the durable journals comes
+    from these historical rows.
+    """
+    with _connect(dsn) as connection:
+        return connection.execute(
+            "SELECT generation, attempt_no, step_key, container_id, input_digest, "
+            "status, result, attempt_token, started_at, finished_at "
+            "FROM attempts "
+            "WHERE job_id = %s AND stage = 'execute' "
+            "ORDER BY generation DESC, attempt_no DESC, step_key",
+            (job_id,),
         ).fetchall()
 
 

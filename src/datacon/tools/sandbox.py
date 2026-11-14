@@ -25,10 +25,45 @@ from datacon.asan import ASanSignature, parse_asan
 MIB = 1024 * 1024
 MAX_LOG_BYTES = 16 * 1024 * 1024
 MAX_ARTIFACT_BYTES = 128 * 1024 * 1024
+MAX_PREVIEW_BYTES = 512
 _IMAGE_DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
 _SAFE_NAME = re.compile(r"[^a-z0-9_.-]+")
 _PROBE_TIMEOUT = 120
+
+# A fixed profile shipped with the package makes the seccomp boundary
+# auditable. We never rely on "no seccomp=unconfined argument" as proof that a
+# daemon default profile is active, and we never accept an arbitrary profile:
+# the plan records this profile's canonical digest, the create command sends
+# the exact file, and the inspect output is checked against the same digest.
+SECCOMP_PROFILE_PATH = (
+    Path(__file__).resolve().parents[1] / "data" / "seccomp" / "default.json"
+)
+
+
+def _canonical_json_digest(document: Any) -> str:
+    payload = json.dumps(
+        document, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+    return "sha256:" + hashlib.sha256(payload).hexdigest()
+
+
+def seccomp_profile_digest(path: Path | str = SECCOMP_PROFILE_PATH) -> str:
+    """Return the digest of the fixed profile's canonical JSON document."""
+    try:
+        document = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError, UnicodeError) as error:
+        raise SandboxPolicyError(
+            f"the fixed seccomp profile is not readable: {error}"
+        ) from error
+    if not isinstance(document, dict) or not isinstance(
+        document.get("defaultAction"), str
+    ):
+        raise SandboxPolicyError("the fixed seccomp profile is not a profile object")
+    return _canonical_json_digest(document)
+
+
+SECCOMP_PROFILE_DIGEST = seccomp_profile_digest()
 
 
 class SandboxError(RuntimeError):
@@ -61,6 +96,7 @@ class IsolationPolicy:
     cap_drop: tuple[str, ...] = ("ALL",)
     no_new_privileges: bool = True
     seccomp: str = "runtime/default"
+    seccomp_profile_digest: str | None = None
 
     @classmethod
     def from_plan(cls, value: Mapping[str, Any]) -> "IsolationPolicy":
@@ -69,6 +105,13 @@ class IsolationPolicy:
         caps = value.get("cap_drop")
         if not isinstance(caps, list) or not all(isinstance(item, str) for item in caps):
             raise SandboxPolicyError("plan isolation cap_drop is invalid")
+        digest = value.get("seccomp_profile_digest")
+        if digest is None:
+            # Legacy plans predate the explicit profile. Fail closed at the
+            # policy boundary instead of silently claiming a daemon default.
+            raise SandboxPolicyError(
+                "the plan has no explicit seccomp profile digest"
+            )
         return cls(
             network=value.get("network", ""),
             user=value.get("user", ""),
@@ -76,6 +119,7 @@ class IsolationPolicy:
             cap_drop=tuple(caps),
             no_new_privileges=value.get("no_new_privileges") is True,
             seccomp=value.get("seccomp", ""),
+            seccomp_profile_digest=digest,
         )
 
     def validate(self) -> None:
@@ -93,6 +137,19 @@ class IsolationPolicy:
             raise SandboxPolicyError("no-new-privileges must be enabled")
         if self.seccomp not in ("runtime/default", "docker/default"):
             raise SandboxPolicyError("a default seccomp profile is required")
+        if (
+            not isinstance(self.seccomp_profile_digest, str)
+            or not _DIGEST.fullmatch(self.seccomp_profile_digest)
+        ):
+            raise SandboxPolicyError(
+                "an explicit seccomp profile digest is required"
+            )
+        if not SECCOMP_PROFILE_PATH.is_file():
+            raise SandboxPolicyError("the fixed seccomp profile is missing")
+        if seccomp_profile_digest() != self.seccomp_profile_digest:
+            raise SandboxPolicyError(
+                "the plan seccomp profile digest does not match the fixed profile"
+            )
 
 
 @dataclass(frozen=True)
@@ -174,8 +231,10 @@ class ReplayResult:
     metadata: dict[str, Any]
 
     def as_dict(self) -> dict[str, Any]:
-        stdout_text = self.stdout.decode("utf-8", "replace")
-        stderr_text = self.stderr.decode("utf-8", "replace")
+        # Raw stdout/stderr are evidence files, not metadata. Keeping the full
+        # text here would copy every log into the report, execution metadata and
+        # the database attempt row. Record only stable digests, lengths and a
+        # bounded preview; readers reconstruct observations from the files.
         return {
             "version": self.version,
             "phase": self.phase,
@@ -184,8 +243,16 @@ class ReplayResult:
             "duration_seconds": self.duration_seconds,
             "container_id": self.container_id,
             "input_digest": self.input_digest,
-            "stdout": stdout_text,
-            "stderr": stderr_text,
+            "stdout_sha256": "sha256:" + hashlib.sha256(self.stdout).hexdigest(),
+            "stdout_bytes": len(self.stdout),
+            "stdout_preview": self.stdout[:MAX_PREVIEW_BYTES].decode(
+                "utf-8", "replace"
+            ),
+            "stderr_sha256": "sha256:" + hashlib.sha256(self.stderr).hexdigest(),
+            "stderr_bytes": len(self.stderr),
+            "stderr_preview": self.stderr[:MAX_PREVIEW_BYTES].decode(
+                "utf-8", "replace"
+            ),
             "signature": self.signature.as_dict() if self.signature else None,
             "timed_out": self.timed_out,
             "quota_hit": self.quota_hit,
@@ -275,6 +342,8 @@ def container_create_args(
         "ALL",
         "--security-opt",
         "no-new-privileges",
+        "--security-opt",
+        f"seccomp={SECCOMP_PROFILE_PATH}",
         "--pids-limit",
         str(limits.pids),
         "--memory",
@@ -316,12 +385,123 @@ def _close_enough(actual: Any, expected: int) -> bool:
     return type(actual) is int and actual == expected
 
 
+def _validate_security_options(
+    config: Mapping[str, Any], policy: IsolationPolicy
+) -> None:
+    security = [str(item) for item in config.get("SecurityOpt") or []]
+    lowered = [item.lower() for item in security]
+    if not any(item.startswith("no-new-privileges") for item in lowered):
+        raise SandboxPolicyError("no-new-privileges is not active")
+    seccomp_options = [item for item in security if item.lower().startswith("seccomp=")]
+    if len(seccomp_options) != 1:
+        raise SandboxPolicyError("exactly one explicit seccomp profile is required")
+    value = seccomp_options[0].split("=", 1)[1]
+    if value.strip().lower() in ("", "unconfined", "default", "runtime/default", "docker/default"):
+        raise SandboxPolicyError(
+            "seccomp must use an explicit, digest-pinned profile"
+        )
+    try:
+        document = json.loads(value)
+    except (TypeError, ValueError) as error:
+        raise SandboxPolicyError(
+            "the running seccomp profile is not inspectable"
+        ) from error
+    if not isinstance(document, dict):
+        raise SandboxPolicyError("the running seccomp profile is not an object")
+    if _canonical_json_digest(document) != policy.seccomp_profile_digest:
+        raise SandboxPolicyError(
+            "the running seccomp profile does not match the approved digest"
+        )
+
+
+def _validate_mounts(
+    config: Mapping[str, Any],
+    mounts: Sequence[tuple[str, str, bool]],
+) -> None:
+    declared: dict[str, tuple[str, bool]] = {}
+    for source, destination, readonly in mounts:
+        if not destination.startswith("/") or ".." in Path(destination).parts:
+            raise SandboxPolicyError(f"invalid declared mount destination: {destination}")
+        if destination in declared:
+            raise SandboxPolicyError(f"duplicate declared mount destination: {destination}")
+        try:
+            resolved = str(Path(source).resolve(strict=True))
+        except OSError as error:
+            raise SandboxPolicyError(
+                f"declared mount source is not readable: {error}"
+            ) from error
+        declared[destination] = (resolved, bool(readonly))
+
+    actual: list[tuple[str, str, bool]] = []
+    inspected = config.get("Mounts")
+    if isinstance(inspected, list) and inspected:
+        for mount in inspected:
+            if not isinstance(mount, Mapping):
+                raise SandboxPolicyError("container mount metadata is invalid")
+            if mount.get("Type") != "bind":
+                raise SandboxPolicyError("only read-only bind mounts are allowed")
+            destination = mount.get("Destination")
+            source = mount.get("Source")
+            if not isinstance(destination, str) or not isinstance(source, str):
+                raise SandboxPolicyError("container mount metadata is incomplete")
+            if not Path(source).is_absolute():
+                raise SandboxPolicyError("a bind mount source is not absolute")
+            actual.append((source, destination, mount.get("RW") is False))
+    else:
+        binds = config.get("Binds") or []
+        if not isinstance(binds, list):
+            raise SandboxPolicyError("container bind metadata is invalid")
+        for bind in binds:
+            parts = str(bind).split(":")
+            if len(parts) < 3 or parts[2] not in ("ro", "readonly"):
+                raise SandboxPolicyError("a bind mount is writable")
+            source = Path(parts[0])
+            if not source.is_absolute():
+                raise SandboxPolicyError("a bind mount source is not absolute")
+            actual.append((str(source), parts[1], True))
+
+    seen: set[str] = set()
+    for source, destination, readonly in actual:
+        if destination in seen:
+            raise SandboxPolicyError(f"duplicate container mount: {destination}")
+        seen.add(destination)
+        allowed = declared.get(destination)
+        if allowed is None:
+            raise SandboxPolicyError(
+                f"container has an undeclared bind mount destination: {destination}"
+            )
+        allowed_source, allowed_readonly = allowed
+        if not readonly or not allowed_readonly:
+            raise SandboxPolicyError(f"bind mount {destination} is writable")
+        try:
+            resolved_source = str(Path(source).resolve(strict=True))
+        except OSError as error:
+            raise SandboxPolicyError(
+                f"container mount source is not readable: {error}"
+            ) from error
+        if resolved_source != allowed_source:
+            raise SandboxPolicyError(
+                f"bind mount source for {destination} is not the declared source"
+            )
+    if seen != set(declared):
+        missing = sorted(set(declared) - seen)
+        raise SandboxPolicyError(
+            "expected read-only bind mounts are missing: " + ", ".join(missing)
+        )
+
+
 def validate_host_config(
     config: Mapping[str, Any],
     policy: IsolationPolicy,
     limits: ResourceLimits,
+    *,
+    mounts: Sequence[tuple[str, str, bool]] = (),
 ) -> None:
-    """Fail closed unless inspect output shows every requested control."""
+    """Fail closed unless inspect output shows every requested control.
+
+    ``mounts`` is the exact list given to ``docker create``. Inspect output may
+    not add any other bind mount, even a read-only one.
+    """
     policy.validate()
     limits.validate()
     if config.get("NetworkMode") != "none":
@@ -335,11 +515,7 @@ def validate_host_config(
         raise SandboxPolicyError("container did not drop ALL capabilities")
     if config.get("CapAdd"):
         raise SandboxPolicyError("container added capabilities")
-    security = [str(item).lower() for item in config.get("SecurityOpt") or []]
-    if not any(item.startswith("no-new-privileges") for item in security):
-        raise SandboxPolicyError("no-new-privileges is not active")
-    if any(item == "seccomp=unconfined" for item in security):
-        raise SandboxPolicyError("seccomp must not be unconfined")
+    _validate_security_options(config, policy)
     if config.get("Privileged") is True:
         raise SandboxPolicyError("container is privileged")
     if not _close_enough(config.get("PidsLimit"), limits.pids):
@@ -362,29 +538,7 @@ def validate_host_config(
     if config.get("IpcMode") not in (None, "private"):
         raise SandboxPolicyError("container IPC namespace is not private")
 
-    mounts = config.get("Mounts")
-    binds = config.get("Binds") or []
-    if isinstance(mounts, list) and mounts:
-        for mount in mounts:
-            if not isinstance(mount, Mapping):
-                raise SandboxPolicyError("container mount metadata is invalid")
-            if mount.get("Type") != "bind":
-                raise SandboxPolicyError("only read-only bind mounts are allowed")
-            if mount.get("RW") is not False:
-                raise SandboxPolicyError("a bind mount is writable")
-            source = mount.get("Source")
-            if not isinstance(source, str) or not Path(source).is_absolute():
-                raise SandboxPolicyError("a bind mount source is not absolute")
-    else:
-        if not isinstance(binds, list) or not binds:
-            raise SandboxPolicyError("expected read-only material bind mounts are missing")
-        for bind in binds:
-            parts = str(bind).split(":")
-            if len(parts) < 3 or parts[2] not in ("ro", "readonly"):
-                raise SandboxPolicyError("a bind mount is writable")
-            source = Path(parts[0])
-            if not source.is_absolute():
-                raise SandboxPolicyError("a bind mount source is not absolute")
+    _validate_mounts(config, mounts)
 
     tmpfs = config.get("Tmpfs") or {}
     if not isinstance(tmpfs, dict) or "/work" not in tmpfs or "/tmp" not in tmpfs:
@@ -478,6 +632,119 @@ def _quota_events(files: Mapping[str, bytes]) -> list[str]:
             except ValueError:
                 pass
     return sorted(set(hits))
+
+
+def evaluate_probe_values(
+    values: Mapping[str, str],
+    policy: IsolationPolicy,
+    limits: ResourceLimits,
+    *,
+    exit_code: int,
+    oom_killed: bool,
+) -> tuple[bool, dict[str, Any]]:
+    """Judge container-internal probe values without trusting ``unknown``.
+
+    cgroup v2 is read first; when it is absent the probe reports explicit v1
+    values. A missing or ``max`` value means the limit cannot be proven and
+    therefore fails closed.
+    """
+    checks: dict[str, Any] = {
+        "probe_exit_code": exit_code,
+        "uid": values.get("uid"),
+        "seccomp": values.get("seccomp"),
+        "seccomp_filters": values.get("seccomp_filters"),
+        "no_new_privs": values.get("no_new_privs"),
+        "cap_eff": values.get("cap_eff"),
+        "cgroup_version": values.get("cgroup_version"),
+        "network_links": values.get("links", ""),
+        "ipv6_links": values.get("ipv6_links", ""),
+        "routes": values.get("routes", ""),
+        "ipv6_routes": values.get("ipv6_routes", ""),
+        "pids_max": values.get("pids"),
+        "memory_max": values.get("memory"),
+        "cpu_max": values.get("cpu"),
+        "cpu_quota_us": values.get("cpu_quota_us"),
+        "cpu_period_us": values.get("cpu_period_us"),
+        "work_mib": values.get("work_mib"),
+        "tmp_mib": values.get("tmp_mib"),
+        "oom_killed": oom_killed,
+    }
+    errors: list[str] = []
+
+    def require(condition: bool, message: str) -> None:
+        if not condition:
+            errors.append(message)
+
+    require(exit_code == 0, "probe exited non-zero")
+    require(values.get("uid") == policy.user.split(":")[0], "container uid is not the planned uid")
+    require(values.get("seccomp") == "2", "seccomp filter mode is not enabled")
+    filters = values.get("seccomp_filters")
+    require(
+        isinstance(filters, str) and filters.isdigit() and int(filters) >= 1,
+        "seccomp filter count is not provable",
+    )
+    require(values.get("no_new_privs") == "1", "no-new-privileges is not effective")
+    capability = values.get("cap_eff")
+    try:
+        require(
+            isinstance(capability, str) and int(capability, 16) == 0,
+            "effective capabilities are not empty",
+        )
+    except (TypeError, ValueError):
+        require(False, "effective capabilities are not provable")
+    require(
+        values.get("links", "") == "",
+        "a non-loopback network interface is up or unprovable",
+    )
+    require(values.get("ipv6_links", "") == "", "non-loopback IPv6 addresses exist")
+    require(values.get("routes", "") == "", "IPv4 routes exist")
+    require(values.get("ipv6_routes", "") == "", "IPv6 routes exist")
+    require(
+        values.get("pids") == str(limits.pids),
+        "PID limit is missing, unlimited or differs",
+    )
+    require(
+        values.get("memory") == str(limits.memory_mib * MIB),
+        "memory limit is missing, unlimited or differs",
+    )
+    cpu_max = values.get("cpu")
+    if cpu_max not in (None, "", "unknown"):
+        parts = str(cpu_max).split()
+        require(
+            len(parts) == 2
+            and parts[0].isdigit()
+            and parts[0] == str(limits.cpu * 100_000)
+            and parts[1].isdigit()
+            and int(parts[1]) > 0,
+            "CPU cgroup v2 limit is missing, unlimited or differs",
+        )
+    else:
+        quota = values.get("cpu_quota_us")
+        period = values.get("cpu_period_us")
+        try:
+            quota_value = int(str(quota))
+            period_value = int(str(period))
+        except (TypeError, ValueError):
+            quota_value = period_value = -1
+        require(
+            quota_value > 0
+            and period_value > 0
+            and quota_value == limits.cpu * period_value,
+            "CPU cgroup v1 limit is missing, unlimited or differs",
+        )
+    try:
+        work_mib = int(str(values.get("work_mib")))
+        tmp_mib = int(str(values.get("tmp_mib")))
+    except (TypeError, ValueError):
+        work_mib = tmp_mib = -1
+    require(work_mib > 0 and tmp_mib > 0, "writable tmpfs sizes are not provable")
+    require(
+        work_mib + tmp_mib <= limits.scratch_mib + 2,
+        "writable tmpfs exceeds the scratch budget",
+    )
+    require(not oom_killed, "probe container was OOM-killed")
+    checks["errors"] = errors
+    return not errors, checks
 
 
 class DockerSandbox:
@@ -610,16 +877,26 @@ class DockerSandbox:
         )
         created = self._docker(args[1:], timeout=120)
         if created.returncode != 0:
+            self._remove(name)
             raise SandboxError(
                 "cannot create sandbox container: "
                 + created.stderr.decode("utf-8", "replace")[:500]
             )
-        inspect = self._inspect(name)
-        config = dict(inspect.get("HostConfig", {}))
-        config["User"] = inspect.get("Config", {}).get("User", "")
-        config["Mounts"] = inspect.get("Mounts", [])
-        validate_host_config(config, self.policy, self.limits)
-        return name, config
+        # Once ``docker create`` succeeds the container exists. Any inspect or
+        # policy failure below must remove it before propagating, otherwise a
+        # malformed container survives its generation and keeps running.
+        try:
+            inspect = self._inspect(name)
+            config = dict(inspect.get("HostConfig", {}))
+            config["User"] = inspect.get("Config", {}).get("User", "")
+            config["Mounts"] = inspect.get("Mounts", [])
+            validate_host_config(
+                config, self.policy, self.limits, mounts=mounts
+            )
+            return name, config
+        except BaseException:
+            self._remove(name)
+            raise
 
     def _start_and_wait(
         self,
@@ -711,26 +988,58 @@ class DockerSandbox:
         marker.chmod(0o444)
         name = self._name("probe")
         script = r"""
-set -eu
+set -u
 uid=$(id -u)
-[ "$uid" != "0" ] || exit 20
+if [ "$uid" = "0" ]; then echo "uid=0"; exit 20; fi
 if touch /datacon-root-write 2>/dev/null; then exit 21; fi
 if touch /fixture/.write-probe 2>/dev/null; then exit 22; fi
-touch /work/.write-probe
-if [ -e /var/run/docker.sock ]; then exit 23; fi
-links=$(ls /sys/class/net | grep -v '^lo$' || true)
+touch /work/.write-probe || exit 23
+if [ -e /var/run/docker.sock ]; then exit 24; fi
+links=$(for iface in /sys/class/net/*; do
+  name=$(basename "$iface")
+  [ "$name" = "lo" ] && continue
+  [ -d "$iface" ] || continue
+  state=$(cat "$iface/operstate" 2>/dev/null || echo unknown)
+  [ "$state" = "down" ] || printf '%s:%s ' "$name" "$state"
+done)
+ipv6_links=$(awk '$NF != "lo" { print }' /proc/net/if_inet6 2>/dev/null || true)
 routes=$(awk 'NR > 1 { print }' /proc/net/route)
-[ -z "$routes" ] || exit 24
+# network=none still creates kernel pseudo-devices and loopback IPv6 routes.
+# Any non-loopback route or address is a failure; down pseudo-devices with no
+# address cannot carry traffic and are not a usable interface.
+ipv6_routes=$(awk 'NF > 0 && $NF != "lo" { print }' /proc/net/ipv6_route 2>/dev/null || true)
+if [ -n "$routes" ] || [ -n "$ipv6_routes" ] || [ -n "$links" ] || [ -n "$ipv6_links" ]; then exit 25; fi
 seccomp=$(awk '/^Seccomp:/ {print $2}' /proc/self/status)
-[ "$seccomp" = "2" ] || exit 25
-pids=$(cat /sys/fs/cgroup/pids.max 2>/dev/null || echo unknown)
-memory=$(cat /sys/fs/cgroup/memory.max 2>/dev/null || echo unknown)
-cpu=$(cat /sys/fs/cgroup/cpu.max 2>/dev/null || echo unknown)
+seccomp_filters=$(awk '/^Seccomp_filters:/ {print $2}' /proc/self/status)
+no_new_privs=$(awk '/^NoNewPrivs:/ {print $2}' /proc/self/status)
+cap_eff=$(awk '/^CapEff:/ {print $2}' /proc/self/status)
+if [ "$seccomp" != "2" ]; then exit 26; fi
+if [ "${seccomp_filters:-unknown}" = "unknown" ] && [ ! -f /proc/self/status ]; then exit 27; fi
+cgroup_version=unknown
+pids=unknown
+memory=unknown
+cpu=unknown
+cpu_quota_us=unknown
+cpu_period_us=unknown
+if [ -f /sys/fs/cgroup/cgroup.controllers ]; then
+  cgroup_version=2
+  pids=$(cat /sys/fs/cgroup/pids.max 2>/dev/null || echo unknown)
+  memory=$(cat /sys/fs/cgroup/memory.max 2>/dev/null || echo unknown)
+  cpu=$(cat /sys/fs/cgroup/cpu.max 2>/dev/null || echo unknown)
+elif [ -d /sys/fs/cgroup/pids ] || [ -d /sys/fs/cgroup/memory ]; then
+  cgroup_version=1
+  pids=$(cat /sys/fs/cgroup/pids/pids.max 2>/dev/null || echo unknown)
+  memory=$(cat /sys/fs/cgroup/memory/memory.limit_in_bytes 2>/dev/null || echo unknown)
+  cpu_quota_us=$(cat /sys/fs/cgroup/cpu/cpu.cfs_quota_us 2>/dev/null || echo unknown)
+  cpu_period_us=$(cat /sys/fs/cgroup/cpu/cpu.cfs_period_us 2>/dev/null || echo unknown)
+fi
 work_mib=$(df -Pm /work | awk 'NR==2 {print $2}')
 tmp_mib=$(df -Pm /tmp | awk 'NR==2 {print $2}')
 compiler=$(clang --version | head -n 1)
-printf 'uid=%s\nseccomp=%s\npids=%s\nmemory=%s\ncpu=%s\nwork_mib=%s\ntmp_mib=%s\ncompiler=%s\nlinks=%s\nroutes=%s\n' \
-  "$uid" "$seccomp" "$pids" "$memory" "$cpu" "$work_mib" "$tmp_mib" "$compiler" "$links" "$routes"
+printf 'uid=%s\nseccomp=%s\nseccomp_filters=%s\nno_new_privs=%s\ncap_eff=%s\ncgroup_version=%s\npids=%s\nmemory=%s\ncpu=%s\ncpu_quota_us=%s\ncpu_period_us=%s\nwork_mib=%s\ntmp_mib=%s\ncompiler=%s\nlinks=%s\nipv6_links=%s\nroutes=%s\nipv6_routes=%s\n' \
+  "$uid" "$seccomp" "${seccomp_filters:-unknown}" "${no_new_privs:-unknown}" "${cap_eff:-unknown}" \
+  "$cgroup_version" "$pids" "$memory" "$cpu" "$cpu_quota_us" "$cpu_period_us" \
+  "$work_mib" "$tmp_mib" "$compiler" "$links" "$ipv6_links" "$routes" "$ipv6_routes"
 """
         args = container_create_args(
             image=self.image,
@@ -756,7 +1065,12 @@ printf 'uid=%s\nseccomp=%s\npids=%s\nmemory=%s\ncpu=%s\nwork_mib=%s\ntmp_mib=%s\
             config = dict(inspect.get("HostConfig", {}))
             config["User"] = inspect.get("Config", {}).get("User", "")
             config["Mounts"] = inspect.get("Mounts", [])
-            validate_host_config(config, self.policy, self.limits)
+            validate_host_config(
+                config,
+                self.policy,
+                self.limits,
+                mounts=[(str(probe_root), "/fixture", True)],
+            )
             start = self._docker(["start", name], timeout=30)
             if start.returncode != 0:
                 raise SandboxUnavailable("cannot start isolation probe")
@@ -767,7 +1081,6 @@ printf 'uid=%s\nseccomp=%s\npids=%s\nmemory=%s\ncpu=%s\nwork_mib=%s\ntmp_mib=%s\
                     raise SandboxPolicyError("isolation probe timed out") from error
                 raise
             if wait.returncode != 0:
-                self._remove(name)
                 raise SandboxPolicyError("isolation probe did not complete")
             logs = self._docker(["logs", name], timeout=30)
             raw = (logs.stdout + logs.stderr).decode("utf-8", "replace")
@@ -782,48 +1095,14 @@ printf 'uid=%s\nseccomp=%s\npids=%s\nmemory=%s\ncpu=%s\nwork_mib=%s\ntmp_mib=%s\
             key, separator, value = line.partition("=")
             if separator:
                 values[key.strip()] = value.strip()
-        checks: dict[str, Any] = {
-            "probe_exit_code": exit_code,
-            "uid": values.get("uid"),
-            "seccomp": values.get("seccomp"),
-            "network_links": values.get("links", ""),
-            "routes": values.get("routes", ""),
-            "pids_max": values.get("pids"),
-            "memory_max": values.get("memory"),
-            "cpu_max": values.get("cpu"),
-            "work_mib": values.get("work_mib"),
-            "tmp_mib": values.get("tmp_mib"),
-            "oom_killed": bool(state.get("OOMKilled")),
-        }
-        ok = (
-            exit_code == 0
-            and checks["uid"] == self.policy.user.split(":")[0]
-            and checks["seccomp"] == "2"
-            and checks["routes"] == ""
-            and checks["pids_max"] in (str(self.limits.pids), "max")
-            and checks["memory_max"] in (
-                str(self.limits.memory_mib * MIB),
-                "max",
-            )
-            and "oom_killed" in checks
-            and not checks["oom_killed"]
+        oom_killed = bool(state.get("OOMKilled"))
+        ok, checks = evaluate_probe_values(
+            values,
+            self.policy,
+            self.limits,
+            exit_code=exit_code,
+            oom_killed=oom_killed,
         )
-        # Memory and CPU cgroup files may be absent under some Docker Desktop
-        # kernels; inspect already proved the host configuration in that case.
-        if values.get("memory") not in (None, "unknown", "max"):
-            ok = ok and values["memory"] == str(self.limits.memory_mib * MIB)
-        if values.get("cpu") not in (None, "unknown"):
-            cpu_value = values["cpu"].split()[0]
-            ok = ok and cpu_value in (
-                str(self.limits.cpu * 100_000),
-                "max",
-            )
-        if values.get("work_mib") is not None and values.get("tmp_mib") is not None:
-            try:
-                total = int(values["work_mib"]) + int(values["tmp_mib"])
-            except ValueError:
-                total = 0
-            ok = ok and total <= self.limits.scratch_mib + 2
         if not ok:
             raise SandboxPolicyError(
                 "isolation probe did not confirm the requested policy: "

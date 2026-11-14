@@ -16,9 +16,9 @@ import os
 from pathlib import Path, PurePosixPath
 import shutil
 import uuid
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
-from datacon import jsonutil
+from datacon import contracts, jsonutil
 
 SCHEMA_VERSION = 1
 MAX_MANIFEST_BYTES = 4 * 1024 * 1024
@@ -60,6 +60,16 @@ _ROLE_NAMES = frozenset(
     }
 )
 _ENTRY_FIELDS = frozenset({"path", "role", "size_bytes", "sha256"})
+_VERDICTS = frozenset(
+    {"REPRODUCED", "NOT_REPRODUCED", "INCONCLUSIVE", "BLOCKED", "FAILED"}
+)
+_FULL_EVIDENCE_VERDICTS = frozenset(
+    {"REPRODUCED", "NOT_REPRODUCED", "INCONCLUSIVE"}
+)
+_REPLAY_VERSIONS = ("vulnerable", "fixed")
+_REPLAY_PHASES = ("normal", "candidate_1", "candidate_2")
+_REASON_CODE = re.compile(r"[A-Z][A-Z0-9_]{0,63}")
+_WINDOWS_DRIVE = re.compile(r"^[A-Za-z]:")
 
 
 class BundleError(RuntimeError):
@@ -83,6 +93,7 @@ class BundleVerification:
     root: Path
     manifest: dict[str, Any]
     manifest_digest: str
+    manifest_bytes: bytes
     file_data: dict[str, bytes]
 
 
@@ -111,6 +122,8 @@ def _normalize_file_path(value: Any) -> str:
         raise BundleError("UNSAFE_PATH", "bundle path is too long")
     if value.startswith("/") or value.startswith("\\") or value.startswith("./") or "/./" in value:
         raise BundleError("UNSAFE_PATH", f"absolute or dot bundle path is not allowed: {value}")
+    if value.startswith("//") or _WINDOWS_DRIVE.match(value):
+        raise BundleError("UNSAFE_PATH", f"drive or UNC bundle path is not allowed: {value}")
     if "\\" in value:
         raise BundleError("UNSAFE_PATH", f"backslash path is not allowed: {value}")
     pure = PurePosixPath(value)
@@ -156,6 +169,7 @@ def write_bundle(
     artifacts: Mapping[str, tuple[str, bytes | bytearray | memoryview | Path | str]] | None = None,
     verdict: str | None = None,
     created_at: str | None = None,
+    verify: Callable[[Path], object] | None = None,
 ) -> BundleInfo:
     """Create a new bundle directory and its manifest.
 
@@ -173,6 +187,15 @@ def write_bundle(
         raise BundleError("INVALID_MANIFEST", "report job_id does not match")
     if report.get("plan_digest") != plan_digest:
         raise BundleError("INVALID_MANIFEST", "report plan_digest does not match")
+    report_verdict = report.get("verdict")
+    if report_verdict not in _VERDICTS:
+        raise BundleError("INVALID_MANIFEST", "report verdict must be a known value")
+    report_reason = report.get("reason_code")
+    if report_reason is not None and (
+        not isinstance(report_reason, str)
+        or not _REASON_CODE.fullmatch(report_reason)
+    ):
+        raise BundleError("INVALID_MANIFEST", "report reason_code is invalid")
 
     target = Path(root)
     if target.exists() or target.is_symlink():
@@ -197,6 +220,13 @@ def write_bundle(
             payloads[normalized] = _read_artifact(value)
         if len(payloads) > MAX_FILES:
             raise BundleError("INVALID_MANIFEST", "bundle has too many files")
+        for path, data in payloads.items():
+            # report.json / report.md are generated here rather than read from
+            # disk; they still have to obey the same evidence size cap.
+            if len(data) > MAX_FILE_BYTES:
+                raise BundleError(
+                    "FILE_TOO_LARGE", f"bundle file exceeds the size cap: {path}"
+                )
 
         for path, data in payloads.items():
             destination = temporary / PurePosixPath(path)
@@ -225,10 +255,13 @@ def write_bundle(
             "schema_version": SCHEMA_VERSION,
             "job_id": job_text,
             "plan_digest": plan_digest,
-            "verdict": verdict if isinstance(verdict, str) else report.get("verdict"),
+            "verdict": verdict if isinstance(verdict, str) else report_verdict,
+            "reason_code": report_reason,
             "created_at": created_at or _utc_now(),
             "files": entries,
         }
+        if manifest["verdict"] not in _VERDICTS:
+            raise BundleError("INVALID_MANIFEST", "manifest verdict is invalid")
         manifest_bytes = canonical_manifest_bytes(manifest) + b"\n"
         (temporary / "manifest.json").write_bytes(manifest_bytes)
         (temporary / "manifest.json").chmod(0o600)
@@ -239,6 +272,11 @@ def write_bundle(
         ):
             directory.chmod(0o700)
         temporary.chmod(0o700)
+        if verify is not None:
+            # Sample the completed staging directory before it becomes the
+            # archived bundle. A bundle that cannot verify offline must never
+            # be published as evidence.
+            verify(temporary)
         temporary.rename(target)
     except BaseException:
         shutil.rmtree(temporary, ignore_errors=True)
@@ -269,7 +307,9 @@ def _load_manifest(root: Path) -> tuple[dict[str, Any], bytes]:
     return manifest, data
 
 
-def _validate_manifest_header(manifest: Mapping[str, Any]) -> tuple[str, str, list[dict[str, Any]]]:
+def _validate_manifest_header(
+    manifest: Mapping[str, Any],
+) -> tuple[str, str, list[dict[str, Any]], str, str | None]:
     if manifest.get("schema_version") != SCHEMA_VERSION:
         raise BundleError("INVALID_MANIFEST", "manifest schema_version must be 1")
     try:
@@ -279,12 +319,21 @@ def _validate_manifest_header(manifest: Mapping[str, Any]) -> tuple[str, str, li
     plan_digest = manifest.get("plan_digest")
     if not isinstance(plan_digest, str) or not _DIGEST.fullmatch(plan_digest):
         raise BundleError("INVALID_MANIFEST", "manifest plan_digest is invalid")
+    verdict = manifest.get("verdict")
+    if verdict not in _VERDICTS:
+        raise BundleError("INVALID_MANIFEST", "manifest verdict is invalid")
+    reason_code = manifest.get("reason_code")
+    if reason_code is not None and (
+        not isinstance(reason_code, str)
+        or not _REASON_CODE.fullmatch(reason_code)
+    ):
+        raise BundleError("INVALID_MANIFEST", "manifest reason_code is invalid")
     files = manifest.get("files")
     if not isinstance(files, list):
         raise BundleError("INVALID_MANIFEST", "manifest files must be a list")
     if len(files) > MAX_FILES:
         raise BundleError("INVALID_MANIFEST", "manifest lists too many files")
-    return job_id, plan_digest, files
+    return job_id, plan_digest, files, verdict, reason_code
 
 
 def _validate_entry(entry: Any, seen: set[str]) -> dict[str, Any]:
@@ -314,6 +363,177 @@ def _validate_entry(entry: Any, seen: set[str]) -> dict[str, Any]:
     return {"path": path, "role": role, "size_bytes": size, "sha256": sha}
 
 
+def _parse_json_file(data: Mapping[str, bytes], relative: str) -> dict[str, Any]:
+    try:
+        content = data[relative]
+    except KeyError as error:
+        raise BundleError(
+            "INVALID_MANIFEST", f"required evidence file is missing: {relative}"
+        ) from error
+    try:
+        parsed = jsonutil.loads_strict(content)
+    except jsonutil.StrictJsonError as error:
+        raise BundleError(
+            "INVALID_MANIFEST", f"{relative} is invalid JSON: {error}"
+        ) from error
+    if not isinstance(parsed, dict):
+        raise BundleError("INVALID_MANIFEST", f"{relative} must be an object")
+    return parsed
+
+
+def _reason_code_valid(report: Mapping[str, Any]) -> str | None:
+    reason = report.get("reason_code")
+    if reason is None:
+        return None
+    if not isinstance(reason, str) or not _REASON_CODE.fullmatch(reason):
+        raise BundleError("INVALID_MANIFEST", "report reason_code is invalid")
+    return reason
+
+
+def _validate_report_replays(report: Mapping[str, Any]) -> set[tuple[str, str]]:
+    replays = report.get("replays")
+    if not isinstance(replays, list):
+        raise BundleError("INVALID_MANIFEST", "report replays must be a list")
+    keys: set[tuple[str, str]] = set()
+    for item in replays:
+        if not isinstance(item, Mapping):
+            raise BundleError("INVALID_MANIFEST", "report replay must be an object")
+        version = item.get("version")
+        phase = item.get("phase")
+        if version not in _REPLAY_VERSIONS or phase not in _REPLAY_PHASES:
+            raise BundleError(
+                "INVALID_MANIFEST",
+                f"report replay has an unknown version/phase: {version}/{phase}",
+            )
+        key = (version, phase)
+        if key in keys:
+            raise BundleError(
+                "INVALID_MANIFEST",
+                f"report contains a duplicate replay: {version}/{phase}",
+            )
+        keys.add(key)
+        if not isinstance(item.get("status"), str):
+            raise BundleError(
+                "INVALID_MANIFEST", f"report replay {version}/{phase} has no status"
+            )
+    return keys
+
+
+def _require_evidence_roles(
+    listed: Mapping[str, Mapping[str, Any]],
+    expected: Mapping[str, frozenset[str]],
+) -> None:
+    for path, allowed_roles in expected.items():
+        entry = listed.get(path)
+        if entry is None:
+            raise BundleError(
+                "INVALID_MANIFEST", f"required execution evidence is missing: {path}"
+            )
+        if entry.get("role") not in allowed_roles:
+            raise BundleError(
+                "INVALID_MANIFEST",
+                f"evidence {path} has role {entry.get('role')!r}, "
+                f"expected one of {sorted(allowed_roles)}",
+            )
+
+
+def _verify_semantics(
+    *,
+    job_id: str,
+    plan_digest: str,
+    verdict: str,
+    manifest_reason: str | None,
+    listed: Mapping[str, Mapping[str, Any]],
+    data: Mapping[str, bytes],
+) -> None:
+    """Cross-check the manifest against the plan, review and report content.
+
+    The manifest digest only proves internal byte consistency. This step
+    re-derives the plan digest and requires an approved review, a consistent
+    report and (for outcome verdicts) the complete execution evidence tree.
+    """
+    report = _parse_json_file(data, "report.json")
+    if report.get("job_id") != job_id:
+        raise BundleError("INVALID_MANIFEST", "report job_id does not match manifest")
+    if report.get("plan_digest") != plan_digest:
+        raise BundleError(
+            "INVALID_MANIFEST", "report plan_digest does not match manifest"
+        )
+    report_verdict = report.get("verdict")
+    if report_verdict not in _VERDICTS:
+        raise BundleError("INVALID_MANIFEST", "report verdict must be a known value")
+    if report_verdict != verdict:
+        raise BundleError(
+            "INVALID_MANIFEST", "manifest verdict does not match report verdict"
+        )
+    report_reason = _reason_code_valid(report)
+    if manifest_reason is not None and report_reason != manifest_reason:
+        raise BundleError(
+            "INVALID_MANIFEST", "manifest reason_code does not match report"
+        )
+
+    plan = _parse_json_file(data, "plan.json")
+    try:
+        computed_plan_digest = contracts.plan_digest(plan)
+    except (KeyError, TypeError, ValueError, UnicodeError) as error:
+        raise BundleError(
+            "INVALID_MANIFEST", f"plan.json cannot be validated: {error}"
+        ) from error
+    if computed_plan_digest != plan_digest:
+        raise BundleError(
+            "INVALID_MANIFEST",
+            "plan.json content does not match the manifest plan_digest",
+        )
+
+    review = _parse_json_file(data, "review.json")
+    if review.get("decision") != "approve":
+        raise BundleError(
+            "INVALID_MANIFEST", "review.json must record an approve decision"
+        )
+    if review.get("plan_digest") != plan_digest:
+        raise BundleError(
+            "INVALID_MANIFEST", "review.json is bound to a different plan"
+        )
+
+    replay_keys = _validate_report_replays(report)
+    if verdict in _FULL_EVIDENCE_VERDICTS:
+        expected: dict[str, frozenset[str]] = {
+            "metadata/execution.json": frozenset({"execution_metadata"}),
+            "metadata/probe.json": frozenset({"probe"}),
+        }
+        for version in _REPLAY_VERSIONS:
+            expected[f"build/{version}/build.log"] = frozenset({"build_log"})
+            expected[f"build/{version}/parser"] = frozenset({"build_artifact"})
+            expected[f"build/{version}/metadata.json"] = frozenset(
+                {"build_metadata"}
+            )
+            for phase in _REPLAY_PHASES:
+                directory = f"replay/{version}/{phase}"
+                expected[f"{directory}/stdout.log"] = frozenset(
+                    {"replay_stdout", "normal_output"}
+                )
+                expected[f"{directory}/stderr.log"] = frozenset(
+                    {"asan_log", "replay_stderr", "normal_error"}
+                )
+                expected[f"{directory}/metadata.json"] = frozenset(
+                    {"replay_metadata"}
+                )
+        _require_evidence_roles(listed, expected)
+        required_keys = {
+            (version, phase)
+            for version in _REPLAY_VERSIONS
+            for phase in _REPLAY_PHASES
+        }
+        if replay_keys != required_keys:
+            missing = sorted(required_keys - replay_keys)
+            extra = sorted(replay_keys - required_keys)
+            raise BundleError(
+                "INVALID_MANIFEST",
+                "report replays do not match the six required runs; "
+                f"missing={missing} extra={extra}",
+            )
+
+
 def verify_bundle(root: Path | str) -> BundleVerification:
     """Verify a bundle without database or network access."""
     path = Path(root)
@@ -326,8 +546,10 @@ def verify_bundle(root: Path | str) -> BundleVerification:
     if not root_path.is_dir():
         raise BundleError("INVALID_MANIFEST", "bundle root must be a directory")
 
-    manifest, _ = _load_manifest(root_path)
-    job_id, plan_digest, files = _validate_manifest_header(manifest)
+    manifest, manifest_bytes = _load_manifest(root_path)
+    job_id, plan_digest, files, verdict, manifest_reason = _validate_manifest_header(
+        manifest
+    )
     entries = []
     seen: set[str] = set()
     for entry in files:
@@ -375,30 +597,62 @@ def verify_bundle(root: Path | str) -> BundleVerification:
             raise BundleError("DIGEST_MISMATCH", f"sha256 mismatch for {relative}")
         data[relative] = content
 
-    try:
-        report = jsonutil.loads_strict(data["report.json"])
-    except (KeyError, jsonutil.StrictJsonError) as error:
-        raise BundleError("INVALID_MANIFEST", "report.json is invalid") from error
-    if not isinstance(report, dict):
-        raise BundleError("INVALID_MANIFEST", "report.json must be an object")
-    if report.get("job_id") != job_id:
-        raise BundleError("INVALID_MANIFEST", "report job_id does not match manifest")
-    if report.get("plan_digest") != plan_digest:
-        raise BundleError("INVALID_MANIFEST", "report plan_digest does not match manifest")
-    if not isinstance(report.get("verdict"), str):
-        raise BundleError("INVALID_MANIFEST", "report verdict is missing")
+    _verify_semantics(
+        job_id=job_id,
+        plan_digest=plan_digest,
+        verdict=verdict,
+        manifest_reason=manifest_reason,
+        listed=listed,
+        data=data,
+    )
 
     return BundleVerification(
         root=root_path,
         manifest=manifest,
         manifest_digest=canonical_manifest_digest(manifest),
+        manifest_bytes=manifest_bytes,
         file_data=data,
     )
 
 
-def export_bundle(source: Path | str, destination: Path | str) -> BundleInfo:
+def _confirm_source_manifest(root: Path, expected_digest: str) -> None:
+    """Re-read the source manifest immediately before copying.
+
+    ``export_bundle`` copies from the verified in-memory data, but the source
+    manifest is the identity of the bundle. If the source directory was
+    replaced after verification the copied bytes would belong to a different
+    bundle, so the identity is confirmed again before any output is written.
+    """
+    manifest, _ = _load_manifest(root)
+    if canonical_manifest_digest(manifest) != expected_digest:
+        raise BundleError(
+            "DIGEST_MISMATCH",
+            "the source manifest changed after verification",
+        )
+
+
+def export_bundle(
+    source: Path | str,
+    destination: Path | str,
+    *,
+    expected_manifest_digest: str | None = None,
+) -> BundleInfo:
     """Copy a verified bundle to a new directory, verifying the copy."""
+    if expected_manifest_digest is not None and not _DIGEST.fullmatch(
+        expected_manifest_digest
+    ):
+        raise BundleError("INVALID_MANIFEST", "expected manifest digest is invalid")
     verified = verify_bundle(source)
+    if (
+        expected_manifest_digest is not None
+        and verified.manifest_digest != expected_manifest_digest
+    ):
+        raise BundleError(
+            "DIGEST_MISMATCH",
+            "the archived bundle digest does not match the trusted task record",
+        )
+    _confirm_source_manifest(verified.root, verified.manifest_digest)
+
     target = Path(destination)
     if target.is_symlink():
         raise BundleError("EXPORT_TARGET_NOT_EMPTY", "export target is a symlink")
@@ -423,19 +677,44 @@ def export_bundle(source: Path | str, destination: Path | str) -> BundleInfo:
     parent.mkdir(parents=True, exist_ok=True)
     temporary = parent / f".{target.name}.export-{uuid.uuid4().hex}"
     temporary.mkdir(mode=0o700)
+    temporary_resolved = temporary.resolve()
     try:
         for relative in sorted(verified.file_data):
+            if relative == "manifest.json":
+                raise BundleError(
+                    "INVALID_MANIFEST", "manifest must not be copied as an artifact"
+                )
             output = temporary / PurePosixPath(relative)
             output.parent.mkdir(parents=True, exist_ok=True)
+            if output.is_symlink():
+                raise BundleError("SYMLINK", "export output path is a symlink")
+            try:
+                resolved_output = output.resolve(strict=False)
+            except OSError as error:
+                raise BundleError("UNSAFE_PATH", str(error)) from error
+            if (
+                resolved_output != temporary_resolved
+                and temporary_resolved not in resolved_output.parents
+            ):
+                raise BundleError(
+                    "UNSAFE_PATH", f"export path escapes the bundle: {relative}"
+                )
             output.write_bytes(verified.file_data[relative])
             output.chmod(0o600)
-        shutil.copyfile(
-            verified.root / "manifest.json", temporary / "manifest.json"
-        )
+        # Copy the exact bytes that were verified and hashed, never a reread
+        # from the mutable source directory.
+        (temporary / "manifest.json").write_bytes(verified.manifest_bytes)
         (temporary / "manifest.json").chmod(0o600)
         copied = verify_bundle(temporary)
         if copied.manifest_digest != verified.manifest_digest:
             raise BundleError("DIGEST_MISMATCH", "exported manifest digest changed")
+        if expected_manifest_digest is not None and (
+            copied.manifest_digest != expected_manifest_digest
+        ):
+            raise BundleError(
+                "DIGEST_MISMATCH",
+                "exported manifest digest does not match the trusted task record",
+            )
         if target.exists():
             target.rmdir()
         temporary.rename(target)

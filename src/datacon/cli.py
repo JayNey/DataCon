@@ -127,6 +127,8 @@ def _submit(args) -> int:
         result = store.submit(dsn, request, operator_id=operator)
     except psycopg.Error as error:
         return _error(1, "DATABASE_ERROR", _database_error_message(error))
+    except RuntimeError as error:
+        return _error(1, "INVALID_CONFIGURATION", str(error))
     print(json.dumps(result, ensure_ascii=False))
     return 0
 
@@ -203,6 +205,8 @@ def _worker(args) -> int:
         )
     except psycopg.Error as error:
         return _error(1, "DATABASE_ERROR", _database_error_message(error))
+    except RuntimeError as error:
+        return _error(1, "INVALID_CONFIGURATION", str(error))
     print(json.dumps(result, ensure_ascii=False))
     return 0
 
@@ -243,7 +247,11 @@ def _export(args) -> int:
             "the archived bundle digest does not match the trusted task record",
         )
     try:
-        exported = evidence.export_bundle(verified.root, args.out)
+        exported = evidence.export_bundle(
+            verified.root,
+            args.out,
+            expected_manifest_digest=job["evidence_digest"],
+        )
     except evidence.BundleError as error:
         return _error(3, error.reason_code, error.message)
     except OSError as error:

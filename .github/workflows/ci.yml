@@ -125,6 +125,7 @@ jobs:
               "datacon/data/cases/inputs/candidate.txt",
               "datacon/data/cases/inputs/clean.txt",
               "datacon/data/cases/inputs/normal.txt",
+              "datacon/data/seccomp/default.json",
           ]
           missing = [name for name in required if name not in names]
           if missing:

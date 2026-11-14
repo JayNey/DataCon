@@ -17,6 +17,14 @@ import pytest
 
 from datacon import state
 from datacon.evidence import verify_bundle
+from datacon.tools.sandbox import (
+    SECCOMP_PROFILE_DIGEST,
+    DockerSandbox,
+    IsolationPolicy,
+    ResourceLimits,
+    SandboxPolicyError,
+)
+import datacon.tools.sandbox as sandbox_module
 from support import cli, review, status, submit, worker, write_request
 
 pytestmark = [pytest.mark.postgres, pytest.mark.docker]
@@ -191,7 +199,11 @@ def test_mvp03_crash_after_tool_recovers_and_reuses_result(
     isolated_database, tmp_path
 ):
     job, _, env = approved(isolated_database, tmp_path)
-    fault_env = {**env, "DATACON_FAULT_AFTER_TOOL": "build:vulnerable"}
+    fault_env = {
+        **env,
+        "DATACON_FAULT_AFTER_TOOL": "build:vulnerable",
+        "DATACON_TEST_MODE": "1",
+    }
     crashed = cli(
         "worker",
         "--once",
@@ -237,3 +249,127 @@ def test_mvp03_crash_after_tool_recovers_and_reuses_result(
         status="completed",
         result={"stale": True},
     ) is False
+
+
+def _remove_option(args, option, count=1):
+    index = args.index(option)
+    del args[index : index + 1 + count]
+
+
+def _set_option(args, option, value):
+    index = args.index(option)
+    args[index + 1] = value
+
+
+def _remove_all(args, option, count=1):
+    while option in args:
+        _remove_option(args, option, count)
+
+
+def _seccomp_unconfined(args):
+    for index, item in enumerate(args):
+        if item.startswith("seccomp="):
+            args[index] = "seccomp=unconfined"
+
+
+def _seccomp_missing(args):
+    for index in range(len(args) - 1, -1, -1):
+        if args[index] == "--security-opt" and args[index + 1].startswith(
+            "seccomp="
+        ):
+            del args[index : index + 2]
+
+
+def _tmpfs_unbounded(args):
+    for index, item in enumerate(args):
+        if item == "--tmpfs":
+            target = args[index + 1].split(":", 1)[0]
+            args[index + 1] = f"{target}:rw"
+
+
+def _remove_security_opt(args, value):
+    for index in range(len(args) - 2, -1, -1):
+        if args[index] == "--security-opt" and args[index + 1] == value:
+            del args[index : index + 2]
+            return
+    raise AssertionError(f"{value} security option not found")
+
+
+NEGATIVE_MUTATIONS = [
+    ("read-only-root", lambda args: args.remove("--read-only")),
+    ("user-root", lambda args: _set_option(args, "--user", "0:0")),
+    ("network-bridge", lambda args: _set_option(args, "--network", "bridge")),
+    (
+        "no-new-privileges",
+        lambda args: _remove_security_opt(args, "no-new-privileges"),
+    ),
+    ("seccomp-missing", _seccomp_missing),
+    ("seccomp-unconfined", _seccomp_unconfined),
+    ("pids-limit", lambda args: _remove_option(args, "--pids-limit")),
+    (
+        "memory-limit",
+        lambda args: (
+            _remove_option(args, "--memory-swap"),
+            _remove_option(args, "--memory"),
+        ),
+    ),
+    ("cpu-limit", lambda args: _remove_option(args, "--cpus")),
+    ("tmpfs-limit", _tmpfs_unbounded),
+]
+
+
+@pytest.mark.parametrize(
+    "mutation", [item[1] for item in NEGATIVE_MUTATIONS], ids=[item[0] for item in NEGATIVE_MUTATIONS]
+)
+def test_mvp04_single_control_drift_is_rejected_and_cleaned_up(
+    tmp_path, monkeypatch, mutation
+):
+    policy = IsolationPolicy(
+        network="none",
+        user="65534:65534",
+        read_only_root=True,
+        cap_drop=("ALL",),
+        no_new_privileges=True,
+        seccomp="runtime/default",
+        seccomp_profile_digest=SECCOMP_PROFILE_DIGEST,
+    )
+    limits = ResourceLimits(cpu=2, memory_mib=2048, pids=128, scratch_mib=512)
+    job_id = f"negative-{uuid.uuid4().hex}"
+    sandbox = DockerSandbox(
+        image=(
+            "silkeh/clang:19-bookworm@sha256:"
+            "f5ce959d91f059acf5a4b3f1c19f46713c4b2881c7d7cd1d5143ca1d1412277f"
+        ),
+        platform="linux/amd64",
+        policy=policy,
+        limits=limits,
+        job_id=job_id,
+        run_root=tmp_path / "runs",
+    )
+    fixture = tmp_path / "fixture"
+    fixture.mkdir()
+    (fixture / "marker.txt").write_text("read-only\n", encoding="utf-8")
+    real_create_args = sandbox_module.container_create_args
+
+    def drifted_create_args(**kwargs):
+        command = real_create_args(**kwargs)
+        mutation(command)
+        return command
+
+    monkeypatch.setattr(
+        sandbox_module, "container_create_args", drifted_create_args
+    )
+    with pytest.raises(SandboxPolicyError):
+        sandbox._create(
+            suffix="negative",
+            command=["/bin/true"],
+            mounts=[(str(fixture), "/fixture", True)],
+        )
+    leftovers = subprocess.run(
+        ["docker", "ps", "-aq", "--filter", f"label=datacon.job_id={job_id}"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert leftovers.returncode == 0
+    assert leftovers.stdout.strip() == "", "a drifted container was not removed"

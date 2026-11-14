@@ -597,6 +597,7 @@ def run_worker(
     execute: bool = True,
     run_root: str | None = None,
 ) -> dict[str, Any]:
+    execution.validate_test_hooks()
     worker = _worker_id()
     with PostgresSaver.from_conn_string(dsn) as checkpointer:
         checkpointer.setup()

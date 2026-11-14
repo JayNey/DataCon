@@ -1,5 +1,11 @@
 BEGIN;
 
+-- Serialize concurrent migration runs. The DO block below checks for a
+-- constraint and then adds it; without this lock two runners can both observe
+-- the constraint as missing and one ADD CONSTRAINT fails. The advisory lock is
+-- transaction-scoped, so it is released even if the migration aborts.
+SELECT pg_advisory_xact_lock(hashtext('datacon:migrations'));
+
 -- T05/T06 incremental records. Existing jobs, plans, reviews and attempts are
 -- preserved; every statement is re-runnable. The verdict and evidence columns
 -- are terminal metadata, while execution attempts continue to use the

@@ -435,6 +435,14 @@ def analyze_case(
         raise AnalysisBlocked(
             "MATERIAL_MISSING", "case registry isolation must be an object"
         )
+    if not isinstance(isolation.get("seccomp_profile_digest"), str):
+        # A plan without a pinned profile could only fail closed at execution;
+        # refuse to freeze it so operators see the misconfiguration before
+        # review instead of approving an unexecutable plan.
+        raise AnalysisBlocked(
+            "MATERIAL_MISSING",
+            "case registry isolation must pin seccomp_profile_digest",
+        )
 
     manifest = case.manifest
     manifest_case = case.manifest_case

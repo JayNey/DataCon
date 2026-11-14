@@ -475,6 +475,19 @@ def test_malformed_registry_isolation_is_analysis_blocked(case_root, value):
     assert "TypeError" not in caught.value.message
 
 
+def test_registry_isolation_without_seccomp_digest_is_analysis_blocked(case_root):
+    registry_path = case_root / "registry.json"
+    registry = read_json(registry_path)
+    registry["isolation"].pop("seccomp_profile_digest", None)
+    write_json(registry_path, registry)
+
+    with pytest.raises(AnalysisBlocked) as caught:
+        analyze_case(request(), case_root=case_root)
+
+    assert caught.value.reason_code == "MATERIAL_MISSING"
+    assert "seccomp_profile_digest" in caught.value.message
+
+
 @pytest.mark.parametrize("name", ["harness main.c", "harness\tmain.c"])
 def test_whitespace_in_material_path_is_analysis_blocked(case_root, name):
     """A POSIX-legal name with whitespace is a material error, not a crash."""
