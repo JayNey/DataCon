@@ -315,8 +315,8 @@ def test_probe_rejects_network_and_kernel_boundary_drift(change):
 
 
 class RecordingSandbox(DockerSandbox):
-    def __init__(self, tmp_path, inspect_payload, *, inspect_error=False):
-        super().__init__(
+    def __init__(self, tmp_path, inspect_payload, *, inspect_error=False, generation=None):
+        options = dict(
             image=IMAGE,
             platform="linux/amd64",
             policy=POLICY,
@@ -325,6 +325,9 @@ class RecordingSandbox(DockerSandbox):
             job_id="job-1234",
             run_root=tmp_path,
         )
+        if generation is not None:
+            options["generation"] = generation
+        super().__init__(**options)
         self.calls = []
         self.inspect_payload = inspect_payload
         self.inspect_error = inspect_error
@@ -408,3 +411,77 @@ def test_create_removes_the_container_when_create_is_rejected(tmp_path):
             mounts=[(MOUNT_SOURCE, "/fixture", True)],
         )
     assert any(call and call[0] == "rm" for call in sandbox.calls)
+
+
+def _label_values(command):
+    return [
+        command[index + 1]
+        for index, item in enumerate(command)
+        if item == "--label"
+    ]
+
+
+def test_container_labels_include_generation():
+    command = args(job_id="job-1234", generation=3)
+    labels = _label_values(command)
+    assert "datacon.job_id=job-1234" in labels
+    assert "datacon.generation=3" in labels
+
+
+def test_docker_sandbox_create_labels_the_generation(tmp_path):
+    sandbox = RecordingSandbox(tmp_path, _inspect_payload(), generation=3)
+    sandbox._create(
+        suffix="labelled",
+        command=["/bin/true"],
+        mounts=[(MOUNT_SOURCE, "/fixture", True)],
+    )
+    created = next(call for call in sandbox.calls if call and call[0] == "create")
+    labels = _label_values(created)
+    assert "datacon.generation=3" in labels
+
+
+def test_reclaim_removes_only_older_generation(tmp_path):
+    sandbox = DockerSandbox(
+        image=IMAGE,
+        platform="linux/amd64",
+        policy=POLICY,
+        limits=LIMITS,
+        docker="docker",
+        job_id="job-1234",
+        run_root=tmp_path,
+        generation=5,
+    )
+    removed = []
+    containers = {
+        "old": "2",
+        "current": "5",
+        "newer": "6",
+        "legacy": None,
+    }
+
+    def fake_docker(command, *, timeout=60.0):
+        if command[0] == "ps":
+            return SimpleNamespace(
+                returncode=0,
+                stdout=(" ".join(containers) + "\n").encode(),
+                stderr=b"",
+            )
+        if command[0] == "inspect":
+            name = command[1]
+            labels = {"datacon.job_id": "job-1234"}
+            if containers[name] is not None:
+                labels["datacon.generation"] = containers[name]
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps([{"Config": {"Labels": labels}}]).encode(),
+                stderr=b"",
+            )
+        if command[0] == "rm":
+            removed.append(command[-1])
+            return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+        raise AssertionError(f"unexpected docker command: {command}")
+
+    sandbox._docker = fake_docker
+    assert sandbox.reclaim_job() == 2
+    assert set(removed) == {"old", "legacy"}
+    assert "current" not in removed and "newer" not in removed

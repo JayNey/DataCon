@@ -21,26 +21,222 @@ from datacon.evidence import (
     verify_bundle,
     write_bundle,
 )
-from test_plan import PLAN
-
 JOB_ID = str(uuid4())
-PLAN_DIGEST = plan_digest(PLAN)
 REASONS = {"REPRODUCED": "ASAN_SIGNATURE_MATCHED"}
+
+# A complete bundle is built from a plan whose case-config digest is
+# recomputed from the same materials that the bundle ships. This is the real
+# shape produced by execution: the verifier can bind every material byte back
+# to the frozen plan instead of trusting report.json.
+ASAN_LOG = """\
+==7==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x502000000014
+WRITE of size 1 at 0x502000000014 thread T0
+    #0 0x55555565fadf in parse_token /fixture/vulnerable/parser.c:22:17
+    #1 0x55555565fc67 in main /fixture/harness.c:14:19
+SUMMARY: AddressSanitizer: heap-buffer-overflow /fixture/vulnerable/parser.c:22:17 in parse_token
+"""
+MATERIALS = {
+    "harness.c": b"int main(void) { return 0; }\n",
+    "build.sh": (
+        b"#!/bin/sh\nset -eu\n"
+        b"clang -std=c11 -g -O0 -fno-omit-frame-pointer -fsanitize=address "
+        b"/fixture/harness.c -o /work/parser\n"
+    ),
+    "dependencies.lock": b"clang=19.1.7\n",
+    "fix.patch": b"--- a/parser.c\n+++ b/parser.c\n",
+    "vulnerable/parser.c": b"char *parse_token(void) { return 0; }\n",
+    "fixed/parser.c": b"char *parse_token(void) { return 0; }\n",
+    "inputs/normal.txt": b"normal\n",
+    "inputs/candidate.txt": b"ABCD\n",
+}
+MATERIAL_DIGESTS = {
+    path: "sha256:" + hashlib.sha256(data).hexdigest()
+    for path, data in MATERIALS.items()
+}
+MATERIAL_ROLES = {
+    "harness.c": "material_harness",
+    "build.sh": "material_build_recipe",
+    "dependencies.lock": "material_dependencies",
+    "fix.patch": "material_patch",
+    "vulnerable/parser.c": "material_source_vulnerable",
+    "fixed/parser.c": "material_source_fixed",
+    "inputs/normal.txt": "material_input_normal",
+    "inputs/candidate.txt": "material_input_candidate",
+}
+COMPILE_ARGS = [
+    "-std=c11",
+    "-g",
+    "-O0",
+    "-fno-omit-frame-pointer",
+    "-fsanitize=address",
+    "-o",
+]
+
+from test_plan import PLAN as BASE_PLAN
+
+PLAN = deepcopy(BASE_PLAN)
+PLAN["harness_digest"] = MATERIAL_DIGESTS["harness.c"]
+PLAN["build_recipe_digest"] = MATERIAL_DIGESTS["build.sh"]
+PLAN["dependencies_digest"] = MATERIAL_DIGESTS["dependencies.lock"]
+PLAN["repository"]["patch_digest"] = MATERIAL_DIGESTS["fix.patch"]
+PLAN["inputs"] = {
+    "normal": MATERIAL_DIGESTS["inputs/normal.txt"],
+    "candidate": MATERIAL_DIGESTS["inputs/candidate.txt"],
+}
+
+CASE_CONFIG = {
+    "case_id": PLAN["case_id"],
+    "cve_id": PLAN["cve_id"],
+    "benchmark_id": "B01",
+    "registry_entry": {
+        "cve_id": PLAN["cve_id"],
+        "benchmark_id": "B01",
+        "repository": {
+            "origin": PLAN["repository"]["origin"],
+            "bundle": "fixture-repo.bundle",
+            "bundle_digest": PLAN["repository"]["bundle_digest"],
+            "commits": dict(PLAN["revisions"]),
+            "patch": "fix.patch",
+        },
+    },
+    "manifest_case": {
+        "case_id": PLAN["case_id"],
+        "inputs": {
+            "normal": "inputs/normal.txt",
+            "candidate": "inputs/candidate.txt",
+        },
+        "expected_exit": dict(PLAN["expected_exit"]),
+        "expected_stdout": {"normal": "OK\n", "candidate_clean": "ABCD\n"},
+    },
+    "materials": dict(MATERIAL_DIGESTS),
+    "image": "silkeh/clang:19-bookworm@" + PLAN["image_digest"],
+    "platform": PLAN["platform"],
+    "toolchain": dict(PLAN["toolchain"]),
+    "asan_options": PLAN["asan_options"],
+    "asan_signature": dict(PLAN["asan_signature"]),
+}
+PLAN["case_config_digest"] = jsonutil.digest_json(CASE_CONFIG)
+PLAN_DIGEST = plan_digest(PLAN)
+
+
+def digest(data: bytes) -> str:
+    return "sha256:" + hashlib.sha256(data).hexdigest()
+
+
+def build_record(version: str) -> dict:
+    artifact = f"parser-{version}".encode()
+    log = f"{version} build\n".encode()
+    return {
+        "tool_id": "sandbox.build",
+        "job_id": JOB_ID,
+        "generation": 1,
+        "plan_digest": PLAN_DIGEST,
+        "input_digest": PLAN["analysis_digest"],
+        "status": "completed",
+        "version": version,
+        "container_id": f"build-{version}",
+        "artifact_digest": digest(artifact),
+        "attempt_no": 1,
+        "files": {
+            "log": f"generation-1/build/{version}/build.log",
+            "artifact": f"generation-1/build/{version}/parser",
+        },
+        "file_digests": {"log": digest(log), "artifact": digest(artifact)},
+        "exit_code": 0,
+        "duration_seconds": 0.1,
+        "image_digest": PLAN["image_digest"],
+        "compile_args": list(COMPILE_ARGS),
+        "log_digest": digest(log),
+        "log_truncated": False,
+        "build_recipe_digest": PLAN["build_recipe_digest"],
+        "build_command": ["/bin/sh", "/fixture/build.sh", version],
+    }
+
+
+def replay_record(version: str, phase: str) -> dict:
+    from datacon.asan import parse_asan
+
+    if version == "vulnerable" and phase.startswith("candidate"):
+        stdout = b""
+        stderr = ASAN_LOG.encode()
+        exit_code = PLAN["expected_exit"]["candidate_asan"]
+    elif version == "fixed" and phase.startswith("candidate"):
+        stdout = b"ABCD\n"
+        stderr = b""
+        exit_code = PLAN["expected_exit"]["candidate_clean"]
+    else:
+        stdout = b"OK\n"
+        stderr = b""
+        exit_code = PLAN["expected_exit"]["normal"]
+    signature = parse_asan(stderr.decode("utf-8", "replace"))
+    input_digest = (
+        PLAN["inputs"]["normal"]
+        if phase == "normal"
+        else PLAN["inputs"]["candidate"]
+    )
+    return {
+        "tool_id": "sandbox.replay",
+        "job_id": JOB_ID,
+        "generation": 1,
+        "plan_digest": PLAN_DIGEST,
+        "input_digest": input_digest,
+        "status": "completed",
+        "version": version,
+        "phase": phase,
+        "container_id": f"replay-{version}-{phase}",
+        "signature": signature.as_dict() if signature else None,
+        "attempt_no": 1,
+        "files": {
+            "stdout": f"generation-1/replay/{version}/{phase}/stdout.log",
+            "stderr": f"generation-1/replay/{version}/{phase}/stderr.log",
+        },
+        "file_digests": {"stdout": digest(stdout), "stderr": digest(stderr)},
+        "exit_code": exit_code,
+        "duration_seconds": 0.1,
+        "stdout_sha256": digest(stdout),
+        "stdout_bytes": len(stdout),
+        "stdout_preview": stdout[:512].decode("utf-8", "replace"),
+        "stderr_sha256": digest(stderr),
+        "stderr_bytes": len(stderr),
+        "stderr_preview": stderr[:512].decode("utf-8", "replace"),
+        "timed_out": False,
+        "quota_hit": False,
+        "log_truncated": False,
+        "image_digest": PLAN["image_digest"],
+        "asan_options": PLAN["asan_options"],
+        "limits_hit": [],
+    }
+
+
+BUILDS = [build_record(version) for version in ("vulnerable", "fixed")]
+REPLAYS = [
+    replay_record(version, phase)
+    for version in ("vulnerable", "fixed")
+    for phase in ("normal", "candidate_1", "candidate_2")
+]
 
 REPORT = {
     "schema_version": 1,
     "job_id": JOB_ID,
     "plan_digest": PLAN_DIGEST,
-    "cve_id": "CVE-2099-0001",
-    "case_id": "fixture-c-parser",
+    "cve_id": PLAN["cve_id"],
+    "case_id": PLAN["case_id"],
     "verdict": "REPRODUCED",
     "reason_code": REASONS["REPRODUCED"],
-    "builds": [],
-    "replays": [
-        {"version": version, "phase": phase, "status": "completed"}
-        for version in ("vulnerable", "fixed")
-        for phase in ("normal", "candidate_1", "candidate_2")
-    ],
+    "repository": dict(PLAN["repository"]),
+    "versions": dict(PLAN["revisions"]),
+    "inputs": dict(PLAN["inputs"]),
+    "signature": dict(PLAN["asan_signature"]),
+    "environment": {
+        "image_digest": PLAN["image_digest"],
+        "platform": PLAN["platform"],
+        "toolchain": dict(PLAN["toolchain"]),
+        "asan_options": PLAN["asan_options"],
+        "compile_args": list(COMPILE_ARGS),
+        "probe": {"checks": {"seccomp": "2"}},
+    },
+    "builds": BUILDS,
+    "replays": REPLAYS,
     "missing": [],
 }
 
@@ -62,8 +258,13 @@ def full_artifacts() -> dict[str, tuple[str, bytes]]:
         "review.json": ("review", canonical(REVIEW)),
         "metadata/execution.json": ("execution_metadata", b'{"generation":1}\n'),
         "metadata/probe.json": ("probe", b'{"checks":{"seccomp":"2"}}\n'),
+        "metadata/case.json": (
+            "case_config",
+            canonical({"case_config": CASE_CONFIG}),
+        ),
     }
-    for version in ("vulnerable", "fixed"):
+    for build in BUILDS:
+        version = build["version"]
         artifacts[f"build/{version}/build.log"] = (
             "build_log",
             f"{version} build\n".encode(),
@@ -74,25 +275,30 @@ def full_artifacts() -> dict[str, tuple[str, bytes]]:
         )
         artifacts[f"build/{version}/metadata.json"] = (
             "build_metadata",
-            canonical({"version": version, "status": "completed"}),
+            canonical(build),
         )
-    for version in ("vulnerable", "fixed"):
-        for phase in ("normal", "candidate_1", "candidate_2"):
-            directory = f"replay/{version}/{phase}"
-            artifacts[f"{directory}/stdout.log"] = (
-                "replay_stdout" if phase != "normal" else "normal_output",
-                b"OK\n",
-            )
-            artifacts[f"{directory}/stderr.log"] = (
-                "asan_log"
-                if (version, phase) == ("vulnerable", "candidate_1")
-                else "replay_stderr",
-                b"",
-            )
-            artifacts[f"{directory}/metadata.json"] = (
-                "replay_metadata",
-                canonical({"version": version, "phase": phase, "status": "completed"}),
-            )
+    for replay in REPLAYS:
+        directory = f"replay/{replay['version']}/{replay['phase']}"
+        artifacts[f"{directory}/stdout.log"] = (
+            "replay_stdout" if replay["phase"] != "normal" else "normal_output",
+            replay["stdout_preview"].encode(),
+        )
+        artifacts[f"{directory}/stderr.log"] = (
+            "asan_log"
+            if replay["version"] == "vulnerable"
+            and replay["phase"].startswith("candidate")
+            else "replay_stderr",
+            replay["stderr_preview"].encode(),
+        )
+        artifacts[f"{directory}/metadata.json"] = (
+            "replay_metadata",
+            canonical(replay),
+        )
+    for relative, data in MATERIALS.items():
+        artifacts[f"materials/{relative}"] = (
+            MATERIAL_ROLES[relative],
+            data,
+        )
     return artifacts
 
 
@@ -181,6 +387,175 @@ def test_valid_bundle_round_trips_and_exports(tmp_path):
     assert exported.manifest_digest == info.manifest_digest
     assert (tmp_path / "exported" / "manifest.json").is_file()
     assert (tmp_path / "exported" / "report.md").read_text() == "# report\n"
+
+
+def test_verify_accepts_valid_reproduced_bundle(tmp_path):
+    info = make_bundle(tmp_path)
+    verified = verify_bundle(info.root)
+    assert verified.manifest["verdict"] == "REPRODUCED"
+    report = json.loads(verified.file_data["report.json"])
+    assert report["replays"]
+    assert len(report["replays"]) == 6
+    assert len(report["builds"]) == 2
+    for relative in MATERIALS:
+        assert f"materials/{relative}" in verified.file_data
+
+
+def _mutate_report(root: Path, mutate) -> None:
+    report = json.loads((root / "report.json").read_text(encoding="utf-8"))
+    mutate(report)
+    _rewrite_manifested_file(root, "report.json", canonical(report))
+
+
+def _set_manifest_reason(root: Path, reason: str | None) -> None:
+    manifest_path = root / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["reason_code"] = reason
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+
+def test_verify_rejects_report_evidence_digest_mismatch(tmp_path):
+    info = make_bundle(tmp_path)
+    _rewrite_manifested_file(
+        info.root,
+        "replay/vulnerable/candidate_1/stderr.log",
+        ASAN_LOG.encode() + b"tampered trailing data\n",
+    )
+    with pytest.raises(BundleError) as caught:
+        verify_bundle(info.root)
+    assert caught.value.reason_code in ("DIGEST_MISMATCH", "INVALID_MANIFEST")
+
+
+def test_verify_rejects_build_metadata_not_matching_plan(tmp_path):
+    info = make_bundle(tmp_path)
+
+    def mutate(report):
+        report["builds"][0]["image_digest"] = "sha256:" + "9" * 64
+
+    _mutate_report(info.root, mutate)
+    with pytest.raises(BundleError) as caught:
+        verify_bundle(info.root)
+    assert caught.value.reason_code in ("DIGEST_MISMATCH", "INVALID_MANIFEST")
+
+
+def test_verify_rejects_material_digest_not_matching_plan(tmp_path):
+    info = make_bundle(tmp_path)
+    _rewrite_manifested_file(info.root, "materials/build.sh", b"#!/bin/sh\nexit 0\n")
+    with pytest.raises(BundleError) as caught:
+        verify_bundle(info.root)
+    assert caught.value.reason_code in ("DIGEST_MISMATCH", "INVALID_MANIFEST")
+
+
+def test_verify_rejects_replay_signature_not_matching_log(tmp_path):
+    info = make_bundle(tmp_path)
+
+    def mutate(report):
+        replay = next(
+            item
+            for item in report["replays"]
+            if item["version"] == "vulnerable"
+            and item["phase"] == "candidate_1"
+        )
+        replay["signature"] = {
+            "error": "use-after-free",
+            "function": "other_function",
+        }
+
+    _mutate_report(info.root, mutate)
+    with pytest.raises(BundleError) as caught:
+        verify_bundle(info.root)
+    assert caught.value.reason_code in ("DIGEST_MISMATCH", "INVALID_MANIFEST")
+
+
+def test_verify_rejects_reproduced_with_timeout_replays(tmp_path):
+    info = make_bundle(tmp_path)
+
+    def mutate(report):
+        for replay in report["replays"]:
+            if replay["version"] == "vulnerable" and replay["phase"].startswith(
+                "candidate"
+            ):
+                replay["status"] = "timeout"
+                replay["timed_out"] = True
+
+    _mutate_report(info.root, mutate)
+    with pytest.raises(BundleError) as caught:
+        verify_bundle(info.root)
+    assert caught.value.reason_code in ("DIGEST_MISMATCH", "INVALID_MANIFEST")
+
+
+def test_verify_rejects_empty_builds_for_reproduced(tmp_path):
+    info = make_bundle(tmp_path)
+    _mutate_report(info.root, lambda report: report.update({"builds": []}))
+    with pytest.raises(BundleError) as caught:
+        verify_bundle(info.root)
+    assert caught.value.reason_code in ("DIGEST_MISMATCH", "INVALID_MANIFEST")
+
+
+def test_verify_rejects_replay_input_mismatch(tmp_path):
+    info = make_bundle(tmp_path)
+
+    def mutate(report):
+        replay = next(
+            item
+            for item in report["replays"]
+            if item["version"] == "fixed" and item["phase"] == "candidate_2"
+        )
+        replay["input_digest"] = PLAN["inputs"]["normal"]
+
+    _mutate_report(info.root, mutate)
+    with pytest.raises(BundleError) as caught:
+        verify_bundle(info.root)
+    assert caught.value.reason_code in ("DIGEST_MISMATCH", "INVALID_MANIFEST")
+
+
+def test_verify_rejects_manifest_reason_not_in_verdict_set(tmp_path):
+    info = make_bundle(tmp_path)
+    _mutate_report(info.root, lambda report: report.update({"reason_code": "TIMEOUT"}))
+    _set_manifest_reason(info.root, "TIMEOUT")
+    with pytest.raises(BundleError) as caught:
+        verify_bundle(info.root)
+    assert caught.value.reason_code in ("DIGEST_MISMATCH", "INVALID_MANIFEST")
+
+
+def test_verify_rejects_unknown_replay_status(tmp_path):
+    info = make_bundle(tmp_path)
+
+    def mutate(report):
+        report["replays"][0]["status"] = "definitely-not-a-status"
+
+    _mutate_report(info.root, mutate)
+    with pytest.raises(BundleError) as caught:
+        verify_bundle(info.root)
+    assert caught.value.reason_code in ("DIGEST_MISMATCH", "INVALID_MANIFEST")
+
+
+def test_verify_bundle_rejects_oversized_file_before_read(tmp_path, monkeypatch):
+    info = make_bundle(tmp_path)
+    manifest = json.loads((info.root / "manifest.json").read_text(encoding="utf-8"))
+    entry = next(
+        item for item in manifest["files"] if item["path"] == "plan.json"
+    )
+    target = info.root / "plan.json"
+    os.truncate(target, entry["size_bytes"] + 1024)
+
+    def forbidden_read_bytes(self):
+        raise AssertionError(f"read_bytes must not be used for {self}")
+
+    monkeypatch.setattr(Path, "read_bytes", forbidden_read_bytes)
+    with pytest.raises(BundleError) as caught:
+        verify_bundle(info.root)
+    assert caught.value.reason_code in ("DIGEST_MISMATCH", "FILE_TOO_LARGE")
+
+
+def test_verify_bundle_rejects_total_size_over_cap(tmp_path, monkeypatch):
+    import datacon.evidence as evidence_module
+
+    info = make_bundle(tmp_path)
+    monkeypatch.setattr(evidence_module, "MAX_TOTAL_BYTES", 1, raising=False)
+    with pytest.raises(BundleError) as caught:
+        verify_bundle(info.root)
+    assert caught.value.reason_code == "FILE_TOO_LARGE"
 
 
 def test_manifest_verdict_must_match_report(tmp_path):

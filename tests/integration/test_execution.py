@@ -46,6 +46,9 @@ WRITE of size 1 at 0x502000000014 thread T0
     #1 0x55555565fc67 in main /fixture/harness.c:14:19
 SUMMARY: AddressSanitizer: heap-buffer-overflow /fixture/vulnerable/parser.c:22:17 in parse_token
 """
+IMAGE_DIGEST = (
+    "sha256:f5ce959d91f059acf5a4b3f1c19f46713c4b2881c7d7cd1d5143ca1d1412277f"
+)
 
 
 def digest(data: bytes) -> str:
@@ -79,23 +82,32 @@ class FakeSandbox:
             limits={},
         )
 
-    def build(self, version, *, materials_dir, compile_args, deadline_seconds):
+    def build(
+        self,
+        version,
+        *,
+        materials_dir,
+        compile_args,
+        deadline_seconds,
+        expected_materials=None,
+    ):
         self.builds += 1
         artifact = f"fake-{version}-binary".encode()
+        recipe = Path(materials_dir) / "build.sh"
         return BuildResult(
             version=version,
             status="completed",
             exit_code=0,
             duration_seconds=0.01,
             container_id=f"fake-build-{version}",
-            image_digest="sha256:" + "a" * 64,
+            image_digest=IMAGE_DIGEST,
             compile_args=tuple(compile_args),
             artifact_digest=digest(artifact),
             log=b"",
             log_truncated=False,
             artifact=artifact,
             metadata={
-                "build_recipe_digest": "sha256:" + "b" * 64,
+                "build_recipe_digest": digest(recipe.read_bytes()),
                 "build_command": ["/bin/sh", "/fixture/build.sh", version],
             },
         )
@@ -110,6 +122,7 @@ class FakeSandbox:
         asan_options,
         timeout_seconds,
         deadline_seconds,
+        expected_artifact_digest=None,
     ):
         self.replays += 1
         key = f"{version}:{phase}"
@@ -135,6 +148,8 @@ class FakeSandbox:
             signature = parse_asan(ASAN_LOG)
         elif self.case_id == "fixture-c-parser" and version == "fixed" and phase.startswith("candidate"):
             stdout = b"ABCD\n"
+        elif self.case_id != "fixture-c-parser" and phase.startswith("candidate"):
+            stdout = b"ABC\n"
         return ReplayResult(
             version=version,
             phase=phase,
@@ -150,9 +165,11 @@ class FakeSandbox:
             quota_hit=False,
             log_truncated=False,
             metadata={
-                "image_digest": "sha256:" + "a" * 64,
+                "image_digest": IMAGE_DIGEST,
                 "asan_options": asan_options,
+                "oom_killed": False,
                 "limits_hit": [],
+                "timeout_seconds": timeout_seconds,
             },
         )
 
@@ -347,6 +364,34 @@ def test_archive_failure_is_visible_in_status(
     current = status(isolated_database.dsn, job["job_id"])
     assert current["state"] == "FAILED"
     assert current["reason_code"] == "EVIDENCE_WRITE_FAILED"
+    assert current["verdict"] is None
+    assert current["verdict_reason"] is None
+    assert current["evidence"]["available"] is False
+    assert current["evidence"]["error"]
+
+
+def test_archive_failure_keeps_verdict_unset(
+    isolated_database, tmp_path, monkeypatch
+):
+    """A failed archive must never publish the computed verdict."""
+    job, _, generation = prepare_approved_job(isolated_database, tmp_path)
+    evidence_file = tmp_path / "not-a-directory"
+    evidence_file.write_text("occupied", encoding="utf-8")
+    monkeypatch.setenv("DATACON_EVIDENCE_ROOT", str(evidence_file))
+    outcome = execution.run_execution(
+        isolated_database.dsn,
+        UUID(job["job_id"]),
+        generation,
+        run_root=tmp_path / "runs",
+        sandbox=FakeSandbox(),
+    )
+    assert outcome.state == "FAILED"
+    assert outcome.reason_code == "EVIDENCE_WRITE_FAILED"
+    assert outcome.verdict is None
+    current = status(isolated_database.dsn, job["job_id"])
+    assert current["state"] == "FAILED"
+    assert current["verdict"] is None
+    assert current["verdict_reason"] is None
     assert current["evidence"]["available"] is False
     assert current["evidence"]["error"]
 
@@ -1125,3 +1170,288 @@ def test_archive_only_without_evidence_is_inconclusive_not_blocked(
     assert current["reason_code"] == "EVIDENCE_INCOMPLETE"
     assert current["evidence"]["available"] is False
     assert current["evidence"]["error"]
+
+
+def test_materialized_build_recipe_tamper_is_blocked(
+    isolated_database, tmp_path, monkeypatch
+):
+    job, _, generation = prepare_approved_job(isolated_database, tmp_path)
+    original = execution._materialize
+
+    def tampering_materialize(context, run_root):
+        result = original(context, run_root)
+        materials_dir = result[0]
+        recipe = Path(materials_dir) / "build.sh"
+        recipe.chmod(0o644)
+        recipe.write_bytes(b"#!/bin/sh\nexit 0\n")
+        return result
+
+    monkeypatch.setattr(execution, "_materialize", tampering_materialize)
+    sandbox = FakeSandbox()
+    outcome = run_with_fake(
+        isolated_database, job, generation, tmp_path, sandbox, monkeypatch
+    )
+    assert outcome.state != "REPRODUCED", outcome
+    assert outcome.verdict != "REPRODUCED"
+    assert sandbox.builds == 0, "a tampered build recipe must not reach the sandbox"
+    current = status(isolated_database.dsn, job["job_id"])
+    assert current["state"] != "REPRODUCED"
+
+
+def test_replay_artifact_tamper_is_blocked(
+    isolated_database, tmp_path, monkeypatch
+):
+    job, _, generation = prepare_approved_job(isolated_database, tmp_path)
+    original = execution._persist_build
+    tampered = {"count": 0}
+
+    def tampering_persist(*args, **kwargs):
+        payload = original(*args, **kwargs)
+        context = args[1]
+        artifact = payload.get("files", {}).get("artifact")
+        if artifact:
+            path = execution._work_root(context) / artifact
+            path.chmod(0o644)
+            path.write_bytes(b"tampered-parser")
+            tampered["count"] += 1
+        return payload
+
+    monkeypatch.setattr(execution, "_persist_build", tampering_persist)
+    sandbox = FakeSandbox()
+    outcome = run_with_fake(
+        isolated_database, job, generation, tmp_path, sandbox, monkeypatch
+    )
+    assert tampered["count"] == 2
+    assert outcome.state != "REPRODUCED", outcome
+    assert outcome.verdict != "REPRODUCED"
+    assert sandbox.replays == 0, "a tampered parser must not reach replay"
+
+
+def test_evidence_material_digest_matches_plan(
+    isolated_database, tmp_path, monkeypatch
+):
+    job, _, generation = prepare_approved_job(isolated_database, tmp_path)
+    outcome = run_with_fake(
+        isolated_database, job, generation, tmp_path, FakeSandbox(), monkeypatch
+    )
+    assert outcome.state == "REPRODUCED", outcome
+    current = status(isolated_database.dsn, job["job_id"])
+    verified = verify_bundle(current["evidence"]["path"])
+    plan = json.loads(verified.file_data["plan.json"])
+    materials = {
+        "harness.c": plan["harness_digest"],
+        "build.sh": plan["build_recipe_digest"],
+        "dependencies.lock": plan["dependencies_digest"],
+        "fix.patch": plan["repository"]["patch_digest"],
+        "inputs/normal.txt": plan["inputs"]["normal"],
+        "inputs/candidate.txt": plan["inputs"]["candidate"],
+    }
+    for relative, expected in materials.items():
+        data = verified.file_data[f"materials/{relative}"]
+        assert digest(data) == expected, relative
+
+
+class InputMismatchSandbox(FakeSandbox):
+    """Persist a completed result whose input digest is not the plan's."""
+
+    def replay(self, version, phase, **kwargs):
+        from dataclasses import replace
+
+        result = super().replay(version, phase, **kwargs)
+        return replace(result, input_digest="sha256:" + "0" * 64)
+
+
+def test_archive_fence_loss_returns_stale_without_publishing(
+    isolated_database, tmp_path, monkeypatch
+):
+    job, _, generation = prepare_approved_job(isolated_database, tmp_path)
+
+    def lose_fence(*args, **kwargs):
+        raise state.StaleGeneration("the lease moved to another generation")
+
+    monkeypatch.setattr(execution.state, "assert_archive_fence", lose_fence)
+    outcome = run_with_fake(
+        isolated_database, job, generation, tmp_path, FakeSandbox(), monkeypatch
+    )
+    assert outcome.state == "STALE", outcome
+    current = status(isolated_database.dsn, job["job_id"])
+    assert current["state"] == "ARCHIVING"
+    assert current["verdict"] is None
+    assert not (tmp_path / "evidence" / job["job_id"]).exists()
+    assert not list((tmp_path / "evidence").glob(".*.generation-*.tmp-*"))
+
+
+def test_archive_only_does_not_promote_input_mismatch(
+    isolated_database, tmp_path, monkeypatch
+):
+    job, _, generation = prepare_approved_job(isolated_database, tmp_path)
+    sandbox = InputMismatchSandbox()
+    outcome = run_with_fake(
+        isolated_database, job, generation, tmp_path, sandbox, monkeypatch
+    )
+    assert outcome.state == "INCONCLUSIVE", outcome
+    assert outcome.verdict_reason == "NOT_COMPARABLE"
+    current = status(isolated_database.dsn, job["job_id"])
+    assert current["state"] == "INCONCLUSIVE"
+    assert current["evidence"]["available"] is False
+
+    # The same completed results must not be promoted when archive-only
+    # recovery takes over the job.
+    job_uuid = UUID(job["job_id"])
+    current_generation = state.load_job(isolated_database.dsn, job_uuid)["generation"]
+    isolated_database.connection.execute(
+        "UPDATE jobs SET state = 'ARCHIVING', stage = 'archive', "
+        "lease_owner = 'archive-only', lease_expires_at = now() + interval '10 minutes', "
+        "execute_deadline_at = now() - interval '1 minute' WHERE job_id = %s",
+        (job_uuid,),
+    )
+
+    class ExplodingSandbox:
+        def __getattr__(self, name):
+            def fail(*args, **kwargs):
+                raise AssertionError(f"archive recovery started a container: {name}")
+
+            return fail
+
+    recovered = execution.run_execution(
+        isolated_database.dsn,
+        job_uuid,
+        current_generation,
+        run_root=tmp_path / "runs",
+        sandbox=ExplodingSandbox(),
+    )
+    assert recovered.state == "INCONCLUSIVE", recovered
+    assert recovered.verdict != "REPRODUCED"
+    current = status(isolated_database.dsn, job["job_id"])
+    assert current["state"] != "REPRODUCED"
+    assert current["evidence"]["available"] is False
+
+
+def test_archive_only_rejects_completed_result_with_other_plan(
+    isolated_database, tmp_path, monkeypatch
+):
+    job, _, generation = prepare_approved_job(isolated_database, tmp_path)
+    outcome = run_with_fake(
+        isolated_database, job, generation, tmp_path, FakeSandbox(), monkeypatch
+    )
+    assert outcome.state == "REPRODUCED", outcome
+    job_uuid = UUID(job["job_id"])
+    row = isolated_database.connection.execute(
+        "SELECT result FROM attempts WHERE job_id = %s AND stage = 'execute' "
+        "AND step_key = 'replay:vulnerable:candidate_1'",
+        (job_uuid,),
+    ).fetchone()
+    result = row[0]
+    result["plan_digest"] = "sha256:" + "0" * 64
+    isolated_database.connection.execute(
+        "UPDATE attempts SET result = %s WHERE job_id = %s AND stage = 'execute' "
+        "AND step_key = 'replay:vulnerable:candidate_1'",
+        (json.dumps(result), job_uuid),
+    )
+    current_generation = state.load_job(isolated_database.dsn, job_uuid)["generation"]
+    isolated_database.connection.execute(
+        "UPDATE jobs SET state = 'ARCHIVING', stage = 'archive', "
+        "lease_owner = 'archive-only', lease_expires_at = now() + interval '10 minutes', "
+        "execute_deadline_at = now() - interval '1 minute' WHERE job_id = %s",
+        (job_uuid,),
+    )
+
+    class ExplodingSandbox:
+        def __getattr__(self, name):
+            def fail(*args, **kwargs):
+                raise AssertionError(f"archive recovery started a container: {name}")
+
+            return fail
+
+    recovered = execution.run_execution(
+        isolated_database.dsn,
+        job_uuid,
+        current_generation,
+        run_root=tmp_path / "runs",
+        sandbox=ExplodingSandbox(),
+    )
+    assert recovered.state == "INCONCLUSIVE", recovered
+    assert recovered.verdict != "REPRODUCED"
+    current = status(isolated_database.dsn, job["job_id"])
+    assert current["state"] != "REPRODUCED"
+
+
+def test_work_paths_include_generation(isolated_database, tmp_path, monkeypatch):
+    job, _, generation = prepare_approved_job(isolated_database, tmp_path)
+    outcome = run_with_fake(
+        isolated_database, job, generation, tmp_path, FakeSandbox(), monkeypatch
+    )
+    assert outcome.state == "REPRODUCED", outcome
+    rows = isolated_database.connection.execute(
+        "SELECT step_key, result FROM attempts WHERE job_id = %s AND stage = 'execute' "
+        "AND step_key IN ('build:vulnerable', 'replay:vulnerable:candidate_1')",
+        (UUID(job["job_id"]),),
+    ).fetchall()
+    assert rows
+    for row in rows:
+        files = row[1].get("files") or {}
+        for relative in files.values():
+            if relative:
+                assert f"generation-{generation}/" in relative, (row[0], relative)
+
+
+def test_journal_secret_inside_run_root_fails_closed(
+    isolated_database, tmp_path, monkeypatch
+):
+    job, _, generation = prepare_approved_job(isolated_database, tmp_path)
+    run_root = tmp_path / "runs"
+    monkeypatch.setenv("DATACON_RUN_ROOT", str(run_root))
+    monkeypatch.setenv("DATACON_EVIDENCE_ROOT", str(tmp_path / "evidence"))
+    monkeypatch.setenv("DATACON_JOURNAL_SECRET_FILE", str(run_root / "secret"))
+    sandbox = FakeSandbox()
+    outcome = execution.run_execution(
+        isolated_database.dsn,
+        UUID(job["job_id"]),
+        generation,
+        run_root=run_root,
+        sandbox=sandbox,
+    )
+    assert sandbox.probes == 0
+    assert sandbox.builds == 0
+    assert sandbox.replays == 0
+    assert outcome.state in ("BLOCKED", "FAILED")
+    current = status(isolated_database.dsn, job["job_id"])
+    assert current["state"] in ("BLOCKED", "FAILED")
+    assert current["evidence"]["error"]
+    assert not (run_root / "secret").exists()
+
+
+def test_nested_evidence_root_inside_run_root_fails_closed(
+    isolated_database, tmp_path, monkeypatch
+):
+    job, _, generation = prepare_approved_job(isolated_database, tmp_path)
+    run_root = tmp_path / "runs"
+    monkeypatch.setenv("DATACON_RUN_ROOT", str(run_root))
+    monkeypatch.setenv("DATACON_EVIDENCE_ROOT", str(run_root / "evidence"))
+    monkeypatch.delenv("DATACON_JOURNAL_SECRET_FILE", raising=False)
+    sandbox = FakeSandbox()
+    outcome = execution.run_execution(
+        isolated_database.dsn,
+        UUID(job["job_id"]),
+        generation,
+        run_root=run_root,
+        sandbox=sandbox,
+    )
+    assert sandbox.probes == 0
+    assert sandbox.builds == 0
+    assert sandbox.replays == 0
+    assert outcome.state in ("BLOCKED", "FAILED")
+    current = status(isolated_database.dsn, job["job_id"])
+    assert current["state"] in ("BLOCKED", "FAILED")
+    assert current["evidence"]["error"]
+
+
+def test_default_secret_outside_run_root_still_works(
+    isolated_database, tmp_path, monkeypatch
+):
+    job, _, generation = prepare_approved_job(isolated_database, tmp_path)
+    outcome = run_with_fake(
+        isolated_database, job, generation, tmp_path, FakeSandbox(), monkeypatch
+    )
+    assert outcome.state == "REPRODUCED", outcome
+    assert (tmp_path / ".datacon-journal-secret").is_file()
