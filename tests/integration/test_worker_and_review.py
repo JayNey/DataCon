@@ -1,4 +1,5 @@
 import json
+import shutil
 from uuid import UUID, uuid4
 
 import pytest
@@ -820,6 +821,50 @@ def test_manifest_path_is_directory_blocks_as_material_missing(
         "SELECT count(*) FROM jobs WHERE job_id = %s AND state = 'FAILED'",
         (UUID(job["job_id"]),),
     ) == 0
+
+
+def test_manifest_symlink_outside_case_root_blocks_without_failed(
+    isolated_database, tmp_path
+):
+    """A manifest symlink must not point the loader outside the case root."""
+    case_root = copy_cases(tmp_path)
+    manifest_path = case_root / "manifest.json"
+    outside = tmp_path / "outside-manifest.json"
+    shutil.copyfile(manifest_path, outside)
+    manifest_path.unlink()
+    manifest_path.symlink_to(outside)
+
+    request = write_request(tmp_path)
+    submitted = cli(
+        "submit",
+        "--request",
+        str(request),
+        env_extra={"DATACON_CASE_ROOT": str(case_root)},
+    )
+    assert submitted.returncode == 2, submitted.stderr
+    assert submitted.stdout == ""
+    assert json.loads(submitted.stderr)["reason_code"] == "INVALID_REQUEST"
+    assert "Traceback" not in submitted.stderr
+
+    job = queue_job(isolated_database, tmp_path)
+    result = worker(
+        isolated_database.dsn,
+        env_extra={"DATACON_CASE_ROOT": str(case_root)},
+    )
+
+    current = _assert_blocked_material_without_plan(
+        isolated_database, job, result
+    )
+    assert current["reason_code"] == "MATERIAL_MISSING"
+    last_error = current["last_error"] or ""
+    assert "manifest" in last_error
+    assert "ValueError" not in last_error
+    assert "RuntimeError" not in last_error
+    assert scalar(
+        isolated_database,
+        "SELECT workflow_synced FROM jobs WHERE job_id = %s",
+        (UUID(job["job_id"]),),
+    ) is True
 
 
 def test_review_with_null_deadline_expires_without_db_error(

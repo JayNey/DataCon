@@ -166,14 +166,18 @@ def resolve_inside(root: Path, relative: str, *, allow_dot: bool = False) -> Pat
             f"material path {text} cannot be resolved: {error}"
         ) from error
     if candidate != root and root not in candidate.parents:
-        raise ValueError("material path escapes the case directory")
+        raise ValueError(
+            f"material path {text} escapes the case directory"
+        )
     current = root
     for part in PurePosixPath(text).parts:
         if part == ".":
             continue
         current = current / part
         if current.is_symlink():
-            raise ValueError("material path must not contain symlinks")
+            raise ValueError(
+                f"material path {text} must not contain symlinks"
+            )
     return candidate
 
 

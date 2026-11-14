@@ -532,6 +532,25 @@ def test_harness_symlink_loop_is_analysis_blocked(case_root):
     assert "ValueError" not in caught.value.message
 
 
+def test_manifest_symlink_outside_case_root_is_analysis_blocked(
+    case_root, tmp_path
+):
+    """The manifest is a material file; a symlink must not leave the case root."""
+    manifest = case_root / "manifest.json"
+    outside = tmp_path / "outside-manifest.json"
+    shutil.copyfile(manifest, outside)
+    manifest.unlink()
+    manifest.symlink_to(outside)
+
+    with pytest.raises(AnalysisBlocked) as caught:
+        analyze_case(request(), case_root=case_root)
+
+    assert caught.value.reason_code == "MATERIAL_MISSING"
+    assert "manifest.json" in caught.value.message
+    assert "RuntimeError" not in caught.value.message
+    assert "ValueError" not in caught.value.message
+
+
 @pytest.mark.parametrize("name", ["registry.json", "manifest.json", "advisory.json"])
 @pytest.mark.parametrize("value", [True, 1.0, "1"])
 def test_schema_version_must_be_the_integer_one(case_root, name, value):

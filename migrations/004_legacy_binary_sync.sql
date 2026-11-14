@@ -6,7 +6,7 @@ BEGIN;
 -- older binary after the migration). Re-running this migration is safe.
 UPDATE jobs
 SET workflow_synced = true,
-    updated_at = now()
+    updated_at = clock_timestamp()
 WHERE state = 'BLOCKED'
   AND reason_code = 'UNSUPPORTED_TARGET'
   AND workflow_synced = false;

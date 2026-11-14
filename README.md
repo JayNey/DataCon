@@ -55,12 +55,14 @@ export DATACON_DATABASE_URL="postgresql://datacon:${DATACON_DB_PASSWORD}@127.0.0
 
 ```bash
 uv sync
+set -euo pipefail
 for migration in migrations/*.sql; do
-  docker exec -i datacon-pg psql -U datacon -d datacon < "$migration"
+  docker exec -i datacon-pg psql -v ON_ERROR_STOP=1 \
+    -U datacon -d datacon < "$migration"
 done
 ```
 
-本机有 `psql` 时也可以逐个执行 `psql "$DATACON_DATABASE_URL" -f "$migration"`。四个迁移都可重复执行；`001`、`002` 只增量加列和表，不删除 T01/T02 的任务；`003` 在不丢数据的前提下把旧 `002` 的 `attempts` 唯一键升级为包含 `generation` 的形状；`004` 只把旧 binary 任务的 `workflow_synced` 回填为 `true`。
+本机有 `psql` 时也可以逐个执行 `psql -v ON_ERROR_STOP=1 "$DATACON_DATABASE_URL" -f "$migration"`。四个迁移都可重复执行，但任一语句失败会立即中止并返回非 0；`001`、`002` 只增量加列和表，不删除 T01/T02 的任务；`003` 在不丢数据的前提下把旧 `002` 的 `attempts` 唯一键升级为包含 `generation` 的形状；`004` 只把旧 binary 任务的 `workflow_synced` 回填为 `true`。
 
 发布说明（迁移锁）：`002` 的 `CREATE INDEX` 会短暂阻塞写入，`003` 的 `ADD CONSTRAINT ... UNIQUE` 需要扫描并重写 `attempts` 的索引，在大型表上会持有强锁。对已有大量数据的部署应在维护窗口执行，或先评估“`CREATE UNIQUE INDEX CONCURRENTLY` + 以现有唯一索引挂接约束”的方案；`CONCURRENTLY` 不能在事务块内运行，也不能与当前按文件整段执行的迁移脚本混用。本仓库的合成数据集很小，不在迁移中自动切换，以免改变可审计的建表顺序。
 
@@ -107,7 +109,7 @@ uv run datacon status "$job"   # state=READY，review_state.decision=approve
 | `3` | 任务不存在、当前状态 / 权限 / 审核时限阻断操作 |
 | `1` | 数据库未配置或数据库操作失败 |
 
-审核命令的失败原因码包括 `PLAN_MISMATCH`、`REVIEW_CONFLICT`、`REVIEW_EXPIRED`、`INVALID_STATE` 和 `JOB_NOT_FOUND`；内部一致性错误使用 `REVIEW_ERROR`（退出码 `3`），数据库错误仍使用 `DATABASE_ERROR`（退出码 `1`）。Supervisor 阻断原因包括 `MATERIAL_MISSING`、`SOURCE_CONFLICT`、`EVIDENCE_INVALID`、`UNSUPPORTED_TARGET`、`DEADLINE_EXCEEDED`、`REVIEW_REJECTED`、`REVIEW_EXPIRED` 和 `PLAN_MISMATCH`；分析失败使用 `FAILED/ANALYSIS_ERROR`。
+审核命令的失败原因码包括 `PLAN_MISMATCH`、`REVIEW_CONFLICT`、`REVIEW_EXPIRED`、`INVALID_STATE` 和 `JOB_NOT_FOUND`；内部一致性错误使用 `REVIEW_ERROR`（退出码 `3`），数据库错误仍使用 `DATABASE_ERROR`（退出码 `1`）。Supervisor 阻断原因包括 `MATERIAL_MISSING`、`SOURCE_CONFLICT`、`EVIDENCE_INVALID`、`UNSUPPORTED_TARGET`、`DEADLINE_EXCEEDED`、`REVIEW_REJECTED`、`REVIEW_EXPIRED`、`PLAN_MISMATCH` 和 `INVALID_REQUEST`（提交后已登记的 case 不再可用或与请求不一致，非分析失败）；分析失败使用 `FAILED/ANALYSIS_ERROR`。
 
 ## 请求契约
 

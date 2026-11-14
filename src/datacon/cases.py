@@ -397,6 +397,8 @@ def load_registry(
     only knob tests need to exercise broken or substituted material.
     """
     base = case_root(path if path is not None else root)
+    # registry.json is the operator-provided anchor and may itself be a
+    # symlink; only paths named by the registry are contained below ``base``.
     document = _load_json(base / "registry.json", "case registry")
     version = document.get("schema_version")
     if type(version) is not int or version != 1:
@@ -414,9 +416,10 @@ def load_registry(
         manifest_path = jsonutil.safe_relative_path(
             document.get("manifest", "manifest.json"), "manifest"
         )
+        manifest_file = jsonutil.resolve_inside(base, manifest_path)
     except ValueError as error:
         raise CaseConfigurationError("MATERIAL_MISSING", str(error)) from error
-    manifest = _load_json(base / manifest_path, "case manifest")
+    manifest = _load_json(manifest_file, "case manifest")
     manifest_version = manifest.get("schema_version")
     if type(manifest_version) is not int or manifest_version != 1:
         raise CaseConfigurationError(
