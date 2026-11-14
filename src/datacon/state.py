@@ -144,7 +144,8 @@ def load_job(dsn: str, job_id: UUID) -> dict[str, Any] | None:
             "state_version, generation, workflow_synced, operator_id, "
             "lease_owner, lease_expires_at, "
             "prepare_deadline_at, review_deadline_at, execute_deadline_at, "
-            "approved_at, submitted_at, updated_at "
+            "approved_at, submitted_at, updated_at, verdict, verdict_reason, "
+            "evidence_digest, evidence_path, evidence_status, evidence_error "
             "FROM jobs WHERE job_id = %s",
             (job_id,),
         ).fetchone()
@@ -171,15 +172,30 @@ def prepare_deadline_passed(dsn: str, job_id: UUID, *, generation: int) -> bool:
         return row["passed"]
 
 
-def claim_next(dsn: str, worker_id: str, *, lease_seconds: int = LEASE_SECONDS) -> dict | None:
+def claim_next(
+    dsn: str,
+    worker_id: str,
+    *,
+    lease_seconds: int = LEASE_SECONDS,
+    execute: bool = True,
+) -> dict | None:
     if not isinstance(worker_id, str) or not worker_id.strip():
         raise StateError("worker_id must be non-empty")
     if type(lease_seconds) is not int or not 1 <= lease_seconds <= 86400:
         raise StateError("lease_seconds is invalid")
+    execution_clause = ""
+    if execute:
+        execution_clause = """
+               OR (state = 'READY' AND workflow_synced = true
+                   AND (lease_expires_at IS NULL
+                        OR lease_expires_at <= clock_timestamp()))
+               OR (state IN ('RUNNING', 'ARCHIVING')
+                   AND (lease_expires_at IS NULL
+                        OR lease_expires_at <= clock_timestamp()))"""
     with _connect(dsn) as connection:
         row = connection.execute(
-            """
-            SELECT job_id, state
+            f"""
+            SELECT job_id, state, workflow_synced
             FROM jobs
             WHERE state = 'QUEUED'
                OR (state = 'PREPARING'
@@ -201,6 +217,7 @@ def claim_next(dsn: str, worker_id: str, *, lease_seconds: int = LEASE_SECONDS) 
                    AND review_deadline_at IS NULL
                    AND (lease_expires_at IS NULL
                         OR lease_expires_at <= clock_timestamp()))
+               {execution_clause}
             ORDER BY submitted_at
             FOR UPDATE SKIP LOCKED
             LIMIT 1
@@ -214,28 +231,69 @@ def claim_next(dsn: str, worker_id: str, *, lease_seconds: int = LEASE_SECONDS) 
                 SELECT clock_timestamp() AS claimed_at
             )
             UPDATE jobs
-            SET state = CASE WHEN state = 'QUEUED' THEN 'PREPARING' ELSE state END,
-                stage = CASE WHEN state = 'QUEUED' THEN 'prepare' ELSE stage END,
+            SET state = CASE
+                    WHEN state = 'QUEUED' THEN 'PREPARING'
+                    WHEN state = 'READY' AND workflow_synced THEN 'RUNNING'
+                    ELSE state
+                END,
+                stage = CASE
+                    WHEN state = 'QUEUED' THEN 'prepare'
+                    WHEN state = 'READY' AND workflow_synced THEN 'execute'
+                    ELSE stage
+                END,
                 generation = generation + 1,
                 state_version = state_version + 1,
                 lease_owner = %s,
                 lease_expires_at = claim_time.claimed_at
-                    + make_interval(secs => %s),
+                    + make_interval(secs => CASE
+                        WHEN state = 'READY' AND workflow_synced THEN GREATEST(
+                            %s,
+                            (request->'limits'->>'execute_seconds')::int
+                        )
+                        WHEN state IN ('RUNNING', 'ARCHIVING') THEN GREATEST(
+                            %s,
+                            COALESCE(
+                                EXTRACT(EPOCH FROM (
+                                    execute_deadline_at - claim_time.claimed_at
+                                ))::int,
+                                0
+                            ) + 60
+                        )
+                        ELSE %s
+                    END),
                 prepare_deadline_at = COALESCE(
                     prepare_deadline_at,
                     claim_time.claimed_at
                     + ((request->'limits'->>'prepare_seconds')::int
                        * interval '1 second')
                 ),
+                execute_deadline_at = CASE
+                    WHEN state = 'READY' AND workflow_synced THEN COALESCE(
+                        execute_deadline_at,
+                        claim_time.claimed_at
+                        + ((request->'limits'->>'execute_seconds')::int
+                           * interval '1 second')
+                    )
+                    ELSE execute_deadline_at
+                END,
                 updated_at = claim_time.claimed_at
             FROM claim_time
             WHERE job_id = %s
             RETURNING job_id, request, state, stage, reason_code, last_error,
                       state_version, generation, workflow_synced,
                       lease_owner, lease_expires_at,
-                      prepare_deadline_at, review_deadline_at
+                      prepare_deadline_at, review_deadline_at,
+                      execute_deadline_at, verdict, verdict_reason,
+                      evidence_digest, evidence_path, evidence_status,
+                      evidence_error
             """,
-            (worker_id, lease_seconds, row["job_id"]),
+            (
+                worker_id,
+                lease_seconds,
+                lease_seconds,
+                lease_seconds,
+                row["job_id"],
+            ),
         ).fetchone()
         _audit(
             connection,
@@ -414,6 +472,7 @@ def record_attempt(
     input_digest: str | None,
     status: str,
     result: dict[str, Any] | list[Any] | None = None,
+    container_id: str | None = None,
 ) -> bool:
     """Persist one attempt row, returning False when the write was not applied.
 
@@ -456,13 +515,14 @@ def record_attempt(
             """
             INSERT INTO attempts
                 (attempt_id, job_id, stage, step_key, attempt_no, generation,
-                 input_digest, status, result, finished_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s,
+                 container_id, input_digest, status, result, finished_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
                     CASE WHEN %s = 'started' THEN NULL
                          ELSE clock_timestamp() END)
             ON CONFLICT (job_id, stage, step_key, attempt_no, generation)
             DO UPDATE
-            SET input_digest = EXCLUDED.input_digest,
+            SET container_id = EXCLUDED.container_id,
+                input_digest = EXCLUDED.input_digest,
                 status = EXCLUDED.status,
                 result = EXCLUDED.result,
                 finished_at = EXCLUDED.finished_at
@@ -477,6 +537,7 @@ def record_attempt(
                 step_key,
                 attempt_no,
                 generation,
+                container_id,
                 input_digest,
                 status,
                 Jsonb(result) if result is not None else None,
@@ -518,6 +579,182 @@ def analysis_progress(
         "completed": completed,
         "draft_failed": draft_failed,
     }
+
+
+def begin_execution(dsn: str, job_id: UUID, *, generation: int) -> bool:
+    """Move a READY job to RUNNING under the current claim's generation."""
+    with _connect(dsn) as connection:
+        job = _locked_job(connection, job_id, generation=generation)
+        if job["state"] == "RUNNING":
+            return True
+        if job["state"] != "READY":
+            raise StateError(f"cannot start execution while the job is {job['state']}")
+        updated = connection.execute(
+            "UPDATE jobs SET state = 'RUNNING', stage = 'execute', "
+            "execute_deadline_at = COALESCE("
+            "execute_deadline_at, clock_timestamp() + "
+            "((request->'limits'->>'execute_seconds')::int * interval '1 second')), "
+            "lease_expires_at = GREATEST("
+            "lease_expires_at, clock_timestamp() + "
+            "((request->'limits'->>'execute_seconds')::int * interval '1 second')), "
+            "state_version = state_version + 1, updated_at = clock_timestamp() "
+            "WHERE job_id = %s AND generation = %s AND state = 'READY' "
+            "AND lease_expires_at IS NOT NULL "
+            "AND lease_expires_at > clock_timestamp() RETURNING job_id",
+            (job_id, generation),
+        ).fetchone()
+        if updated is None:
+            raise StaleGeneration("the worker lease is no longer active")
+        _audit(
+            connection,
+            job_id,
+            "execution_started",
+            stage="execute",
+            detail={"generation": generation},
+        )
+        return True
+
+
+def mark_archiving(dsn: str, job_id: UUID, *, generation: int) -> bool:
+    """Move a live RUNNING generation into the bounded archive phase."""
+    with _connect(dsn) as connection:
+        job = _locked_job(connection, job_id, generation=generation)
+        if job["state"] == "ARCHIVING":
+            return True
+        if job["state"] != "RUNNING":
+            raise StateError(f"cannot archive a job while it is {job['state']}")
+        updated = connection.execute(
+            "UPDATE jobs SET state = 'ARCHIVING', stage = 'archive', "
+            "state_version = state_version + 1, updated_at = clock_timestamp() "
+            "WHERE job_id = %s AND generation = %s "
+            "AND lease_expires_at IS NOT NULL "
+            "AND lease_expires_at > clock_timestamp() RETURNING job_id",
+            (job_id, generation),
+        ).fetchone()
+        if updated is None:
+            raise StaleGeneration("execution generation is no longer current")
+        _audit(
+            connection,
+            job_id,
+            "archiving_started",
+            stage="archive",
+            detail={"generation": generation},
+        )
+        return True
+
+
+def finish_execution(
+    dsn: str,
+    job_id: UUID,
+    *,
+    generation: int,
+    state: str,
+    reason_code: str | None,
+    verdict: str | None,
+    verdict_reason: str | None,
+    evidence_digest: str | None = None,
+    evidence_path: str | None = None,
+    evidence_status: str | None = None,
+    evidence_error: str | None = None,
+    last_error: str | None = None,
+    stage: str = "done",
+) -> bool:
+    """Atomically commit a terminal execution state and fence older writers.
+
+    The generation is advanced so a worker that lost the lease can never write
+    again. A failed archive keeps the previously recorded verdict in the row
+    while the job itself becomes ``FAILED`` with ``EVIDENCE_WRITE_FAILED``.
+    """
+    if state not in ("REPRODUCED", "NOT_REPRODUCED", "INCONCLUSIVE", "BLOCKED", "FAILED"):
+        raise StateError("execution terminal state is invalid")
+    if verdict is not None and verdict not in (
+        "REPRODUCED",
+        "NOT_REPRODUCED",
+        "INCONCLUSIVE",
+    ):
+        raise StateError("verdict is invalid")
+    with _connect(dsn) as connection:
+        job = _locked_job(connection, job_id, generation=generation)
+        if job["state"] not in ("RUNNING", "ARCHIVING"):
+            raise StateError(f"cannot finish execution while the job is {job['state']}")
+        updated = connection.execute(
+            "UPDATE jobs SET state = %s, stage = %s, reason_code = %s, "
+            "last_error = %s, verdict = COALESCE(%s, verdict), "
+            "verdict_reason = COALESCE(%s, verdict_reason), "
+            "evidence_digest = COALESCE(%s, evidence_digest), "
+            "evidence_path = COALESCE(%s, evidence_path), "
+            "evidence_status = COALESCE(%s, evidence_status), "
+            "evidence_error = %s, "
+            "generation = generation + 1, state_version = state_version + 1, "
+            "workflow_synced = true, lease_owner = NULL, lease_expires_at = NULL, "
+            "updated_at = clock_timestamp() "
+            "WHERE job_id = %s AND generation = %s "
+            "AND lease_expires_at IS NOT NULL "
+            "AND lease_expires_at > clock_timestamp() RETURNING job_id",
+            (
+                state,
+                stage,
+                reason_code,
+                _truncate(last_error) if last_error else None,
+                verdict,
+                verdict_reason,
+                evidence_digest,
+                evidence_path,
+                evidence_status,
+                _truncate(evidence_error) if evidence_error else None,
+                job_id,
+                generation,
+            ),
+        ).fetchone()
+        if updated is None:
+            return False
+        _audit(
+            connection,
+            job_id,
+            "execution_finished" if state != "FAILED" else "failed",
+            stage=stage,
+            reason_code=reason_code,
+            detail={
+                "generation": generation,
+                "state": state,
+                "verdict": verdict,
+                "verdict_reason": verdict_reason,
+                "evidence_digest": evidence_digest,
+                "evidence_status": evidence_status,
+            },
+        )
+        return True
+
+
+def attempts_for_step(
+    dsn: str,
+    job_id: UUID,
+    *,
+    stage: str,
+    step_key: str,
+    generation: int,
+) -> list[dict[str, Any]]:
+    with _connect(dsn) as connection:
+        return connection.execute(
+            "SELECT attempt_no, container_id, input_digest, status, result, "
+            "started_at, finished_at FROM attempts "
+            "WHERE job_id = %s AND stage = %s AND step_key = %s "
+            "AND generation = %s ORDER BY attempt_no",
+            (job_id, stage, step_key, generation),
+        ).fetchall()
+
+
+def execution_attempts(
+    dsn: str, job_id: UUID, generation: int
+) -> list[dict[str, Any]]:
+    with _connect(dsn) as connection:
+        return connection.execute(
+            "SELECT attempt_no, step_key, container_id, input_digest, status, "
+            "result, started_at, finished_at FROM attempts "
+            "WHERE job_id = %s AND stage = 'execute' AND generation = %s "
+            "ORDER BY attempt_no, step_key",
+            (job_id, generation),
+        ).fetchall()
 
 
 def finalize_workflow(dsn: str, job_id: UUID, generation: int) -> bool:
@@ -865,6 +1102,8 @@ def status(dsn: str, job_id: UUID) -> dict[str, Any] | None:
         row = connection.execute(
             """
             SELECT j.job_id, j.state, j.stage, j.reason_code, j.last_error,
+                   j.verdict, j.verdict_reason, j.evidence_digest, j.evidence_path,
+                   j.evidence_status, j.evidence_error,
                    p.plan_digest, p.summary, p.plan, p.created_at AS plan_created_at,
                    r.decision, r.reviewer_id, r.plan_digest AS review_plan_digest,
                    r.decided_at
@@ -903,6 +1142,21 @@ def status(dsn: str, job_id: UUID) -> dict[str, Any] | None:
             "plan_digest": row["review_plan_digest"],
             "decided_at": jsonutil.timestamp(row["decided_at"]),
         }
+    evidence = None
+    if (
+        row["evidence_status"] is not None
+        or row["evidence_digest"] is not None
+        or row["evidence_path"] is not None
+        or row["verdict"] is not None
+    ):
+        evidence = {
+            "available": row["evidence_status"] == "archived"
+            and row["evidence_path"] is not None,
+            "status": row["evidence_status"],
+            "digest": row["evidence_digest"],
+            "path": row["evidence_path"],
+            "error": row["evidence_error"],
+        }
     return {
         "job_id": str(row["job_id"]),
         "state": row["state"],
@@ -912,4 +1166,7 @@ def status(dsn: str, job_id: UUID) -> dict[str, Any] | None:
         "reason_code": row["reason_code"],
         "last_error": row["last_error"],
         "evidence_refs": evidence_refs,
+        "verdict": row["verdict"],
+        "verdict_reason": row["verdict_reason"],
+        "evidence": evidence,
     }

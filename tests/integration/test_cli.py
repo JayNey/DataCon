@@ -86,6 +86,9 @@ def test_submit_and_status_in_separate_processes(database, postgres_dsn, tmp_pat
         "reason_code": None,
         "last_error": None,
         "evidence_refs": [],
+        "verdict": None,
+        "verdict_reason": None,
+        "evidence": None,
     }
 
     (stored, stored_state, stored_reason) = database.execute(
@@ -120,6 +123,9 @@ def test_binary_submit_is_archived_as_blocked(database, postgres_dsn, tmp_path):
         "reason_code": "UNSUPPORTED_TARGET",
         "last_error": None,
         "evidence_refs": [],
+        "verdict": None,
+        "verdict_reason": None,
+        "evidence": None,
     }
 
     row = database.execute(
@@ -247,3 +253,38 @@ def test_shipped_example_can_be_submitted(database, postgres_dsn):
     result = cli("submit", "--request", str(EXAMPLE), database_url=postgres_dsn)
     assert result.returncode == 0, result.stderr
     assert json.loads(result.stdout)["state"] == "QUEUED"
+
+
+def test_export_before_evidence_exists_is_blocked(database, postgres_dsn, tmp_path):
+    request = tmp_path / "request.json"
+    request.write_text(REQUEST, encoding="utf-8")
+    job = submit(postgres_dsn, request)
+    destination = tmp_path / "exported"
+    result = cli(
+        "export",
+        job["job_id"],
+        "--out",
+        str(destination),
+        database_url=postgres_dsn,
+    )
+    assert result.returncode == 3
+    assert json.loads(result.stderr)["reason_code"] == "EVIDENCE_NOT_AVAILABLE"
+    assert not destination.exists()
+
+
+def test_verify_bundle_rejects_a_missing_directory(tmp_path):
+    result = cli("verify-bundle", str(tmp_path / "missing"))
+    assert result.returncode == 3
+    assert json.loads(result.stderr)["reason_code"] == "MISSING_FILE"
+
+
+def test_export_rejects_a_malformed_job_id(postgres_dsn, tmp_path):
+    result = cli(
+        "export",
+        "not-a-uuid",
+        "--out",
+        str(tmp_path / "exported"),
+        database_url=postgres_dsn,
+    )
+    assert result.returncode == 2
+    assert json.loads(result.stderr)["reason_code"] == "INVALID_REQUEST"

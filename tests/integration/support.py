@@ -45,8 +45,11 @@ def submit(database_url, request_path, *, env_extra=None):
     return json.loads(result.stdout)
 
 
-def worker(database_url, *, env_extra=None):
-    result = cli("worker", "--once", database_url=database_url, env_extra=env_extra)
+def worker(database_url, *, env_extra=None, execute=False):
+    args = ["worker", "--once"]
+    if not execute:
+        args.append("--prepare-only")
+    result = cli(*args, database_url=database_url, env_extra=env_extra)
     assert result.returncode == 0, result.stderr
     return json.loads(result.stdout)
 

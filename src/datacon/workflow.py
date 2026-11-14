@@ -15,6 +15,7 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, interrupt
 
 from datacon import contracts
+from datacon import execution
 from datacon import jsonutil
 from datacon import state as state_store
 from datacon.agents.analysis import (
@@ -593,6 +594,8 @@ def run_worker(
     poll_seconds: float = 2.0,
     case_root: str | None = None,
     lease_seconds: int = state_store.LEASE_SECONDS,
+    execute: bool = True,
+    run_root: str | None = None,
 ) -> dict[str, Any]:
     worker = _worker_id()
     with PostgresSaver.from_conn_string(dsn) as checkpointer:
@@ -600,19 +603,82 @@ def run_worker(
         graph = build_graph(dsn, checkpointer, case_root=case_root)
         while True:
             claimed = state_store.claim_next(
-                dsn, worker, lease_seconds=lease_seconds
+                dsn, worker, lease_seconds=lease_seconds, execute=execute
             )
             if claimed is None:
                 if once:
                     return {"processed": 0}
                 time.sleep(poll_seconds)
                 continue
-            result = _process_claim(graph, dsn, claimed)
+            result = _process_claim(
+                graph,
+                dsn,
+                claimed,
+                case_root=case_root,
+                execute=execute,
+                run_root=run_root,
+            )
             if once:
                 return result
 
 
-def _process_claim(graph, dsn: str, claimed: dict[str, Any]) -> dict[str, Any]:
+def _run_execution_claim(
+    dsn: str,
+    claimed: dict[str, Any],
+    *,
+    case_root: str | None,
+    run_root: str | None,
+) -> dict[str, Any]:
+    job_id = claimed["job_id"]
+    generation = claimed["generation"]
+    try:
+        outcome = execution.run_execution(
+            dsn,
+            job_id,
+            generation,
+            case_root=case_root,
+            run_root=run_root,
+        )
+    except state_store.StaleGeneration:
+        outcome = execution.ExecutionResult("STALE")
+    except Exception as error:  # noqa: BLE001 - never crash the worker loop
+        # The executor turns its own domain errors into archived outcomes.
+        # A truly unexpected error stays recoverable: leave the claimed job in
+        # RUNNING so a later generation can reconcile and retry.
+        try:
+            state_store.record_attempt(
+                dsn,
+                job_id,
+                stage="execute",
+                step_key="workflow",
+                attempt_no=1,
+                generation=generation,
+                input_digest=None,
+                status="infra_error",
+                result={"error": type(error).__name__},
+            )
+        except (state_store.StateError, psycopg.Error):
+            pass
+        outcome = execution.ExecutionResult("STALE")
+    job = state_store.load_job(dsn, job_id)
+    return {
+        "processed": 1,
+        "job_id": str(job_id),
+        "state": job["state"] if job else None,
+        "workflow": "completed" if outcome.state != "STALE" else "stale",
+        "verdict": outcome.verdict if outcome.state != "STALE" else None,
+    }
+
+
+def _process_claim(
+    graph,
+    dsn: str,
+    claimed: dict[str, Any],
+    *,
+    case_root: str | None = None,
+    execute: bool = True,
+    run_root: str | None = None,
+) -> dict[str, Any]:
     job_id = claimed["job_id"]
     job_text = str(job_id)
     generation = claimed["generation"]
@@ -630,6 +696,10 @@ def _process_claim(graph, dsn: str, claimed: dict[str, Any]) -> dict[str, Any]:
         "plan_digest": None,
     }
     stage = claimed["stage"] or "prepare"
+    if execute and claimed["state"] in ("RUNNING", "ARCHIVING"):
+        return _run_execution_claim(
+            dsn, claimed, case_root=case_root, run_root=run_root
+        )
     graph_failure: BaseException | None = None
     attempt_no = 1
     retried = False
@@ -743,6 +813,22 @@ def _process_claim(graph, dsn: str, claimed: dict[str, Any]) -> dict[str, Any]:
                     break
             retried = True
             attempt_no += 1
+
+    if execute and graph_failure is None and not stop_finalize:
+        current = state_store.load_job(dsn, job_id)
+        if current is not None and current["state"] == "READY":
+            try:
+                state_store.begin_execution(
+                    dsn, job_id, generation=generation
+                )
+            except state_store.StaleGeneration:
+                stop_finalize = True
+            except state_store.StateError:
+                pass
+            else:
+                return _run_execution_claim(
+                    dsn, claimed, case_root=case_root, run_root=run_root
+                )
 
     business_authoritative = False
     if graph_failure is not None and not stop_finalize:
