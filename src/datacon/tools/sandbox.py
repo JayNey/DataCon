@@ -307,6 +307,7 @@ def container_create_args(
     labels: Mapping[str, str] | None = None,
     docker: str = "docker",
     job_id: str | None = None,
+    generation: int | None = None,
 ) -> list[str]:
     """Return the exact ``docker create`` argument vector."""
     policy.validate()
@@ -375,6 +376,10 @@ def container_create_args(
         args.extend(["--mount", _mount_option(source, destination, readonly)])
     if job_id:
         labels = {**(labels or {}), "datacon.job_id": job_id}
+    if generation is not None:
+        if type(generation) is not int or generation < 0:
+            raise SandboxPolicyError("container generation must be a non-negative integer")
+        labels = {**(labels or {}), "datacon.generation": str(generation)}
     for key, value in sorted((labels or {}).items()):
         args.extend(["--label", f"{key}={value}"])
     args.extend([image, *command])
@@ -760,6 +765,7 @@ class DockerSandbox:
         docker: str = "docker",
         job_id: str,
         run_root: Path | str,
+        generation: int | None = None,
         pull_timeout: float = 600.0,
     ):
         policy.validate()
@@ -778,6 +784,13 @@ class DockerSandbox:
         self.limits = limits
         self.docker = docker
         self.job_id = str(job_id)
+        if generation is not None and (
+            type(generation) is not int or generation < 0
+        ):
+            raise SandboxPolicyError(
+                "container generation must be a non-negative integer"
+            )
+        self.generation = generation
         self.run_root = Path(run_root)
         self.pull_timeout = pull_timeout
 
@@ -834,7 +847,14 @@ class DockerSandbox:
             raise SandboxUnavailable("the pinned toolchain image cannot be inspected")
 
     def reclaim_job(self) -> int:
-        """Remove containers left by an interrupted execution generation."""
+        """Remove containers from this job that belong to older generations.
+
+        A worker whose lease expired may still be running containers. Those
+        containers carry the generation that created them; only generations
+        strictly older than this worker (or legacy containers with no
+        generation label) are removed, so a reclaimed job never deletes the
+        current or a newer generation's probe/build/replay.
+        """
         result = self._docker(
             [
                 "ps",
@@ -845,11 +865,33 @@ class DockerSandbox:
             timeout=30,
         )
         removed = 0
-        if result.returncode == 0:
-            for name in result.stdout.decode("utf-8", "replace").split():
-                if name:
-                    self._remove(name)
-                    removed += 1
+        if result.returncode != 0:
+            return removed
+        for name in result.stdout.decode("utf-8", "replace").split():
+            if not name:
+                continue
+            try:
+                inspect = self._inspect(name)
+            except SandboxError:
+                # The container disappeared between ps and inspect; never let
+                # cleanup failure mask the execution path.
+                continue
+            labels = (inspect.get("Config") or {}).get("Labels") or {}
+            raw_generation = labels.get("datacon.generation")
+            if self.generation is None:
+                should_remove = True
+            elif raw_generation is None:
+                should_remove = True
+            else:
+                try:
+                    container_generation = int(raw_generation)
+                except (TypeError, ValueError):
+                    should_remove = True
+                else:
+                    should_remove = container_generation < self.generation
+            if should_remove:
+                self._remove(name)
+                removed += 1
         return removed
 
     # -- containers --------------------------------------------------------
@@ -873,6 +915,7 @@ class DockerSandbox:
             env=env,
             docker=self.docker,
             job_id=self.job_id,
+            generation=self.generation,
             labels={"datacon.run": suffix},
         )
         created = self._docker(args[1:], timeout=120)
@@ -1129,10 +1172,29 @@ printf 'uid=%s\nseccomp=%s\nseccomp_filters=%s\nno_new_privs=%s\ncap_eff=%s\ncgr
         materials_dir: Path | str,
         compile_args: Sequence[str] = (),
         deadline_seconds: float = 300.0,
+        expected_materials: Mapping[str, str] | None = None,
     ) -> BuildResult:
         if version not in ("vulnerable", "fixed"):
             raise SandboxError("build version is invalid")
         materials = Path(materials_dir)
+        if materials.is_symlink() or not materials.is_dir():
+            raise SandboxError(
+                "reviewed material root is missing",
+                reason_code="MATERIAL_MISSING",
+            )
+        for relative, digest in (expected_materials or {}).items():
+            path = materials / relative
+            if path.is_symlink() or not path.is_file():
+                raise SandboxError(
+                    f"reviewed material is missing: {relative}",
+                    reason_code="MATERIAL_MISSING",
+                )
+            actual = "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
+            if actual != digest:
+                raise SandboxError(
+                    f"reviewed material changed before build: {relative}",
+                    reason_code="PLAN_MISMATCH",
+                )
         if not (materials / "build.sh").is_file():
             raise SandboxError("reviewed build recipe is missing")
         work = self.run_root / "build" / version / uuid.uuid4().hex
@@ -1233,11 +1295,19 @@ printf 'uid=%s\nseccomp=%s\nseccomp_filters=%s\nno_new_privs=%s\ncap_eff=%s\ncgr
         asan_options: str,
         timeout_seconds: float,
         deadline_seconds: float | None = None,
+        expected_artifact_digest: str | None = None,
     ) -> ReplayResult:
         artifact = Path(artifact_path)
         input_file = Path(input_path)
         if not artifact.is_file() or artifact.is_symlink():
             raise SandboxError("built artifact is missing")
+        if expected_artifact_digest is not None:
+            actual = "sha256:" + hashlib.sha256(artifact.read_bytes()).hexdigest()
+            if actual != expected_artifact_digest:
+                raise SandboxError(
+                    "built artifact changed before replay",
+                    reason_code="PLAN_MISMATCH",
+                )
         if not input_file.is_file() or input_file.is_symlink():
             raise SandboxError("replay input is missing")
         timeout = timeout_seconds

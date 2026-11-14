@@ -665,6 +665,28 @@ def mark_archiving(dsn: str, job_id: UUID, *, generation: int) -> bool:
         return True
 
 
+def assert_archive_fence(dsn: str, job_id: UUID, *, generation: int) -> bool:
+    """Re-confirm the archive lease immediately before publishing a bundle.
+
+    ``mark_archiving`` fences the start of archiving, but verification can take
+    time and another worker may have claimed the job. Publishing must be
+    refused unless this exact generation still owns an active lease.
+    """
+    with _connect(dsn) as connection:
+        row = connection.execute(
+            "UPDATE jobs SET lease_expires_at = GREATEST("
+            "lease_expires_at, clock_timestamp() + interval '60 seconds') "
+            "WHERE job_id = %s AND generation = %s "
+            "AND state IN ('RUNNING', 'ARCHIVING') "
+            "AND lease_expires_at IS NOT NULL "
+            "AND lease_expires_at > clock_timestamp() RETURNING job_id",
+            (job_id, generation),
+        ).fetchone()
+        if row is None:
+            raise StaleGeneration("execution generation is no longer current")
+        return True
+
+
 def finish_execution(
     dsn: str,
     job_id: UUID,

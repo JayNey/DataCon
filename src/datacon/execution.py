@@ -104,6 +104,7 @@ class ExecutionContext:
     case_root: Path
     manifest_case: dict[str, Any]
     materials: dict[str, str]
+    case_config: dict[str, Any]
     material_root: Path
     run_root: Path
     playbook: dict[str, Any]
@@ -393,6 +394,7 @@ def _load_context(
         case_root=registry.root,
         manifest_case=manifest_case,
         materials=materials,
+        case_config=case_config,
         material_root=Path(case.material_root),
         run_root=Path(run_root)
         if run_root is not None
@@ -422,7 +424,13 @@ def _load_context(
     return context
 
 
-def _assert_context_unchanged(dsn: str, context: ExecutionContext) -> None:
+def _assert_context_unchanged(
+    dsn: str,
+    context: ExecutionContext,
+    *,
+    materials_dir: Path | None = None,
+    material_digests: Mapping[str, str] | None = None,
+) -> None:
     """Re-check approval, plan, materials, policy and budget before a container."""
     _assert_budget(context, purpose="starting a target container")
     job = state.load_job(dsn, context.job_id)
@@ -506,8 +514,19 @@ def _assert_context_unchanged(dsn: str, context: ExecutionContext) -> None:
             ) from error
 
 
-def _materialize(context: ExecutionContext, run_root: Path) -> tuple[Path, dict[str, Path]]:
-    """Write the approved materials and inputs as read-only files."""
+    if materials_dir is not None and material_digests is not None:
+        _verify_materialized_tree(materials_dir, material_digests)
+
+
+def _materialize(
+    context: ExecutionContext, run_root: Path
+) -> tuple[Path, dict[str, Path], dict[str, str]]:
+    """Write the approved materials and inputs as read-only files.
+
+    ``run_root`` is the generation-scoped directory. Every byte written here
+    is re-hashed immediately before a target container mounts it, so a writer
+    cannot silently replace the reviewed recipe, harness, source or inputs.
+    """
     target = run_root / "materials"
     expected = {
         "harness": (context.case.manifest["harness"], context.plan["harness_digest"]),
@@ -577,7 +596,7 @@ def _materialize(context: ExecutionContext, run_root: Path) -> tuple[Path, dict[
             "candidate": candidate_path,
             "normal": normal_path,
             "build_recipe": target / context.case.manifest["build_recipe"],
-        }
+        }, _material_digests(context, payloads)
     temporary = target.parent / f".materials-tmp-{uuid.uuid4().hex}"
     if temporary.exists():
         raise ExecutionBlocked("MATERIAL_MISSING", "temporary material path exists")
@@ -610,7 +629,20 @@ def _materialize(context: ExecutionContext, run_root: Path) -> tuple[Path, dict[
         "candidate": target / "inputs" / "candidate.txt",
         "normal": target / "inputs" / "normal.txt",
         "build_recipe": target / context.case.manifest["build_recipe"],
+    }, _material_digests(context, payloads)
+
+
+def _material_digests(
+    context: ExecutionContext, payloads: Mapping[str, bytes]
+) -> dict[str, str]:
+    digests = {
+        relative: _digest(data) for relative, data in payloads.items()
     }
+    # Replay commands use stable names even when the manifest names the input
+    # differently; both copies are part of the verified tree.
+    digests["inputs/candidate.txt"] = context.plan["inputs"]["candidate"]
+    digests["inputs/normal.txt"] = context.plan["inputs"]["normal"]
+    return digests
 
 
 def _verify_materialized(target: Path, payloads: Mapping[str, bytes]) -> None:
@@ -621,6 +653,45 @@ def _verify_materialized(target: Path, payloads: Mapping[str, bytes]) -> None:
                 "MATERIAL_MISSING", f"materialized file is missing: {relative}"
             )
         if path.read_bytes() != expected:
+            raise ExecutionBlocked(
+                "MATERIAL_MISSING", f"materialized file drifted: {relative}"
+            )
+
+
+def _verify_materialized_tree(
+    target: Path, expected: Mapping[str, str]
+) -> None:
+    """Fail closed on extra files, symlinks or changed bytes in the copy."""
+    if target.is_symlink() or not target.is_dir():
+        raise ExecutionBlocked("MATERIAL_MISSING", "materialized directory is missing")
+    seen: set[str] = set()
+    for current_root, directories, filenames in os.walk(target, followlinks=False):
+        current = Path(current_root)
+        for name in directories:
+            child = current / name
+            if child.is_symlink():
+                raise ExecutionBlocked(
+                    "MATERIAL_MISSING", "materialized tree contains a symlink"
+                )
+        for name in filenames:
+            child = current / name
+            relative = child.relative_to(target).as_posix()
+            if child.is_symlink() or not child.is_file():
+                raise ExecutionBlocked(
+                    "MATERIAL_MISSING",
+                    f"materialized file is not regular: {relative}",
+                )
+            seen.add(relative)
+    if seen != set(expected):
+        missing = sorted(set(expected) - seen)
+        extra = sorted(seen - set(expected))
+        raise ExecutionBlocked(
+            "MATERIAL_MISSING",
+            f"materialized tree changed; missing={missing} extra={extra}",
+        )
+    for relative, digest in expected.items():
+        path = target / Path(relative)
+        if _digest(path.read_bytes()) != digest:
             raise ExecutionBlocked(
                 "MATERIAL_MISSING", f"materialized file drifted: {relative}"
             )
@@ -645,19 +716,53 @@ def _work_root(context: ExecutionContext) -> Path:
     )
 
 
-def _journal_secret_path() -> Path:
-    """Return the HMAC key path, outside the writable run root."""
+def _generation_root(context: ExecutionContext) -> Path:
+    return _work_root(context) / f"generation-{context.generation}"
+
+
+def _outside_run_root(path: Path, run_root: Path, label: str) -> Path:
+    """Resolve ``path`` and reject anything inside the writable run root."""
+    try:
+        resolved = path.expanduser().resolve()
+        resolved_root = run_root.expanduser().resolve()
+    except OSError as error:
+        raise ExecutionFailed(
+            "EVIDENCE_WRITE_FAILED", f"{label} cannot be resolved: {error}"
+        ) from error
+    if resolved == resolved_root or resolved_root in resolved.parents:
+        raise ExecutionFailed(
+            "EVIDENCE_WRITE_FAILED",
+            f"{label} must live outside DATACON_RUN_ROOT",
+        )
+    return resolved
+
+
+def _journal_secret_path(run_root: Path) -> Path:
+    """Return the HMAC key path, enforcing that it is outside the run root."""
     explicit = os.getenv("DATACON_JOURNAL_SECRET_FILE")
-    if explicit:
-        return Path(explicit)
     evidence_root = Path(
         os.getenv("DATACON_EVIDENCE_ROOT", ".datacon/evidence")
     ).expanduser()
-    return evidence_root.parent / ".datacon-journal-secret"
+    _outside_run_root(evidence_root, run_root, "DATACON_EVIDENCE_ROOT")
+    path = Path(explicit).expanduser() if explicit else (
+        evidence_root.parent / ".datacon-journal-secret"
+    )
+    if path.is_symlink():
+        raise ExecutionFailed(
+            "EVIDENCE_WRITE_FAILED", "journal secret path must not be a symlink"
+        )
+    return _outside_run_root(path, run_root, "journal secret")
 
 
-def _journal_secret(*, create: bool) -> bytes | None:
-    path = _journal_secret_path()
+def _assert_journal_paths(run_root: Path) -> None:
+    """Fail before any target container when the HMAC key is exposed."""
+    path = _journal_secret_path(run_root)
+    if path.exists():
+        _journal_secret(create=False, run_root=run_root)
+
+
+def _journal_secret(*, create: bool, run_root: Path) -> bytes | None:
+    path = _journal_secret_path(run_root)
     if path.is_symlink():
         raise ExecutionFailed(
             "EVIDENCE_WRITE_FAILED", "journal secret path must not be a symlink"
@@ -873,7 +978,7 @@ def _write_journal(
         raise ExecutionFailed(
             "EVIDENCE_WRITE_FAILED", "journal path escaped the run root"
         )
-    secret = _journal_secret(create=True)
+    secret = _journal_secret(create=True, run_root=run_root)
     assert secret is not None
     document = dict(payload)
     document["hmac"] = _journal_hmac(document, secret)
@@ -908,7 +1013,7 @@ def _find_reusable_journal(
     )
     if not rows:
         return None
-    secret = _journal_secret(create=False)
+    secret = _journal_secret(create=False, run_root=_work_root(context))
     if secret is None:
         return None
     run_root = _work_root(context)
@@ -996,12 +1101,12 @@ def _write_run_file(
 def _persist_build(
     dsn: str,
     context: ExecutionContext,
-    run_root: Path,
     result: BuildResult,
     attempt_no: int,
     token: str,
 ) -> dict[str, Any]:
-    directory = run_root / "build" / result.version
+    run_root = _work_root(context)
+    directory = _generation_root(context) / "build" / result.version
     directory.mkdir(parents=True, exist_ok=True)
     log_path = directory / "build.log"
     _write_run_file(run_root, log_path, result.log, 0o600)
@@ -1063,12 +1168,12 @@ def _persist_build(
 def _persist_replay(
     dsn: str,
     context: ExecutionContext,
-    run_root: Path,
     result: ReplayResult,
     attempt_no: int,
     token: str,
 ) -> dict[str, Any]:
-    directory = run_root / "replay" / result.version / result.phase
+    run_root = _work_root(context)
+    directory = _generation_root(context) / "replay" / result.version / result.phase
     directory.mkdir(parents=True, exist_ok=True)
     stdout_path = directory / "stdout.log"
     stderr_path = directory / "stderr.log"
@@ -1287,6 +1392,83 @@ def _build_report(
     return report, "\n".join(lines)
 
 
+def _verified_run_file(
+    run_root: Path,
+    payload: Mapping[str, Any],
+    key: str,
+    suffix: str,
+) -> bytes | None:
+    files = payload.get("files")
+    relative = files.get(key) if isinstance(files, Mapping) else None
+    if not isinstance(relative, str) or ".." in Path(relative).parts:
+        return None
+    if not relative.endswith(suffix):
+        return None
+    path = run_root / relative
+    if path.is_symlink() or not path.is_file():
+        return None
+    data = path.read_bytes()
+    digests = payload.get("file_digests")
+    expected = digests.get(key) if isinstance(digests, Mapping) else None
+    if expected is not None and _digest(data) != expected:
+        return None
+    return data
+
+
+def _case_materials(
+    context: ExecutionContext,
+) -> dict[str, tuple[str, bytes]]:
+    manifest = context.case.manifest
+    entries = (
+        (manifest["harness"], "material_harness", context.plan["harness_digest"]),
+        (
+            manifest["build_recipe"],
+            "material_build_recipe",
+            context.plan["build_recipe_digest"],
+        ),
+        (
+            manifest["dependencies"],
+            "material_dependencies",
+            context.plan["dependencies_digest"],
+        ),
+        (
+            context.case.repository["patch"],
+            "material_patch",
+            context.plan["repository"]["patch_digest"],
+        ),
+        (
+            context.manifest_case["inputs"]["normal"],
+            "material_input_normal",
+            context.plan["inputs"]["normal"],
+        ),
+        (
+            context.manifest_case["inputs"]["candidate"],
+            "material_input_candidate",
+            context.plan["inputs"]["candidate"],
+        ),
+        (
+            manifest["versions"]["vulnerable"],
+            "material_source_vulnerable",
+            context.materials.get(manifest["versions"]["vulnerable"]),
+        ),
+        (
+            manifest["versions"]["fixed"],
+            "material_source_fixed",
+            context.materials.get(manifest["versions"]["fixed"]),
+        ),
+    )
+    materials: dict[str, tuple[str, bytes]] = {}
+    for relative, role, expected in entries:
+        try:
+            data, actual = context.case.read_material(relative, expected)
+        except CaseConfigurationError:
+            continue
+        if expected is not None and actual != expected:
+            continue
+        materials[relative] = (role, data)
+    return materials
+
+
 def _evidence_artifacts(
     context: ExecutionContext,
     run_root: Path,
@@ -1314,6 +1496,13 @@ def _evidence_artifacts(
             "execution_metadata",
             jsonutil.canonical_bytes(execution_metadata) + b"\n",
         ),
+        "metadata/case.json": (
+            "case_config",
+            jsonutil.canonical_bytes(
+                {"case_config": context.case_config}
+            )
+            + b"\n",
+        ),
     }
     if probe is not None:
         artifacts["metadata/probe.json"] = (
@@ -1321,61 +1510,44 @@ def _evidence_artifacts(
             jsonutil.canonical_bytes(probe) + b"\n",
         )
     for version in ("vulnerable", "fixed"):
-        build = builds.get(version) or {}
-        directory = run_root / "build" / version
-        if (directory / "build.log").is_file():
-            artifacts[f"build/{version}/build.log"] = (
-                "build_log",
-                directory / "build.log",
-            )
-        if (directory / "metadata.json").is_file():
-            artifacts[f"build/{version}/metadata.json"] = (
-                "build_metadata",
-                directory / "metadata.json",
-            )
-        if (directory / "parser").is_file() and build.get("artifact_digest"):
-            artifacts[f"build/{version}/parser"] = (
-                "build_artifact",
-                directory / "parser",
-            )
-        metadata_path = directory / "metadata.json"
-        if not metadata_path.is_file() and build:
-            artifacts[f"build/{version}/metadata.json"] = (
-                "build_metadata",
-                jsonutil.canonical_bytes(dict(build)) + b"\n",
-            )
+        build = builds.get(version)
+        if not build:
+            continue
+        log = _verified_run_file(run_root, build, "log", "/build.log")
+        artifact = _verified_run_file(run_root, build, "artifact", "/parser")
+        if log is not None:
+            artifacts[f"build/{version}/build.log"] = ("build_log", log)
+        if artifact is not None:
+            artifacts[f"build/{version}/parser"] = ("build_artifact", artifact)
+        artifacts[f"build/{version}/metadata.json"] = (
+            "build_metadata",
+            jsonutil.canonical_bytes(dict(build)) + b"\n",
+        )
     for run in runs:
         version = run.get("version", "")
         phase = run.get("phase", "")
-        directory = run_root / "replay" / version / phase
-        if (directory / "stdout.log").is_file():
+        if version not in ("vulnerable", "fixed") or phase not in (
+            "normal",
+            "candidate_1",
+            "candidate_2",
+        ):
+            continue
+        stdout = _verified_run_file(run_root, run, "stdout", "/stdout.log")
+        stderr = _verified_run_file(run_root, run, "stderr", "/stderr.log")
+        if stdout is not None:
             artifacts[f"replay/{version}/{phase}/stdout.log"] = (
-                "replay_stdout",
-                directory / "stdout.log",
+                "replay_stdout" if phase != "normal" else "normal_output",
+                stdout,
             )
-        if (directory / "stderr.log").is_file():
+        if stderr is not None:
             role = "asan_log" if run.get("signature") else "replay_stderr"
-            artifacts[f"replay/{version}/{phase}/stderr.log"] = (
-                role,
-                directory / "stderr.log",
-            )
+            artifacts[f"replay/{version}/{phase}/stderr.log"] = (role, stderr)
         artifacts[f"replay/{version}/{phase}/metadata.json"] = (
             "replay_metadata",
             jsonutil.canonical_bytes(dict(run)) + b"\n",
         )
-    manifest = context.case.manifest
-    for relative, role in (
-        (manifest["harness"], "material_harness"),
-        (manifest["build_recipe"], "material_build_recipe"),
-        (manifest["dependencies"], "material_dependencies"),
-        (context.manifest_case["inputs"]["normal"], "material_input_normal"),
-        (context.manifest_case["inputs"]["candidate"], "material_input_candidate"),
-        (manifest["versions"]["vulnerable"], "material_source_vulnerable"),
-        (manifest["versions"]["fixed"], "material_source_fixed"),
-    ):
-        path = run_root / "materials" / Path(relative)
-        if path.is_file():
-            artifacts[f"materials/{relative}"] = (role, path)
+    for relative, (role, data) in _case_materials(context).items():
+        artifacts[f"materials/{relative}"] = (role, data)
     return artifacts
 
 
@@ -1395,8 +1567,14 @@ def _archive(
     evidence_root = Path(
         os.getenv("DATACON_EVIDENCE_ROOT", ".datacon/evidence")
     ).resolve()
-    temporary = evidence_root / f".{context.job_id_text}.tmp-{uuid.uuid4().hex}"
-    backup = evidence_root / f".{context.job_id_text}.old-{uuid.uuid4().hex}"
+    temporary = (
+        evidence_root
+        / f".{context.job_id_text}.generation-{context.generation}.tmp-{uuid.uuid4().hex}"
+    )
+    backup = (
+        evidence_root
+        / f".{context.job_id_text}.generation-{context.generation}.old-{uuid.uuid4().hex}"
+    )
     try:
         evidence_root.mkdir(mode=0o700, parents=True, exist_ok=True)
         evidence_root.chmod(0o700)
@@ -1415,6 +1593,12 @@ def _archive(
             # previously archived bundle. An unverified bundle is never
             # published as evidence.
             verify=verify_bundle,
+        )
+        # Verification can take time. Refuse to publish unless this exact
+        # generation still owns an active lease; a stale worker must never
+        # replace a newer generation's bundle.
+        state.assert_archive_fence(
+            dsn, context.job_id, generation=context.generation
         )
         if bundle.exists():
             if bundle.is_dir():
@@ -1437,6 +1621,12 @@ def _archive(
         if backup.exists() and not bundle.exists():
             backup.rename(bundle)
         return None, None, f"EVIDENCE_WRITE_FAILED: {error}"
+    except (state.StateError, state.StaleGeneration):
+        # The lease disappeared while the bundle was being verified. Remove
+        # the staging directory and let the caller return STALE; a stale
+        # worker must not touch the published evidence path.
+        shutil.rmtree(temporary, ignore_errors=True)
+        raise
 
 def _archive_only(dsn: str, context: ExecutionContext) -> ExecutionResult:
     """Recover an ARCHIVING generation without starting any target container.
@@ -1452,24 +1642,63 @@ def _archive_only(dsn: str, context: ExecutionContext) -> ExecutionResult:
     for row in rows:
         if row["status"] == "completed" and isinstance(row["result"], dict):
             completed.setdefault(row["step_key"], row["result"])
+    rejected: list[str] = []
+
+    def plan_bound(result: Mapping[str, Any], step: str) -> bool:
+        if result.get("plan_digest") != context.plan_digest:
+            rejected.append(f"{step} belongs to a different frozen plan")
+            return False
+        return True
+
     probe = completed.get("sandbox.probe")
+    if probe is not None:
+        if not isinstance(probe, dict) or not plan_bound(probe, "probe"):
+            probe = None
+        elif probe.get("status") != "completed":
+            probe = None
     builds: dict[str, dict[str, Any]] = {}
     for version in ("vulnerable", "fixed"):
         result = completed.get(f"build:{version}")
-        if result is not None and _reusable_build(build_root, result):
+        if result is None:
+            continue
+        if not isinstance(result, dict) or not plan_bound(
+            result, f"build:{version}"
+        ):
+            continue
+        if result.get("input_digest") != context.plan["analysis_digest"]:
+            rejected.append(f"build:{version} input does not match the plan")
+            continue
+        if _reusable_build(build_root, result):
             builds[version] = result
     runs: list[dict[str, Any]] = []
     for version in ("vulnerable", "fixed"):
         for phase in ("normal", "candidate_1", "candidate_2"):
             result = completed.get(_replay_step(version, phase))
-            if result is not None and _reusable_replay(build_root, result):
+            if result is None:
+                continue
+            if not isinstance(result, dict) or not plan_bound(
+                result, _replay_step(version, phase)
+            ):
+                continue
+            expected_input = (
+                context.plan["inputs"]["normal"]
+                if phase == "normal"
+                else context.plan["inputs"]["candidate"]
+            )
+            if result.get("input_digest") != expected_input:
+                rejected.append(
+                    f"{version}/{phase} input does not match the approved plan"
+                )
+                continue
+            if _reusable_replay(build_root, result):
                 runs.append(result)
     complete = (
         isinstance(probe, dict)
         and len(builds) == 2
         and len(runs) == 6
+        and not rejected
     )
-    missing: list[str] = []
+    missing: list[str] = list(rejected)
     if not complete:
         if not isinstance(probe, dict):
             missing.append("probe evidence is missing")
@@ -1495,6 +1724,10 @@ def _archive_only(dsn: str, context: ExecutionContext) -> ExecutionResult:
                 _policy_from_context(context),
                 [_to_observation(run, build_root) for run in runs],
                 builds=builds,
+                expected_inputs={
+                    "vulnerable": context.plan["inputs"]["candidate"],
+                    "fixed": context.plan["inputs"]["candidate"],
+                },
             )
         except ExecutionFailed as error:
             missing.append(error.message)
@@ -1667,6 +1900,31 @@ def run_execution(
         return _archive_only(dsn, context)
 
     try:
+        _assert_journal_paths(context.run_root)
+    except ExecutionFailed as error:
+        # The HMAC key must live outside the writable run root; fail before
+        # any probe/build/replay container exists. Do not archive: the
+        # evidence destination itself may be inside the untrusted run root,
+        # and the failure must remain visible via status.evidence.error.
+        try:
+            state.finish_execution(
+                dsn,
+                job_id,
+                generation=generation,
+                state="FAILED",
+                reason_code=error.reason_code,
+                verdict=None,
+                verdict_reason=None,
+                evidence_status="failed",
+                evidence_error=f"{error.reason_code}: {error.message}",
+                last_error=error.message,
+                stage="failed",
+            )
+        except (state.StateError, state.StaleGeneration):
+            return ExecutionResult("STALE")
+        return ExecutionResult("FAILED", reason_code=error.reason_code)
+
+    try:
         _assert_budget(context, purpose="starting isolated execution")
     except ExecutionBlocked as error:
         return _finish_blocked(dsn, job_id, generation, error, context=context)
@@ -1677,8 +1935,13 @@ def run_execution(
     build_root = work_root / "run"
     build_root.mkdir(parents=True, exist_ok=True)
     build_root.chmod(0o700)
+    generation_root = _generation_root(context)
+    generation_root.mkdir(parents=True, exist_ok=True)
+    generation_root.chmod(0o700)
     try:
-        materials_dir, inputs = _materialize(context, build_root)
+        materials_dir, inputs, material_digests = _materialize(
+            context, generation_root
+        )
     except ExecutionBlocked as error:
         return _finish_blocked(dsn, job_id, generation, error, context=context)
 
@@ -1690,6 +1953,7 @@ def run_execution(
             limits=context.limits,
             job_id=context.job_id_text,
             run_root=build_root,
+            generation=generation,
         )
     reclaim = getattr(sandbox, "reclaim_job", None)
     if callable(reclaim):
@@ -1714,7 +1978,12 @@ def run_execution(
         )
         probe_payload = probe_result
         for version in ("vulnerable", "fixed"):
-            _assert_context_unchanged(dsn, context)
+            _assert_context_unchanged(
+                dsn,
+                context,
+                materials_dir=materials_dir,
+                material_digests=material_digests,
+            )
             _assert_budget(context, purpose=f"building {version}")
             result, reused = _run_step(
                 dsn,
@@ -1722,7 +1991,14 @@ def run_execution(
                 step_key=f"build:{version}",
                 input_digest=context.plan["analysis_digest"],
                 action=lambda attempt_no, token, version=version: _do_build(
-                    dsn, context, sandbox, materials_dir, version, attempt_no, token
+                    dsn,
+                    context,
+                    sandbox,
+                    materials_dir,
+                    material_digests,
+                    version,
+                    attempt_no,
+                    token,
                 ),
                 reusable=lambda payload: _reusable_build(build_root, payload),
             )
@@ -1734,7 +2010,12 @@ def run_execution(
                 )
         for version in ("vulnerable", "fixed"):
             for phase in ("normal", "candidate_1", "candidate_2"):
-                _assert_context_unchanged(dsn, context)
+                _assert_context_unchanged(
+                    dsn,
+                    context,
+                    materials_dir=materials_dir,
+                    material_digests=material_digests,
+                )
                 _assert_budget(context, purpose=f"replaying {version}/{phase}")
                 input_path = inputs["normal"] if phase == "normal" else inputs["candidate"]
                 step_key = _replay_step(version, phase)
@@ -1763,6 +2044,7 @@ def run_execution(
                     reusable=lambda payload: _reusable_replay(build_root, payload),
                 )
                 runs.append(result)
+        input_mismatch = False
         for run in runs:
             expected = (
                 context.plan["inputs"]["normal"]
@@ -1770,19 +2052,43 @@ def run_execution(
                 else context.plan["inputs"]["candidate"]
             )
             if run.get("input_digest") != expected:
-                missing.append(f"input digest mismatch for {run.get('version')}/{run.get('phase')}")
-        policy = _policy_from_context(context)
-        if missing:
-            decision = VerdictDecision(
+                input_mismatch = True
+                missing.append(
+                    f"input digest mismatch for {run.get('version')}/{run.get('phase')}"
+                )
+        if input_mismatch:
+            # The completed result does not describe the approved bytes.
+            # Never archive it as a full six-replay bundle: the verifier
+            # rejects plan-mismatched inputs, and publishing the computed
+            # verdict would be misleading.
+            try:
+                state.finish_execution(
+                    dsn,
+                    context.job_id,
+                    generation=context.generation,
+                    state="INCONCLUSIVE",
+                    reason_code="NOT_COMPARABLE",
+                    verdict="INCONCLUSIVE",
+                    verdict_reason="NOT_COMPARABLE",
+                    evidence_status="failed",
+                    evidence_error=(
+                        "replay input digest does not match the approved plan"
+                    ),
+                    last_error="required input digests do not match the approved plan",
+                    stage="done",
+                )
+            except (state.StateError, state.StaleGeneration):
+                return ExecutionResult("STALE")
+            return ExecutionResult(
                 "INCONCLUSIVE",
-                "NOT_COMPARABLE",
-                "required input digests do not match the approved plan",
-                {"priority": list(PRIORITY)},
+                verdict="INCONCLUSIVE",
+                verdict_reason="NOT_COMPARABLE",
+                reason_code="NOT_COMPARABLE",
             )
-        else:
-            decision = decide_verdict(
-                policy, [_to_observation(run, build_root) for run in runs], builds=builds
-            )
+        policy = _policy_from_context(context)
+        decision = decide_verdict(
+            policy, [_to_observation(run, build_root) for run in runs], builds=builds
+        )
         verdict = decision.verdict
         verdict_reason = decision.reason_code
     except ExecutionBlocked as error:
@@ -1891,14 +2197,17 @@ def run_execution(
         return ExecutionResult("STALE")
     if archive_error is not None:
         try:
+            # The computed decision is not published as authoritative until a
+            # verifiable bundle exists. COALESCE in finish_execution therefore
+            # only preserves a verdict from an earlier successful archive.
             state.finish_execution(
                 dsn,
                 job_id,
                 generation=context.generation,
                 state="FAILED",
                 reason_code="EVIDENCE_WRITE_FAILED",
-                verdict=decision.verdict,
-                verdict_reason=decision.reason_code,
+                verdict=None,
+                verdict_reason=None,
                 evidence_status="failed",
                 evidence_error=archive_error,
                 last_error="evidence bundle could not be written",
@@ -1909,12 +2218,7 @@ def run_execution(
             # archiving). Never let this escape to the workflow's generic
             # handler, which would leave the job looking recoverable RUNNING.
             return ExecutionResult("STALE")
-        return ExecutionResult(
-            "FAILED",
-            verdict=decision.verdict,
-            verdict_reason=decision.reason_code,
-            reason_code="EVIDENCE_WRITE_FAILED",
-        )
+        return ExecutionResult("FAILED", reason_code="EVIDENCE_WRITE_FAILED")
     final_state = decision.verdict
     reason_code = None if final_state in ("REPRODUCED", "NOT_REPRODUCED") else decision.reason_code
     try:
@@ -1952,7 +2256,7 @@ def _replay_log_text(
     files = payload.get("files")
     relative = files.get(key) if isinstance(files, Mapping) else None
     if isinstance(relative, str):
-        if ".." in Path(relative).parts or not relative.startswith("replay/"):
+        if ".." in Path(relative).parts or not relative.endswith(f"/{key}.log"):
             raise ExecutionFailed("RUN_INCOMPLETE", f"unsafe {key} evidence path")
         path = run_root / relative
         if path.is_symlink() or not path.is_file():
@@ -2003,9 +2307,11 @@ def _reusable_build(run_root: Path, payload: Mapping[str, Any]) -> bool:
     digests = payload.get("file_digests")
     if not isinstance(files, Mapping) or not isinstance(digests, Mapping):
         return False
-    for key, prefix in (("artifact", "build/"), ("log", "build/")):
+    for key, suffix in (("artifact", "/parser"), ("log", "/build.log")):
         relative = files.get(key)
-        if not isinstance(relative, str) or not relative.startswith(prefix):
+        if not isinstance(relative, str) or ".." in Path(relative).parts:
+            return False
+        if not relative.endswith(suffix):
             return False
         path = run_root / relative
         if path.is_symlink() or not path.is_file():
@@ -2020,9 +2326,11 @@ def _reusable_replay(run_root: Path, payload: Mapping[str, Any]) -> bool:
     digests = payload.get("file_digests")
     if not isinstance(files, Mapping) or not isinstance(digests, Mapping):
         return False
-    for key in ("stdout", "stderr"):
+    for key, suffix in (("stdout", "/stdout.log"), ("stderr", "/stderr.log")):
         relative = files.get(key)
-        if not isinstance(relative, str) or not relative.startswith("replay/"):
+        if not isinstance(relative, str) or ".." in Path(relative).parts:
+            return False
+        if not relative.endswith(suffix):
             return False
         path = run_root / relative
         if path.is_symlink() or not path.is_file():
@@ -2045,6 +2353,9 @@ def _do_probe(context: ExecutionContext, sandbox: Any) -> dict[str, Any]:
         )
     return {
         "tool_id": "sandbox.probe",
+        "job_id": context.job_id_text,
+        "plan_digest": context.plan_digest,
+        "generation": context.generation,
         "status": "completed" if report.ok else "policy_denied",
         "container_id": None,
         "checks": report.checks,
@@ -2055,25 +2366,44 @@ def _do_probe(context: ExecutionContext, sandbox: Any) -> dict[str, Any]:
     }
 
 
+def _expected_build_materials(context: ExecutionContext) -> dict[str, str]:
+    manifest = context.case.manifest
+    source_vulnerable = manifest["versions"]["vulnerable"]
+    source_fixed = manifest["versions"]["fixed"]
+    expected = {
+        manifest["harness"]: context.plan["harness_digest"],
+        manifest["build_recipe"]: context.plan["build_recipe_digest"],
+        manifest["dependencies"]: context.plan["dependencies_digest"],
+    }
+    for relative in (source_vulnerable, source_fixed):
+        digest = context.materials.get(relative)
+        if isinstance(digest, str):
+            expected[relative] = digest
+    return expected
+
+
 def _do_build(
     dsn: str,
     context: ExecutionContext,
     sandbox: Any,
     materials_dir: Path,
+    material_digests: Mapping[str, str],
     version: str,
     attempt_no: int,
     token: str,
 ) -> dict[str, Any]:
     deadline = max(1.0, min(BUILD_TIMEOUT, _remaining(context) - context.reserve_seconds))
+    # Hash the exact tree that will be mounted immediately before the
+    # container is created. A replaced recipe/source aborts the step.
+    _verify_materialized_tree(materials_dir, material_digests)
     result: BuildResult = sandbox.build(
         version,
         materials_dir=materials_dir,
         compile_args=context.compile_args,
         deadline_seconds=deadline,
+        expected_materials=_expected_build_materials(context),
     )
-    return _persist_build(
-        dsn, context, materials_dir.parent, result, attempt_no, token
-    )
+    return _persist_build(dsn, context, result, attempt_no, token)
 
 
 def _do_replay(
@@ -2088,7 +2418,26 @@ def _do_replay(
     attempt_no: int,
     token: str,
 ) -> dict[str, Any]:
-    artifact_path = context.run_root / context.job_id_text / context.plan_digest.split(":")[1] / "run" / "build" / version / "parser"
+    files = build.get("files") if isinstance(build.get("files"), Mapping) else {}
+    relative = files.get("artifact") if isinstance(files, Mapping) else None
+    if (
+        not isinstance(relative, str)
+        or ".." in Path(relative).parts
+        or not relative.endswith("/parser")
+    ):
+        raise ExecutionBlocked(
+            "PLAN_MISMATCH", "the build result has no trusted parser path"
+        )
+    artifact_path = _work_root(context) / relative
+    expected_artifact = build.get("artifact_digest")
+    if artifact_path.is_symlink() or not artifact_path.is_file():
+        raise ExecutionBlocked("MATERIAL_MISSING", "the built parser is missing")
+    if not isinstance(expected_artifact, str) or _digest(
+        artifact_path.read_bytes()
+    ) != expected_artifact:
+        raise ExecutionBlocked(
+            "PLAN_MISMATCH", "the built parser changed before replay"
+        )
     try:
         result: ReplayResult = sandbox.replay(
             version,
@@ -2098,6 +2447,7 @@ def _do_replay(
             asan_options=context.plan["asan_options"],
             timeout_seconds=timeout_seconds,
             deadline_seconds=timeout_seconds,
+            expected_artifact_digest=expected_artifact,
         )
     except SandboxError as error:
         if error.reason_code != "TIMEOUT":
@@ -2126,14 +2476,7 @@ def _do_replay(
                 "error": error.message,
             },
         )
-    return _persist_replay(
-        dsn,
-        context,
-        context.run_root / context.job_id_text / context.plan_digest.split(":")[1] / "run",
-        result,
-        attempt_no,
-        token,
-    )
+    return _persist_replay(dsn, context, result, attempt_no, token)
 
 
 def _finish_blocked(
@@ -2208,7 +2551,9 @@ def _finish_blocked(
             ),
             verdict="BLOCKED",
         )
-    except (BundleError, state.StateError, state.StaleGeneration) as archive_failure:
+    except state.StaleGeneration:
+        return ExecutionResult("STALE")
+    except (BundleError, state.StateError) as archive_failure:
         archive_error = str(archive_failure)
         digest = path = None
     if archive_error is not None:
@@ -2327,7 +2672,9 @@ def _finish_failed(
             ),
             verdict=terminal,
         )
-    except (BundleError, state.StateError, state.StaleGeneration) as archive_failure:
+    except state.StaleGeneration:
+        return ExecutionResult("STALE")
+    except (BundleError, state.StateError) as archive_failure:
         digest = path = None
         archive_error = str(archive_failure)
     if archive_error is not None:
@@ -2338,8 +2685,8 @@ def _finish_failed(
                 generation=generation,
                 state="FAILED",
                 reason_code="EVIDENCE_WRITE_FAILED",
-                verdict=terminal if incomplete else None,
-                verdict_reason=error.reason_code if incomplete else None,
+                verdict=None,
+                verdict_reason=None,
                 evidence_status="failed",
                 evidence_error=archive_error,
                 last_error=error.message,

@@ -15,6 +15,68 @@ from datacon.asan import ASanSignature, has_asan_diagnostic, signature_matches
 VERSIONS = ("vulnerable", "fixed")
 CANDIDATE_PHASES = ("candidate_1", "candidate_2")
 REQUIRED_PHASES = ("normal", *CANDIDATE_PHASES)
+# Single source of truth for the reason codes each verdict may carry. The
+# evidence verifier imports these sets instead of hard-coding a second copy.
+REPRODUCED_REASONS = frozenset({"ASAN_SIGNATURE_MATCHED"})
+NOT_REPRODUCED_REASONS = frozenset({"CANDIDATE_CLEAN"})
+INCONCLUSIVE_REASONS = frozenset(
+    {
+        "CONTROL_FAILED",
+        "EVIDENCE_INCOMPLETE",
+        "FIXED_STILL_VULNERABLE",
+        "INTERMITTENT",
+        "NOT_COMPARABLE",
+        "OTHER_CRASH",
+        "RESOURCE_LIMITED",
+        "RUN_INCOMPLETE",
+        "TIMEOUT",
+        "VERDICT_UNCLASSIFIED",
+    }
+)
+# BLOCKED/FAILED codes are the closed sets execution.py can actually return.
+BLOCKED_REASONS = frozenset(
+    {
+        "DEADLINE_EXCEEDED",
+        "INVALID_REQUEST",
+        "INVALID_STATE",
+        "JOB_NOT_FOUND",
+        "MATERIAL_MISSING",
+        "PLAN_MISMATCH",
+        "POLICY_DENIED",
+        "SOURCE_CONFLICT",
+    }
+)
+FAILED_REASONS = frozenset({"BUILD_FAILED", "EVIDENCE_WRITE_FAILED"})
+VERDICT_REASONS = {
+    "REPRODUCED": REPRODUCED_REASONS,
+    "NOT_REPRODUCED": NOT_REPRODUCED_REASONS,
+    "INCONCLUSIVE": INCONCLUSIVE_REASONS,
+    "BLOCKED": BLOCKED_REASONS,
+    "FAILED": FAILED_REASONS,
+}
+
+# Completed is the only status that can support a positive outcome. The other
+# values are the concrete ReplayResult/execution states that may appear in an
+# inconclusive bundle.
+REPLAY_STATUSES = frozenset(
+    {"completed", "timeout", "resource_limited", "infra_error"}
+)
+
+
+def reason_allowed(verdict: str, reason: str | None) -> bool:
+    """Return whether ``reason`` belongs to the closed set for ``verdict``."""
+    allowed = VERDICT_REASONS.get(verdict)
+    return allowed is not None and reason in allowed
+
+
+def replay_status_allowed(verdict: str, status: str) -> bool:
+    if status not in REPLAY_STATUSES:
+        return False
+    if verdict in ("REPRODUCED", "NOT_REPRODUCED"):
+        return status == "completed"
+    return True
+
+
 PRIORITY = (
     "INCONCLUSIVE: missing/incomparable evidence, abnormal control, "
     "intermittent trigger, other crash, timeout or resource exhaustion",
@@ -178,7 +240,13 @@ def decide_verdict(
 
     if expected_inputs:
         for run in runs:
-            expected = expected_inputs.get(run.version)
+            # Normal controls use the normal input; only candidate replays are
+            # compared against the candidate digest supplied by the caller.
+            if run.phase == "normal":
+                continue
+            expected = expected_inputs.get((run.version, run.phase))
+            if expected is None:
+                expected = expected_inputs.get(run.version)
             if expected is not None and run.input_digest != expected:
                 checks["input_mismatch"] = {
                     "version": run.version,

@@ -15,14 +15,23 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import shutil
+import stat
 import uuid
 from typing import Any, Callable, Mapping
 
 from datacon import contracts, jsonutil
+from datacon.asan import has_asan_diagnostic, parse_asan, signature_matches
+from datacon.verdict import (
+    reason_allowed,
+    replay_status_allowed,
+)
 
 SCHEMA_VERSION = 1
 MAX_MANIFEST_BYTES = 4 * 1024 * 1024
 MAX_FILE_BYTES = 128 * 1024 * 1024
+# A bundle is bounded per file and in aggregate, so a manifest cannot make an
+# offline verifier allocate MAX_FILES * MAX_FILE_BYTES.
+MAX_TOTAL_BYTES = 256 * 1024 * 1024
 MAX_FILES = 4096
 MAX_ROLE_LENGTH = 64
 import re
@@ -56,6 +65,8 @@ _ROLE_NAMES = frozenset(
         "material_input_candidate",
         "material_source_vulnerable",
         "material_source_fixed",
+        "material_patch",
+        "case_config",
         "symbolizer_log",
     }
 )
@@ -68,6 +79,7 @@ _FULL_EVIDENCE_VERDICTS = frozenset(
 )
 _REPLAY_VERSIONS = ("vulnerable", "fixed")
 _REPLAY_PHASES = ("normal", "candidate_1", "candidate_2")
+_CANDIDATE_PHASES = ("candidate_1", "candidate_2")
 _REASON_CODE = re.compile(r"[A-Z][A-Z0-9_]{0,63}")
 _WINDOWS_DRIVE = re.compile(r"^[A-Za-z]:")
 
@@ -107,6 +119,10 @@ def canonical_manifest_digest(manifest: Mapping[str, Any]) -> str:
 
 def _sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def _digest(data: bytes) -> str:
+    return "sha256:" + _sha256(data)
 
 
 def _utc_now() -> str:
@@ -156,6 +172,24 @@ def _read_artifact(value: bytes | bytearray | memoryview | Path | str) -> bytes:
             raise BundleError("MISSING_FILE", f"artifact is not readable: {error}") from error
     if len(data) > MAX_FILE_BYTES:
         raise BundleError("FILE_TOO_LARGE", "bundle file exceeds the size cap")
+    return data
+
+
+def _read_bounded(path: Path, *, expected_size: int) -> bytes:
+    """Read at most ``expected_size + 1`` bytes from a regular file.
+
+    Callers stat the file first, but a concurrent writer can still grow it.
+    The bounded read guarantees the verifier never buffers more than the
+    manifest declares (plus one byte to detect growth).
+    """
+    try:
+        with path.open("rb") as handle:
+            data = handle.read(expected_size + 1)
+            extra = handle.read(1)
+    except OSError as error:
+        raise BundleError("MISSING_FILE", f"file is not readable: {path}") from error
+    if extra:
+        raise BundleError("DIGEST_MISMATCH", f"file grew while reading: {path}")
     return data
 
 
@@ -227,6 +261,10 @@ def write_bundle(
                 raise BundleError(
                     "FILE_TOO_LARGE", f"bundle file exceeds the size cap: {path}"
                 )
+        if sum(len(data) for data in payloads.values()) > MAX_TOTAL_BYTES:
+            raise BundleError(
+                "FILE_TOO_LARGE", "bundle exceeds the total evidence size cap"
+            )
 
         for path, data in payloads.items():
             destination = temporary / PurePosixPath(path)
@@ -294,10 +332,15 @@ def _load_manifest(root: Path) -> tuple[dict[str, Any], bytes]:
         raise BundleError("SYMLINK", "manifest.json must not be a symlink")
     if not path.is_file():
         raise BundleError("MISSING_FILE", "manifest.json is missing")
-    size = path.stat().st_size
+    info = path.lstat()
+    if not stat.S_ISREG(info.st_mode):
+        raise BundleError("INVALID_MANIFEST", "manifest.json must be a regular file")
+    size = info.st_size
     if size > MAX_MANIFEST_BYTES:
         raise BundleError("INVALID_MANIFEST", "manifest.json is too large")
-    data = path.read_bytes()
+    data = _read_bounded(path, expected_size=size)
+    if len(data) != size:
+        raise BundleError("DIGEST_MISMATCH", "manifest.json size changed while reading")
     try:
         manifest = jsonutil.loads_strict(data)
     except jsonutil.StrictJsonError as error:
@@ -437,6 +480,502 @@ def _require_evidence_roles(
             )
 
 
+def _mapping(value: Any, label: str) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping):
+        raise BundleError("INVALID_MANIFEST", f"{label} must be an object")
+    return value
+
+
+def _material_entries(
+    listed: Mapping[str, Mapping[str, Any]],
+) -> dict[str, Mapping[str, Any]]:
+    return {
+        path[len("materials/") :]: entry
+        for path, entry in listed.items()
+        if path.startswith("materials/")
+    }
+
+
+def _single_role_path(
+    listed: Mapping[str, Mapping[str, Any]], role: str
+) -> tuple[str, Mapping[str, Any]]:
+    matches = [
+        (path, entry)
+        for path, entry in listed.items()
+        if entry["role"] == role
+    ]
+    if len(matches) != 1:
+        raise BundleError(
+            "INVALID_MANIFEST",
+            f"expected exactly one {role} evidence file, found {len(matches)}",
+        )
+    return matches[0]
+
+
+def _case_binding(
+    plan: Mapping[str, Any],
+    listed: Mapping[str, Mapping[str, Any]],
+    data: Mapping[str, bytes],
+) -> tuple[Mapping[str, Any], Mapping[str, str], bytes]:
+    """Rebuild the case-config digest that the approved plan froze.
+
+    The plan's ``case_config_digest`` covers the registry entry, the
+    case-specific manifest fragment, every used material digest, the image,
+    platform, toolchain, ASan options and the reviewed signature. Shipping
+    that exact document lets an offline verifier bind source materials (which
+    have no standalone plan field) back to the plan instead of trusting
+    report.json.
+    """
+    entry = listed.get("metadata/case.json")
+    if entry is None:
+        raise BundleError(
+            "INVALID_MANIFEST", "metadata/case.json is required for complete evidence"
+        )
+    if entry["role"] != "case_config":
+        raise BundleError(
+            "INVALID_MANIFEST",
+            "metadata/case.json must carry the case_config role",
+        )
+    document = _parse_json_file(data, "metadata/case.json")
+    case_config = _mapping(document.get("case_config"), "case_config")
+    try:
+        computed = jsonutil.digest_json(case_config)
+    except (ValueError, UnicodeError, RecursionError) as error:
+        raise BundleError(
+            "INVALID_MANIFEST", f"case config is not canonical JSON: {error}"
+        ) from error
+    if computed != plan.get("case_config_digest"):
+        raise BundleError(
+            "DIGEST_MISMATCH",
+            "metadata/case.json does not match plan.case_config_digest",
+        )
+    if case_config.get("case_id") != plan.get("case_id"):
+        raise BundleError("INVALID_MANIFEST", "case config names a different case")
+    if case_config.get("cve_id") != plan.get("cve_id"):
+        raise BundleError("INVALID_MANIFEST", "case config names a different CVE")
+    image = case_config.get("image")
+    if (
+        not isinstance(image, str)
+        or not image.endswith("@" + str(plan.get("image_digest")))
+    ):
+        raise BundleError("INVALID_MANIFEST", "case config image does not match the plan")
+    for field in ("platform", "toolchain", "asan_options", "asan_signature"):
+        if case_config.get(field) != plan.get(field):
+            raise BundleError(
+                "INVALID_MANIFEST", f"case config {field} does not match the plan"
+            )
+    registry_entry = _mapping(case_config.get("registry_entry"), "registry_entry")
+    repository = _mapping(registry_entry.get("repository"), "registry repository")
+    if repository.get("commits") != plan.get("revisions"):
+        raise BundleError(
+            "INVALID_MANIFEST", "case registry revisions do not match the plan"
+        )
+    if repository.get("bundle_digest") != plan.get("repository", {}).get(
+        "bundle_digest"
+    ):
+        raise BundleError(
+            "INVALID_MANIFEST", "case registry bundle digest does not match the plan"
+        )
+    materials = _mapping(case_config.get("materials"), "case materials")
+    manifest_case = _mapping(case_config.get("manifest_case"), "manifest_case")
+    inputs = _mapping(manifest_case.get("inputs"), "manifest_case.inputs")
+    if materials.get(inputs.get("normal")) != plan.get("inputs", {}).get("normal"):
+        raise BundleError(
+            "INVALID_MANIFEST", "case normal input digest does not match the plan"
+        )
+    if materials.get(inputs.get("candidate")) != plan.get("inputs", {}).get(
+        "candidate"
+    ):
+        raise BundleError(
+            "INVALID_MANIFEST", "case candidate input digest does not match the plan"
+        )
+    recipe_path, _ = _single_role_path(listed, "material_build_recipe")
+    recipe = data[recipe_path]
+    if _digest(recipe) != plan.get("build_recipe_digest"):
+        raise BundleError(
+            "DIGEST_MISMATCH", "build recipe does not match plan.build_recipe_digest"
+        )
+    return case_config, materials, recipe
+
+
+def _verify_materials(
+    plan: Mapping[str, Any],
+    listed: Mapping[str, Mapping[str, Any]],
+    data: Mapping[str, bytes],
+    case_config: Mapping[str, Any],
+    materials: Mapping[str, str],
+) -> None:
+    bundle_materials = _material_entries(listed)
+    for relative, entry in bundle_materials.items():
+        if relative not in materials:
+            raise BundleError(
+                "INVALID_MANIFEST",
+                f"materials/{relative} is not pinned by the plan case config",
+            )
+        content = data[f"materials/{relative}"]
+        if _digest(content) != materials[relative]:
+            raise BundleError(
+                "DIGEST_MISMATCH",
+                f"material digest does not match plan case config: {relative}",
+            )
+    expected_plan_digests = {
+        "material_harness": plan.get("harness_digest"),
+        "material_build_recipe": plan.get("build_recipe_digest"),
+        "material_dependencies": plan.get("dependencies_digest"),
+        "material_patch": plan.get("repository", {}).get("patch_digest"),
+        "material_input_normal": plan.get("inputs", {}).get("normal"),
+        "material_input_candidate": plan.get("inputs", {}).get("candidate"),
+    }
+    for role, expected in expected_plan_digests.items():
+        path, entry = _single_role_path(listed, role)
+        if not path.startswith("materials/"):
+            raise BundleError(
+                "INVALID_MANIFEST", f"{role} must be a materials/* evidence file"
+            )
+        relative = path[len("materials/") :]
+        content = data[path]
+        if expected is not None and _digest(content) != expected:
+            raise BundleError(
+                "DIGEST_MISMATCH", f"{role} does not match the approved plan"
+            )
+        if materials.get(relative) != _digest(content):
+            raise BundleError(
+                "DIGEST_MISMATCH",
+                f"{role} path is not pinned by the plan case config",
+            )
+    for role in ("material_source_vulnerable", "material_source_fixed"):
+        path, entry = _single_role_path(listed, role)
+        if not path.startswith("materials/"):
+            raise BundleError(
+                "INVALID_MANIFEST", f"{role} must be a materials/* evidence file"
+            )
+        relative = path[len("materials/") :]
+        if materials.get(relative) != _digest(data[path]):
+            raise BundleError(
+                "DIGEST_MISMATCH",
+                f"{role} is not pinned by the plan case config",
+            )
+
+
+def _compile_args_from_recipe(recipe: bytes) -> list[str]:
+    from datacon.tools.sandbox import _extract_compile_args
+
+    return list(_extract_compile_args(recipe))
+
+
+def _build_evidence_path(version: str, name: str) -> str:
+    return f"build/{version}/{name}"
+
+
+def _replay_evidence_path(version: str, phase: str, name: str) -> str:
+    return f"replay/{version}/{phase}/{name}"
+
+
+def _require_path_suffix(value: Any, suffix: str, label: str) -> None:
+    if not isinstance(value, str) or ".." in Path(value).parts:
+        raise BundleError("INVALID_MANIFEST", f"{label} path is invalid")
+    if not value.endswith(suffix):
+        raise BundleError("INVALID_MANIFEST", f"{label} has an unexpected path")
+
+
+def _verify_builds(
+    plan: Mapping[str, Any],
+    report: Mapping[str, Any],
+    data: Mapping[str, bytes],
+    expected_compile_args: list[str],
+) -> None:
+    builds = report.get("builds")
+    if not isinstance(builds, list):
+        raise BundleError("INVALID_MANIFEST", "report builds must be a list")
+    if len(builds) != 2:
+        raise BundleError(
+            "INVALID_MANIFEST", "complete evidence requires exactly two builds"
+        )
+    seen: set[str] = set()
+    for build in builds:
+        if not isinstance(build, Mapping):
+            raise BundleError("INVALID_MANIFEST", "report build must be an object")
+        version = build.get("version")
+        if version not in _REPLAY_VERSIONS or version in seen:
+            raise BundleError(
+                "INVALID_MANIFEST", f"report build has an invalid version: {version}"
+            )
+        seen.add(version)
+        if build.get("status") != "completed":
+            raise BundleError(
+                "INVALID_MANIFEST", f"{version} build did not complete"
+            )
+        if build.get("input_digest") != plan.get("analysis_digest"):
+            raise BundleError(
+                "DIGEST_MISMATCH", f"{version} build input does not match the plan"
+            )
+        if build.get("image_digest") != plan.get("image_digest"):
+            raise BundleError(
+                "DIGEST_MISMATCH", f"{version} build image does not match the plan"
+            )
+        if build.get("build_recipe_digest") != plan.get("build_recipe_digest"):
+            raise BundleError(
+                "DIGEST_MISMATCH", f"{version} build recipe does not match the plan"
+            )
+        if list(build.get("compile_args") or []) != expected_compile_args:
+            raise BundleError(
+                "INVALID_MANIFEST",
+                f"{version} compile args do not match the reviewed recipe",
+            )
+        if build.get("log_truncated") is not False:
+            raise BundleError(
+                "INVALID_MANIFEST", f"{version} build log is truncated"
+            )
+        files = _mapping(build.get("files"), f"{version} build files")
+        digests = _mapping(build.get("file_digests"), f"{version} build digests")
+        _require_path_suffix(files.get("log"), "/build.log", f"{version} build log")
+        _require_path_suffix(
+            files.get("artifact"), "/parser", f"{version} build artifact"
+        )
+        log_path = _build_evidence_path(version, "build.log")
+        artifact_path = _build_evidence_path(version, "parser")
+        log = data[log_path]
+        artifact = data[artifact_path]
+        if _digest(log) != build.get("log_digest"):
+            raise BundleError(
+                "DIGEST_MISMATCH", f"{version} build log digest does not match"
+            )
+        if _digest(artifact) != build.get("artifact_digest"):
+            raise BundleError(
+                "DIGEST_MISMATCH", f"{version} build artifact digest does not match"
+            )
+        if digests.get("log") != _digest(log):
+            raise BundleError(
+                "DIGEST_MISMATCH", f"{version} build file_digests.log does not match"
+            )
+        if digests.get("artifact") != _digest(artifact):
+            raise BundleError(
+                "DIGEST_MISMATCH",
+                f"{version} build file_digests.artifact does not match",
+            )
+        metadata = _parse_json_file(
+            data, _build_evidence_path(version, "metadata.json")
+        )
+        if dict(metadata) != dict(build):
+            raise BundleError(
+                "INVALID_MANIFEST",
+                f"{version} build metadata does not match report.builds",
+            )
+    if seen != set(_REPLAY_VERSIONS):
+        raise BundleError(
+            "INVALID_MANIFEST", "report builds do not cover both versions"
+        )
+
+
+def _verify_replays(
+    plan: Mapping[str, Any],
+    verdict: str,
+    report: Mapping[str, Any],
+    data: Mapping[str, bytes],
+) -> dict[tuple[str, str], dict[str, Any]]:
+    replays = report.get("replays")
+    if not isinstance(replays, list):
+        raise BundleError("INVALID_MANIFEST", "report replays must be a list")
+    observations: dict[tuple[str, str], dict[str, Any]] = {}
+    for item in replays:
+        if not isinstance(item, Mapping):
+            raise BundleError("INVALID_MANIFEST", "report replay must be an object")
+        version = item.get("version")
+        phase = item.get("phase")
+        if version not in _REPLAY_VERSIONS or phase not in _REPLAY_PHASES:
+            raise BundleError(
+                "INVALID_MANIFEST",
+                f"report replay has an unknown version/phase: {version}/{phase}",
+            )
+        key = (version, phase)
+        if key in observations:
+            raise BundleError(
+                "INVALID_MANIFEST",
+                f"report contains a duplicate replay: {version}/{phase}",
+            )
+        status = item.get("status")
+        if not isinstance(status, str) or not replay_status_allowed(verdict, status):
+            raise BundleError(
+                "INVALID_MANIFEST",
+                f"replay {version}/{phase} has a status {status!r} that is not "
+                f"allowed for verdict {verdict}",
+            )
+        expected_input = (
+            plan.get("inputs", {}).get("normal")
+            if phase == "normal"
+            else plan.get("inputs", {}).get("candidate")
+        )
+        if item.get("input_digest") != expected_input:
+            raise BundleError(
+                "DIGEST_MISMATCH",
+                f"replay {version}/{phase} input does not match the plan",
+            )
+        if item.get("log_truncated") is not False:
+            raise BundleError(
+                "INVALID_MANIFEST", f"replay {version}/{phase} log is truncated"
+            )
+        files = _mapping(item.get("files"), f"{version}/{phase} files")
+        digests = _mapping(item.get("file_digests"), f"{version}/{phase} digests")
+        _require_path_suffix(files.get("stdout"), "/stdout.log", "replay stdout")
+        _require_path_suffix(files.get("stderr"), "/stderr.log", "replay stderr")
+        stdout = data[_replay_evidence_path(version, phase, "stdout.log")]
+        stderr = data[_replay_evidence_path(version, phase, "stderr.log")]
+        if item.get("stdout_sha256") != _digest(stdout):
+            raise BundleError(
+                "DIGEST_MISMATCH",
+                f"replay {version}/{phase} stdout digest does not match",
+            )
+        if item.get("stderr_sha256") != _digest(stderr):
+            raise BundleError(
+                "DIGEST_MISMATCH",
+                f"replay {version}/{phase} stderr digest does not match",
+            )
+        if item.get("stdout_bytes") != len(stdout):
+            raise BundleError(
+                "DIGEST_MISMATCH",
+                f"replay {version}/{phase} stdout size does not match",
+            )
+        if item.get("stderr_bytes") != len(stderr):
+            raise BundleError(
+                "DIGEST_MISMATCH",
+                f"replay {version}/{phase} stderr size does not match",
+            )
+        if digests.get("stdout") != _digest(stdout):
+            raise BundleError(
+                "DIGEST_MISMATCH",
+                f"replay {version}/{phase} file_digests.stdout does not match",
+            )
+        if digests.get("stderr") != _digest(stderr):
+            raise BundleError(
+                "DIGEST_MISMATCH",
+                f"replay {version}/{phase} file_digests.stderr does not match",
+            )
+        stderr_text = stderr.decode("utf-8", "replace")
+        parsed = parse_asan(stderr_text)
+        expected_signature = parsed.as_dict() if parsed else None
+        if item.get("signature") != expected_signature:
+            raise BundleError(
+                "INVALID_MANIFEST",
+                f"replay {version}/{phase} signature does not match the raw log",
+            )
+        if bool(item.get("timed_out")) != (status == "timeout"):
+            raise BundleError(
+                "INVALID_MANIFEST",
+                f"replay {version}/{phase} timeout flag does not match status",
+            )
+        metadata = _parse_json_file(
+            data, _replay_evidence_path(version, phase, "metadata.json")
+        )
+        if dict(metadata) != dict(item):
+            raise BundleError(
+                "INVALID_MANIFEST",
+                f"replay {version}/{phase} metadata does not match report.replays",
+            )
+        observations[key] = {
+            "status": status,
+            "exit_code": item.get("exit_code"),
+            "stderr": stderr_text,
+            "signature": parsed,
+            "stdout": stdout.decode("utf-8", "replace"),
+        }
+    required = {
+        (version, phase)
+        for version in _REPLAY_VERSIONS
+        for phase in _REPLAY_PHASES
+    }
+    if set(observations) != required:
+        missing = sorted(required - set(observations))
+        extra = sorted(set(observations) - required)
+        raise BundleError(
+            "INVALID_MANIFEST",
+            "report replays do not match the six required runs; "
+            f"missing={missing} extra={extra}",
+        )
+    return observations
+
+
+def _candidate_kind(
+    plan: Mapping[str, Any], observation: Mapping[str, Any]
+) -> str:
+    signature = observation.get("signature")
+    expected_exit = plan.get("expected_exit") or {}
+    if (
+        signature is not None
+        and signature_matches(signature, plan.get("asan_signature") or {})
+        and observation.get("exit_code") == expected_exit.get("candidate_asan")
+    ):
+        return "target_signature"
+    if (
+        observation.get("exit_code") == expected_exit.get("candidate_clean")
+        and not has_asan_diagnostic(observation.get("stderr"))
+    ):
+        return "clean"
+    return "other"
+
+
+def _verify_outcome(
+    plan: Mapping[str, Any],
+    verdict: str,
+    report: Mapping[str, Any],
+    observations: Mapping[tuple[str, str], Mapping[str, Any]],
+) -> None:
+    expected_exit = plan.get("expected_exit") or {}
+    reason = report.get("reason_code")
+    # CONTROL_FAILED is the one inconclusive reason that legitimately records
+    # an abnormal normal-control run. Every other outcome still requires both
+    # normal controls to match the plan.
+    if verdict in ("REPRODUCED", "NOT_REPRODUCED") or reason != "CONTROL_FAILED":
+        for version in _REPLAY_VERSIONS:
+            control = observations[(version, "normal")]
+            if control.get("exit_code") != expected_exit.get("normal"):
+                raise BundleError(
+                    "INVALID_MANIFEST",
+                    f"{version} normal control exit does not match",
+                )
+            if has_asan_diagnostic(control.get("stderr")):
+                raise BundleError(
+                    "INVALID_MANIFEST",
+                    f"{version} normal control emitted an ASan diagnostic",
+                )
+    if verdict == "REPRODUCED":
+        for version in _REPLAY_VERSIONS:
+            for phase in _CANDIDATE_PHASES:
+                kind = _candidate_kind(plan, observations[(version, phase)])
+                if version == "vulnerable" and kind != "target_signature":
+                    raise BundleError(
+                        "INVALID_MANIFEST",
+                        f"vulnerable {phase} is not the reviewed ASan hit",
+                    )
+                if version == "fixed" and kind != "clean":
+                    raise BundleError(
+                        "INVALID_MANIFEST",
+                        f"fixed {phase} is not clean",
+                    )
+        return
+    if verdict == "NOT_REPRODUCED":
+        for version in _REPLAY_VERSIONS:
+            for phase in _CANDIDATE_PHASES:
+                if _candidate_kind(plan, observations[(version, phase)]) != "clean":
+                    raise BundleError(
+                        "INVALID_MANIFEST",
+                        f"{version} {phase} is not a clean candidate run",
+                    )
+        return
+    # INCONCLUSIVE: the reason-specific status shape must be visible. Normal
+    # stdout is not checked because the frozen plan intentionally does not
+    # carry expected_stdout; that trust boundary is documented here.
+    statuses = {item["status"] for item in observations.values()}
+    if reason == "TIMEOUT" and "timeout" not in statuses:
+        raise BundleError(
+            "INVALID_MANIFEST", "TIMEOUT verdict has no timeout replay"
+        )
+    if reason == "RESOURCE_LIMITED" and "resource_limited" not in statuses:
+        raise BundleError(
+            "INVALID_MANIFEST",
+            "RESOURCE_LIMITED verdict has no resource-limited replay",
+        )
+
+
 def _verify_semantics(
     *,
     job_id: str,
@@ -471,6 +1010,17 @@ def _verify_semantics(
         raise BundleError(
             "INVALID_MANIFEST", "manifest reason_code does not match report"
         )
+    if verdict in _FULL_EVIDENCE_VERDICTS:
+        if report_reason is None or not reason_allowed(verdict, report_reason):
+            raise BundleError(
+                "INVALID_MANIFEST",
+                f"reason_code {report_reason!r} is not allowed for {verdict}",
+            )
+    elif report_reason is not None and not reason_allowed(verdict, report_reason):
+        raise BundleError(
+            "INVALID_MANIFEST",
+            f"reason_code {report_reason!r} is not allowed for {verdict}",
+        )
 
     plan = _parse_json_file(data, "plan.json")
     try:
@@ -495,43 +1045,75 @@ def _verify_semantics(
             "INVALID_MANIFEST", "review.json is bound to a different plan"
         )
 
-    replay_keys = _validate_report_replays(report)
-    if verdict in _FULL_EVIDENCE_VERDICTS:
-        expected: dict[str, frozenset[str]] = {
-            "metadata/execution.json": frozenset({"execution_metadata"}),
-            "metadata/probe.json": frozenset({"probe"}),
-        }
-        for version in _REPLAY_VERSIONS:
-            expected[f"build/{version}/build.log"] = frozenset({"build_log"})
-            expected[f"build/{version}/parser"] = frozenset({"build_artifact"})
-            expected[f"build/{version}/metadata.json"] = frozenset(
-                {"build_metadata"}
+    if verdict not in _FULL_EVIDENCE_VERDICTS:
+        return
+
+    expected: dict[str, frozenset[str]] = {
+        "metadata/execution.json": frozenset({"execution_metadata"}),
+        "metadata/probe.json": frozenset({"probe"}),
+        "metadata/case.json": frozenset({"case_config"}),
+    }
+    for version in _REPLAY_VERSIONS:
+        expected[f"build/{version}/build.log"] = frozenset({"build_log"})
+        expected[f"build/{version}/parser"] = frozenset({"build_artifact"})
+        expected[f"build/{version}/metadata.json"] = frozenset({"build_metadata"})
+        for phase in _REPLAY_PHASES:
+            directory = f"replay/{version}/{phase}"
+            expected[f"{directory}/stdout.log"] = frozenset(
+                {"replay_stdout", "normal_output"}
             )
-            for phase in _REPLAY_PHASES:
-                directory = f"replay/{version}/{phase}"
-                expected[f"{directory}/stdout.log"] = frozenset(
-                    {"replay_stdout", "normal_output"}
-                )
-                expected[f"{directory}/stderr.log"] = frozenset(
-                    {"asan_log", "replay_stderr", "normal_error"}
-                )
-                expected[f"{directory}/metadata.json"] = frozenset(
-                    {"replay_metadata"}
-                )
-        _require_evidence_roles(listed, expected)
-        required_keys = {
-            (version, phase)
-            for version in _REPLAY_VERSIONS
-            for phase in _REPLAY_PHASES
-        }
-        if replay_keys != required_keys:
-            missing = sorted(required_keys - replay_keys)
-            extra = sorted(replay_keys - required_keys)
-            raise BundleError(
-                "INVALID_MANIFEST",
-                "report replays do not match the six required runs; "
-                f"missing={missing} extra={extra}",
+            expected[f"{directory}/stderr.log"] = frozenset(
+                {"asan_log", "replay_stderr", "normal_error"}
             )
+            expected[f"{directory}/metadata.json"] = frozenset(
+                {"replay_metadata"}
+            )
+    _require_evidence_roles(listed, expected)
+
+    report_repository = report.get("repository")
+    if report_repository != plan.get("repository"):
+        raise BundleError(
+            "INVALID_MANIFEST", "report repository does not match the plan"
+        )
+    if report.get("versions") != plan.get("revisions"):
+        raise BundleError(
+            "INVALID_MANIFEST", "report revisions do not match the plan"
+        )
+    if report.get("inputs") != plan.get("inputs"):
+        raise BundleError("INVALID_MANIFEST", "report inputs do not match the plan")
+    if report.get("signature") != plan.get("asan_signature"):
+        raise BundleError(
+            "INVALID_MANIFEST", "report signature does not match the plan"
+        )
+    environment = _mapping(report.get("environment"), "report environment")
+    if environment.get("image_digest") != plan.get("image_digest"):
+        raise BundleError(
+            "INVALID_MANIFEST", "report environment image does not match the plan"
+        )
+    if environment.get("platform") != plan.get("platform"):
+        raise BundleError(
+            "INVALID_MANIFEST", "report environment platform does not match the plan"
+        )
+    if environment.get("toolchain") != plan.get("toolchain"):
+        raise BundleError(
+            "INVALID_MANIFEST", "report environment toolchain does not match the plan"
+        )
+    if environment.get("asan_options") != plan.get("asan_options"):
+        raise BundleError(
+            "INVALID_MANIFEST", "report environment ASan options do not match the plan"
+        )
+
+    case_config, materials, recipe = _case_binding(plan, listed, data)
+    _verify_materials(plan, listed, data, case_config, materials)
+    expected_compile_args = _compile_args_from_recipe(recipe)
+    if list(environment.get("compile_args") or []) != expected_compile_args:
+        raise BundleError(
+            "INVALID_MANIFEST",
+            "report environment compile args do not match the reviewed recipe",
+        )
+    _verify_builds(plan, report, data, expected_compile_args)
+    observations = _verify_replays(plan, verdict, report, data)
+    _verify_outcome(plan, verdict, report, observations)
 
 
 def verify_bundle(root: Path | str) -> BundleVerification:
@@ -588,9 +1170,33 @@ def verify_bundle(root: Path | str) -> BundleVerification:
     if missing:
         raise BundleError("MISSING_FILE", "bundle is missing: " + ", ".join(missing))
 
+    if sum(entry["size_bytes"] for entry in listed.values()) > MAX_TOTAL_BYTES:
+        raise BundleError(
+            "FILE_TOO_LARGE", "bundle exceeds the total evidence size cap"
+        )
+
     data: dict[str, bytes] = {}
+    total = 0
     for relative, entry in listed.items():
-        content = actual[relative].read_bytes()
+        path = actual[relative]
+        # Stat again immediately before reading. The os.walk pass happened
+        # earlier, so a file could have been replaced with a symlink or grown
+        # past the manifest's declaration in the meantime.
+        info = path.lstat()
+        if not stat.S_ISREG(info.st_mode):
+            raise BundleError(
+                "INVALID_MANIFEST", f"evidence is not a regular file: {relative}"
+            )
+        if info.st_size != entry["size_bytes"]:
+            raise BundleError("DIGEST_MISMATCH", f"size mismatch for {relative}")
+        if info.st_size > MAX_FILE_BYTES:
+            raise BundleError("FILE_TOO_LARGE", f"file is too large: {relative}")
+        total += info.st_size
+        if total > MAX_TOTAL_BYTES:
+            raise BundleError(
+                "FILE_TOO_LARGE", "bundle exceeds the total evidence size cap"
+            )
+        content = _read_bounded(path, expected_size=entry["size_bytes"])
         if len(content) != entry["size_bytes"]:
             raise BundleError("DIGEST_MISMATCH", f"size mismatch for {relative}")
         if _sha256(content) != entry["sha256"]:
