@@ -4,6 +4,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+import sysconfig
 import zipfile
 
 from datacon import cases as case_registry
@@ -197,3 +198,132 @@ def test_wheel_install_can_analyze_the_default_case(tmp_path):
     )
     assert result.returncode == 0, result.stdout + result.stderr
     assert "wheel-analyze-ok" in result.stdout
+
+
+INSTALLED_SMOKE = """
+import importlib.metadata as metadata
+import json
+import os
+import sys
+
+import datacon
+
+site = os.path.realpath(sys.argv[1])
+package_file = os.path.realpath(datacon.__file__)
+assert package_file.startswith(site + os.sep), package_file
+
+version = metadata.version("datacon")
+assert version == "0.1.0", version
+requires = metadata.requires("datacon") or []
+assert any(requirement.lower().startswith("psycopg") for requirement in requires), requires
+entries = {
+    entry.name: entry.value
+    for entry in metadata.entry_points(group="console_scripts")
+}
+assert entries.get("datacon") == "datacon.cli:main", entries
+
+from datacon.agents.analysis import analyze_case
+from datacon.contracts import DEFAULT_LIMITS, parse_request
+
+body = json.loads(sys.argv[2])
+body["limits"] = dict(DEFAULT_LIMITS)
+request = parse_request(json.dumps(body))
+assert request["target"]["case_id"] == "fixture-c-parser"
+result = analyze_case(request)
+assert result.plan["case_id"] == "fixture-c-parser", result.plan["case_id"]
+assert result.plan_digest.startswith("sha256:"), result.plan_digest
+print("wheel-installed-ok")
+"""
+
+
+def test_installed_wheel_exposes_entry_point_metadata_and_default_case(tmp_path):
+    """Install the wheel in a real venv instead of only extracting its zip.
+
+    Dependencies stay in the locked project environment and are exposed via
+    PYTHONPATH; the datacon package itself must come from the installed wheel,
+    and the console script must be the wheel's real entry point.
+    """
+    if shutil.which("uv") is None:
+        import pytest
+
+        pytest.skip("uv is required to build the wheel for the installation test")
+
+    wheel = build_wheel(tmp_path / "wheel")
+    venv = tmp_path / "venv"
+    subprocess.run(
+        [sys.executable, "-m", "venv", str(venv)],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=120,
+        env=os.environ.copy(),
+    )
+    if os.name == "nt":
+        python = venv / "Scripts" / "python.exe"
+        console = venv / "Scripts" / "datacon.exe"
+    else:
+        python = venv / "bin" / "python"
+        console = venv / "bin" / "datacon"
+
+    installed = subprocess.run(
+        [
+            str(python),
+            "-m",
+            "pip",
+            "install",
+            "--no-index",
+            "--no-deps",
+            "--disable-pip-version-check",
+            str(wheel),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        env=os.environ.copy(),
+    )
+    assert installed.returncode == 0, installed.stdout + installed.stderr
+
+    deps_site = sysconfig.get_paths()["purelib"]
+    env = os.environ.copy()
+    env.pop("DATACON_CASE_ROOT", None)
+    env["PYTHONPATH"] = deps_site
+
+    help_result = subprocess.run(
+        [str(console), "--help"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env=env,
+    )
+    assert help_result.returncode == 0, help_result.stdout + help_result.stderr
+    assert "usage: datacon" in help_result.stdout
+
+    site = subprocess.run(
+        [
+            str(python),
+            "-c",
+            "import sysconfig; print(sysconfig.get_paths()['purelib'])",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env=os.environ.copy(),
+    )
+    assert site.returncode == 0, site.stdout + site.stderr
+    smoke = subprocess.run(
+        [
+            str(python),
+            "-c",
+            INSTALLED_SMOKE,
+            site.stdout.strip(),
+            json.dumps(request_body("fixture-c-parser")),
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=120,
+        env=env,
+    )
+    assert smoke.returncode == 0, smoke.stdout + smoke.stderr
+    assert "wheel-installed-ok" in smoke.stdout

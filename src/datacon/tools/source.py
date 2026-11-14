@@ -6,15 +6,25 @@ from dataclasses import dataclass
 import os
 from pathlib import Path
 import re
+import signal
 import subprocess
+import threading
 
 from datacon import jsonutil
 
 MAX_SOURCE_BYTES = 4 * 1024 * 1024
 MAX_DIFF_BYTES = 8 * 1024 * 1024
+# A tree entry is longer than a path (mode, type, object id and tab), so the
+# byte cap is deliberately independent of MAX_TREE_PATHS. Both limits are
+# enforced while the subprocess is still running.
+MAX_TREE_BYTES = 32 * 1024 * 1024
 MAX_TREE_PATHS = 100_000
+MAX_DIFF_NAMES_BYTES = 4 * 1024 * 1024
 MAX_CHANGED_PATHS = 10_000
 MAX_SYMBOLS = 10_000
+MAX_GIT_STDERR_BYTES = 64 * 1024
+GIT_TIMEOUT_SECONDS = 30
+_READ_CHUNK_BYTES = 64 * 1024
 _REF = re.compile(r"refs/(?:heads|tags)/[A-Za-z0-9][A-Za-z0-9._/-]*")
 _OID = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
 
@@ -84,6 +94,158 @@ def _git_environment(hooks: Path) -> dict[str, str]:
     return environment
 
 
+def _kill_process(process) -> None:
+    """Kill a subprocess and, on POSIX, its whole process group.
+
+    Killing only the parent is not enough: a Git helper can keep the stdout
+    pipe open after its parent is gone, which would leave a reader thread
+    blocked. Never let a cleanup failure mask the original limit error.
+    """
+    poll = getattr(process, "poll", None)
+    if poll is not None and poll() is not None:
+        return
+    pid = getattr(process, "pid", None)
+    if os.name == "posix" and pid is not None:
+        try:
+            os.killpg(os.getpgid(pid), signal.SIGKILL)
+            return
+        except (ProcessLookupError, PermissionError, OverflowError, OSError):
+            pass
+    kill = getattr(process, "kill", None)
+    if kill is None:
+        return
+    try:
+        kill()
+    except (ProcessLookupError, OSError):
+        pass
+
+
+def _bounded_run(
+    command: list[str],
+    *,
+    environment: dict[str, str],
+    max_stdout_bytes: int,
+    max_stderr_bytes: int,
+    operation: str,
+    output_cap_message: str,
+    tool_id: str = "git.resolve",
+    timeout: float = GIT_TIMEOUT_SECONDS,
+) -> tuple[int, bytes, bytes]:
+    """Run one Git command without ever buffering unbounded stdout/stderr.
+
+    ``subprocess.run(capture_output=True)`` reads the whole pipe before the
+    caller can enforce a cap. This path reads fixed-size chunks, kills the
+    process group as soon as stdout exceeds ``max_stdout_bytes``, and keeps
+    stderr bounded while still draining it so the child cannot block on a full
+    stderr pipe. The timeout is measured from process start.
+    """
+    try:
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=environment,
+            start_new_session=True,
+        )
+    except (FileNotFoundError, PermissionError) as error:
+        raise SourceToolError(
+            tool_id,
+            f"git {operation} could not start: {type(error).__name__}",
+        ) from error
+    except OSError as error:
+        raise TransientSourceToolError(
+            tool_id,
+            f"git {operation} could not start: {type(error).__name__}",
+        ) from error
+
+    stdout = bytearray()
+    stderr = bytearray()
+    stdout_overflow = threading.Event()
+    timed_out = threading.Event()
+
+    def read_stdout() -> None:
+        try:
+            while True:
+                chunk = process.stdout.read(_READ_CHUNK_BYTES)
+                if not chunk:
+                    return
+                remaining = max_stdout_bytes - len(stdout)
+                if remaining < len(chunk):
+                    if remaining > 0:
+                        stdout.extend(chunk[:remaining])
+                    stdout_overflow.set()
+                    _kill_process(process)
+                    return
+                stdout.extend(chunk)
+        finally:
+            try:
+                process.stdout.close()
+            except OSError:
+                pass
+
+    def read_stderr() -> None:
+        try:
+            while True:
+                chunk = process.stderr.read(_READ_CHUNK_BYTES)
+                if not chunk:
+                    return
+                remaining = max_stderr_bytes - len(stderr)
+                if remaining > 0:
+                    stderr.extend(chunk[:remaining])
+                # Anything beyond the cap is drained and discarded, never kept
+                # in memory. The child must not block on a full stderr pipe.
+        finally:
+            try:
+                process.stderr.close()
+            except OSError:
+                pass
+
+    # Daemon threads ensure a broken child cannot keep the worker alive even
+    # if the operating system does not report EOF after the process exits.
+    readers = [
+        threading.Thread(target=read_stdout, daemon=True),
+        threading.Thread(target=read_stderr, daemon=True),
+    ]
+    for reader in readers:
+        reader.start()
+    reader_stalled = False
+    try:
+        process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        timed_out.set()
+        _kill_process(process)
+        process.wait()
+    finally:
+        for reader in readers:
+            reader.join(timeout=5)
+        reader_stalled = any(reader.is_alive() for reader in readers)
+
+    if timed_out.is_set():
+        raise TransientSourceToolError(
+            tool_id, f"git {operation} timed out"
+        )
+    if stdout_overflow.is_set():
+        raise SourceToolError(tool_id, output_cap_message)
+    if reader_stalled:
+        # Do not read buffers that a live reader can still mutate. Treat a
+        # leaked pipe as a transient child-process failure.
+        raise TransientSourceToolError(
+            tool_id, f"git {operation} output reader did not stop"
+        )
+    return process.returncode, bytes(stdout), bytes(stderr)
+
+
+def _git_failure(
+    tool_id: str, operation: str, stderr: bytes, returncode: int
+) -> SourceToolError:
+    """Classify a non-zero Git exit, keeping the existing 500-char limit."""
+    message = stderr.decode("utf-8", "replace").strip()[:500]
+    error_type = (
+        TransientSourceToolError if returncode < 0 else SourceToolError
+    )
+    return error_type(tool_id, f"git {operation} failed: {message}")
+
+
 class GitRepository:
     """A read-only bare repository materialized from a pinned case bundle."""
 
@@ -135,43 +297,37 @@ class GitRepository:
             ],
         ]
         for arguments in commands:
-            try:
-                result = subprocess.run(
-                    [*base, *arguments],
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    timeout=30,
-                    env=environment,
-                )
-            except subprocess.TimeoutExpired as error:
-                raise TransientSourceToolError(
-                    "git.resolve", f"git {arguments[0]} timed out"
-                ) from error
-            except (FileNotFoundError, PermissionError) as error:
-                raise SourceToolError(
-                    "git.resolve",
-                    f"git {arguments[0]} could not start: {type(error).__name__}",
-                ) from error
-            except OSError as error:
-                raise TransientSourceToolError(
-                    "git.resolve",
-                    f"git {arguments[0]} could not start: {type(error).__name__}",
-                ) from error
-            if result.returncode != 0:
-                error_type = (
-                    TransientSourceToolError
-                    if result.returncode < 0
-                    else SourceToolError
-                )
-                raise error_type(
-                    "git.resolve",
-                    f"git {arguments[0]} failed: {result.stderr.strip()[:500]}",
+            returncode, _, stderr = _bounded_run(
+                [*base, *arguments],
+                environment=environment,
+                max_stdout_bytes=1024 * 1024,
+                max_stderr_bytes=MAX_GIT_STDERR_BYTES,
+                operation=arguments[0],
+                output_cap_message=(
+                    f"git {arguments[0]} output exceeds the analysis cap"
+                ),
+            )
+            if returncode != 0:
+                raise _git_failure(
+                    "git.resolve", arguments[0], stderr, returncode
                 )
         return cls(repository, hooks)
 
-    def _run(self, *arguments: str, binary: bool = True) -> bytes:
+    def _run(
+        self,
+        *arguments: str,
+        binary: bool = True,
+        max_stdout_bytes: int = MAX_DIFF_BYTES,
+        max_stderr_bytes: int = MAX_GIT_STDERR_BYTES,
+        output_cap_message: str = "Git output exceeds the analysis cap",
+    ) -> bytes:
+        """Run one repository command with an explicit bounded stdout path.
+
+        ``_run`` itself is bounded; all production callers go through
+        ``_run_limited``, which supplies the operation-specific cap. The
+        defaults exist only so older tests/helpers can still monkeypatch or
+        call ``_run`` directly without creating an unbounded path.
+        """
         environment = _git_environment(self._hooks)
         command = [
             "git",
@@ -188,44 +344,48 @@ class GitRepository:
             "-C",
             str(self.path),
         ]
-        try:
-            result = subprocess.run(
-                [*command, *arguments],
-                capture_output=True,
-                timeout=30,
-                env=environment,
+        returncode, stdout, stderr = _bounded_run(
+            [*command, *arguments],
+            environment=environment,
+            max_stdout_bytes=max_stdout_bytes,
+            max_stderr_bytes=max_stderr_bytes,
+            operation=arguments[0],
+            output_cap_message=output_cap_message,
+        )
+        if returncode != 0:
+            raise _git_failure(
+                "git.resolve", arguments[0], stderr, returncode
             )
-        except subprocess.TimeoutExpired as error:
-            raise TransientSourceToolError(
-                "git.resolve", f"git {arguments[0]} timed out"
-            ) from error
-        except (FileNotFoundError, PermissionError) as error:
-            raise SourceToolError(
-                "git.resolve",
-                f"git {arguments[0]} could not start: {type(error).__name__}",
-            ) from error
-        except OSError as error:
-            raise TransientSourceToolError(
-                "git.resolve",
-                f"git {arguments[0]} could not start: {type(error).__name__}",
-            ) from error
-        if result.returncode != 0:
-            message = result.stderr.decode("utf-8", "replace").strip()[:500]
-            error_type = (
-                TransientSourceToolError
-                if result.returncode < 0
-                else SourceToolError
-            )
-            raise error_type(
-                "git.resolve", f"git {arguments[0]} failed: {message}"
-            )
-        return result.stdout
+        return stdout
+
+    def _run_limited(
+        self,
+        *arguments: str,
+        max_stdout_bytes: int,
+        max_stderr_bytes: int = MAX_GIT_STDERR_BYTES,
+        output_cap_message: str = "Git output exceeds the analysis cap",
+    ) -> bytes:
+        """Bounded Git call used for every potentially large output."""
+        return self._run(
+            *arguments,
+            max_stdout_bytes=max_stdout_bytes,
+            max_stderr_bytes=max_stderr_bytes,
+            output_cap_message=output_cap_message,
+        )
 
     def resolve_commit(self, ref: str, expected: str | None = None) -> str:
         if not isinstance(ref, str) or not _REF.fullmatch(ref):
             raise SourceToolError("git.resolve", "revision ref is not allowed")
         try:
-            output = self._run("rev-parse", "--verify", f"{ref}^{{commit}}")
+            output = self._run_limited(
+                "rev-parse",
+                "--verify",
+                f"{ref}^{{commit}}",
+                max_stdout_bytes=1024,
+                output_cap_message=(
+                    "git rev-parse output exceeds the analysis cap"
+                ),
+            )
         except TransientSourceToolError:
             raise
         except SourceToolError as error:
@@ -250,7 +410,15 @@ class GitRepository:
             raise SourceToolError("git.resolve", "source path must not contain ':'")
         object_name = f"{commit}:{safe}"
         try:
-            raw_size = self._run("cat-file", "-s", object_name)
+            raw_size = self._run_limited(
+                "cat-file",
+                "-s",
+                object_name,
+                max_stdout_bytes=1024,
+                output_cap_message=(
+                    "Git object size output exceeds the analysis cap"
+                ),
+            )
         except TransientSourceToolError:
             raise
         except SourceToolError as error:
@@ -266,7 +434,13 @@ class GitRepository:
         if size > MAX_SOURCE_BYTES:
             raise SourceToolError("git.resolve", "source file exceeds the analysis cap")
         try:
-            data = self._run("cat-file", "blob", object_name)
+            data = self._run_limited(
+                "cat-file",
+                "blob",
+                object_name,
+                max_stdout_bytes=MAX_SOURCE_BYTES,
+                output_cap_message="source file exceeds the analysis cap",
+            )
         except TransientSourceToolError:
             raise
         except SourceToolError as error:
@@ -281,7 +455,17 @@ class GitRepository:
         """Return every file path in a commit so evidence refs can be resolved."""
         if not _OID.fullmatch(commit):
             raise SourceToolError("git.resolve", "commit must be a full object ID")
-        output = self._run("ls-tree", "-r", "-z", commit, "--")
+        output = self._run_limited(
+            "ls-tree",
+            "-r",
+            "-z",
+            commit,
+            "--",
+            max_stdout_bytes=MAX_TREE_BYTES,
+            output_cap_message=(
+                "repository tree output exceeds the analysis cap"
+            ),
+        )
         tree = _decode_utf8(
             output,
             tool_id="git.resolve",
@@ -318,7 +502,7 @@ class GitRepository:
         for oid in (vulnerable, fixed):
             if not _OID.fullmatch(oid):
                 raise SourceToolError("git.diff", "diff requires full commit IDs")
-        patch = self._run(
+        patch = self._run_limited(
             "diff",
             "--no-ext-diff",
             "--no-textconv",
@@ -329,16 +513,22 @@ class GitRepository:
             vulnerable,
             fixed,
             "--",
+            max_stdout_bytes=MAX_DIFF_BYTES,
+            output_cap_message="diff exceeds the analysis cap",
         )
         if len(patch) > MAX_DIFF_BYTES:
             raise SourceToolError("git.diff", "diff exceeds the analysis cap")
-        names = self._run(
+        names = self._run_limited(
             "diff",
             "--name-only",
             "--no-renames",
             vulnerable,
             fixed,
             "--",
+            max_stdout_bytes=MAX_DIFF_NAMES_BYTES,
+            output_cap_message=(
+                "changed path output exceeds the analysis cap"
+            ),
         )
         path_text = _decode_utf8(
             names,

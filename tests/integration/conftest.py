@@ -11,6 +11,12 @@ ROOT = Path(__file__).resolve().parents[2]
 MIGRATIONS = sorted((ROOT / "migrations").glob("*.sql"))
 
 
+def ci_environment() -> bool:
+    """Return whether this run must not silently skip required CI tests."""
+    value = os.getenv("CI", "").strip().lower()
+    return value not in ("", "0", "false", "no")
+
+
 def apply_migrations(connection):
     for migration in MIGRATIONS:
         connection.execute(migration.read_text(encoding="utf-8"))
@@ -20,6 +26,11 @@ def apply_migrations(connection):
 def postgres_dsn():
     dsn = os.getenv("DATACON_TEST_DATABASE_URL")
     if not dsn:
+        if ci_environment():
+            pytest.fail(
+                "CI requires DATACON_TEST_DATABASE_URL; PostgreSQL tests "
+                "must not be skipped"
+            )
         pytest.skip("set DATACON_TEST_DATABASE_URL to run PostgreSQL integration tests")
     return dsn
 

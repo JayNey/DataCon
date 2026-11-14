@@ -70,18 +70,27 @@ def _locked_job(
 ) -> dict[str, Any]:
     """Lock one job and require the caller's generation and active lease.
 
-    All time comparisons use the database clock. The row lock serializes the
-    check with ``claim_next`` so a worker that lost its lease cannot append a
-    write between the generation check and the write itself.
+    All time comparisons use ``clock_timestamp()``, the actual wall clock at
+    evaluation time. Transaction-start ``now()`` is deliberately not used: a
+    statement that waited on the job row lock would otherwise compare against
+    a timestamp captured before the wait. The row lock serializes the check
+    with ``claim_next`` so a worker that lost its lease cannot append a write
+    between the generation check and the write itself.
     """
     job = connection.execute(
         "SELECT state, generation, lease_owner, lease_expires_at, "
-        "prepare_deadline_at, state_version, now() AS db_now "
+        "prepare_deadline_at, state_version "
         "FROM jobs WHERE job_id = %s FOR UPDATE",
         (job_id,),
     ).fetchone()
     if job is None:
         raise StateError("job does not exist")
+    # Evaluate the clock only after the row lock has been acquired. A target
+    # list evaluated alongside FOR UPDATE could otherwise capture the time
+    # before the lock wait.
+    job["db_now"] = connection.execute(
+        "SELECT clock_timestamp() AS db_now"
+    ).fetchone()["db_now"]
     if job["generation"] != generation:
         raise StaleGeneration("execution generation is no longer current")
     if require_lease and (
@@ -104,8 +113,8 @@ def _audit(
 ) -> None:
     connection.execute(
         "INSERT INTO audit_events "
-        "(job_id, stage, attempt_no, event_type, reason_code, detail) "
-        "VALUES (%s, %s, %s, %s, %s, %s)",
+        "(job_id, stage, attempt_no, event_type, reason_code, detail, created_at) "
+        "VALUES (%s, %s, %s, %s, %s, %s, clock_timestamp())",
         (
             job_id,
             stage,
@@ -131,11 +140,16 @@ def load_job(dsn: str, job_id: UUID) -> dict[str, Any] | None:
 
 
 def prepare_deadline_passed(dsn: str, job_id: UUID, *, generation: int) -> bool:
-    """Return whether the prepare deadline passed, using the database clock."""
+    """Return whether the prepare deadline passed, using the database clock.
+
+    ``clock_timestamp()`` is the actual evaluation time, not the transaction
+    start captured by ``now()``. This distinction matters when a caller has
+    waited on a row lock past the deadline.
+    """
     with _connect(dsn) as connection:
         row = connection.execute(
             "SELECT generation, (prepare_deadline_at IS NOT NULL "
-            "AND prepare_deadline_at <= now()) AS passed "
+            "AND prepare_deadline_at <= clock_timestamp()) AS passed "
             "FROM jobs WHERE job_id = %s",
             (job_id,),
         ).fetchone()
@@ -158,19 +172,24 @@ def claim_next(dsn: str, worker_id: str, *, lease_seconds: int = LEASE_SECONDS) 
             FROM jobs
             WHERE state = 'QUEUED'
                OR (state = 'PREPARING'
-                   AND (lease_expires_at IS NULL OR lease_expires_at <= now()))
+                   AND (lease_expires_at IS NULL
+                        OR lease_expires_at <= clock_timestamp()))
                OR (workflow_synced = false AND state IN ('AWAITING_REVIEW', 'READY')
-                   AND (lease_expires_at IS NULL OR lease_expires_at <= now()))
+                   AND (lease_expires_at IS NULL
+                        OR lease_expires_at <= clock_timestamp()))
                OR (workflow_synced = false AND state = 'BLOCKED'
                    AND reason_code IS DISTINCT FROM 'UNSUPPORTED_TARGET'
-                   AND (lease_expires_at IS NULL OR lease_expires_at <= now()))
+                   AND (lease_expires_at IS NULL
+                        OR lease_expires_at <= clock_timestamp()))
                OR (state = 'AWAITING_REVIEW'
                    AND review_deadline_at IS NOT NULL
-                   AND review_deadline_at <= now()
-                   AND (lease_expires_at IS NULL OR lease_expires_at <= now()))
+                   AND review_deadline_at <= clock_timestamp()
+                   AND (lease_expires_at IS NULL
+                        OR lease_expires_at <= clock_timestamp()))
                OR (state = 'AWAITING_REVIEW'
                    AND review_deadline_at IS NULL
-                   AND (lease_expires_at IS NULL OR lease_expires_at <= now()))
+                   AND (lease_expires_at IS NULL
+                        OR lease_expires_at <= clock_timestamp()))
             ORDER BY submitted_at
             FOR UPDATE SKIP LOCKED
             LIMIT 1
@@ -180,19 +199,25 @@ def claim_next(dsn: str, worker_id: str, *, lease_seconds: int = LEASE_SECONDS) 
             return None
         updated = connection.execute(
             """
+            WITH claim_time AS MATERIALIZED (
+                SELECT clock_timestamp() AS claimed_at
+            )
             UPDATE jobs
             SET state = CASE WHEN state = 'QUEUED' THEN 'PREPARING' ELSE state END,
                 stage = CASE WHEN state = 'QUEUED' THEN 'prepare' ELSE stage END,
                 generation = generation + 1,
                 state_version = state_version + 1,
                 lease_owner = %s,
-                lease_expires_at = now() + make_interval(secs => %s),
+                lease_expires_at = claim_time.claimed_at
+                    + make_interval(secs => %s),
                 prepare_deadline_at = COALESCE(
                     prepare_deadline_at,
-                    now() + ((request->'limits'->>'prepare_seconds')::int
-                             * interval '1 second')
+                    claim_time.claimed_at
+                    + ((request->'limits'->>'prepare_seconds')::int
+                       * interval '1 second')
                 ),
-                updated_at = now()
+                updated_at = claim_time.claimed_at
+            FROM claim_time
             WHERE job_id = %s
             RETURNING job_id, request, state, stage, reason_code, last_error,
                       state_version, generation, workflow_synced,
@@ -265,7 +290,7 @@ def freeze_plan(
                 "UPDATE jobs SET state = 'BLOCKED', stage = 'blocked', "
                 "reason_code = 'DEADLINE_EXCEEDED', last_error = %s, "
                 "state_version = state_version + 1, workflow_synced = false, "
-                "updated_at = now() "
+                "updated_at = clock_timestamp() "
                 "WHERE job_id = %s AND generation = %s",
                 (
                     "preparation deadline passed before the plan was frozen",
@@ -292,12 +317,13 @@ def freeze_plan(
         )
         updated = connection.execute(
             "UPDATE jobs SET state = 'AWAITING_REVIEW', stage = 'review', "
-            "review_deadline_at = now() + make_interval(hours => %s), "
+            "review_deadline_at = clock_timestamp() + make_interval(hours => %s), "
             "state_version = state_version + 1, "
-            "workflow_synced = false, updated_at = now() "
+            "workflow_synced = false, updated_at = clock_timestamp() "
             "WHERE job_id = %s AND generation = %s "
             "AND state IN ('PREPARING', 'AWAITING_REVIEW') "
-            "AND lease_expires_at IS NOT NULL AND lease_expires_at > now() "
+            "AND lease_expires_at IS NOT NULL "
+            "AND lease_expires_at > clock_timestamp() "
             "RETURNING job_id",
             (REVIEW_WINDOW_HOURS, job_id, generation),
         ).fetchone()
@@ -322,11 +348,12 @@ def ensure_awaiting_review(dsn: str, job_id: UUID, *, generation: int) -> None:
         connection.execute(
             "UPDATE jobs SET state = 'AWAITING_REVIEW', stage = 'review', "
             "review_deadline_at = COALESCE("
-            "review_deadline_at, now() + make_interval(hours => %s)), "
+            "review_deadline_at, clock_timestamp() + make_interval(hours => %s)), "
             "state_version = state_version + 1, workflow_synced = false, "
-            "updated_at = now() "
+            "updated_at = clock_timestamp() "
             "WHERE job_id = %s AND generation = %s AND state = 'PREPARING' "
-            "AND lease_expires_at IS NOT NULL AND lease_expires_at > now()",
+            "AND lease_expires_at IS NOT NULL "
+            "AND lease_expires_at > clock_timestamp()",
             (REVIEW_WINDOW_HOURS, job_id, generation),
         )
 
@@ -346,9 +373,10 @@ def block_job(
         updated = connection.execute(
             "UPDATE jobs SET state = %s, stage = 'blocked', reason_code = %s, "
             "last_error = %s, state_version = state_version + 1, "
-            "workflow_synced = false, updated_at = now() "
+            "workflow_synced = false, updated_at = clock_timestamp() "
             "WHERE job_id = %s AND generation = %s "
-            "AND lease_expires_at IS NOT NULL AND lease_expires_at > now() "
+            "AND lease_expires_at IS NOT NULL "
+            "AND lease_expires_at > clock_timestamp() "
             "RETURNING job_id",
             (state, reason_code, _truncate(message), job_id, generation),
         ).fetchone()
@@ -396,15 +424,21 @@ def record_attempt(
         raise StateError("attempt status is invalid")
     with _connect(dsn) as connection:
         job = connection.execute(
-            "SELECT generation, lease_expires_at, now() AS db_now "
+            "SELECT generation, lease_expires_at "
             "FROM jobs WHERE job_id = %s FOR UPDATE",
             (job_id,),
         ).fetchone()
+        if job is None:
+            return False
+        # Read the clock after the lock so a blocked write cannot be judged
+        # against the transaction start captured before the wait.
+        db_now = connection.execute(
+            "SELECT clock_timestamp() AS db_now"
+        ).fetchone()["db_now"]
         if (
-            job is None
-            or job["generation"] != generation
+            job["generation"] != generation
             or job["lease_expires_at"] is None
-            or job["lease_expires_at"] <= job["db_now"]
+            or job["lease_expires_at"] <= db_now
         ):
             return False
         cursor = connection.execute(
@@ -413,7 +447,8 @@ def record_attempt(
                 (attempt_id, job_id, stage, step_key, attempt_no, generation,
                  input_digest, status, result, finished_at)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s,
-                    CASE WHEN %s = 'started' THEN NULL ELSE now() END)
+                    CASE WHEN %s = 'started' THEN NULL
+                         ELSE clock_timestamp() END)
             ON CONFLICT (job_id, stage, step_key, attempt_no, generation)
             DO UPDATE
             SET input_digest = EXCLUDED.input_digest,
@@ -476,12 +511,29 @@ def analysis_progress(
 
 def finalize_workflow(dsn: str, job_id: UUID, generation: int) -> bool:
     with _connect(dsn) as connection:
+        job = connection.execute(
+            "SELECT generation, lease_expires_at "
+            "FROM jobs WHERE job_id = %s FOR UPDATE",
+            (job_id,),
+        ).fetchone()
+        if job is None:
+            return False
+        # The finalize write can also wait on the job row. Read the clock only
+        # after the lock so a stale lease is judged against the actual time.
+        db_now = connection.execute(
+            "SELECT clock_timestamp() AS db_now"
+        ).fetchone()["db_now"]
+        if (
+            job["generation"] != generation
+            or job["lease_expires_at"] is None
+            or job["lease_expires_at"] <= db_now
+        ):
+            return False
         updated = connection.execute(
             "UPDATE jobs SET workflow_synced = true, lease_owner = NULL, "
             "lease_expires_at = NULL, state_version = state_version + 1, "
-            "updated_at = now() "
+            "updated_at = clock_timestamp() "
             "WHERE job_id = %s AND generation = %s "
-            "AND lease_expires_at IS NOT NULL AND lease_expires_at > now() "
             "RETURNING job_id",
             (job_id, generation),
         ).fetchone()
@@ -596,23 +648,29 @@ def record_review(
                 state=job["state"],
                 message=f"job is {job['state']}, not AWAITING_REVIEW",
             )
+        # Read the clock only after the row lock is held. The review command
+        # may have started its transaction (and therefore ``now()``) before a
+        # worker released the lock, but the decision is not effective until
+        # this point. ``clock_timestamp()`` is the actual decision time.
+        decision_at = connection.execute(
+            "SELECT clock_timestamp() AS db_now"
+        ).fetchone()["db_now"]
         if job["review_deadline_at"] is None:
             # A legacy/partially migrated row has no review window. Fail
             # closed instead of raising an indeterminate-type database error
             # or letting the row sit in AWAITING_REVIEW forever.
             expired = True
         else:
-            expired = connection.execute(
-                "SELECT %s <= now() AS expired",
-                (job["review_deadline_at"],),
-            ).fetchone()["expired"]
+            # The deadline is inclusive: a decision at the exact deadline is
+            # already too late.
+            expired = job["review_deadline_at"] <= decision_at
         if expired:
             updated = connection.execute(
                 "UPDATE jobs SET state = 'BLOCKED', stage = 'blocked', "
                 "reason_code = 'REVIEW_EXPIRED', last_error = %s, "
                 "state_version = state_version + 1, generation = generation + 1, "
                 "workflow_synced = false, lease_owner = NULL, "
-                "lease_expires_at = NULL, updated_at = now() "
+                "lease_expires_at = NULL, updated_at = clock_timestamp() "
                 "WHERE job_id = %s AND state = 'AWAITING_REVIEW' "
                 "AND generation = %s RETURNING job_id",
                 (
@@ -681,8 +739,8 @@ def record_review(
         review = connection.execute(
             "INSERT INTO reviews "
             "(review_id, job_id, plan_digest, reviewer_id, decision, "
-            "review_deadline_at) "
-            "VALUES (%s, %s, %s, %s, %s, %s) "
+            "review_deadline_at, decided_at) "
+            "VALUES (%s, %s, %s, %s, %s, %s, clock_timestamp()) "
             "RETURNING review_id, plan_digest, reviewer_id, decision, decided_at",
             (
                 uuid.uuid4(),
@@ -697,10 +755,11 @@ def record_review(
             state = "READY"
             updated = connection.execute(
                 "UPDATE jobs SET state = 'READY', stage = 'ready', "
-                "reason_code = NULL, last_error = NULL, approved_at = now(), "
+                "reason_code = NULL, last_error = NULL, "
+                "approved_at = clock_timestamp(), "
                 "state_version = state_version + 1, generation = generation + 1, "
                 "workflow_synced = false, lease_owner = NULL, "
-                "lease_expires_at = NULL, updated_at = now() "
+                "lease_expires_at = NULL, updated_at = clock_timestamp() "
                 "WHERE job_id = %s AND state = 'AWAITING_REVIEW' "
                 "AND generation = %s RETURNING job_id",
                 (job_id, job["generation"]),
@@ -712,7 +771,7 @@ def record_review(
                 "reason_code = 'REVIEW_REJECTED', last_error = %s, "
                 "state_version = state_version + 1, generation = generation + 1, "
                 "workflow_synced = false, lease_owner = NULL, "
-                "lease_expires_at = NULL, updated_at = now() "
+                "lease_expires_at = NULL, updated_at = clock_timestamp() "
                 "WHERE job_id = %s AND state = 'AWAITING_REVIEW' "
                 "AND generation = %s RETURNING job_id",
                 (
@@ -750,7 +809,7 @@ def expire_review(dsn: str, job_id: UUID, generation: int) -> bool:
     with _connect(dsn) as connection:
         job = connection.execute(
             "SELECT state, generation, review_deadline_at, lease_owner, "
-            "lease_expires_at, now() AS db_now, "
+            "lease_expires_at, "
             "(SELECT plan_digest FROM plans WHERE plans.job_id = jobs.job_id) "
             "AS plan_digest "
             "FROM jobs WHERE job_id = %s FOR UPDATE",
@@ -760,14 +819,19 @@ def expire_review(dsn: str, job_id: UUID, generation: int) -> bool:
             return False
         if job["generation"] != generation:
             raise StaleGeneration("execution generation is no longer current")
+        # Read the clock only after the row lock is held. A worker that was
+        # waiting for the lock across the deadline must observe that wait.
+        db_now = connection.execute(
+            "SELECT clock_timestamp() AS db_now"
+        ).fetchone()["db_now"]
         if (
             job["lease_expires_at"] is None
-            or job["lease_expires_at"] <= job["db_now"]
+            or job["lease_expires_at"] <= db_now
         ):
             raise StaleGeneration("the worker lease is no longer active")
         if (
             job["review_deadline_at"] is not None
-            and job["review_deadline_at"] > job["db_now"]
+            and job["review_deadline_at"] > db_now
         ):
             return False
         connection.execute(
@@ -775,7 +839,7 @@ def expire_review(dsn: str, job_id: UUID, generation: int) -> bool:
             "reason_code = 'REVIEW_EXPIRED', last_error = %s, "
             "state_version = state_version + 1, generation = generation + 1, "
             "workflow_synced = false, lease_owner = NULL, "
-            "lease_expires_at = NULL, updated_at = now() "
+            "lease_expires_at = NULL, updated_at = clock_timestamp() "
             "WHERE job_id = %s AND generation = %s",
             ("review deadline passed before a decision was recorded", job_id, generation),
         )

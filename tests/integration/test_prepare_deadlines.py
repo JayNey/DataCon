@@ -34,25 +34,62 @@ def assert_review_window_is_24_hours(database, job_uuid):
     assert REVIEW_WINDOW_SECONDS - 120 <= seconds <= REVIEW_WINDOW_SECONDS + 5
 
 
-def test_review_deadline_sql_uses_the_database_clock():
-    """Guard against a silent switch to the worker process clock.
+def test_review_deadline_sql_uses_the_actual_database_clock():
+    """Guard against process-clock and transaction-clock deadline comparisons.
 
     The old tests monkeypatched a nonexistent ``workflow.datetime`` attribute,
     so they stayed green even if the implementation used ``datetime.now()`` or
-    ``time.time()``. This static guard inspects the real deadline SQL and
-    rejects process-clock calls in the state module.
+    ``time.time()``. They also accepted PostgreSQL ``now()``, which is the
+    transaction start time and can be older than a row-lock wait. Deadline
+    comparisons must use the actual database clock, ``clock_timestamp()``.
     """
     tree = ast.parse(STATE_SOURCE)
-    deadline_sql = [
+    sql_constants = [
         node.value
         for node in ast.walk(tree)
-        if isinstance(node, ast.Constant)
-        and isinstance(node.value, str)
-        and "review_deadline_at" in node.value
-        and "UPDATE jobs" in node.value
+        if isinstance(node, ast.Constant) and isinstance(node.value, str)
+    ]
+    deadline_sql = [
+        statement
+        for statement in sql_constants
+        if "review_deadline_at" in statement and "UPDATE jobs" in statement
     ]
     assert deadline_sql
-    assert all("now()" in statement for statement in deadline_sql)
+    assert all("clock_timestamp()" in statement for statement in deadline_sql)
+    # ``now()`` is transaction_timestamp(): it must not be used for the
+    # decision-sensitive writes, even though the module docstrings mention it.
+    assert all("now()" not in statement for statement in deadline_sql)
+
+    review_inserts = [
+        statement
+        for statement in sql_constants
+        if "INSERT INTO reviews" in statement
+    ]
+    assert review_inserts
+    assert all(
+        "decided_at" in statement and "clock_timestamp()" in statement
+        for statement in review_inserts
+    )
+
+    approved_updates = [
+        statement
+        for statement in sql_constants
+        if "approved_at" in statement and "UPDATE jobs" in statement
+    ]
+    assert approved_updates
+    assert all("clock_timestamp()" in statement for statement in approved_updates)
+
+    audit_inserts = [
+        statement
+        for statement in sql_constants
+        if "INSERT INTO audit_events" in statement
+    ]
+    assert audit_inserts
+    assert all(
+        "created_at" in statement and "clock_timestamp()" in statement
+        for statement in audit_inserts
+    )
+
     assert "datetime" not in STATE_SOURCE
     assert "time.time" not in STATE_SOURCE
     assert "time.monotonic" not in STATE_SOURCE
