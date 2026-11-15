@@ -40,6 +40,7 @@ BLOCKED_REASONS = frozenset(
         "INVALID_REQUEST",
         "INVALID_STATE",
         "JOB_NOT_FOUND",
+        "MATERIAL_IO_ERROR",
         "MATERIAL_MISSING",
         "PLAN_MISMATCH",
         "POLICY_DENIED",

@@ -3,17 +3,24 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from datetime import datetime, timedelta, timezone
+import hashlib
 import json
 from pathlib import Path
+import stat
 from types import SimpleNamespace
+from uuid import uuid4
 
 import pytest
 
+from datacon import execution
 from datacon.tools.sandbox import (
     SECCOMP_PROFILE_DIGEST,
     SECCOMP_PROFILE_PATH,
+    BuildResult,
     DockerSandbox,
     IsolationPolicy,
+    ReplayResult,
     ResourceLimits,
     SandboxError,
     SandboxPolicyError,
@@ -485,3 +492,306 @@ def test_reclaim_removes_only_older_generation(tmp_path):
     assert sandbox.reclaim_job() == 2
     assert set(removed) == {"old", "legacy"}
     assert "current" not in removed and "newer" not in removed
+
+
+# ---------------------------------------------------------------------------
+# R1: containers mount staging copies, never bytes inside the run root.
+# ---------------------------------------------------------------------------
+
+STAGE_MATERIALS = {
+    "harness.c": b"int main(void) { return 0; }\n",
+    "build.sh": (
+        b"#!/bin/sh\nset -eu\n"
+        b"clang -std=c11 -g -O0 -fsanitize=address "
+        b"/fixture/harness.c -o /work/parser\n"
+    ),
+    "dependencies.lock": b"clang=19.1.7\n",
+    "vulnerable/parser.c": b"char *parse_token(void) { return 0; }\n",
+    "fixed/parser.c": b"char *parse_token(void) { return 0; }\n",
+    "inputs/normal.txt": b"normal\n",
+    "inputs/candidate.txt": b"candidate\n",
+}
+
+
+def _sha(data: bytes) -> str:
+    return "sha256:" + hashlib.sha256(data).hexdigest()
+
+
+def _staging_context(tmp_path, monkeypatch):
+    run_root = tmp_path / "runs"
+    materials = run_root / "materials"
+    for relative, data in STAGE_MATERIALS.items():
+        path = materials / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+    material_digests = {
+        relative: _sha(data) for relative, data in STAGE_MATERIALS.items()
+    }
+    monkeypatch.setenv("DATACON_RUN_ROOT", str(run_root))
+    monkeypatch.setenv("DATACON_EVIDENCE_ROOT", str(tmp_path / "evidence"))
+    monkeypatch.delenv("DATACON_STAGING_ROOT", raising=False)
+    manifest = {
+        "harness": "harness.c",
+        "build_recipe": "build.sh",
+        "dependencies": "dependencies.lock",
+        "versions": {
+            "vulnerable": "vulnerable/parser.c",
+            "fixed": "fixed/parser.c",
+        },
+    }
+    job_id = uuid4()
+    context = SimpleNamespace(
+        job_id=job_id,
+        job_id_text=str(job_id),
+        generation=1,
+        plan_digest="sha256:" + "c" * 64,
+        plan={
+            "harness_digest": material_digests["harness.c"],
+            "build_recipe_digest": material_digests["build.sh"],
+            "dependencies_digest": material_digests["dependencies.lock"],
+            "analysis_digest": "sha256:" + "d" * 64,
+            "inputs": {
+                "normal": material_digests["inputs/normal.txt"],
+                "candidate": material_digests["inputs/candidate.txt"],
+            },
+            "asan_options": "detect_leaks=0",
+            "image_digest": "sha256:" + "a" * 64,
+        },
+        case=SimpleNamespace(manifest=manifest),
+        materials={
+            "vulnerable/parser.c": material_digests["vulnerable/parser.c"],
+            "fixed/parser.c": material_digests["fixed/parser.c"],
+        },
+        compile_args=("-std=c11",),
+        run_root=run_root,
+        deadline_at=datetime.now(timezone.utc) + timedelta(seconds=60),
+        reserve_seconds=1.0,
+    )
+    return context, materials, material_digests
+
+
+def _is_inside(path: Path, root: Path) -> bool:
+    resolved = path.resolve()
+    resolved_root = root.resolve()
+    return resolved == resolved_root or resolved_root in resolved.parents
+
+
+def test_build_mounts_staged_materials_after_run_root_tamper(
+    tmp_path, monkeypatch
+):
+    context, materials, digests = _staging_context(tmp_path, monkeypatch)
+
+    class StagingBuildSandbox:
+        def build(
+            self,
+            version,
+            *,
+            materials_dir,
+            compile_args,
+            deadline_seconds,
+            expected_materials=None,
+        ):
+            # Simulate a writer that owns only the run root and replaces the
+            # source tree immediately after the executor finished staging.
+            (materials / "build.sh").write_bytes(b"#!/bin/sh\nexit 1\n")
+            (materials / "harness.c").write_bytes(b"tampered harness\n")
+            self.materials_dir = Path(materials_dir)
+            self.recipe = (self.materials_dir / "build.sh").read_bytes()
+            self.harness = (self.materials_dir / "harness.c").read_bytes()
+            artifact = b"staged-parser"
+            return BuildResult(
+                version=version,
+                status="completed",
+                exit_code=0,
+                duration_seconds=0.01,
+                container_id="cid",
+                image_digest=context.plan["image_digest"],
+                compile_args=tuple(compile_args),
+                artifact_digest=_sha(artifact),
+                log=b"",
+                log_truncated=False,
+                artifact=artifact,
+                metadata={"build_recipe_digest": digests["build.sh"]},
+            )
+
+    captured = {}
+
+    def persist(
+        dsn, ctx, result, attempt_no, token, *, staged_materials=None
+    ):
+        captured["staged"] = staged_materials
+        return {"status": result.status}
+
+    monkeypatch.setattr(execution, "_persist_build", persist)
+    sandbox = StagingBuildSandbox()
+    execution._do_build(
+        "unused-dsn",
+        context,
+        sandbox,
+        materials,
+        digests,
+        "vulnerable",
+        1,
+        "token",
+    )
+
+    assert not _is_inside(sandbox.materials_dir, context.run_root)
+    assert sandbox.recipe == STAGE_MATERIALS["build.sh"]
+    assert sandbox.harness == STAGE_MATERIALS["harness.c"]
+    assert captured["staged"] == digests
+    # Staging is removed after the attempt; the tampered run-root copy remains.
+    assert not sandbox.materials_dir.exists()
+    assert (materials / "build.sh").read_bytes() == b"#!/bin/sh\nexit 1\n"
+
+
+def test_replay_mounts_staged_parser_and_input_after_run_root_tamper(
+    tmp_path, monkeypatch
+):
+    context, _, digests = _staging_context(tmp_path, monkeypatch)
+    work = (
+        context.run_root
+        / str(context.job_id)
+        / context.plan_digest.split(":")[1]
+        / "run"
+    )
+    run_artifact = work / "generation-1" / "build" / "vulnerable" / "parser"
+    run_input = work / "generation-1" / "inputs" / "candidate.txt"
+    run_artifact.parent.mkdir(parents=True, exist_ok=True)
+    run_input.parent.mkdir(parents=True, exist_ok=True)
+    run_artifact.write_bytes(b"run-root-parser")
+    run_input.write_bytes(STAGE_MATERIALS["inputs/candidate.txt"])
+
+    class StagingReplaySandbox:
+        def replay(
+            self,
+            version,
+            phase,
+            *,
+            artifact_path,
+            input_path,
+            asan_options,
+            timeout_seconds,
+            deadline_seconds,
+            expected_artifact_digest=None,
+            expected_input_digest=None,
+        ):
+            # Replace both run-root sources after staging has completed.
+            run_artifact.write_bytes(b"tampered parser")
+            run_input.write_bytes(b"tampered input")
+            self.artifact_path = Path(artifact_path)
+            self.input_path = Path(input_path)
+            self.artifact = self.artifact_path.read_bytes()
+            self.input = self.input_path.read_bytes()
+            self.expected_input_digest = expected_input_digest
+            return ReplayResult(
+                version=version,
+                phase=phase,
+                status="completed",
+                exit_code=0,
+                duration_seconds=0.01,
+                container_id="cid",
+                input_digest=expected_input_digest,
+                stdout=b"clean\n",
+                stderr=b"",
+                signature=None,
+                timed_out=False,
+                quota_hit=False,
+                log_truncated=False,
+                metadata={},
+            )
+
+    def persist(dsn, ctx, result, attempt_no, token):
+        return {"status": result.status}
+
+    monkeypatch.setattr(execution, "_persist_replay", persist)
+    sandbox = StagingReplaySandbox()
+    execution._do_replay(
+        "unused-dsn",
+        context,
+        sandbox,
+        {
+            "files": {"artifact": "generation-1/build/vulnerable/parser"},
+            "artifact_digest": _sha(b"run-root-parser"),
+        },
+        "vulnerable",
+        "candidate_1",
+        run_input,
+        10.0,
+        1,
+        "token",
+    )
+
+    assert not _is_inside(sandbox.artifact_path, context.run_root)
+    assert not _is_inside(sandbox.input_path, context.run_root)
+    assert sandbox.artifact == b"run-root-parser"
+    assert sandbox.input == STAGE_MATERIALS["inputs/candidate.txt"]
+    assert sandbox.expected_input_digest == digests["inputs/candidate.txt"]
+    assert not sandbox.artifact_path.exists()
+    assert not sandbox.input_path.exists()
+
+
+def test_staging_root_inside_run_root_fails_closed(tmp_path, monkeypatch):
+    context, _, _ = _staging_context(tmp_path, monkeypatch)
+    configured = context.run_root / "staging"
+    monkeypatch.setenv("DATACON_STAGING_ROOT", str(configured))
+    with pytest.raises(execution.ExecutionFailed) as caught:
+        execution._staging_root(context)
+    assert caught.value.reason_code == "EVIDENCE_WRITE_FAILED"
+    assert not configured.exists()
+
+
+def test_symlinked_staging_root_fails_closed(tmp_path, monkeypatch):
+    context, _, _ = _staging_context(tmp_path, monkeypatch)
+    target = tmp_path / "outside"
+    target.mkdir()
+    link = tmp_path / "staging-link"
+    link.symlink_to(target, target_is_directory=True)
+    monkeypatch.setenv("DATACON_STAGING_ROOT", str(link))
+    with pytest.raises(execution.ExecutionFailed) as caught:
+        execution._staging_root(context)
+    assert caught.value.reason_code == "EVIDENCE_WRITE_FAILED"
+
+
+def test_replay_checks_input_digest_before_creating_a_container(
+    tmp_path, monkeypatch
+):
+    artifact = tmp_path / "parser"
+    input_file = tmp_path / "input"
+    artifact.write_bytes(b"parser")
+    input_file.write_bytes(b"input")
+    sandbox = DockerSandbox(
+        image=IMAGE,
+        platform="linux/amd64",
+        policy=POLICY,
+        limits=LIMITS,
+        docker="docker",
+        job_id="job-1234",
+        run_root=tmp_path,
+    )
+    calls = []
+
+    def refuse_create(**kwargs):
+        calls.append(kwargs)
+        raise AssertionError("a container must not be created")
+
+    monkeypatch.setattr(sandbox, "_create", refuse_create)
+    with pytest.raises(SandboxError) as caught:
+        sandbox.replay(
+            "vulnerable",
+            "candidate_1",
+            artifact_path=artifact,
+            input_path=input_file,
+            asan_options="detect_leaks=0",
+            timeout_seconds=5.0,
+            expected_artifact_digest=_sha(b"parser"),
+            expected_input_digest="sha256:" + "0" * 64,
+        )
+    assert caught.value.reason_code == "PLAN_MISMATCH"
+    assert calls == []
+
+
+def test_staging_root_is_private_and_outside_the_run_root(tmp_path, monkeypatch):
+    context, _, _ = _staging_context(tmp_path, monkeypatch)
+    root = execution._staging_root(context)
+    assert not _is_inside(root, context.run_root)
+    assert stat.S_IMODE(root.lstat().st_mode) == 0o700

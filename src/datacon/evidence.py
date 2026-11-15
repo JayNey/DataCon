@@ -678,12 +678,30 @@ def _require_path_suffix(value: Any, suffix: str, label: str) -> None:
         raise BundleError("INVALID_MANIFEST", f"{label} has an unexpected path")
 
 
+def _truncation_allowed(verdict: str, report: Mapping[str, Any]) -> bool:
+    """Only an inconclusive reason may legitimately archive a truncated log."""
+    return verdict == "INCONCLUSIVE" and report.get("reason_code") in {
+        "NOT_COMPARABLE",
+        "EVIDENCE_INCOMPLETE",
+    }
+
+
+def _require_untruncated(value: Any, *, allowed: bool, label: str) -> None:
+    if value is False:
+        return
+    if allowed and value is True:
+        return
+    raise BundleError("INVALID_MANIFEST", f"{label} is truncated")
+
+
 def _verify_builds(
     plan: Mapping[str, Any],
+    verdict: str,
     report: Mapping[str, Any],
     data: Mapping[str, bytes],
     expected_compile_args: list[str],
 ) -> None:
+    truncation_allowed = _truncation_allowed(verdict, report)
     builds = report.get("builds")
     if not isinstance(builds, list):
         raise BundleError("INVALID_MANIFEST", "report builds must be a list")
@@ -722,10 +740,11 @@ def _verify_builds(
                 "INVALID_MANIFEST",
                 f"{version} compile args do not match the reviewed recipe",
             )
-        if build.get("log_truncated") is not False:
-            raise BundleError(
-                "INVALID_MANIFEST", f"{version} build log is truncated"
-            )
+        _require_untruncated(
+            build.get("log_truncated"),
+            allowed=truncation_allowed,
+            label=f"{version} build log",
+        )
         files = _mapping(build.get("files"), f"{version} build files")
         digests = _mapping(build.get("file_digests"), f"{version} build digests")
         _require_path_suffix(files.get("log"), "/build.log", f"{version} build log")
@@ -776,6 +795,7 @@ def _verify_replays(
     replays = report.get("replays")
     if not isinstance(replays, list):
         raise BundleError("INVALID_MANIFEST", "report replays must be a list")
+    truncation_allowed = _truncation_allowed(verdict, report)
     observations: dict[tuple[str, str], dict[str, Any]] = {}
     for item in replays:
         if not isinstance(item, Mapping):
@@ -810,10 +830,11 @@ def _verify_replays(
                 "DIGEST_MISMATCH",
                 f"replay {version}/{phase} input does not match the plan",
             )
-        if item.get("log_truncated") is not False:
-            raise BundleError(
-                "INVALID_MANIFEST", f"replay {version}/{phase} log is truncated"
-            )
+        _require_untruncated(
+            item.get("log_truncated"),
+            allowed=truncation_allowed,
+            label=f"replay {version}/{phase} log",
+        )
         files = _mapping(item.get("files"), f"{version}/{phase} files")
         digests = _mapping(item.get("file_digests"), f"{version}/{phase} digests")
         _require_path_suffix(files.get("stdout"), "/stdout.log", "replay stdout")
@@ -877,6 +898,7 @@ def _verify_replays(
             "stderr": stderr_text,
             "signature": parsed,
             "stdout": stdout.decode("utf-8", "replace"),
+            "log_truncated": bool(item.get("log_truncated")),
         }
     required = {
         (version, phase)
@@ -895,7 +917,9 @@ def _verify_replays(
 
 
 def _candidate_kind(
-    plan: Mapping[str, Any], observation: Mapping[str, Any]
+    plan: Mapping[str, Any],
+    observation: Mapping[str, Any],
+    expected_stdout: Mapping[str, str],
 ) -> str:
     signature = observation.get("signature")
     expected_exit = plan.get("expected_exit") or {}
@@ -907,10 +931,42 @@ def _candidate_kind(
         return "target_signature"
     if (
         observation.get("exit_code") == expected_exit.get("candidate_clean")
+        and observation.get("stdout") == expected_stdout.get("candidate_clean")
         and not has_asan_diagnostic(observation.get("stderr"))
     ):
         return "clean"
     return "other"
+
+
+def _control_mismatch(
+    control: Mapping[str, Any],
+    expected_exit: Mapping[str, Any],
+    expected_stdout: Mapping[str, str],
+) -> str | None:
+    """Return the first abnormal field for a completed normal control."""
+    if control.get("status") != "completed":
+        return "status"
+    if control.get("exit_code") != expected_exit.get("normal"):
+        return "exit"
+    if control.get("stdout") != expected_stdout.get("normal"):
+        return "stdout"
+    if has_asan_diagnostic(control.get("stderr")):
+        return "asan"
+    return None
+
+
+def _require_normal_control(
+    version: str,
+    control: Mapping[str, Any],
+    expected_exit: Mapping[str, Any],
+    expected_stdout: Mapping[str, str],
+) -> None:
+    mismatch = _control_mismatch(control, expected_exit, expected_stdout)
+    if mismatch is not None:
+        raise BundleError(
+            "INVALID_MANIFEST",
+            f"{version} normal control does not match the plan ({mismatch})",
+        )
 
 
 def _verify_outcome(
@@ -918,29 +974,108 @@ def _verify_outcome(
     verdict: str,
     report: Mapping[str, Any],
     observations: Mapping[tuple[str, str], Mapping[str, Any]],
+    expected_stdout: Mapping[str, str],
 ) -> None:
     expected_exit = plan.get("expected_exit") or {}
     reason = report.get("reason_code")
-    # CONTROL_FAILED is the one inconclusive reason that legitimately records
-    # an abnormal normal-control run. Every other outcome still requires both
-    # normal controls to match the plan.
-    if verdict in ("REPRODUCED", "NOT_REPRODUCED") or reason != "CONTROL_FAILED":
+    normal_stdout = expected_stdout.get("normal")
+    if not isinstance(normal_stdout, str):
+        raise BundleError(
+            "INVALID_MANIFEST", "case config has no normal expected stdout"
+        )
+
+    if verdict in ("REPRODUCED", "NOT_REPRODUCED"):
+        # A positive outcome must never be supported by a degraded control.
+        for version in _REPLAY_VERSIONS:
+            _require_normal_control(
+                version,
+                observations[(version, "normal")],
+                expected_exit,
+                expected_stdout,
+            )
+    elif reason == "CONTROL_FAILED":
+        # CONTROL_FAILED is only meaningful when at least one normal control
+        # actually failed on exit, stdout or an ASan diagnostic.
+        failed = False
         for version in _REPLAY_VERSIONS:
             control = observations[(version, "normal")]
-            if control.get("exit_code") != expected_exit.get("normal"):
+            mismatch = _control_mismatch(control, expected_exit, expected_stdout)
+            if mismatch == "status":
                 raise BundleError(
                     "INVALID_MANIFEST",
-                    f"{version} normal control exit does not match",
+                    f"{version} normal control did not complete under CONTROL_FAILED",
                 )
-            if has_asan_diagnostic(control.get("stderr")):
+            if mismatch is not None:
+                failed = True
+        if not failed:
+            raise BundleError(
+                "INVALID_MANIFEST",
+                "CONTROL_FAILED has no failed normal control",
+            )
+    elif reason in ("TIMEOUT", "RESOURCE_LIMITED", "EVIDENCE_INCOMPLETE"):
+        statuses = {item["status"] for item in observations.values()}
+        if reason == "TIMEOUT" and "timeout" not in statuses:
+            raise BundleError(
+                "INVALID_MANIFEST", "TIMEOUT verdict has no timeout replay"
+            )
+        if reason == "RESOURCE_LIMITED" and "resource_limited" not in statuses:
+            raise BundleError(
+                "INVALID_MANIFEST",
+                "RESOURCE_LIMITED verdict has no resource-limited replay",
+            )
+        allowed_noncompleted = {
+            "TIMEOUT": frozenset({"timeout"}),
+            "RESOURCE_LIMITED": frozenset({"resource_limited"}),
+            "EVIDENCE_INCOMPLETE": frozenset(
+                {"infra_error", "timeout", "resource_limited"}
+            ),
+        }[reason]
+        truncation_allowed = _truncation_allowed(verdict, report)
+        for version in _REPLAY_VERSIONS:
+            control = observations[(version, "normal")]
+            status = control.get("status")
+            if status == "completed":
+                # A completed control still has to prove the planned exit.
+                if control.get("exit_code") != expected_exit.get("normal"):
+                    raise BundleError(
+                        "INVALID_MANIFEST",
+                        f"{version} normal control exit does not match",
+                    )
+                if control.get("log_truncated") and truncation_allowed:
+                    # The stream is intentionally incomplete; its digest and
+                    # byte count were already checked above.
+                    continue
+                if control.get("stdout") != normal_stdout:
+                    raise BundleError(
+                        "INVALID_MANIFEST",
+                        f"{version} normal control stdout does not match",
+                    )
+                if has_asan_diagnostic(control.get("stderr")):
+                    raise BundleError(
+                        "INVALID_MANIFEST",
+                        f"{version} normal control emitted an ASan diagnostic",
+                    )
+            elif status not in allowed_noncompleted:
                 raise BundleError(
                     "INVALID_MANIFEST",
-                    f"{version} normal control emitted an ASan diagnostic",
+                    f"{version} normal control status {status!r} is not "
+                    f"allowed for {reason}",
                 )
+    else:
+        for version in _REPLAY_VERSIONS:
+            _require_normal_control(
+                version,
+                observations[(version, "normal")],
+                expected_exit,
+                expected_stdout,
+            )
+
     if verdict == "REPRODUCED":
         for version in _REPLAY_VERSIONS:
             for phase in _CANDIDATE_PHASES:
-                kind = _candidate_kind(plan, observations[(version, phase)])
+                kind = _candidate_kind(
+                    plan, observations[(version, phase)], expected_stdout
+                )
                 if version == "vulnerable" and kind != "target_signature":
                     raise BundleError(
                         "INVALID_MANIFEST",
@@ -955,25 +1090,34 @@ def _verify_outcome(
     if verdict == "NOT_REPRODUCED":
         for version in _REPLAY_VERSIONS:
             for phase in _CANDIDATE_PHASES:
-                if _candidate_kind(plan, observations[(version, phase)]) != "clean":
+                if _candidate_kind(
+                    plan, observations[(version, phase)], expected_stdout
+                ) != "clean":
                     raise BundleError(
                         "INVALID_MANIFEST",
                         f"{version} {phase} is not a clean candidate run",
                     )
         return
-    # INCONCLUSIVE: the reason-specific status shape must be visible. Normal
-    # stdout is not checked because the frozen plan intentionally does not
-    # carry expected_stdout; that trust boundary is documented here.
-    statuses = {item["status"] for item in observations.values()}
-    if reason == "TIMEOUT" and "timeout" not in statuses:
-        raise BundleError(
-            "INVALID_MANIFEST", "TIMEOUT verdict has no timeout replay"
-        )
-    if reason == "RESOURCE_LIMITED" and "resource_limited" not in statuses:
-        raise BundleError(
-            "INVALID_MANIFEST",
-            "RESOURCE_LIMITED verdict has no resource-limited replay",
-        )
+
+
+def _expected_stdout_from_case_config(
+    case_config: Mapping[str, Any],
+) -> Mapping[str, str]:
+    manifest_case = _mapping(
+        case_config.get("manifest_case"), "case_config.manifest_case"
+    )
+    expected = _mapping(
+        manifest_case.get("expected_stdout"),
+        "case_config.manifest_case.expected_stdout",
+    )
+    for key in ("normal", "candidate_clean"):
+        if not isinstance(expected.get(key), str):
+            raise BundleError(
+                "INVALID_MANIFEST",
+                f"case config expected stdout assertion {key} is missing",
+            )
+    return expected
+
 
 
 def _verify_semantics(
@@ -1104,6 +1248,7 @@ def _verify_semantics(
         )
 
     case_config, materials, recipe = _case_binding(plan, listed, data)
+    expected_stdout = _expected_stdout_from_case_config(case_config)
     _verify_materials(plan, listed, data, case_config, materials)
     expected_compile_args = _compile_args_from_recipe(recipe)
     if list(environment.get("compile_args") or []) != expected_compile_args:
@@ -1111,9 +1256,9 @@ def _verify_semantics(
             "INVALID_MANIFEST",
             "report environment compile args do not match the reviewed recipe",
         )
-    _verify_builds(plan, report, data, expected_compile_args)
+    _verify_builds(plan, verdict, report, data, expected_compile_args)
     observations = _verify_replays(plan, verdict, report, data)
-    _verify_outcome(plan, verdict, report, observations)
+    _verify_outcome(plan, verdict, report, observations, expected_stdout)
 
 
 def verify_bundle(root: Path | str) -> BundleVerification:

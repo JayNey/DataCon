@@ -66,6 +66,8 @@ class FakeSandbox:
         self.builds = 0
         self.replays = 0
         self.reclaimed = 0
+        self.build_material_dirs = []
+        self.replay_paths = []
 
     def reclaim_job(self):
         self.reclaimed += 1
@@ -92,6 +94,7 @@ class FakeSandbox:
         expected_materials=None,
     ):
         self.builds += 1
+        self.build_material_dirs.append(Path(materials_dir))
         artifact = f"fake-{version}-binary".encode()
         recipe = Path(materials_dir) / "build.sh"
         return BuildResult(
@@ -123,8 +126,12 @@ class FakeSandbox:
         timeout_seconds,
         deadline_seconds,
         expected_artifact_digest=None,
+        expected_input_digest=None,
     ):
         self.replays += 1
+        self.replay_paths.append(
+            (Path(artifact_path), Path(input_path))
+        )
         key = f"{version}:{phase}"
         override = self.overrides.get(key)
         data = Path(input_path).read_bytes()
@@ -236,6 +243,34 @@ def test_reproduced_execution_archives_six_replays(isolated_database, tmp_path, 
         "candidate_2",
     }
     assert {run["version"] for run in report["replays"]} == {"vulnerable", "fixed"}
+
+
+def _is_inside(path: Path, root: Path) -> bool:
+    resolved = path.resolve()
+    resolved_root = root.resolve()
+    return resolved == resolved_root or resolved_root in resolved.parents
+
+
+def test_targets_mount_staging_copies_outside_run_root(
+    isolated_database, tmp_path, monkeypatch
+):
+    job, _, generation = prepare_approved_job(isolated_database, tmp_path)
+    sandbox = FakeSandbox()
+    outcome = run_with_fake(
+        isolated_database, job, generation, tmp_path, sandbox, monkeypatch
+    )
+    assert outcome.state == "REPRODUCED", outcome
+    run_root = tmp_path / "runs"
+    assert sandbox.build_material_dirs
+    assert sandbox.replay_paths
+    for directory in sandbox.build_material_dirs:
+        assert not _is_inside(directory, run_root)
+    for artifact, input_file in sandbox.replay_paths:
+        assert not _is_inside(artifact, run_root)
+        assert not _is_inside(input_file, run_root)
+    staging_root = tmp_path / ".datacon-staging"
+    assert staging_root.is_dir()
+    assert not list(staging_root.iterdir()), "per-attempt staging was not removed"
 
 
 def test_clean_candidate_is_not_reproduced(isolated_database, tmp_path, monkeypatch):
@@ -1393,6 +1428,34 @@ def test_work_paths_include_generation(isolated_database, tmp_path, monkeypatch)
         for relative in files.values():
             if relative:
                 assert f"generation-{generation}/" in relative, (row[0], relative)
+
+
+def test_staging_root_inside_run_root_fails_closed(
+    isolated_database, tmp_path, monkeypatch
+):
+    job, _, generation = prepare_approved_job(isolated_database, tmp_path)
+    run_root = tmp_path / "runs"
+    monkeypatch.setenv("DATACON_RUN_ROOT", str(run_root))
+    monkeypatch.setenv("DATACON_EVIDENCE_ROOT", str(tmp_path / "evidence"))
+    monkeypatch.setenv("DATACON_STAGING_ROOT", str(run_root / "staging"))
+    monkeypatch.delenv("DATACON_JOURNAL_SECRET_FILE", raising=False)
+    sandbox = FakeSandbox()
+    outcome = execution.run_execution(
+        isolated_database.dsn,
+        UUID(job["job_id"]),
+        generation,
+        run_root=run_root,
+        sandbox=sandbox,
+    )
+    assert outcome.state in ("BLOCKED", "FAILED")
+    assert outcome.reason_code == "EVIDENCE_WRITE_FAILED"
+    assert sandbox.probes == 0
+    assert sandbox.builds == 0
+    assert sandbox.replays == 0
+    current = status(isolated_database.dsn, job["job_id"])
+    assert current["state"] in ("BLOCKED", "FAILED")
+    assert current["evidence"]["error"]
+    assert not (run_root / "staging").exists()
 
 
 def test_journal_secret_inside_run_root_fails_closed(

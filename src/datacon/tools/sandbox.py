@@ -1296,6 +1296,7 @@ printf 'uid=%s\nseccomp=%s\nseccomp_filters=%s\nno_new_privs=%s\ncap_eff=%s\ncgr
         timeout_seconds: float,
         deadline_seconds: float | None = None,
         expected_artifact_digest: str | None = None,
+        expected_input_digest: str | None = None,
     ) -> ReplayResult:
         artifact = Path(artifact_path)
         input_file = Path(input_path)
@@ -1310,6 +1311,20 @@ printf 'uid=%s\nseccomp=%s\nseccomp_filters=%s\nno_new_privs=%s\ncap_eff=%s\ncgr
                 )
         if not input_file.is_file() or input_file.is_symlink():
             raise SandboxError("replay input is missing")
+        # Hash the exact bytes before the container exists. The result records
+        # this digest instead of re-reading the input after the run, so a
+        # post-run replacement cannot be mistaken for the executed bytes.
+        input_digest = "sha256:" + hashlib.sha256(
+            input_file.read_bytes()
+        ).hexdigest()
+        if (
+            expected_input_digest is not None
+            and input_digest != expected_input_digest
+        ):
+            raise SandboxError(
+                "replay input changed before replay",
+                reason_code="PLAN_MISMATCH",
+            )
         timeout = timeout_seconds
         if deadline_seconds is not None:
             timeout = min(timeout, max(0.5, deadline_seconds))
@@ -1379,7 +1394,6 @@ printf 'uid=%s\nseccomp=%s\nseccomp_filters=%s\nno_new_privs=%s\ncap_eff=%s\ncgr
             status = "timeout"
         elif quota_hit:
             status = "resource_limited"
-        digest = "sha256:" + hashlib.sha256(input_file.read_bytes()).hexdigest()
         return ReplayResult(
             version=version,
             phase=phase,
@@ -1387,7 +1401,7 @@ printf 'uid=%s\nseccomp=%s\nseccomp_filters=%s\nno_new_privs=%s\ncap_eff=%s\ncgr
             exit_code=exit_code,
             duration_seconds=duration,
             container_id=name,
-            input_digest=digest,
+            input_digest=input_digest,
             stdout=stdout,
             stderr=stderr,
             signature=signature,

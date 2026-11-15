@@ -21,6 +21,7 @@ from datacon.evidence import (
     verify_bundle,
     write_bundle,
 )
+from datacon.verdict import reason_allowed
 JOB_ID = str(uuid4())
 REASONS = {"REPRODUCED": "ASAN_SIGNATURE_MATCHED"}
 
@@ -412,6 +413,98 @@ def _set_manifest_reason(root: Path, reason: str | None) -> None:
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     manifest["reason_code"] = reason
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+
+def _set_verdict(root: Path, verdict: str, reason: str | None) -> None:
+    manifest_path = root / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["verdict"] = verdict
+    manifest["reason_code"] = reason
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    report = json.loads((root / "report.json").read_text(encoding="utf-8"))
+    report["verdict"] = verdict
+    report["reason_code"] = reason
+    _rewrite_manifested_file(root, "report.json", canonical(report))
+
+
+_UNSET = object()
+
+
+def _update_replay(
+    root: Path,
+    version: str,
+    phase: str,
+    *,
+    stdout: bytes | object = _UNSET,
+    stderr: bytes | object = _UNSET,
+    **fields,
+) -> None:
+    """Rewrite a replay record together with its evidence files and metadata."""
+    from datacon.asan import parse_asan
+
+    report = json.loads((root / "report.json").read_text(encoding="utf-8"))
+    item = next(
+        replay
+        for replay in report["replays"]
+        if replay["version"] == version and replay["phase"] == phase
+    )
+    if stdout is not _UNSET:
+        data = bytes(stdout)
+        _rewrite_manifested_file(
+            root, f"replay/{version}/{phase}/stdout.log", data
+        )
+        item["stdout_sha256"] = digest(data)
+        item["stdout_bytes"] = len(data)
+        item["stdout_preview"] = data[:512].decode("utf-8", "replace")
+        item.setdefault("file_digests", {})["stdout"] = digest(data)
+    if stderr is not _UNSET:
+        data = bytes(stderr)
+        _rewrite_manifested_file(
+            root, f"replay/{version}/{phase}/stderr.log", data
+        )
+        item["stderr_sha256"] = digest(data)
+        item["stderr_bytes"] = len(data)
+        item["stderr_preview"] = data[:512].decode("utf-8", "replace")
+        item.setdefault("file_digests", {})["stderr"] = digest(data)
+        parsed = parse_asan(data.decode("utf-8", "replace"))
+        item["signature"] = parsed.as_dict() if parsed else None
+    item.update(fields)
+    if "status" in fields and "timed_out" not in fields:
+        item["timed_out"] = fields["status"] == "timeout"
+    _rewrite_manifested_file(
+        root, f"replay/{version}/{phase}/metadata.json", canonical(item)
+    )
+    _rewrite_manifested_file(root, "report.json", canonical(report))
+
+
+def _update_build(root: Path, version: str, **fields) -> None:
+    report = json.loads((root / "report.json").read_text(encoding="utf-8"))
+    item = next(
+        build for build in report["builds"] if build["version"] == version
+    )
+    item.update(fields)
+    _rewrite_manifested_file(
+        root, f"build/{version}/metadata.json", canonical(item)
+    )
+    _rewrite_manifested_file(root, "report.json", canonical(report))
+
+
+def _make_not_reproduced_bundle(tmp_path: Path, *, name: str):
+    info = make_bundle(tmp_path, name=name)
+    _set_verdict(info.root, "NOT_REPRODUCED", "CANDIDATE_CLEAN")
+    for version in ("vulnerable", "fixed"):
+        for phase in ("candidate_1", "candidate_2"):
+            _update_replay(
+                info.root,
+                version,
+                phase,
+                stdout=b"ABCD\n",
+                stderr=b"",
+                status="completed",
+                exit_code=0,
+                timed_out=False,
+            )
+    return info
 
 
 def test_verify_rejects_report_evidence_digest_mismatch(tmp_path):
@@ -954,3 +1047,208 @@ def test_report_markdown_obeys_the_evidence_size_cap(tmp_path, monkeypatch):
             },
         )
     assert caught.value.reason_code == "FILE_TOO_LARGE"
+
+
+# ---------------------------------------------------------------------------
+# R2: inconclusive timeout/resource/infra controls are valid evidence.
+# ---------------------------------------------------------------------------
+
+
+def test_inconclusive_timeout_accepts_timed_out_normal_control(tmp_path):
+    info = make_bundle(tmp_path, name="timeout-control")
+    _set_verdict(info.root, "INCONCLUSIVE", "TIMEOUT")
+    _update_replay(
+        info.root,
+        "vulnerable",
+        "normal",
+        status="timeout",
+        exit_code=None,
+        timed_out=True,
+    )
+    verified = verify_bundle(info.root)
+    assert verified.manifest["reason_code"] == "TIMEOUT"
+
+
+def test_inconclusive_resource_limited_accepts_limited_normal_control(tmp_path):
+    info = make_bundle(tmp_path, name="resource-control")
+    _set_verdict(info.root, "INCONCLUSIVE", "RESOURCE_LIMITED")
+    _update_replay(
+        info.root,
+        "fixed",
+        "normal",
+        status="resource_limited",
+        exit_code=137,
+        timed_out=False,
+    )
+    verified = verify_bundle(info.root)
+    assert verified.manifest["reason_code"] == "RESOURCE_LIMITED"
+
+
+def test_inconclusive_evidence_incomplete_accepts_infra_error_control(tmp_path):
+    info = make_bundle(tmp_path, name="infra-control")
+    _set_verdict(info.root, "INCONCLUSIVE", "EVIDENCE_INCOMPLETE")
+    _update_replay(
+        info.root,
+        "vulnerable",
+        "normal",
+        status="infra_error",
+        exit_code=None,
+        timed_out=False,
+    )
+    verified = verify_bundle(info.root)
+    assert verified.manifest["reason_code"] == "EVIDENCE_INCOMPLETE"
+
+
+def test_reproduced_rejects_timed_out_normal_control(tmp_path):
+    info = make_bundle(tmp_path, name="reproduced-timeout-control")
+    _update_replay(
+        info.root,
+        "vulnerable",
+        "normal",
+        status="timeout",
+        exit_code=None,
+        timed_out=True,
+    )
+    with pytest.raises(BundleError) as caught:
+        verify_bundle(info.root)
+    assert caught.value.reason_code in ("DIGEST_MISMATCH", "INVALID_MANIFEST")
+
+
+# ---------------------------------------------------------------------------
+# R3: truncated logs are evidence only for an inconclusive reason.
+# ---------------------------------------------------------------------------
+
+
+def test_inconclusive_not_comparable_accepts_truncated_build_log(tmp_path):
+    info = make_bundle(tmp_path, name="truncated-build")
+    _set_verdict(info.root, "INCONCLUSIVE", "NOT_COMPARABLE")
+    _update_build(info.root, "vulnerable", log_truncated=True)
+    verified = verify_bundle(info.root)
+    assert verified.manifest["verdict"] == "INCONCLUSIVE"
+
+
+def test_inconclusive_evidence_incomplete_accepts_truncated_replay_log(tmp_path):
+    info = make_bundle(tmp_path, name="truncated-replay")
+    _set_verdict(info.root, "INCONCLUSIVE", "EVIDENCE_INCOMPLETE")
+    _update_replay(
+        info.root, "vulnerable", "candidate_1", log_truncated=True
+    )
+    verified = verify_bundle(info.root)
+    assert verified.manifest["verdict"] == "INCONCLUSIVE"
+
+
+def test_reproduced_rejects_truncated_build_log(tmp_path):
+    info = make_bundle(tmp_path, name="reproduced-truncated-build")
+    _update_build(info.root, "fixed", log_truncated=True)
+    with pytest.raises(BundleError) as caught:
+        verify_bundle(info.root)
+    assert caught.value.reason_code == "INVALID_MANIFEST"
+
+
+def test_reproduced_rejects_truncated_replay_log(tmp_path):
+    info = make_bundle(tmp_path, name="reproduced-truncated-replay")
+    _update_replay(info.root, "fixed", "candidate_2", log_truncated=True)
+    with pytest.raises(BundleError) as caught:
+        verify_bundle(info.root)
+    assert caught.value.reason_code == "INVALID_MANIFEST"
+
+
+def test_truncated_replay_still_must_match_the_parsed_signature(tmp_path):
+    info = make_bundle(tmp_path, name="truncated-signature")
+    _set_verdict(info.root, "INCONCLUSIVE", "EVIDENCE_INCOMPLETE")
+    _update_replay(
+        info.root,
+        "vulnerable",
+        "candidate_1",
+        log_truncated=True,
+        signature={"error": "use-after-free", "function": "other_function"},
+    )
+    with pytest.raises(BundleError) as caught:
+        verify_bundle(info.root)
+    assert caught.value.reason_code == "INVALID_MANIFEST"
+
+
+def test_truncated_build_log_still_must_match_its_digest(tmp_path):
+    info = make_bundle(tmp_path, name="truncated-build-digest")
+    _set_verdict(info.root, "INCONCLUSIVE", "NOT_COMPARABLE")
+    _update_build(info.root, "vulnerable", log_truncated=True)
+    _rewrite_manifested_file(
+        info.root, "build/vulnerable/build.log", b"different build log\n"
+    )
+    with pytest.raises(BundleError) as caught:
+        verify_bundle(info.root)
+    assert caught.value.reason_code == "DIGEST_MISMATCH"
+
+
+# ---------------------------------------------------------------------------
+# R4: expected stdout is part of the offline semantic check.
+# ---------------------------------------------------------------------------
+
+
+def test_reproduced_rejects_wrong_fixed_candidate_stdout(tmp_path):
+    info = make_bundle(tmp_path, name="wrong-fixed-stdout")
+    _update_replay(info.root, "fixed", "candidate_1", stdout=b"WRONG\n")
+    with pytest.raises(BundleError) as caught:
+        verify_bundle(info.root)
+    assert caught.value.reason_code == "INVALID_MANIFEST"
+
+
+def test_reproduced_rejects_wrong_normal_stdout(tmp_path):
+    info = make_bundle(tmp_path, name="wrong-normal-stdout")
+    _update_replay(info.root, "vulnerable", "normal", stdout=b"WRONG\n")
+    with pytest.raises(BundleError) as caught:
+        verify_bundle(info.root)
+    assert caught.value.reason_code == "INVALID_MANIFEST"
+
+
+def test_not_reproduced_accepts_matching_candidate_stdout(tmp_path):
+    info = _make_not_reproduced_bundle(tmp_path, name="clean-stdout")
+    verified = verify_bundle(info.root)
+    assert verified.manifest["verdict"] == "NOT_REPRODUCED"
+
+
+def test_not_reproduced_rejects_wrong_candidate_stdout(tmp_path):
+    info = _make_not_reproduced_bundle(tmp_path, name="wrong-clean-stdout")
+    _update_replay(info.root, "vulnerable", "candidate_2", stdout=b"WRONG\n")
+    with pytest.raises(BundleError) as caught:
+        verify_bundle(info.root)
+    assert caught.value.reason_code == "INVALID_MANIFEST"
+
+
+# ---------------------------------------------------------------------------
+# R5: BLOCKED reason set includes material I/O failures.
+# ---------------------------------------------------------------------------
+
+
+def test_blocked_material_io_error_bundle_verifies(tmp_path):
+    report = deepcopy(REPORT)
+    report["verdict"] = "BLOCKED"
+    report["reason_code"] = "MATERIAL_IO_ERROR"
+    report["replays"] = []
+    report["builds"] = []
+    info = make_bundle(tmp_path, report=report, full=False, name="blocked-io")
+    verified = verify_bundle(info.root)
+    assert verified.manifest["verdict"] == "BLOCKED"
+    assert verified.manifest["reason_code"] == "MATERIAL_IO_ERROR"
+
+
+def test_blocked_reason_set_stays_closed():
+    assert reason_allowed("BLOCKED", "MATERIAL_IO_ERROR")
+    assert not reason_allowed("BLOCKED", "NOT_A_REAL_REASON")
+    assert not reason_allowed("FAILED", "MATERIAL_IO_ERROR")
+
+
+def test_truncated_replay_log_still_must_match_its_output_digests(tmp_path):
+    info = make_bundle(tmp_path, name="truncated-replay-digest")
+    _set_verdict(info.root, "INCONCLUSIVE", "EVIDENCE_INCOMPLETE")
+    _update_replay(
+        info.root, "vulnerable", "candidate_1", log_truncated=True
+    )
+    _rewrite_manifested_file(
+        info.root,
+        "replay/vulnerable/candidate_1/stdout.log",
+        b"different stdout\n",
+    )
+    with pytest.raises(BundleError) as caught:
+        verify_bundle(info.root)
+    assert caught.value.reason_code == "DIGEST_MISMATCH"

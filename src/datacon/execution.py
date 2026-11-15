@@ -51,6 +51,7 @@ PROBE_TIMEOUT = 120.0
 MAX_ATTEMPTS_PER_STEP = 2
 FAULT_ENV = "DATACON_FAULT_AFTER_TOOL"
 TEST_MODE_ENV = "DATACON_TEST_MODE"
+STAGING_ROOT_ENV = "DATACON_STAGING_ROOT"
 
 
 def test_hooks_enabled() -> bool:
@@ -114,6 +115,7 @@ class ExecutionContext:
     compile_args: tuple[str, ...]
     deadline_at: datetime
     reserve_seconds: float
+    material_payloads: dict[str, bytes] = field(default_factory=dict)
 
     @property
     def job_id_text(self) -> str:
@@ -567,6 +569,11 @@ def _materialize(
             )
         payloads[relative] = data
 
+    # Keep the exact bytes that were verified for this execution. Archiving
+    # uses this snapshot instead of re-reading the case directory after the
+    # target has run, so a later case-root replacement cannot become evidence.
+    context.material_payloads = dict(payloads)
+
     candidate_path = target / "inputs" / "candidate.txt"
     normal_path = target / "inputs" / "normal.txt"
     # Input paths from the manifest are preserved for evidence; the replay
@@ -735,6 +742,242 @@ def _outside_run_root(path: Path, run_root: Path, label: str) -> Path:
             f"{label} must live outside DATACON_RUN_ROOT",
         )
     return resolved
+
+
+def _staging_root(context: ExecutionContext) -> Path:
+    """Return the private staging root used for every mounted byte.
+
+    The run root is treated as attacker-writable. Materials, built parsers and
+    replay inputs are copied here, re-hashed and only then mounted. The root
+    itself is private (0700) and must live outside ``DATACON_RUN_ROOT``; the
+    per-attempt directory is traversable by the non-root container user while
+    the private parent stays hidden from other host users.
+    """
+    explicit = os.getenv(STAGING_ROOT_ENV)
+    evidence_root = Path(
+        os.getenv("DATACON_EVIDENCE_ROOT", ".datacon/evidence")
+    ).expanduser()
+    raw = (
+        Path(explicit).expanduser()
+        if explicit
+        else evidence_root.parent / ".datacon-staging"
+    )
+    if raw.is_symlink():
+        raise ExecutionFailed(
+            "EVIDENCE_WRITE_FAILED", "staging root must not be a symlink"
+        )
+    resolved = _outside_run_root(raw, context.run_root, "staging root")
+    try:
+        resolved.mkdir(mode=0o700, parents=True, exist_ok=True)
+        info = resolved.lstat()
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            raise ExecutionFailed(
+                "EVIDENCE_WRITE_FAILED", "staging root is not a directory"
+            )
+        if info.st_uid != os.getuid():
+            raise ExecutionFailed(
+                "EVIDENCE_WRITE_FAILED", "staging root is not owned by this user"
+            )
+        resolved.chmod(0o700)
+    except ExecutionFailed:
+        raise
+    except OSError as error:
+        raise ExecutionFailed(
+            "EVIDENCE_WRITE_FAILED", f"staging root is unavailable: {error}"
+        ) from error
+    return resolved
+
+
+def _new_staging_directory(
+    context: ExecutionContext, label: str
+) -> Path:
+    root = _staging_root(context)
+    directory = root / (
+        f"{_safe_name(label)}-g{context.generation}-{uuid.uuid4().hex}"
+    )
+    try:
+        directory.mkdir(mode=0o700)
+    except OSError as error:
+        raise ExecutionFailed(
+            "EVIDENCE_WRITE_FAILED", f"staging directory is unavailable: {error}"
+        ) from error
+    return directory
+
+
+def _discard_staging(directory: Path) -> OSError | None:
+    """Best-effort removal that never raises into a caller's error path."""
+    try:
+        shutil.rmtree(directory)
+    except OSError as error:
+        return error
+    return None
+
+
+def _cleanup_staging(directory: Path, failure: BaseException | None) -> None:
+    """Remove one attempt's staging copy without masking its real failure."""
+    error = _discard_staging(directory)
+    if error is None:
+        return
+    if failure is None:
+        raise ExecutionFailed(
+            "EVIDENCE_WRITE_FAILED", f"cannot remove staging directory: {error}"
+        ) from error
+    add_note = getattr(failure, "add_note", None)
+    if callable(add_note):
+        add_note(f"staging cleanup also failed: {error}")
+
+
+def _write_staged_file(
+    directory: Path, relative: str, data: bytes, mode: int
+) -> Path:
+    destination = directory / Path(relative)
+    try:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.parent.chmod(0o755)
+        destination.write_bytes(data)
+        destination.chmod(mode)
+    except OSError as error:
+        raise ExecutionFailed(
+            "EVIDENCE_WRITE_FAILED",
+            f"cannot write staging copy {relative}: {error}",
+        ) from error
+    return destination
+
+
+def _make_staging_tree_readable(directory: Path) -> None:
+    """Let the non-root container traverse the attempt directory.
+
+    The 0700 staging root is the private boundary; bind mounts reference the
+    attempt directory itself, so the container never walks the host parent.
+    """
+    try:
+        for current, directories, filenames in os.walk(directory, topdown=False):
+            for name in filenames:
+                path = Path(current) / name
+                path.chmod(0o555 if os.access(path, os.X_OK) else 0o444)
+            for name in directories:
+                (Path(current) / name).chmod(0o755)
+        directory.chmod(0o755)
+    except OSError as error:
+        raise ExecutionFailed(
+            "EVIDENCE_WRITE_FAILED", f"cannot finalize staging modes: {error}"
+        ) from error
+
+
+def _stage_materials(
+    context: ExecutionContext,
+    materials_dir: Path,
+    material_digests: Mapping[str, str],
+    label: str,
+) -> tuple[Path, dict[str, str]]:
+    """Copy the verified material tree outside the run root and re-hash it."""
+    _verify_materialized_tree(materials_dir, material_digests)
+    directory = _new_staging_directory(context, label)
+    try:
+        staged: dict[str, str] = {}
+        for relative in sorted(material_digests):
+            source = materials_dir / Path(relative)
+            if source.is_symlink() or not source.is_file():
+                raise ExecutionBlocked(
+                    "MATERIAL_MISSING",
+                    f"material disappeared before staging: {relative}",
+                )
+            try:
+                data = source.read_bytes()
+            except OSError as error:
+                raise ExecutionBlocked(
+                    "MATERIAL_MISSING",
+                    f"material cannot be read before staging: {relative}",
+                ) from error
+            actual = _digest(data)
+            if actual != material_digests[relative]:
+                raise ExecutionBlocked(
+                    "MATERIAL_MISSING",
+                    f"material changed while staging: {relative}",
+                )
+            _write_staged_file(directory, relative, data, 0o444)
+            staged[relative] = actual
+        recipe = directory / Path(context.case.manifest["build_recipe"])
+        if recipe.is_symlink() or not recipe.is_file():
+            raise ExecutionBlocked(
+                "MATERIAL_MISSING", "build recipe is missing from the staging copy"
+            )
+        recipe.chmod(0o555)
+        _make_staging_tree_readable(directory)
+        # Hash the staged copy, not the source, immediately before mounting.
+        _verify_materialized_tree(directory, material_digests)
+        return directory, staged
+    except (ExecutionBlocked, ExecutionFailed):
+        _discard_staging(directory)
+        raise
+    except OSError as error:
+        _discard_staging(directory)
+        raise ExecutionFailed(
+            "EVIDENCE_WRITE_FAILED", f"cannot stage reviewed materials: {error}"
+        ) from error
+    except BaseException:
+        _discard_staging(directory)
+        raise
+
+
+def _stage_replay_files(
+    context: ExecutionContext,
+    artifact_path: Path,
+    artifact_digest: str,
+    input_path: Path,
+    input_digest: str,
+    label: str,
+) -> tuple[Path, Path, Path]:
+    """Copy the parser and input outside the run root and verify both copies."""
+    directory = _new_staging_directory(context, label)
+    try:
+        for source, relative, expected, mode, kind in (
+            (artifact_path, "parser", artifact_digest, 0o555, "parser"),
+            (input_path, "input", input_digest, 0o444, "input"),
+        ):
+            if source.is_symlink() or not source.is_file():
+                raise ExecutionBlocked(
+                    "MATERIAL_MISSING", f"replay {kind} is missing before staging"
+                )
+            try:
+                data = source.read_bytes()
+            except OSError as error:
+                raise ExecutionBlocked(
+                    "MATERIAL_MISSING",
+                    f"replay {kind} cannot be read before staging",
+                ) from error
+            actual = _digest(data)
+            if actual != expected:
+                raise ExecutionBlocked(
+                    "PLAN_MISMATCH",
+                    f"replay {kind} changed before staging",
+                )
+            destination = _write_staged_file(directory, relative, data, mode)
+            try:
+                staged_digest = _digest(destination.read_bytes())
+            except OSError as error:
+                raise ExecutionFailed(
+                    "EVIDENCE_WRITE_FAILED",
+                    f"cannot verify staged replay {kind}: {error}",
+                ) from error
+            if staged_digest != expected:
+                raise ExecutionBlocked(
+                    "PLAN_MISMATCH",
+                    f"staged replay {kind} does not match the approved digest",
+                )
+        _make_staging_tree_readable(directory)
+        return directory, directory / "parser", directory / "input"
+    except (ExecutionBlocked, ExecutionFailed):
+        _discard_staging(directory)
+        raise
+    except OSError as error:
+        _discard_staging(directory)
+        raise ExecutionFailed(
+            "EVIDENCE_WRITE_FAILED", f"cannot stage replay inputs: {error}"
+        ) from error
+    except BaseException:
+        _discard_staging(directory)
+        raise
 
 
 def _journal_secret_path(run_root: Path) -> Path:
@@ -1104,6 +1347,8 @@ def _persist_build(
     result: BuildResult,
     attempt_no: int,
     token: str,
+    *,
+    staged_materials: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     run_root = _work_root(context)
     directory = _generation_root(context) / "build" / result.version
@@ -1153,6 +1398,10 @@ def _persist_build(
         },
         **result.as_dict(),
     }
+    if staged_materials is not None:
+        # Bind the build result to the exact bytes copied out of the run root
+        # and mounted for this attempt, not just to the case's current files.
+        payload["staged_materials"] = dict(staged_materials)
     _write_journal(
         run_root,
         f"build:{result.version}",
@@ -1458,7 +1707,14 @@ def _case_materials(
         ),
     )
     materials: dict[str, tuple[str, bytes]] = {}
+    snapshot = getattr(context, "material_payloads", None)
     for relative, role, expected in entries:
+        if isinstance(snapshot, Mapping) and relative in snapshot:
+            data = snapshot[relative]
+            if expected is not None and _digest(data) != expected:
+                continue
+            materials[relative] = (role, data)
+            continue
         try:
             data, actual = context.case.read_material(relative, expected)
         except CaseConfigurationError:
@@ -1901,11 +2157,15 @@ def run_execution(
 
     try:
         _assert_journal_paths(context.run_root)
+        # The staging root holds the bytes that containers actually mount, so
+        # a bad location must fail before any probe/build/replay container.
+        _staging_root(context)
     except ExecutionFailed as error:
-        # The HMAC key must live outside the writable run root; fail before
-        # any probe/build/replay container exists. Do not archive: the
-        # evidence destination itself may be inside the untrusted run root,
-        # and the failure must remain visible via status.evidence.error.
+        # The HMAC key and staging copies must live outside the writable run
+        # root; fail before any probe/build/replay container exists. Do not
+        # archive: the evidence destination itself may be inside the untrusted
+        # run root, and the failure must remain visible via
+        # status.evidence.error.
         try:
             state.finish_execution(
                 dsn,
@@ -2028,7 +2288,9 @@ def run_execution(
                     dsn,
                     context,
                     step_key=step_key,
-                    input_digest=_digest(input_path.read_bytes()),
+                    input_digest=context.plan["inputs"][
+                        "normal" if phase == "normal" else "candidate"
+                    ],
                     action=lambda attempt_no, token, version=version, phase=phase, input_path=input_path, replay_timeout=replay_timeout: _do_replay(
                         dsn,
                         context,
@@ -2396,14 +2658,38 @@ def _do_build(
     # Hash the exact tree that will be mounted immediately before the
     # container is created. A replaced recipe/source aborts the step.
     _verify_materialized_tree(materials_dir, material_digests)
-    result: BuildResult = sandbox.build(
-        version,
-        materials_dir=materials_dir,
-        compile_args=context.compile_args,
-        deadline_seconds=deadline,
-        expected_materials=_expected_build_materials(context),
-    )
-    return _persist_build(dsn, context, result, attempt_no, token)
+    staging: Path | None = None
+    failure: BaseException | None = None
+    try:
+        # The container only ever mounts this copy. A writer limited to the
+        # run root cannot replace the bytes after this point.
+        staging, staged_materials = _stage_materials(
+            context,
+            materials_dir,
+            material_digests,
+            f"build-{version}-attempt-{attempt_no}",
+        )
+        result: BuildResult = sandbox.build(
+            version,
+            materials_dir=staging,
+            compile_args=context.compile_args,
+            deadline_seconds=deadline,
+            expected_materials=_expected_build_materials(context),
+        )
+        return _persist_build(
+            dsn,
+            context,
+            result,
+            attempt_no,
+            token,
+            staged_materials=staged_materials,
+        )
+    except BaseException as error:
+        failure = error
+        raise
+    finally:
+        if staging is not None:
+            _cleanup_staging(staging, failure)
 
 
 def _do_replay(
@@ -2438,45 +2724,68 @@ def _do_replay(
         raise ExecutionBlocked(
             "PLAN_MISMATCH", "the built parser changed before replay"
         )
+    expected_input = context.plan["inputs"][
+        "normal" if phase == "normal" else "candidate"
+    ]
+    staging: Path | None = None
+    failure: BaseException | None = None
     try:
-        result: ReplayResult = sandbox.replay(
-            version,
-            phase,
-            artifact_path=artifact_path,
-            input_path=input_path,
-            asan_options=context.plan["asan_options"],
-            timeout_seconds=timeout_seconds,
-            deadline_seconds=timeout_seconds,
-            expected_artifact_digest=expected_artifact,
+        # Parser and input are copied out of the run root, re-hashed, and only
+        # then mounted. The sandbox also re-checks both digests before create.
+        staging, staged_artifact, staged_input = _stage_replay_files(
+            context,
+            artifact_path,
+            expected_artifact,
+            input_path,
+            expected_input,
+            f"replay-{version}-{phase}-attempt-{attempt_no}",
         )
-    except SandboxError as error:
-        if error.reason_code != "TIMEOUT":
-            raise
-        # A docker exec/wait timeout is replay evidence, not an infrastructure
-        # failure: persist a timeout observation so the verdict layer can
-        # return INCONCLUSIVE/TIMEOUT instead of FAILED.
-        result = ReplayResult(
-            version=version,
-            phase=phase,
-            status="timeout",
-            exit_code=None,
-            duration_seconds=0.0,
-            container_id=None,
-            input_digest=_digest(input_path.read_bytes()),
-            stdout=b"",
-            stderr=b"",
-            signature=None,
-            timed_out=True,
-            quota_hit=False,
-            log_truncated=False,
-            metadata={
-                "image_digest": context.plan["image_digest"],
-                "asan_options": context.plan["asan_options"],
-                "timeout_seconds": timeout_seconds,
-                "error": error.message,
-            },
-        )
-    return _persist_replay(dsn, context, result, attempt_no, token)
+        try:
+            result: ReplayResult = sandbox.replay(
+                version,
+                phase,
+                artifact_path=staged_artifact,
+                input_path=staged_input,
+                asan_options=context.plan["asan_options"],
+                timeout_seconds=timeout_seconds,
+                deadline_seconds=timeout_seconds,
+                expected_artifact_digest=expected_artifact,
+                expected_input_digest=expected_input,
+            )
+        except SandboxError as error:
+            if error.reason_code != "TIMEOUT":
+                raise
+            # A docker exec/wait timeout is replay evidence, not an infrastructure
+            # failure: persist a timeout observation so the verdict layer can
+            # return INCONCLUSIVE/TIMEOUT instead of FAILED.
+            result = ReplayResult(
+                version=version,
+                phase=phase,
+                status="timeout",
+                exit_code=None,
+                duration_seconds=0.0,
+                container_id=None,
+                input_digest=expected_input,
+                stdout=b"",
+                stderr=b"",
+                signature=None,
+                timed_out=True,
+                quota_hit=False,
+                log_truncated=False,
+                metadata={
+                    "image_digest": context.plan["image_digest"],
+                    "asan_options": context.plan["asan_options"],
+                    "timeout_seconds": timeout_seconds,
+                    "error": error.message,
+                },
+            )
+        return _persist_replay(dsn, context, result, attempt_no, token)
+    except BaseException as error:
+        failure = error
+        raise
+    finally:
+        if staging is not None:
+            _cleanup_staging(staging, failure)
 
 
 def _finish_blocked(
