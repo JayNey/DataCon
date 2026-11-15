@@ -795,3 +795,58 @@ def test_staging_root_is_private_and_outside_the_run_root(tmp_path, monkeypatch)
     root = execution._staging_root(context)
     assert not _is_inside(root, context.run_root)
     assert stat.S_IMODE(root.lstat().st_mode) == 0o700
+
+
+def test_evidence_materials_use_the_verified_snapshot_not_the_case_source():
+    payloads = {
+        "harness.c": b"verified harness\n",
+        "build.sh": b"#!/bin/sh\nexit 0\n",
+        "dependencies.lock": b"clang=19.1.7\n",
+        "fix.patch": b"patch\n",
+        "vulnerable/parser.c": b"vulnerable\n",
+        "fixed/parser.c": b"fixed\n",
+        "inputs/normal.txt": b"normal\n",
+        "inputs/candidate.txt": b"candidate\n",
+    }
+
+    def forbidden_read(relative, expected):
+        raise AssertionError("case source must not be read after materialization")
+
+    context = SimpleNamespace(
+        case=SimpleNamespace(
+            manifest={
+                "harness": "harness.c",
+                "build_recipe": "build.sh",
+                "dependencies": "dependencies.lock",
+                "versions": {
+                    "vulnerable": "vulnerable/parser.c",
+                    "fixed": "fixed/parser.c",
+                },
+            },
+            repository={"patch": "fix.patch"},
+            read_material=forbidden_read,
+        ),
+        manifest_case={
+            "inputs": {
+                "normal": "inputs/normal.txt",
+                "candidate": "inputs/candidate.txt",
+            }
+        },
+        plan={
+            "harness_digest": _sha(payloads["harness.c"]),
+            "build_recipe_digest": _sha(payloads["build.sh"]),
+            "dependencies_digest": _sha(payloads["dependencies.lock"]),
+            "repository": {"patch_digest": _sha(payloads["fix.patch"])},
+            "inputs": {
+                "normal": _sha(payloads["inputs/normal.txt"]),
+                "candidate": _sha(payloads["inputs/candidate.txt"]),
+            },
+        },
+        materials={
+            "vulnerable/parser.c": _sha(payloads["vulnerable/parser.c"]),
+            "fixed/parser.c": _sha(payloads["fixed/parser.c"]),
+        },
+        material_payloads=payloads,
+    )
+    materials = execution._case_materials(context)
+    assert {relative: data for relative, (_, data) in materials.items()} == payloads
