@@ -16,6 +16,7 @@ from datacon import jsonutil
 from datacon.contracts import plan_digest
 from datacon.evidence import (
     BundleError,
+    _control_mismatch,
     canonical_manifest_digest,
     export_bundle,
     verify_bundle,
@@ -430,6 +431,31 @@ def test_verify_still_accepts_reproduced_with_expected_candidate_asan(tmp_path):
     verified = verify_bundle(info.root)
     assert verified.manifest["verdict"] == "REPRODUCED"
     assert verified.manifest["reason_code"] == "ASAN_SIGNATURE_MATCHED"
+
+
+@pytest.mark.parametrize("value", [False, 0.0])
+def test_verify_rejects_non_integer_control_exit_code(tmp_path, value):
+    """true == 1 and 0.0 == 0 must not satisfy the planned control exit."""
+    info = make_bundle(tmp_path)
+    _update_replay(info.root, "vulnerable", "normal", exit_code=value)
+    with pytest.raises(BundleError) as caught:
+        verify_bundle(info.root)
+    assert caught.value.reason_code == "INVALID_MANIFEST"
+
+
+@pytest.mark.parametrize("value", [True, 0.0])
+def test_control_mismatch_uses_the_strict_integer_predicate(value):
+    control = {
+        "status": "completed",
+        "exit_code": value,
+        "stdout": "OK\n",
+        "stderr": "",
+    }
+    expected_exit = {"normal": 1 if value is True else 0}
+    expected_stdout = {"normal": "OK\n", "candidate_clean": "ABCD\n"}
+    assert (
+        _control_mismatch(control, expected_exit, expected_stdout) == "exit"
+    )
 
 
 def test_verify_accepts_valid_reproduced_bundle(tmp_path):
