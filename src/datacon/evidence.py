@@ -1006,7 +1006,7 @@ def _verify_semantics(
             "INVALID_MANIFEST", "manifest verdict does not match report verdict"
         )
     report_reason = _reason_code_valid(report)
-    if manifest_reason is not None and report_reason != manifest_reason:
+    if manifest_reason != report_reason:
         raise BundleError(
             "INVALID_MANIFEST", "manifest reason_code does not match report"
         )

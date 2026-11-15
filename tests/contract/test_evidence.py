@@ -518,6 +518,14 @@ def test_verify_rejects_manifest_reason_not_in_verdict_set(tmp_path):
     assert caught.value.reason_code in ("DIGEST_MISMATCH", "INVALID_MANIFEST")
 
 
+def test_verify_rejects_null_manifest_reason_for_full_verdict(tmp_path):
+    info = make_bundle(tmp_path)
+    _set_manifest_reason(info.root, None)
+    with pytest.raises(BundleError) as caught:
+        verify_bundle(info.root)
+    assert caught.value.reason_code in ("DIGEST_MISMATCH", "INVALID_MANIFEST")
+
+
 def test_verify_rejects_unknown_replay_status(tmp_path):
     info = make_bundle(tmp_path)
 
