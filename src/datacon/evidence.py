@@ -579,11 +579,18 @@ def _case_binding(
     materials = _mapping(case_config.get("materials"), "case materials")
     manifest_case = _mapping(case_config.get("manifest_case"), "manifest_case")
     inputs = _mapping(manifest_case.get("inputs"), "manifest_case.inputs")
-    if materials.get(inputs.get("normal")) != plan.get("inputs", {}).get("normal"):
+    normal_input = inputs.get("normal")
+    candidate_input = inputs.get("candidate")
+    if not isinstance(normal_input, str) or not isinstance(candidate_input, str):
+        raise BundleError(
+            "INVALID_MANIFEST",
+            "manifest_case.inputs.normal and .candidate must be strings",
+        )
+    if materials.get(normal_input) != plan.get("inputs", {}).get("normal"):
         raise BundleError(
             "INVALID_MANIFEST", "case normal input digest does not match the plan"
         )
-    if materials.get(inputs.get("candidate")) != plan.get("inputs", {}).get(
+    if materials.get(candidate_input) != plan.get("inputs", {}).get(
         "candidate"
     ):
         raise BundleError(
@@ -747,7 +754,47 @@ def _verify_builds(
         staged = _mapping(
             build.get("staged_materials"), f"{version} staged_materials"
         )
-        for relative, digest in materials.items():
+        expected_staged = dict(materials)
+        # Execution copies each reviewed input to a stable replay name, so the
+        # staged tree deliberately contains two extra aliases. They must equal
+        # the plan inputs; every other key must match the case config exactly.
+        plan_inputs = plan.get("inputs")
+        normal_alias = (
+            plan_inputs.get("normal") if isinstance(plan_inputs, Mapping) else None
+        )
+        candidate_alias = (
+            plan_inputs.get("candidate")
+            if isinstance(plan_inputs, Mapping)
+            else None
+        )
+        if not isinstance(normal_alias, str) or not isinstance(
+            candidate_alias, str
+        ):
+            raise BundleError(
+                "INVALID_MANIFEST",
+                "plan inputs must record normal/candidate digests",
+            )
+        expected_staged["inputs/normal.txt"] = normal_alias
+        expected_staged["inputs/candidate.txt"] = candidate_alias
+        for alias, expected_alias in (
+            ("inputs/normal.txt", normal_alias),
+            ("inputs/candidate.txt", candidate_alias),
+        ):
+            if alias in materials and materials[alias] != expected_alias:
+                raise BundleError(
+                    "DIGEST_MISMATCH",
+                    f"{version} build staged input alias conflicts with the "
+                    f"case config: {alias}",
+                )
+        if set(staged) != set(expected_staged):
+            missing = sorted(set(expected_staged) - set(staged))
+            extra = sorted(set(staged) - set(expected_staged))
+            raise BundleError(
+                "DIGEST_MISMATCH",
+                f"{version} build staged materials do not match the plan; "
+                f"missing={missing} extra={extra}",
+            )
+        for relative, digest in expected_staged.items():
             if staged.get(relative) != digest:
                 raise BundleError(
                     "DIGEST_MISMATCH",
@@ -817,6 +864,16 @@ def _verify_replays(
     replays = report.get("replays")
     if not isinstance(replays, list):
         raise BundleError("INVALID_MANIFEST", "report replays must be a list")
+    builds = report.get("builds")
+    build_artifacts = (
+        {
+            build.get("version"): build.get("artifact_digest")
+            for build in builds
+            if isinstance(build, Mapping)
+        }
+        if isinstance(builds, list)
+        else {}
+    )
     truncation_allowed = _truncation_allowed(verdict, report)
     observations: dict[tuple[str, str], dict[str, Any]] = {}
     for item in replays:
@@ -853,6 +910,19 @@ def _verify_replays(
                 "INVALID_MANIFEST",
                 f"completed replay {version}/{phase} must record an integer exit_code",
             )
+        for field in ("stdout_bytes", "stderr_bytes"):
+            value = item.get(field)
+            if type(value) is not int or value < 0:
+                raise BundleError(
+                    "INVALID_MANIFEST",
+                    f"replay {version}/{phase} {field} must be a "
+                    f"non-negative integer",
+                )
+        if type(item.get("timed_out")) is not bool:
+            raise BundleError(
+                "INVALID_MANIFEST",
+                f"replay {version}/{phase} timed_out must be a boolean",
+            )
         if item.get("plan_digest") != plan_digest or item.get("job_id") != job_id:
             raise BundleError(
                 "INVALID_MANIFEST",
@@ -877,6 +947,18 @@ def _verify_replays(
             raise BundleError(
                 "DIGEST_MISMATCH",
                 f"replay {version}/{phase} input does not match the plan",
+            )
+        recorded_artifact = item.get("artifact_digest")
+        if not isinstance(recorded_artifact, str):
+            raise BundleError(
+                "INVALID_MANIFEST",
+                f"replay {version}/{phase} has no artifact_digest binding",
+            )
+        if recorded_artifact != build_artifacts.get(version):
+            raise BundleError(
+                "DIGEST_MISMATCH",
+                f"replay {version}/{phase} artifact does not match the "
+                f"{version} build",
             )
         _require_untruncated(
             item.get("log_truncated"),
@@ -1223,7 +1305,17 @@ def _verify_semantics(
             "INVALID_MANIFEST", "manifest reason_code does not match report"
         )
     rule = report.get("rule")
-    if isinstance(rule, Mapping) and (
+    if rule is not None and not isinstance(rule, Mapping):
+        raise BundleError(
+            "INVALID_MANIFEST", "report rule trace must be an object or null"
+        )
+    if rule is None:
+        if report_verdict in ("REPRODUCED", "NOT_REPRODUCED"):
+            raise BundleError(
+                "INVALID_MANIFEST",
+                "report rule trace is required for outcome verdicts",
+            )
+    elif (
         rule.get("verdict") != report_verdict
         or rule.get("reason_code") != report_reason
     ):
@@ -1298,6 +1390,18 @@ def _verify_semantics(
             "INVALID_MANIFEST",
             "execution metadata does not match manifest job_id/plan_digest",
         )
+    probe = _parse_json_file(data, "metadata/probe.json")
+    if probe.get("status") != "completed":
+        raise BundleError(
+            "INVALID_MANIFEST",
+            "probe metadata does not record a completed isolation probe",
+        )
+    for field in ("job_id", "plan_digest"):
+        if probe.get(field) != execution_metadata.get(field):
+            raise BundleError(
+                "INVALID_MANIFEST",
+                f"probe metadata {field} does not match execution metadata",
+            )
 
     report_repository = report.get("repository")
     if report_repository != plan.get("repository"):

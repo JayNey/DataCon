@@ -14,6 +14,7 @@ from datacon.asan import ASanSignature, parse_asan, signature_matches
 from datacon.verdict import (
     RunObservation,
     VerdictPolicy,
+    _exit_matches,
     decide_verdict,
 )
 
@@ -280,3 +281,37 @@ def test_decision_is_json_serializable_for_reports():
     payload = decision.as_dict()
     assert json.loads(json.dumps(payload))["verdict"] == "REPRODUCED"
     assert payload["priority"][0].startswith("INCONCLUSIVE")
+
+
+@pytest.mark.parametrize("actual", [True, False, 0.0, 1.0, None, "0", "1"])
+@pytest.mark.parametrize("expected", [0, 1])
+def test_exit_matches_requires_exact_integer_types(actual, expected):
+    assert _exit_matches(actual, expected) is False
+
+
+def test_exit_matches_accepts_integer_equality_only():
+    assert _exit_matches(0, 0) is True
+    assert _exit_matches(1, 1) is True
+    assert _exit_matches(0, 1) is False
+    assert _exit_matches(1, 0) is False
+
+
+def test_boolean_exit_cannot_satisfy_an_integer_planned_exit():
+    policy = VerdictPolicy(
+        signature=SIGNATURE,
+        expected_exit={
+            "normal": 0,
+            "candidate_clean": 0,
+            "candidate_asan": 1,
+        },
+        expected_stdout={"normal": "OK\n", "candidate_clean": "ABCD\n"},
+    )
+    runs = [
+        replace(item, exit_code=True)
+        if item.version == "vulnerable" and item.phase.startswith("candidate")
+        else item
+        for item in six_runs()
+    ]
+    decision = decide_verdict(policy, runs, builds=builds())
+    assert decision.verdict == "INCONCLUSIVE"
+    assert decision.checks["vulnerable_candidates"] == ["other", "other"]

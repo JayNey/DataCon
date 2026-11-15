@@ -151,7 +151,7 @@ def _inconclusive(reason_code: str, message: str, checks: dict[str, Any]) -> Ver
 
 
 def _exit_matches(actual: int | None, expected: Any) -> bool:
-    return type(expected) is int and actual == expected
+    return type(expected) is int and type(actual) is int and actual == expected
 
 
 def _stdout_matches(actual: str, expected: Any) -> bool:

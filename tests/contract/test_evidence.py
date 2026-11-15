@@ -183,6 +183,7 @@ def replay_record(version: str, phase: str) -> dict:
         "generation": 1,
         "plan_digest": PLAN_DIGEST,
         "input_digest": input_digest,
+        "artifact_digest": digest(f"parser-{version}".encode()),
         "status": "completed",
         "version": version,
         "phase": phase,
@@ -226,6 +227,12 @@ REPORT = {
     "case_id": PLAN["case_id"],
     "verdict": "REPRODUCED",
     "reason_code": REASONS["REPRODUCED"],
+    "rule": {
+        "verdict": "REPRODUCED",
+        "reason_code": REASONS["REPRODUCED"],
+        "message": "reviewed ASan signature matched the vulnerable candidate",
+        "checks": {},
+    },
     "repository": dict(PLAN["repository"]),
     "versions": dict(PLAN["revisions"]),
     "inputs": dict(PLAN["inputs"]),
@@ -269,7 +276,19 @@ def full_artifacts() -> dict[str, tuple[str, bytes]]:
                 }
             ),
         ),
-        "metadata/probe.json": ("probe", b'{"checks":{"seccomp":"2"}}\n'),
+        "metadata/probe.json": (
+            "probe",
+            canonical(
+                {
+                    "tool_id": "sandbox.probe",
+                    "job_id": JOB_ID,
+                    "plan_digest": PLAN_DIGEST,
+                    "generation": 1,
+                    "status": "completed",
+                    "checks": {"seccomp": "2"},
+                }
+            ),
+        ),
         "metadata/case.json": (
             "case_config",
             canonical({"case_config": CASE_CONFIG}),
@@ -492,6 +511,11 @@ def _set_verdict(root: Path, verdict: str, reason: str | None) -> None:
     report = json.loads((root / "report.json").read_text(encoding="utf-8"))
     report["verdict"] = verdict
     report["reason_code"] = reason
+    report["rule"] = (
+        {"verdict": verdict, "reason_code": reason}
+        if verdict in ("REPRODUCED", "NOT_REPRODUCED")
+        else None
+    )
     _rewrite_manifested_file(root, "report.json", canonical(report))
 
 
@@ -668,6 +692,154 @@ def test_verify_rejects_build_staged_material_not_matching_plan(tmp_path):
     assert caught.value.reason_code == "DIGEST_MISMATCH"
 
 
+def test_verify_rejects_extra_staged_material(tmp_path):
+    info = make_bundle(tmp_path)
+    staged = dict(MATERIAL_DIGESTS)
+    staged["unreviewed/evil.c"] = digest(b"evil\n")
+    _update_build(info.root, "vulnerable", staged_materials=staged)
+    with pytest.raises(BundleError) as caught:
+        verify_bundle(info.root)
+    assert caught.value.reason_code == "DIGEST_MISMATCH"
+    assert "extra=" in caught.value.message
+
+
+def test_verify_rejects_missing_staged_material(tmp_path):
+    info = make_bundle(tmp_path)
+    staged = dict(MATERIAL_DIGESTS)
+    staged.pop("harness.c")
+    _update_build(info.root, "fixed", staged_materials=staged)
+    with pytest.raises(BundleError) as caught:
+        verify_bundle(info.root)
+    assert caught.value.reason_code == "DIGEST_MISMATCH"
+    assert "missing=" in caught.value.message
+
+
+def test_verify_rejects_wrong_staged_input_alias(tmp_path):
+    info = make_bundle(tmp_path)
+    staged = dict(MATERIAL_DIGESTS)
+    staged["inputs/candidate.txt"] = "sha256:" + "0" * 64
+    _update_build(info.root, "vulnerable", staged_materials=staged)
+    with pytest.raises(BundleError) as caught:
+        verify_bundle(info.root)
+    assert caught.value.reason_code == "DIGEST_MISMATCH"
+    assert "inputs/candidate.txt" in caught.value.message
+
+
+@pytest.mark.parametrize("staged", [[], {"harness.c": {}}])
+def test_verify_rejects_malformed_staged_material_map(tmp_path, staged):
+    info = make_bundle(tmp_path)
+    _update_build(info.root, "vulnerable", staged_materials=staged)
+    with pytest.raises(BundleError) as caught:
+        verify_bundle(info.root)
+    assert caught.value.reason_code in ("DIGEST_MISMATCH", "INVALID_MANIFEST")
+
+
+def test_verify_accepts_distinct_stable_input_aliases(tmp_path):
+    """Real execution stages two aliases, not just the case-config keys."""
+    plan = deepcopy(PLAN)
+    case_config = deepcopy(CASE_CONFIG)
+    case_config["manifest_case"]["inputs"] = {
+        "normal": "normal.txt",
+        "candidate": "candidate.txt",
+    }
+    case_materials = dict(CASE_CONFIG["materials"])
+    case_materials.pop("inputs/normal.txt")
+    case_materials.pop("inputs/candidate.txt")
+    case_materials["normal.txt"] = MATERIAL_DIGESTS["inputs/normal.txt"]
+    case_materials["candidate.txt"] = MATERIAL_DIGESTS["inputs/candidate.txt"]
+    case_config["materials"] = case_materials
+    plan["case_config_digest"] = jsonutil.digest_json(case_config)
+    variant_digest = plan_digest(plan)
+
+    staged = {
+        relative: digest_value
+        for relative, digest_value in MATERIAL_DIGESTS.items()
+        if relative not in ("inputs/normal.txt", "inputs/candidate.txt")
+    }
+    staged["normal.txt"] = MATERIAL_DIGESTS["inputs/normal.txt"]
+    staged["candidate.txt"] = MATERIAL_DIGESTS["inputs/candidate.txt"]
+    staged["inputs/normal.txt"] = PLAN["inputs"]["normal"]
+    staged["inputs/candidate.txt"] = PLAN["inputs"]["candidate"]
+
+    builds = deepcopy(BUILDS)
+    for build in builds:
+        build["plan_digest"] = variant_digest
+        build["staged_materials"] = dict(staged)
+    replays = deepcopy(REPLAYS)
+    for replay in replays:
+        replay["plan_digest"] = variant_digest
+    report = deepcopy(REPORT)
+    report["plan_digest"] = variant_digest
+    report["builds"] = builds
+    report["replays"] = replays
+    review = deepcopy(REVIEW)
+    review["plan_digest"] = variant_digest
+
+    artifacts = full_artifacts()
+    artifacts.pop("materials/inputs/normal.txt")
+    artifacts.pop("materials/inputs/candidate.txt")
+    artifacts["materials/normal.txt"] = (
+        "material_input_normal",
+        MATERIALS["inputs/normal.txt"],
+    )
+    artifacts["materials/candidate.txt"] = (
+        "material_input_candidate",
+        MATERIALS["inputs/candidate.txt"],
+    )
+    artifacts["plan.json"] = ("plan", canonical(plan))
+    artifacts["review.json"] = ("review", canonical(review))
+    artifacts["metadata/case.json"] = (
+        "case_config",
+        canonical({"case_config": case_config}),
+    )
+    artifacts["metadata/execution.json"] = (
+        "execution_metadata",
+        canonical(
+            {
+                "job_id": JOB_ID,
+                "plan_digest": variant_digest,
+                "generation": 1,
+            }
+        ),
+    )
+    artifacts["metadata/probe.json"] = (
+        "probe",
+        canonical(
+            {
+                "tool_id": "sandbox.probe",
+                "job_id": JOB_ID,
+                "plan_digest": variant_digest,
+                "generation": 1,
+                "status": "completed",
+                "checks": {"seccomp": "2"},
+            }
+        ),
+    )
+    for build in builds:
+        artifacts[f"build/{build['version']}/metadata.json"] = (
+            "build_metadata",
+            canonical(build),
+        )
+    for replay in replays:
+        artifacts[f"replay/{replay['version']}/{replay['phase']}/metadata.json"] = (
+            "replay_metadata",
+            canonical(replay),
+        )
+    info = write_bundle(
+        tmp_path / "alias-bundle",
+        job_id=JOB_ID,
+        plan_digest=variant_digest,
+        report=report,
+        report_markdown="# report\n",
+        artifacts=artifacts,
+    )
+    verified = verify_bundle(info.root)
+    assert verified.manifest["verdict"] == "REPRODUCED"
+    staged_in_report = verified.file_data["report.json"]
+    assert b"inputs/normal.txt" in staged_in_report
+    assert b"normal.txt" in staged_in_report
+
+
 @pytest.mark.parametrize(
     ("field", "value", "reason"),
     [
@@ -714,6 +886,130 @@ def test_verify_rejects_execution_metadata_not_bound_to_manifest(tmp_path):
         "metadata/execution.json",
         canonical({"job_id": str(uuid4()), "plan_digest": PLAN_DIGEST}),
     )
+    with pytest.raises(BundleError) as caught:
+        verify_bundle(info.root)
+    assert caught.value.reason_code == "INVALID_MANIFEST"
+
+
+def test_verify_rejects_probe_metadata_that_is_not_an_object(tmp_path):
+    info = make_bundle(tmp_path)
+    _rewrite_manifested_file(info.root, "metadata/probe.json", canonical([]))
+    with pytest.raises(BundleError) as caught:
+        verify_bundle(info.root)
+    assert caught.value.reason_code == "INVALID_MANIFEST"
+
+
+def test_verify_rejects_probe_metadata_that_did_not_complete(tmp_path):
+    info = make_bundle(tmp_path)
+    _rewrite_manifested_file(
+        info.root,
+        "metadata/probe.json",
+        canonical(
+            {
+                "job_id": JOB_ID,
+                "plan_digest": PLAN_DIGEST,
+                "status": "policy_denied",
+            }
+        ),
+    )
+    with pytest.raises(BundleError) as caught:
+        verify_bundle(info.root)
+    assert caught.value.reason_code == "INVALID_MANIFEST"
+    assert "probe" in caught.value.message
+
+
+def test_verify_rejects_probe_metadata_not_bound_to_execution(tmp_path):
+    info = make_bundle(tmp_path)
+    _rewrite_manifested_file(
+        info.root,
+        "metadata/probe.json",
+        canonical(
+            {
+                "job_id": JOB_ID,
+                "plan_digest": "sha256:" + "9" * 64,
+                "status": "completed",
+            }
+        ),
+    )
+    with pytest.raises(BundleError) as caught:
+        verify_bundle(info.root)
+    assert caught.value.reason_code == "INVALID_MANIFEST"
+
+
+@pytest.mark.parametrize(
+    "inputs",
+    [
+        [],
+        {},
+        {"normal": [], "candidate": "inputs/candidate.txt"},
+        {"normal": 1, "candidate": 2},
+    ],
+)
+def test_verify_rejects_non_string_case_inputs(tmp_path, inputs):
+    info = make_bundle(tmp_path)
+    plan = deepcopy(PLAN)
+    case_config = deepcopy(CASE_CONFIG)
+    case_config["manifest_case"]["inputs"] = inputs
+    plan["case_config_digest"] = jsonutil.digest_json(case_config)
+    variant_digest = plan_digest(plan)
+    _rebind_bundle_to_plan(info.root, plan, case_config, variant_digest)
+    with pytest.raises(BundleError) as caught:
+        verify_bundle(info.root)
+    assert caught.value.reason_code == "INVALID_MANIFEST"
+
+
+def test_verify_rejects_non_mapping_rule_trace(tmp_path):
+    info = make_bundle(tmp_path)
+    _replace_report(info.root, rule="x")
+    with pytest.raises(BundleError) as caught:
+        verify_bundle(info.root)
+    assert caught.value.reason_code == "INVALID_MANIFEST"
+    assert "rule" in caught.value.message
+
+
+def test_verify_rejects_missing_rule_trace_for_outcome_verdict(tmp_path):
+    info = make_bundle(tmp_path)
+    _replace_report(info.root, rule=None)
+    with pytest.raises(BundleError) as caught:
+        verify_bundle(info.root)
+    assert caught.value.reason_code == "INVALID_MANIFEST"
+    assert "rule" in caught.value.message
+
+
+def test_verify_rejects_replay_not_bound_to_its_build_artifact(tmp_path):
+    info = make_bundle(tmp_path)
+    _update_replay(
+        info.root,
+        "vulnerable",
+        "normal",
+        artifact_digest=digest(b"other parser"),
+    )
+    with pytest.raises(BundleError) as caught:
+        verify_bundle(info.root)
+    assert caught.value.reason_code == "DIGEST_MISMATCH"
+
+
+def test_verify_rejects_replay_without_artifact_binding(tmp_path):
+    info = make_bundle(tmp_path)
+    _update_replay(info.root, "vulnerable", "normal", artifact_digest=None)
+    with pytest.raises(BundleError) as caught:
+        verify_bundle(info.root)
+    assert caught.value.reason_code == "INVALID_MANIFEST"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("stdout_bytes", True),
+        ("stdout_bytes", 1.0),
+        ("stderr_bytes", "3"),
+        ("timed_out", 1),
+        ("timed_out", None),
+    ],
+)
+def test_verify_rejects_malformed_replay_scalar_types(tmp_path, field, value):
+    info = make_bundle(tmp_path)
+    _update_replay(info.root, "vulnerable", "normal", **{field: value})
     with pytest.raises(BundleError) as caught:
         verify_bundle(info.root)
     assert caught.value.reason_code == "INVALID_MANIFEST"
@@ -974,6 +1270,7 @@ def test_minimal_blocked_or_failed_bundle_is_accepted(tmp_path, verdict):
     report = deepcopy(REPORT)
     report["verdict"] = verdict
     report["reason_code"] = "POLICY_DENIED" if verdict == "BLOCKED" else "EVIDENCE_WRITE_FAILED"
+    report["rule"] = None
     report["replays"] = []
     report["builds"] = []
     info = make_bundle(tmp_path, report=report, full=False)
@@ -1268,6 +1565,8 @@ def test_inconclusive_timeout_accepts_timed_out_normal_control(tmp_path):
     )
     verified = verify_bundle(info.root)
     assert verified.manifest["reason_code"] == "TIMEOUT"
+    report = json.loads(verified.file_data["report.json"])
+    assert report["rule"] is None
 
 
 def test_inconclusive_resource_limited_accepts_limited_normal_control(tmp_path):
@@ -1425,12 +1724,61 @@ def test_blocked_material_io_error_bundle_verifies(tmp_path):
     report = deepcopy(REPORT)
     report["verdict"] = "BLOCKED"
     report["reason_code"] = "MATERIAL_IO_ERROR"
+    report["rule"] = None
     report["replays"] = []
     report["builds"] = []
     info = make_bundle(tmp_path, report=report, full=False, name="blocked-io")
     verified = verify_bundle(info.root)
     assert verified.manifest["verdict"] == "BLOCKED"
     assert verified.manifest["reason_code"] == "MATERIAL_IO_ERROR"
+
+
+@pytest.mark.parametrize(
+    ("relative", "fragment"),
+    [
+        ("metadata/case.json", "metadata/case.json"),
+        ("materials/fix.patch", "material_patch"),
+    ],
+)
+def test_legacy_bundle_without_case_binding_fails_diagnosably(
+    tmp_path, relative, fragment
+):
+    artifacts = full_artifacts()
+    artifacts.pop(relative)
+    info = write_bundle(
+        tmp_path / "legacy",
+        job_id=JOB_ID,
+        plan_digest=PLAN_DIGEST,
+        report=REPORT,
+        report_markdown="# report\n",
+        artifacts=artifacts,
+    )
+    with pytest.raises(BundleError) as caught:
+        verify_bundle(info.root)
+    assert caught.value.reason_code == "INVALID_MANIFEST"
+    assert fragment in caught.value.message
+
+
+def test_cli_verify_bundle_reports_legacy_bundle_without_type_error(tmp_path, capsys):
+    from datacon.cli import main as cli_main
+
+    artifacts = full_artifacts()
+    artifacts.pop("metadata/case.json")
+    info = write_bundle(
+        tmp_path / "legacy-cli",
+        job_id=JOB_ID,
+        plan_digest=PLAN_DIGEST,
+        report=REPORT,
+        report_markdown="# report\n",
+        artifacts=artifacts,
+    )
+    capsys.readouterr()
+    code = cli_main(["verify-bundle", str(info.root)])
+    captured = capsys.readouterr()
+    assert code == 3
+    payload = json.loads(captured.err)
+    assert payload["reason_code"] == "INVALID_MANIFEST"
+    assert "metadata/case.json" in payload["message"]
 
 
 def test_blocked_reason_set_stays_closed():

@@ -6,9 +6,12 @@ from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
+import os
 from pathlib import Path
 import stat
+import threading
 from types import SimpleNamespace
+import unicodedata
 from uuid import uuid4
 
 import pytest
@@ -553,12 +556,281 @@ def test_read_run_file_bounded_accepts_normal_files_and_rejects_oversize(tmp_pat
     assert execution._read_run_file_bounded(path, max_bytes=4) is None
 
 
-def test_verified_run_file_rejects_oversized_file_before_read(tmp_path, monkeypatch):
-    monkeypatch.setattr(execution, "MAX_LOG_BYTES", 4)
-    path = tmp_path / "stderr.log"
+def test_read_run_file_bounded_rejects_symlinks_and_fifos(tmp_path):
+    target = tmp_path / "target"
+    target.write_bytes(b"12345")
+    link = tmp_path / "link"
+    link.symlink_to(target)
+    assert execution._read_run_file_bounded(link, max_bytes=16) is None
+
+    fifo = tmp_path / "fifo"
+    os.mkfifo(fifo)
+    results = []
+    worker = threading.Thread(
+        target=lambda: results.append(
+            execution._read_run_file_bounded(fifo, max_bytes=16)
+        ),
+        daemon=True,
+    )
+    worker.start()
+    worker.join(timeout=2)
+    assert not worker.is_alive()
+    assert results == [None]
+
+
+def test_verified_run_file_rejects_oversized_artifact_before_read(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(execution, "MAX_ARTIFACT_BYTES", 4)
+    path = tmp_path / "generation-1" / "build" / "vulnerable" / "parser"
+    path.parent.mkdir(parents=True)
     path.write_bytes(b"12345")
     payload = {
-        "files": {"stderr": "stderr.log"},
+        "files": {"artifact": "generation-1/build/vulnerable/parser"},
+        "file_digests": {"artifact": _sha(b"12345")},
+    }
+
+    def forbidden_read_bytes(self):
+        raise AssertionError(f"read_bytes must not be used for {self}")
+
+    def forbidden_open(self, *args, **kwargs):
+        raise AssertionError(f"open must not be used for {self}")
+
+    monkeypatch.setattr(Path, "read_bytes", forbidden_read_bytes)
+    monkeypatch.setattr(Path, "open", forbidden_open)
+    assert (
+        execution._verified_run_file(
+            tmp_path, payload, "artifact", "/parser"
+        )
+        is None
+    )
+
+
+def test_material_verifiers_reject_oversized_files_before_read(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(execution, "MAX_MATERIAL_BYTES", 4)
+    materials = tmp_path / "materials"
+    materials.mkdir()
+    (materials / "harness.c").write_bytes(b"12345")
+
+    def forbidden_read_bytes(self):
+        raise AssertionError(f"read_bytes must not be used for {self}")
+
+    monkeypatch.setattr(Path, "read_bytes", forbidden_read_bytes)
+    with pytest.raises(execution.ExecutionBlocked) as caught:
+        execution._verify_materialized(
+            materials, {"harness.c": b"12345"}
+        )
+    assert caught.value.reason_code == "MATERIAL_MISSING"
+    with pytest.raises(execution.ExecutionBlocked) as caught:
+        execution._verify_materialized_tree(
+            materials, {"harness.c": _sha(b"12345")}
+        )
+    assert caught.value.reason_code == "MATERIAL_MISSING"
+
+
+def test_stage_materials_rejects_oversized_material_before_read(
+    tmp_path, monkeypatch
+):
+    context, materials, digests = _staging_context(tmp_path, monkeypatch)
+    monkeypatch.setattr(execution, "MAX_MATERIAL_BYTES", 4)
+
+    def forbidden_read_bytes(self):
+        raise AssertionError(f"read_bytes must not be used for {self}")
+
+    monkeypatch.setattr(Path, "read_bytes", forbidden_read_bytes)
+    with pytest.raises(execution.ExecutionBlocked) as caught:
+        execution._stage_materials(context, materials, digests, "bounded")
+    assert caught.value.reason_code == "MATERIAL_MISSING"
+
+
+def test_stage_replay_files_rejects_oversized_artifact_before_read(
+    tmp_path, monkeypatch
+):
+    context, materials, _ = _staging_context(tmp_path, monkeypatch)
+    artifact = tmp_path / "parser"
+    artifact.write_bytes(b"12345")
+    input_path = materials / "inputs" / "normal.txt"
+    input_digest = _sha(input_path.read_bytes())
+    monkeypatch.setattr(execution, "MAX_ARTIFACT_BYTES", 4)
+
+    def forbidden_read_bytes(self):
+        raise AssertionError(f"read_bytes must not be used for {self}")
+
+    monkeypatch.setattr(Path, "read_bytes", forbidden_read_bytes)
+    with pytest.raises(execution.ExecutionBlocked) as caught:
+        execution._stage_replay_files(
+            context,
+            artifact,
+            _sha(b"12345"),
+            input_path,
+            input_digest,
+            "bounded",
+        )
+    assert caught.value.reason_code == "MATERIAL_MISSING"
+
+
+def test_materialize_rechecks_an_existing_tree_with_bounded_reads(
+    tmp_path, monkeypatch
+):
+    payloads = {
+        "harness.c": b"harness-body",
+        "build.sh": b"#!/bin/sh\n",
+        "dependencies.lock": b"deps",
+        "fix.patch": b"patch-body",
+        "vulnerable/parser.c": b"vuln-body",
+        "fixed/parser.c": b"fixed-body",
+        "inputs/normal.txt": b"normal-body",
+        "inputs/candidate.txt": b"candidate-body",
+    }
+    digests = {relative: _sha(data) for relative, data in payloads.items()}
+    context = SimpleNamespace(
+        case=SimpleNamespace(
+            manifest={
+                "harness": "harness.c",
+                "build_recipe": "build.sh",
+                "dependencies": "dependencies.lock",
+                "versions": {
+                    "vulnerable": "vulnerable/parser.c",
+                    "fixed": "fixed/parser.c",
+                },
+            },
+            repository={"patch": "fix.patch"},
+            read_material=lambda relative, expected: (
+                payloads[relative],
+                digests[relative],
+            ),
+        ),
+        manifest_case={
+            "inputs": {
+                "normal": "inputs/normal.txt",
+                "candidate": "inputs/candidate.txt",
+            }
+        },
+        plan={
+            "harness_digest": digests["harness.c"],
+            "build_recipe_digest": digests["build.sh"],
+            "dependencies_digest": digests["dependencies.lock"],
+            "repository": {"patch_digest": digests["fix.patch"]},
+            "inputs": {
+                "normal": digests["inputs/normal.txt"],
+                "candidate": digests["inputs/candidate.txt"],
+            },
+        },
+        materials={
+            "vulnerable/parser.c": digests["vulnerable/parser.c"],
+            "fixed/parser.c": digests["fixed/parser.c"],
+        },
+        material_payloads={},
+    )
+    generation = tmp_path / "generation-1"
+    execution._materialize(context, generation)
+    assert (generation / "materials" / "harness.c").is_file()
+
+    monkeypatch.setattr(execution, "MAX_MATERIAL_BYTES", 4)
+
+    def forbidden_read_bytes(self):
+        raise AssertionError(f"read_bytes must not be used for {self}")
+
+    monkeypatch.setattr(Path, "read_bytes", forbidden_read_bytes)
+    with pytest.raises(execution.ExecutionBlocked) as caught:
+        execution._materialize(context, generation)
+    assert caught.value.reason_code == "MATERIAL_MISSING"
+
+
+def test_do_replay_rejects_oversized_artifact_before_read(
+    tmp_path, monkeypatch
+):
+    context, _, _ = _staging_context(tmp_path, monkeypatch)
+    artifact = (
+        execution._work_root(context)
+        / "generation-1"
+        / "build"
+        / "vulnerable"
+        / "parser"
+    )
+    artifact.parent.mkdir(parents=True)
+    artifact.write_bytes(b"12345")
+    monkeypatch.setattr(execution, "MAX_ARTIFACT_BYTES", 4)
+
+    class ForbiddenSandbox:
+        def replay(self, *args, **kwargs):
+            raise AssertionError("a container must not be created")
+
+    def forbidden_read_bytes(self):
+        raise AssertionError(f"read_bytes must not be used for {self}")
+
+    monkeypatch.setattr(Path, "read_bytes", forbidden_read_bytes)
+    with pytest.raises(execution.ExecutionBlocked) as caught:
+        execution._do_replay(
+            "unused-dsn",
+            context,
+            ForbiddenSandbox(),
+            {
+                "files": {"artifact": "generation-1/build/vulnerable/parser"},
+                "artifact_digest": _sha(b"12345"),
+            },
+            "vulnerable",
+            "candidate_1",
+            execution._work_root(context) / "inputs" / "candidate.txt",
+            10.0,
+            1,
+            "token",
+        )
+    assert caught.value.reason_code == "MATERIAL_MISSING"
+
+
+def test_run_root_paths_reject_absolute_paths(tmp_path):
+    payload = {
+        "files": {"artifact": "/tmp/x/parser"},
+        "file_digests": {"artifact": _sha(b"x")},
+    }
+    assert (
+        execution._verified_run_file(tmp_path, payload, "artifact", "/parser")
+        is None
+    )
+    assert execution._reusable_build(tmp_path, {**payload, "status": "completed"}) is False
+    replay_payload = {
+        "files": {"stdout": "/tmp/x/stdout.log", "stderr": "/tmp/x/stderr.log"},
+        "file_digests": {
+            "stdout": _sha(b"x"),
+            "stderr": _sha(b"x"),
+        },
+    }
+    assert execution._reusable_replay(tmp_path, replay_payload) is False
+    with pytest.raises(execution.ExecutionFailed) as caught:
+        execution._replay_log_text(
+            replay_payload, tmp_path, "stdout", "stdout"
+        )
+    assert caught.value.reason_code == "RUN_INCOMPLETE"
+
+
+def test_do_replay_rejects_absolute_artifact_path(tmp_path, monkeypatch):
+    context, _, _ = _staging_context(tmp_path, monkeypatch)
+    with pytest.raises(execution.ExecutionBlocked) as caught:
+        execution._do_replay(
+            "unused-dsn",
+            context,
+            object(),
+            {"files": {"artifact": "/tmp/x/parser"}},
+            "vulnerable",
+            "candidate_1",
+            tmp_path / "input",
+            10.0,
+            1,
+            "token",
+        )
+    assert caught.value.reason_code == "PLAN_MISMATCH"
+
+
+def test_verified_run_file_rejects_oversized_file_before_read(tmp_path, monkeypatch):
+    monkeypatch.setattr(execution, "MAX_LOG_BYTES", 4)
+    path = tmp_path / "generation-1" / "stderr.log"
+    path.parent.mkdir()
+    path.write_bytes(b"12345")
+    payload = {
+        "files": {"stderr": "generation-1/stderr.log"},
         "file_digests": {"stderr": _sha(b"12345")},
     }
 
@@ -578,10 +850,11 @@ def test_verified_run_file_rejects_oversized_file_before_read(tmp_path, monkeypa
 
 def test_replay_log_text_rejects_oversized_file_before_read(tmp_path, monkeypatch):
     monkeypatch.setattr(execution, "MAX_LOG_BYTES", 4)
-    path = tmp_path / "stdout.log"
+    path = tmp_path / "generation-1" / "stdout.log"
+    path.parent.mkdir()
     path.write_bytes(b"12345")
     payload = {
-        "files": {"stdout": "stdout.log"},
+        "files": {"stdout": "generation-1/stdout.log"},
         "file_digests": {"stdout": _sha(b"12345")},
     }
 
@@ -597,21 +870,31 @@ def test_replay_log_text_rejects_oversized_file_before_read(tmp_path, monkeypatc
 def test_reusable_build_and_replay_reject_oversized_files(tmp_path, monkeypatch):
     monkeypatch.setattr(execution, "MAX_LOG_BYTES", 4)
     monkeypatch.setattr(execution, "MAX_ARTIFACT_BYTES", 4)
-    (tmp_path / "parser").write_bytes(b"12345")
-    (tmp_path / "build.log").write_bytes(b"12345")
+    build_dir = tmp_path / "generation-1" / "build" / "vulnerable"
+    build_dir.mkdir(parents=True)
+    (build_dir / "parser").write_bytes(b"12345")
+    (build_dir / "build.log").write_bytes(b"12345")
     build_payload = {
         "status": "completed",
-        "files": {"artifact": "parser", "log": "build.log"},
+        "files": {
+            "artifact": "generation-1/build/vulnerable/parser",
+            "log": "generation-1/build/vulnerable/build.log",
+        },
         "file_digests": {
             "artifact": _sha(b"12345"),
             "log": _sha(b"12345"),
         },
     }
     assert execution._reusable_build(tmp_path, build_payload) is False
-    (tmp_path / "stdout.log").write_bytes(b"12345")
-    (tmp_path / "stderr.log").write_bytes(b"12345")
+    replay_dir = tmp_path / "generation-1" / "replay" / "vulnerable" / "normal"
+    replay_dir.mkdir(parents=True)
+    (replay_dir / "stdout.log").write_bytes(b"12345")
+    (replay_dir / "stderr.log").write_bytes(b"12345")
     replay_payload = {
-        "files": {"stdout": "stdout.log", "stderr": "stderr.log"},
+        "files": {
+            "stdout": "generation-1/replay/vulnerable/normal/stdout.log",
+            "stderr": "generation-1/replay/vulnerable/normal/stderr.log",
+        },
         "file_digests": {
             "stdout": _sha(b"12345"),
             "stderr": _sha(b"12345"),
@@ -685,6 +968,157 @@ def test_archive_refuses_nested_evidence_root_before_mark_or_write(
 ):
     run_root = tmp_path / "runs"
     evidence_root = run_root / "evidence"
+    monkeypatch.setenv("DATACON_EVIDENCE_ROOT", str(evidence_root))
+    marks = []
+    monkeypatch.setattr(
+        execution.state,
+        "mark_archiving",
+        lambda *args, **kwargs: marks.append((args, kwargs)),
+    )
+    context = SimpleNamespace(
+        run_root=run_root,
+        job_id=uuid4(),
+        job_id_text="job-1234",
+        generation=1,
+        plan_digest="sha256:" + "a" * 64,
+    )
+    digest, path, error = execution._archive(
+        "dsn",
+        context,
+        report={},
+        report_markdown="",
+        artifacts={},
+        verdict=None,
+    )
+    assert (digest, path) == (None, None)
+    assert error is not None
+    assert error.startswith("EVIDENCE_WRITE_FAILED:")
+    assert marks == []
+    assert not evidence_root.exists()
+
+
+# ---------------------------------------------------------------------------
+# R1: run-root containment uses filesystem identity, not resolved strings.
+# ---------------------------------------------------------------------------
+
+
+def test_outside_run_root_rejects_the_run_root_itself(tmp_path):
+    run_root = tmp_path / "run"
+    run_root.mkdir()
+    with pytest.raises(execution.ExecutionFailed) as caught:
+        execution._outside_run_root(run_root, run_root, "evidence root")
+    assert caught.value.reason_code == "EVIDENCE_WRITE_FAILED"
+
+
+@pytest.mark.parametrize("variant", ["RUN", "Run"])
+def test_outside_run_root_rejects_case_variants(tmp_path, variant):
+    run_root = tmp_path / "run"
+    run_root.mkdir()
+    target = tmp_path / variant / "evidence"
+    with pytest.raises(execution.ExecutionFailed) as caught:
+        execution._outside_run_root(target, run_root, "evidence root")
+    assert caught.value.reason_code == "EVIDENCE_WRITE_FAILED"
+
+
+def test_outside_run_root_rejects_unicode_normalization_variants(tmp_path):
+    nfc = unicodedata.normalize("NFC", "café")
+    nfd = unicodedata.normalize("NFD", "café")
+    assert nfc != nfd
+    run_root = tmp_path / nfc
+    run_root.mkdir()
+    target = tmp_path / nfd / "evidence"
+    with pytest.raises(execution.ExecutionFailed) as caught:
+        execution._outside_run_root(target, run_root, "evidence root")
+    assert caught.value.reason_code == "EVIDENCE_WRITE_FAILED"
+
+
+def test_outside_run_root_rejects_parent_traversal_into_run_root(tmp_path):
+    run_root = tmp_path / "run"
+    run_root.mkdir()
+    target = run_root / ".." / "run" / "evidence"
+    with pytest.raises(execution.ExecutionFailed) as caught:
+        execution._outside_run_root(target, run_root, "evidence root")
+    assert caught.value.reason_code == "EVIDENCE_WRITE_FAILED"
+
+
+def test_outside_run_root_rejects_relative_path_into_run_root(
+    tmp_path, monkeypatch
+):
+    run_root = tmp_path / "run"
+    run_root.mkdir()
+    monkeypatch.chdir(tmp_path)
+    with pytest.raises(execution.ExecutionFailed) as caught:
+        execution._outside_run_root(
+            Path("run/evidence"), run_root, "evidence root"
+        )
+    assert caught.value.reason_code == "EVIDENCE_WRITE_FAILED"
+    outside = execution._outside_run_root(
+        Path("outside-evidence"), run_root, "evidence root"
+    )
+    assert outside == (tmp_path / "outside-evidence").resolve()
+
+
+def test_outside_run_root_rejects_a_symlink_into_the_run_root(tmp_path):
+    run_root = tmp_path / "run"
+    run_root.mkdir()
+    link = tmp_path / "link"
+    link.symlink_to(run_root, target_is_directory=True)
+    with pytest.raises(execution.ExecutionFailed) as caught:
+        execution._outside_run_root(link / "evidence", run_root, "evidence root")
+    assert caught.value.reason_code == "EVIDENCE_WRITE_FAILED"
+
+
+def test_outside_run_root_rejects_a_missing_target_below_the_run_root(tmp_path):
+    run_root = tmp_path / "run"
+    run_root.mkdir()
+    target = run_root / "missing" / "evidence"
+    with pytest.raises(execution.ExecutionFailed) as caught:
+        execution._outside_run_root(target, run_root, "evidence root")
+    assert caught.value.reason_code == "EVIDENCE_WRITE_FAILED"
+
+
+def test_outside_run_root_accepts_a_real_outside_directory(tmp_path):
+    run_root = tmp_path / "run"
+    run_root.mkdir()
+    target = tmp_path / "evidence"
+    target.mkdir()
+    assert (
+        execution._outside_run_root(target, run_root, "evidence root")
+        == target.resolve()
+    )
+
+
+def test_journal_secret_case_variant_inside_run_root_fails_closed(
+    tmp_path, monkeypatch
+):
+    run_root = tmp_path / "run"
+    run_root.mkdir()
+    monkeypatch.setenv("DATACON_EVIDENCE_ROOT", str(tmp_path / "evidence"))
+    monkeypatch.setenv(
+        "DATACON_JOURNAL_SECRET_FILE", str(tmp_path / "RUN" / ".secret")
+    )
+    with pytest.raises(execution.ExecutionFailed) as caught:
+        execution._journal_secret_path(run_root)
+    assert caught.value.reason_code == "EVIDENCE_WRITE_FAILED"
+
+
+def test_staging_root_case_variant_inside_run_root_fails_closed(
+    tmp_path, monkeypatch
+):
+    context, _, _ = _staging_context(tmp_path, monkeypatch)
+    configured = tmp_path / "RUNS" / "staging"
+    monkeypatch.setenv("DATACON_STAGING_ROOT", str(configured))
+    with pytest.raises(execution.ExecutionFailed) as caught:
+        execution._staging_root(context)
+    assert caught.value.reason_code == "EVIDENCE_WRITE_FAILED"
+
+
+def test_archive_rejects_case_variant_evidence_root_before_mark(
+    tmp_path, monkeypatch
+):
+    run_root = tmp_path / "runs"
+    run_root.mkdir()
+    evidence_root = tmp_path / "RUNS" / "evidence"
     monkeypatch.setenv("DATACON_EVIDENCE_ROOT", str(evidence_root))
     marks = []
     monkeypatch.setattr(
@@ -920,8 +1354,8 @@ def test_replay_mounts_staged_parser_and_input_after_run_root_tamper(
                 metadata={},
             )
 
-    def persist(dsn, ctx, result, attempt_no, token):
-        return {"status": result.status}
+    def persist(dsn, ctx, result, attempt_no, token, *, artifact_digest=None):
+        return {"status": result.status, "artifact_digest": artifact_digest}
 
     monkeypatch.setattr(execution, "_persist_replay", persist)
     sandbox = StagingReplaySandbox()

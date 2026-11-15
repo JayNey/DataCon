@@ -17,12 +17,18 @@ import os
 from pathlib import Path
 import shutil
 import stat
+import unicodedata
 import uuid
 from typing import Any, Callable, Mapping, Sequence
 from uuid import UUID
 
 from datacon import contracts, jsonutil, state
-from datacon.cases import CaseConfigurationError, CaseDefinition, load_registry
+from datacon.cases import (
+    MAX_MATERIAL_BYTES,
+    CaseConfigurationError,
+    CaseDefinition,
+    load_registry,
+)
 from datacon.evidence import BundleError, verify_bundle, write_bundle
 from datacon.tools.sandbox import (
     MAX_ARTIFACT_BYTES,
@@ -151,25 +157,116 @@ def _digest(data: bytes) -> str:
 def _read_run_file_bounded(path: Path, *, max_bytes: int) -> bytes | None:
     """Read a run-root file only after proving it is a small regular file.
 
-    Everything below ``DATACON_RUN_ROOT`` is attacker-writable. Rejecting an
-    oversized or non-regular file *before* opening it prevents a huge journal,
-    log or artifact from exhausting worker memory ahead of digest/HMAC checks.
+    Everything below ``DATACON_RUN_ROOT`` is attacker-writable. The file is
+    opened with ``O_NOFOLLOW`` and ``O_NONBLOCK`` and then checked with
+    ``fstat`` so a symlink swap or FIFO can neither redirect the read nor block
+    the worker. Rejecting an oversized or non-regular file *before* reading
+    prevents a huge journal, log or artifact from exhausting memory ahead of
+    digest/HMAC checks.
     """
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
     try:
-        info = path.lstat()
+        descriptor = os.open(path, flags)
     except OSError:
         return None
-    if not stat.S_ISREG(info.st_mode) or info.st_size > max_bytes:
-        return None
     try:
-        with path.open("rb") as handle:
-            data = handle.read(max_bytes + 1)
-            extra = handle.read(1)
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > max_bytes:
+            return None
+        remaining = max_bytes + 1
+        chunks: list[bytes] = []
+        while remaining > 0:
+            chunk = os.read(descriptor, remaining)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        data = b"".join(chunks)
+        if len(data) > max_bytes:
+            return None
+        if os.read(descriptor, 1):
+            return None
+        if len(data) != info.st_size:
+            return None
+        return data
     except OSError:
         return None
-    if len(data) != info.st_size or extra:
+    finally:
+        os.close(descriptor)
+
+
+def _stat_identity(path: Path, label: str) -> tuple[int, int] | None:
+    """Return ``(st_dev, st_ino)`` or ``None`` when the path does not exist."""
+    try:
+        info = os.stat(path)
+    except (FileNotFoundError, NotADirectoryError):
         return None
-    return data
+    except OSError as error:
+        # An unreadable ancestor means containment cannot be proven.
+        raise ExecutionFailed(
+            "EVIDENCE_WRITE_FAILED", f"{label} cannot be inspected: {error}"
+        ) from error
+    return (info.st_dev, info.st_ino)
+
+
+def _normalized_parts(path: Path) -> tuple[str, ...]:
+    return tuple(
+        unicodedata.normalize("NFC", part).casefold() for part in path.parts
+    )
+
+
+def _lexically_within_run_root(path: Path, run_root: Path) -> bool:
+    """Conservative normalized comparison for paths whose identity is unknown.
+
+    This is deliberately broader than a byte comparison: it also catches
+    case-only and NFC/NFD-only variants that a case-insensitive or
+    normalization-insensitive filesystem would resolve to the run root.
+    """
+    path_parts = _normalized_parts(path)
+    root_parts = _normalized_parts(run_root)
+    return (
+        len(path_parts) >= len(root_parts)
+        and path_parts[: len(root_parts)] == root_parts
+    )
+
+
+def _inside_run_root(path: Path, run_root: Path, label: str) -> bool:
+    """Decide containment using filesystem identity, not resolved strings.
+
+    ``path`` and ``run_root`` are already resolved lexically. For every
+    existing ancestor of ``path`` we compare device/inode numbers with the run
+    root, which is what makes a case-only or Unicode-normalization-only variant
+    of the same directory indistinguishable from the original. A conservative
+    normalized component comparison is applied as well, so a not-yet-created
+    path nested under a case variant is still rejected on case-sensitive
+    filesystems.
+    """
+    if _lexically_within_run_root(path, run_root):
+        return True
+    root_identity = _stat_identity(run_root, label)
+    current = path
+    while True:
+        identity = _stat_identity(current, label)
+        if identity is not None:
+            break
+        parent = current.parent
+        if parent == current:
+            return False
+        current = parent
+    if root_identity is None:
+        return False
+    probe = current
+    while True:
+        if _stat_identity(probe, label) == root_identity:
+            return True
+        parent = probe.parent
+        if parent == probe:
+            return False
+        probe = parent
 
 
 def _safe_name(value: str) -> str:
@@ -625,9 +722,13 @@ def _materialize(
             ("candidate", candidate_path, context.plan["inputs"]["candidate"]),
             ("normal", normal_path, context.plan["inputs"]["normal"]),
         ):
-            if path.is_symlink() or not path.is_file():
-                raise ExecutionBlocked("MATERIAL_MISSING", f"materialized {label} input is missing")
-            if _digest(path.read_bytes()) != expected:
+            data = _read_run_file_bounded(path, max_bytes=MAX_MATERIAL_BYTES)
+            if data is None:
+                raise ExecutionBlocked(
+                    "MATERIAL_MISSING",
+                    f"materialized {label} input is missing or too large",
+                )
+            if _digest(data) != expected:
                 raise ExecutionBlocked("MATERIAL_MISSING", f"materialized {label} input drifted")
         return target, {
             "candidate": candidate_path,
@@ -685,11 +786,13 @@ def _material_digests(
 def _verify_materialized(target: Path, payloads: Mapping[str, bytes]) -> None:
     for relative, expected in payloads.items():
         path = target / Path(relative)
-        if path.is_symlink() or not path.is_file():
+        data = _read_run_file_bounded(path, max_bytes=MAX_MATERIAL_BYTES)
+        if data is None:
             raise ExecutionBlocked(
-                "MATERIAL_MISSING", f"materialized file is missing: {relative}"
+                "MATERIAL_MISSING",
+                f"materialized file is missing, not regular or too large: {relative}",
             )
-        if path.read_bytes() != expected:
+        if data != expected:
             raise ExecutionBlocked(
                 "MATERIAL_MISSING", f"materialized file drifted: {relative}"
             )
@@ -728,7 +831,13 @@ def _verify_materialized_tree(
         )
     for relative, digest in expected.items():
         path = target / Path(relative)
-        if _digest(path.read_bytes()) != digest:
+        data = _read_run_file_bounded(path, max_bytes=MAX_MATERIAL_BYTES)
+        if data is None:
+            raise ExecutionBlocked(
+                "MATERIAL_MISSING",
+                f"materialized file is missing, not regular or too large: {relative}",
+            )
+        if _digest(data) != digest:
             raise ExecutionBlocked(
                 "MATERIAL_MISSING", f"materialized file drifted: {relative}"
             )
@@ -758,15 +867,22 @@ def _generation_root(context: ExecutionContext) -> Path:
 
 
 def _outside_run_root(path: Path, run_root: Path, label: str) -> Path:
-    """Resolve ``path`` and reject anything inside the writable run root."""
+    """Resolve ``path`` and reject anything inside the writable run root.
+
+    Containment is decided from device/inode identities of the deepest
+    existing ancestors (see ``_inside_run_root``), never from resolved strings
+    alone. That catches ``target == run_root``, nested targets and case-only or
+    Unicode-normalization variants of the run-root path on filesystems that
+    treat them as the same directory.
+    """
     try:
         resolved = path.expanduser().resolve()
         resolved_root = run_root.expanduser().resolve()
-    except OSError as error:
+    except (OSError, RuntimeError) as error:
         raise ExecutionFailed(
             "EVIDENCE_WRITE_FAILED", f"{label} cannot be resolved: {error}"
         ) from error
-    if resolved == resolved_root or resolved_root in resolved.parents:
+    if _inside_run_root(resolved, resolved_root, label):
         raise ExecutionFailed(
             "EVIDENCE_WRITE_FAILED",
             f"{label} must live outside DATACON_RUN_ROOT",
@@ -816,6 +932,9 @@ def _staging_root(context: ExecutionContext) -> Path:
             raise ExecutionFailed(
                 "EVIDENCE_WRITE_FAILED", "staging root is not owned by this user"
             )
+        # Re-check the final directory. The pre-create check used the deepest
+        # existing ancestor; only the created inode proves where it landed.
+        resolved = _outside_run_root(resolved, context.run_root, "staging root")
         resolved.chmod(0o700)
     except ExecutionFailed:
         raise
@@ -915,18 +1034,15 @@ def _stage_materials(
         staged: dict[str, str] = {}
         for relative in sorted(material_digests):
             source = materials_dir / Path(relative)
-            if source.is_symlink() or not source.is_file():
+            data = _read_run_file_bounded(
+                source, max_bytes=MAX_MATERIAL_BYTES
+            )
+            if data is None:
                 raise ExecutionBlocked(
                     "MATERIAL_MISSING",
-                    f"material disappeared before staging: {relative}",
+                    f"material disappeared, is not regular or is too large "
+                    f"before staging: {relative}",
                 )
-            try:
-                data = source.read_bytes()
-            except OSError as error:
-                raise ExecutionBlocked(
-                    "MATERIAL_MISSING",
-                    f"material cannot be read before staging: {relative}",
-                ) from error
             actual = _digest(data)
             if actual != material_digests[relative]:
                 raise ExecutionBlocked(
@@ -969,21 +1085,17 @@ def _stage_replay_files(
     """Copy the parser and input outside the run root and verify both copies."""
     directory = _new_staging_directory(context, label)
     try:
-        for source, relative, expected, mode, kind in (
-            (artifact_path, "parser", artifact_digest, 0o555, "parser"),
-            (input_path, "input", input_digest, 0o444, "input"),
+        for source, relative, expected, mode, kind, limit in (
+            (artifact_path, "parser", artifact_digest, 0o555, "parser", MAX_ARTIFACT_BYTES),
+            (input_path, "input", input_digest, 0o444, "input", MAX_MATERIAL_BYTES),
         ):
-            if source.is_symlink() or not source.is_file():
-                raise ExecutionBlocked(
-                    "MATERIAL_MISSING", f"replay {kind} is missing before staging"
-                )
-            try:
-                data = source.read_bytes()
-            except OSError as error:
+            data = _read_run_file_bounded(source, max_bytes=limit)
+            if data is None:
                 raise ExecutionBlocked(
                     "MATERIAL_MISSING",
-                    f"replay {kind} cannot be read before staging",
-                ) from error
+                    f"replay {kind} is missing, not regular or too large "
+                    f"before staging",
+                )
             actual = _digest(data)
             if actual != expected:
                 raise ExecutionBlocked(
@@ -991,13 +1103,13 @@ def _stage_replay_files(
                     f"replay {kind} changed before staging",
                 )
             destination = _write_staged_file(directory, relative, data, mode)
-            try:
-                staged_digest = _digest(destination.read_bytes())
-            except OSError as error:
+            staged_data = _read_run_file_bounded(destination, max_bytes=limit)
+            if staged_data is None:
                 raise ExecutionFailed(
                     "EVIDENCE_WRITE_FAILED",
-                    f"cannot verify staged replay {kind}: {error}",
-                ) from error
+                    f"cannot read back staged replay {kind}",
+                )
+            staged_digest = _digest(staged_data)
             if staged_digest != expected:
                 raise ExecutionBlocked(
                     "PLAN_MISMATCH",
@@ -1069,6 +1181,9 @@ def _journal_secret(*, create: bool, run_root: Path) -> bytes | None:
                 "EVIDENCE_WRITE_FAILED",
                 f"journal secret is unavailable: {error}",
             ) from error
+    # The file may have been created after the path-level check. Re-check the
+    # final inode so a path that landed inside the run root is never read.
+    path = _outside_run_root(path, run_root, "journal secret")
     try:
         info = path.lstat()
         if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
@@ -1465,6 +1580,8 @@ def _persist_replay(
     result: ReplayResult,
     attempt_no: int,
     token: str,
+    *,
+    artifact_digest: str | None = None,
 ) -> dict[str, Any]:
     run_root = _work_root(context)
     directory = _generation_root(context) / "replay" / result.version / result.phase
@@ -1494,6 +1611,7 @@ def _persist_replay(
         "attempt_token": token,
         "plan_digest": context.plan_digest,
         "input_digest": result.input_digest,
+        "artifact_digest": artifact_digest,
         "status": result.status,
         "version": result.version,
         "phase": result.phase,
@@ -1510,6 +1628,9 @@ def _persist_replay(
         },
         **result.as_dict(),
     }
+    # Keep the build binding authoritative even if a sandbox result happens to
+    # carry a same-named metadata field.
+    payload["artifact_digest"] = artifact_digest
     _write_journal(
         run_root,
         _replay_step(result.version, result.phase),
@@ -1686,6 +1807,37 @@ def _build_report(
     return report, "\n".join(lines)
 
 
+def _run_root_path(
+    run_root: Path, relative: Any, suffix: str
+) -> Path | None:
+    """Map a journal-recorded path to a file strictly inside the run root.
+
+    Journal payloads are attacker-writable. Absolute paths, parent traversal
+    and paths that resolve outside the run root are rejected instead of being
+    joined to ``run_root`` (where an absolute operand would silently replace
+    the trusted prefix).
+    """
+    if not isinstance(relative, str) or not relative:
+        return None
+    candidate = Path(relative)
+    if candidate.is_absolute() or candidate.drive:
+        return None
+    if relative.startswith(("\\", "//")):
+        return None
+    if ".." in candidate.parts:
+        return None
+    if not relative.endswith(suffix):
+        return None
+    try:
+        root = run_root.resolve()
+        path = (root / candidate).resolve()
+    except (OSError, RuntimeError):
+        return None
+    if path == root or root not in path.parents:
+        return None
+    return path
+
+
 def _verified_run_file(
     run_root: Path,
     payload: Mapping[str, Any],
@@ -1694,12 +1846,8 @@ def _verified_run_file(
 ) -> bytes | None:
     files = payload.get("files")
     relative = files.get(key) if isinstance(files, Mapping) else None
-    if not isinstance(relative, str) or ".." in Path(relative).parts:
-        return None
-    if not relative.endswith(suffix):
-        return None
-    path = run_root / relative
-    if path.is_symlink() or not path.is_file():
+    path = _run_root_path(run_root, relative, suffix)
+    if path is None:
         return None
     limit = MAX_ARTIFACT_BYTES if suffix == "/parser" else MAX_LOG_BYTES
     data = _read_run_file_bounded(path, max_bytes=limit)
@@ -1886,6 +2034,18 @@ def _archive(
     try:
         evidence_root.mkdir(mode=0o700, parents=True, exist_ok=True)
         evidence_root.chmod(0o700)
+        try:
+            final_root = _outside_run_root(
+                evidence_root, context.run_root, "DATACON_EVIDENCE_ROOT"
+            )
+        except ExecutionFailed as error:
+            return None, None, f"{error.reason_code}: {error.message}"
+        if final_root != evidence_root:
+            return (
+                None,
+                None,
+                "EVIDENCE_WRITE_FAILED: evidence root changed after creation",
+            )
         bundle = evidence_root / context.job_id_text
         if bundle.is_symlink():
             raise BundleError("SYMLINK", "evidence destination is a symlink")
@@ -2593,11 +2753,9 @@ def _replay_log_text(
     files = payload.get("files")
     relative = files.get(key) if isinstance(files, Mapping) else None
     if isinstance(relative, str):
-        if ".." in Path(relative).parts or not relative.endswith(f"/{key}.log"):
+        path = _run_root_path(run_root, relative, f"/{key}.log")
+        if path is None:
             raise ExecutionFailed("RUN_INCOMPLETE", f"unsafe {key} evidence path")
-        path = run_root / relative
-        if path.is_symlink() or not path.is_file():
-            raise ExecutionFailed("RUN_INCOMPLETE", f"{key} evidence file is missing")
         data = _read_run_file_bounded(path, max_bytes=MAX_LOG_BYTES)
         if data is None:
             raise ExecutionFailed(
@@ -2650,12 +2808,8 @@ def _reusable_build(run_root: Path, payload: Mapping[str, Any]) -> bool:
         return False
     for key, suffix in (("artifact", "/parser"), ("log", "/build.log")):
         relative = files.get(key)
-        if not isinstance(relative, str) or ".." in Path(relative).parts:
-            return False
-        if not relative.endswith(suffix):
-            return False
-        path = run_root / relative
-        if path.is_symlink() or not path.is_file():
+        path = _run_root_path(run_root, relative, suffix)
+        if path is None:
             return False
         limit = MAX_ARTIFACT_BYTES if key == "artifact" else MAX_LOG_BYTES
         data = _read_run_file_bounded(path, max_bytes=limit)
@@ -2671,12 +2825,8 @@ def _reusable_replay(run_root: Path, payload: Mapping[str, Any]) -> bool:
         return False
     for key, suffix in (("stdout", "/stdout.log"), ("stderr", "/stderr.log")):
         relative = files.get(key)
-        if not isinstance(relative, str) or ".." in Path(relative).parts:
-            return False
-        if not relative.endswith(suffix):
-            return False
-        path = run_root / relative
-        if path.is_symlink() or not path.is_file():
+        path = _run_root_path(run_root, relative, suffix)
+        if path is None:
             return False
         data = _read_run_file_bounded(path, max_bytes=MAX_LOG_BYTES)
         if data is None or _digest(data) != digests.get(key):
@@ -2788,21 +2938,25 @@ def _do_replay(
 ) -> dict[str, Any]:
     files = build.get("files") if isinstance(build.get("files"), Mapping) else {}
     relative = files.get("artifact") if isinstance(files, Mapping) else None
-    if (
-        not isinstance(relative, str)
-        or ".." in Path(relative).parts
-        or not relative.endswith("/parser")
-    ):
+    artifact_path = _run_root_path(_work_root(context), relative, "/parser")
+    if artifact_path is None:
         raise ExecutionBlocked(
             "PLAN_MISMATCH", "the build result has no trusted parser path"
         )
-    artifact_path = _work_root(context) / relative
     expected_artifact = build.get("artifact_digest")
-    if artifact_path.is_symlink() or not artifact_path.is_file():
-        raise ExecutionBlocked("MATERIAL_MISSING", "the built parser is missing")
-    if not isinstance(expected_artifact, str) or _digest(
-        artifact_path.read_bytes()
-    ) != expected_artifact:
+    if not isinstance(expected_artifact, str):
+        raise ExecutionBlocked(
+            "PLAN_MISMATCH", "the build result has no trusted parser digest"
+        )
+    artifact = _read_run_file_bounded(
+        artifact_path, max_bytes=MAX_ARTIFACT_BYTES
+    )
+    if artifact is None:
+        raise ExecutionBlocked(
+            "MATERIAL_MISSING",
+            "the built parser is missing, not regular or too large",
+        )
+    if _digest(artifact) != expected_artifact:
         raise ExecutionBlocked(
             "PLAN_MISMATCH", "the built parser changed before replay"
         )
@@ -2861,7 +3015,14 @@ def _do_replay(
                     "error": error.message,
                 },
             )
-        return _persist_replay(dsn, context, result, attempt_no, token)
+        return _persist_replay(
+            dsn,
+            context,
+            result,
+            attempt_no,
+            token,
+            artifact_digest=expected_artifact,
+        )
     except BaseException as error:
         failure = error
         raise
