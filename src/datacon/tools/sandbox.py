@@ -1095,6 +1095,7 @@ printf 'uid=%s\nseccomp=%s\nseccomp_filters=%s\nno_new_privs=%s\ncap_eff=%s\ncgr
             env={"TMPDIR": "/work", "HOME": "/work"},
             docker=self.docker,
             job_id=self.job_id,
+            generation=self.generation,
             labels={"datacon.run": "probe"},
         )
         try:

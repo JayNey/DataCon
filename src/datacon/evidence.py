@@ -700,6 +700,10 @@ def _verify_builds(
     report: Mapping[str, Any],
     data: Mapping[str, bytes],
     expected_compile_args: list[str],
+    *,
+    job_id: str,
+    plan_digest: str,
+    materials: Mapping[str, str],
 ) -> None:
     truncation_allowed = _truncation_allowed(verdict, report)
     builds = report.get("builds")
@@ -723,6 +727,11 @@ def _verify_builds(
             raise BundleError(
                 "INVALID_MANIFEST", f"{version} build did not complete"
             )
+        if build.get("plan_digest") != plan_digest or build.get("job_id") != job_id:
+            raise BundleError(
+                "INVALID_MANIFEST",
+                f"{version} build provenance does not match",
+            )
         if build.get("input_digest") != plan.get("analysis_digest"):
             raise BundleError(
                 "DIGEST_MISMATCH", f"{version} build input does not match the plan"
@@ -735,6 +744,16 @@ def _verify_builds(
             raise BundleError(
                 "DIGEST_MISMATCH", f"{version} build recipe does not match the plan"
             )
+        staged = _mapping(
+            build.get("staged_materials"), f"{version} staged_materials"
+        )
+        for relative, digest in materials.items():
+            if staged.get(relative) != digest:
+                raise BundleError(
+                    "DIGEST_MISMATCH",
+                    f"{version} build staged material does not match plan: "
+                    f"{relative}",
+                )
         if list(build.get("compile_args") or []) != expected_compile_args:
             raise BundleError(
                 "INVALID_MANIFEST",
@@ -791,6 +810,9 @@ def _verify_replays(
     verdict: str,
     report: Mapping[str, Any],
     data: Mapping[str, bytes],
+    *,
+    job_id: str,
+    plan_digest: str,
 ) -> dict[tuple[str, str], dict[str, Any]]:
     replays = report.get("replays")
     if not isinstance(replays, list):
@@ -819,6 +841,32 @@ def _verify_replays(
                 "INVALID_MANIFEST",
                 f"replay {version}/{phase} has a status {status!r} that is not "
                 f"allowed for verdict {verdict}",
+            )
+        exit_code = item.get("exit_code")
+        if exit_code is not None and type(exit_code) is not int:
+            raise BundleError(
+                "INVALID_MANIFEST",
+                f"replay {version}/{phase} exit_code must be an integer or null",
+            )
+        if status == "completed" and type(exit_code) is not int:
+            raise BundleError(
+                "INVALID_MANIFEST",
+                f"completed replay {version}/{phase} must record an integer exit_code",
+            )
+        if item.get("plan_digest") != plan_digest or item.get("job_id") != job_id:
+            raise BundleError(
+                "INVALID_MANIFEST",
+                f"replay {version}/{phase} provenance does not match",
+            )
+        if item.get("image_digest") != plan.get("image_digest"):
+            raise BundleError(
+                "DIGEST_MISMATCH",
+                f"replay {version}/{phase} image does not match plan",
+            )
+        if item.get("asan_options") != plan.get("asan_options"):
+            raise BundleError(
+                "INVALID_MANIFEST",
+                f"replay {version}/{phase} ASan options do not match plan",
             )
         expected_input = (
             plan.get("inputs", {}).get("normal")
@@ -916,6 +964,11 @@ def _verify_replays(
     return observations
 
 
+def _exit_code_matches(actual: Any, expected: Any) -> bool:
+    """Match planned exit codes with the same strict predicate as verdict.py."""
+    return type(expected) is int and type(actual) is int and actual == expected
+
+
 def _candidate_kind(
     plan: Mapping[str, Any],
     observation: Mapping[str, Any],
@@ -926,11 +979,15 @@ def _candidate_kind(
     if (
         signature is not None
         and signature_matches(signature, plan.get("asan_signature") or {})
-        and observation.get("exit_code") == expected_exit.get("candidate_asan")
+        and _exit_code_matches(
+            observation.get("exit_code"), expected_exit.get("candidate_asan")
+        )
     ):
         return "target_signature"
     if (
-        observation.get("exit_code") == expected_exit.get("candidate_clean")
+        _exit_code_matches(
+            observation.get("exit_code"), expected_exit.get("candidate_clean")
+        )
         and observation.get("stdout") == expected_stdout.get("candidate_clean")
         and not has_asan_diagnostic(observation.get("stderr"))
     ):
@@ -946,7 +1003,7 @@ def _control_mismatch(
     """Return the first abnormal field for a completed normal control."""
     if control.get("status") != "completed":
         return "status"
-    if control.get("exit_code") != expected_exit.get("normal"):
+    if not _exit_code_matches(control.get("exit_code"), expected_exit.get("normal")):
         return "exit"
     if control.get("stdout") != expected_stdout.get("normal"):
         return "stdout"
@@ -1036,7 +1093,9 @@ def _verify_outcome(
             status = control.get("status")
             if status == "completed":
                 # A completed control still has to prove the planned exit.
-                if control.get("exit_code") != expected_exit.get("normal"):
+                if not _exit_code_matches(
+                    control.get("exit_code"), expected_exit.get("normal")
+                ):
                     raise BundleError(
                         "INVALID_MANIFEST",
                         f"{version} normal control exit does not match",
@@ -1071,6 +1130,15 @@ def _verify_outcome(
             )
 
     if verdict == "REPRODUCED":
+        # The rule engine only classifies target_signature with an integer
+        # planned candidate exit code. A plan without one can never support a
+        # REPRODUCED verdict, even when an ASan log and a null exit code line
+        # up by accident.
+        if type(expected_exit.get("candidate_asan")) is not int:
+            raise BundleError(
+                "INVALID_MANIFEST",
+                "REPRODUCED requires an integer planned candidate ASan exit code",
+            )
         for version in _REPLAY_VERSIONS:
             for phase in _CANDIDATE_PHASES:
                 kind = _candidate_kind(
@@ -1154,6 +1222,14 @@ def _verify_semantics(
         raise BundleError(
             "INVALID_MANIFEST", "manifest reason_code does not match report"
         )
+    rule = report.get("rule")
+    if isinstance(rule, Mapping) and (
+        rule.get("verdict") != report_verdict
+        or rule.get("reason_code") != report_reason
+    ):
+        raise BundleError(
+            "INVALID_MANIFEST", "report rule trace does not match report verdict"
+        )
     if verdict in _FULL_EVIDENCE_VERDICTS:
         if report_reason is None or not reason_allowed(verdict, report_reason):
             raise BundleError(
@@ -1213,6 +1289,15 @@ def _verify_semantics(
                 {"replay_metadata"}
             )
     _require_evidence_roles(listed, expected)
+    execution_metadata = _parse_json_file(data, "metadata/execution.json")
+    if (
+        execution_metadata.get("job_id") != job_id
+        or execution_metadata.get("plan_digest") != plan_digest
+    ):
+        raise BundleError(
+            "INVALID_MANIFEST",
+            "execution metadata does not match manifest job_id/plan_digest",
+        )
 
     report_repository = report.get("repository")
     if report_repository != plan.get("repository"):
@@ -1256,8 +1341,19 @@ def _verify_semantics(
             "INVALID_MANIFEST",
             "report environment compile args do not match the reviewed recipe",
         )
-    _verify_builds(plan, verdict, report, data, expected_compile_args)
-    observations = _verify_replays(plan, verdict, report, data)
+    _verify_builds(
+        plan,
+        verdict,
+        report,
+        data,
+        expected_compile_args,
+        job_id=job_id,
+        plan_digest=plan_digest,
+        materials=materials,
+    )
+    observations = _verify_replays(
+        plan, verdict, report, data, job_id=job_id, plan_digest=plan_digest
+    )
     _verify_outcome(plan, verdict, report, observations, expected_stdout)
 
 

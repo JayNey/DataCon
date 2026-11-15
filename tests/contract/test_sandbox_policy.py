@@ -24,6 +24,7 @@ from datacon.tools.sandbox import (
     ResourceLimits,
     SandboxError,
     SandboxPolicyError,
+    SandboxUnavailable,
     container_create_args,
     evaluate_probe_values,
     validate_host_config,
@@ -447,6 +448,48 @@ def test_docker_sandbox_create_labels_the_generation(tmp_path):
     assert "datacon.generation=3" in labels
 
 
+def test_docker_sandbox_probe_labels_the_generation(tmp_path):
+    sandbox = RecordingSandbox(tmp_path, _inspect_payload(), generation=7)
+    probe_root = tmp_path / "probe"
+    payload = _inspect_payload()
+    payload["Mounts"] = [
+        {
+            "Type": "bind",
+            "Source": str(probe_root),
+            "Destination": "/fixture",
+            "RW": False,
+        }
+    ]
+    success = SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+
+    def fake_docker(command, *, timeout=60.0):
+        sandbox.calls.append(list(command))
+        if command[0] == "image":
+            return success
+        if command[0] == "create":
+            return SimpleNamespace(returncode=0, stdout=b"cid", stderr=b"")
+        if command[0] == "inspect":
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps([payload]).encode(),
+                stderr=b"",
+            )
+        if command[0] == "start":
+            return SimpleNamespace(returncode=1, stdout=b"", stderr=b"stop here")
+        if command[0] == "rm":
+            return success
+        raise AssertionError(f"unexpected docker command: {command}")
+
+    sandbox._docker = fake_docker
+    with pytest.raises(SandboxUnavailable):
+        sandbox.probe()
+    created = next(call for call in sandbox.calls if call and call[0] == "create")
+    labels = _label_values(created)
+    assert "datacon.job_id=job-1234" in labels
+    assert "datacon.run=probe" in labels
+    assert "datacon.generation=7" in labels
+
+
 def test_reclaim_removes_only_older_generation(tmp_path):
     sandbox = DockerSandbox(
         image=IMAGE,
@@ -463,6 +506,7 @@ def test_reclaim_removes_only_older_generation(tmp_path):
         "old": "2",
         "current": "5",
         "newer": "6",
+        "newer_probe": "6",
         "legacy": None,
     }
 
@@ -478,6 +522,8 @@ def test_reclaim_removes_only_older_generation(tmp_path):
             labels = {"datacon.job_id": "job-1234"}
             if containers[name] is not None:
                 labels["datacon.generation"] = containers[name]
+            if name.endswith("probe"):
+                labels["datacon.run"] = "probe"
             return SimpleNamespace(
                 returncode=0,
                 stdout=json.dumps([{"Config": {"Labels": labels}}]).encode(),
@@ -492,6 +538,180 @@ def test_reclaim_removes_only_older_generation(tmp_path):
     assert sandbox.reclaim_job() == 2
     assert set(removed) == {"old", "legacy"}
     assert "current" not in removed and "newer" not in removed
+    assert "newer_probe" not in removed
+
+
+# ---------------------------------------------------------------------------
+# R1: run-root readers reject oversized files before reading their contents.
+# ---------------------------------------------------------------------------
+
+
+def test_read_run_file_bounded_accepts_normal_files_and_rejects_oversize(tmp_path):
+    path = tmp_path / "stderr.log"
+    path.write_bytes(b"12345")
+    assert execution._read_run_file_bounded(path, max_bytes=5) == b"12345"
+    assert execution._read_run_file_bounded(path, max_bytes=4) is None
+
+
+def test_verified_run_file_rejects_oversized_file_before_read(tmp_path, monkeypatch):
+    monkeypatch.setattr(execution, "MAX_LOG_BYTES", 4)
+    path = tmp_path / "stderr.log"
+    path.write_bytes(b"12345")
+    payload = {
+        "files": {"stderr": "stderr.log"},
+        "file_digests": {"stderr": _sha(b"12345")},
+    }
+
+    def forbidden_read_bytes(self):
+        raise AssertionError(f"read_bytes must not be used for {self}")
+
+    def forbidden_open(self, *args, **kwargs):
+        raise AssertionError(f"open must not be used for {self}")
+
+    monkeypatch.setattr(Path, "read_bytes", forbidden_read_bytes)
+    monkeypatch.setattr(Path, "open", forbidden_open)
+    assert (
+        execution._verified_run_file(tmp_path, payload, "stderr", "/stderr.log")
+        is None
+    )
+
+
+def test_replay_log_text_rejects_oversized_file_before_read(tmp_path, monkeypatch):
+    monkeypatch.setattr(execution, "MAX_LOG_BYTES", 4)
+    path = tmp_path / "stdout.log"
+    path.write_bytes(b"12345")
+    payload = {
+        "files": {"stdout": "stdout.log"},
+        "file_digests": {"stdout": _sha(b"12345")},
+    }
+
+    def forbidden_read_bytes(self):
+        raise AssertionError(f"read_bytes must not be used for {self}")
+
+    monkeypatch.setattr(Path, "read_bytes", forbidden_read_bytes)
+    with pytest.raises(execution.ExecutionFailed) as caught:
+        execution._replay_log_text(payload, tmp_path, "stdout", "stdout")
+    assert caught.value.reason_code == "RUN_INCOMPLETE"
+
+
+def test_reusable_build_and_replay_reject_oversized_files(tmp_path, monkeypatch):
+    monkeypatch.setattr(execution, "MAX_LOG_BYTES", 4)
+    monkeypatch.setattr(execution, "MAX_ARTIFACT_BYTES", 4)
+    (tmp_path / "parser").write_bytes(b"12345")
+    (tmp_path / "build.log").write_bytes(b"12345")
+    build_payload = {
+        "status": "completed",
+        "files": {"artifact": "parser", "log": "build.log"},
+        "file_digests": {
+            "artifact": _sha(b"12345"),
+            "log": _sha(b"12345"),
+        },
+    }
+    assert execution._reusable_build(tmp_path, build_payload) is False
+    (tmp_path / "stdout.log").write_bytes(b"12345")
+    (tmp_path / "stderr.log").write_bytes(b"12345")
+    replay_payload = {
+        "files": {"stdout": "stdout.log", "stderr": "stderr.log"},
+        "file_digests": {
+            "stdout": _sha(b"12345"),
+            "stderr": _sha(b"12345"),
+        },
+    }
+    assert execution._reusable_replay(tmp_path, replay_payload) is False
+
+
+def test_find_reusable_journal_skips_oversized_file_before_read(tmp_path, monkeypatch):
+    job_id = uuid4()
+    plan_digest_value = "sha256:" + "a" * 64
+    context = SimpleNamespace(
+        run_root=tmp_path,
+        job_id=job_id,
+        job_id_text=str(job_id),
+        plan_digest=plan_digest_value,
+        generation=3,
+    )
+    work_root = execution._work_root(context)
+    journal = execution._journal_path(work_root, "build:vulnerable", 1, 3)
+    journal.parent.mkdir(parents=True)
+    journal.write_bytes(b"12345")
+    rows = [
+        {
+            "status": "completed",
+            "input_digest": None,
+            "attempt_token": "token",
+            "attempt_no": 1,
+            "generation": 3,
+            "container_id": "cid",
+        }
+    ]
+    monkeypatch.setattr(
+        execution.state,
+        "attempts_for_step_across_generations",
+        lambda *args, **kwargs: rows,
+    )
+    monkeypatch.setattr(execution, "_journal_secret", lambda **kwargs: b"x" * 32)
+    monkeypatch.setattr(execution, "_JOURNAL_MAX_BYTES", 4)
+
+    def forbidden_read_text(self, *args, **kwargs):
+        raise AssertionError(f"read_text must not be used for {self}")
+
+    monkeypatch.setattr(Path, "read_text", forbidden_read_text)
+    assert (
+        execution._find_reusable_journal(
+            "dsn",
+            context,
+            step_key="build:vulnerable",
+            plan_digest=plan_digest_value,
+            input_digest=None,
+            verify=lambda payload: True,
+        )
+        is None
+    )
+
+
+def test_journal_secret_rejects_oversized_secret(tmp_path, monkeypatch):
+    secret = tmp_path / "secret"
+    secret.write_bytes(b"x" * 2048)
+    secret.chmod(0o600)
+    monkeypatch.setenv("DATACON_JOURNAL_SECRET_FILE", str(secret))
+    monkeypatch.setenv("DATACON_EVIDENCE_ROOT", str(tmp_path / "evidence"))
+    with pytest.raises(execution.ExecutionFailed) as caught:
+        execution._journal_secret(create=False, run_root=tmp_path / "runs")
+    assert caught.value.reason_code == "EVIDENCE_WRITE_FAILED"
+
+
+def test_archive_refuses_nested_evidence_root_before_mark_or_write(
+    tmp_path, monkeypatch
+):
+    run_root = tmp_path / "runs"
+    evidence_root = run_root / "evidence"
+    monkeypatch.setenv("DATACON_EVIDENCE_ROOT", str(evidence_root))
+    marks = []
+    monkeypatch.setattr(
+        execution.state,
+        "mark_archiving",
+        lambda *args, **kwargs: marks.append((args, kwargs)),
+    )
+    context = SimpleNamespace(
+        run_root=run_root,
+        job_id=uuid4(),
+        job_id_text="job-1234",
+        generation=1,
+        plan_digest="sha256:" + "a" * 64,
+    )
+    digest, path, error = execution._archive(
+        "dsn",
+        context,
+        report={},
+        report_markdown="",
+        artifacts={},
+        verdict=None,
+    )
+    assert (digest, path) == (None, None)
+    assert error is not None
+    assert error.startswith("EVIDENCE_WRITE_FAILED:")
+    assert marks == []
+    assert not evidence_root.exists()
 
 
 # ---------------------------------------------------------------------------

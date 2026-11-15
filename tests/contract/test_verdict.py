@@ -237,6 +237,25 @@ def test_other_crash_is_inconclusive():
     assert decision.reason_code == "OTHER_CRASH"
 
 
+def test_missing_candidate_asan_exit_is_other_crash_not_reproduced():
+    """The rule engine never turns a null exit code into target_signature."""
+    policy = VerdictPolicy(
+        signature=SIGNATURE,
+        expected_exit={"normal": 0, "candidate_clean": 0},
+        expected_stdout={"normal": "OK\n", "candidate_clean": "ABCD\n"},
+    )
+    runs = [
+        replace(item, exit_code=None)
+        if item.version == "vulnerable" and item.phase.startswith("candidate")
+        else item
+        for item in six_runs()
+    ]
+    decision = decide_verdict(policy, runs, builds=builds())
+    assert decision.verdict == "INCONCLUSIVE"
+    assert decision.reason_code == "OTHER_CRASH"
+    assert decision.checks["vulnerable_candidates"] == ["other", "other"]
+
+
 def test_non_comparable_builds_are_inconclusive():
     drifted = builds()
     drifted["fixed"] = {

@@ -25,6 +25,8 @@ from datacon import contracts, jsonutil, state
 from datacon.cases import CaseConfigurationError, CaseDefinition, load_registry
 from datacon.evidence import BundleError, verify_bundle, write_bundle
 from datacon.tools.sandbox import (
+    MAX_ARTIFACT_BYTES,
+    MAX_LOG_BYTES,
     BuildResult,
     DockerSandbox,
     IsolationPolicy,
@@ -52,6 +54,10 @@ MAX_ATTEMPTS_PER_STEP = 2
 FAULT_ENV = "DATACON_FAULT_AFTER_TOOL"
 TEST_MODE_ENV = "DATACON_TEST_MODE"
 STAGING_ROOT_ENV = "DATACON_STAGING_ROOT"
+# Journals and the HMAC key live inside/next to the run root, so their readers
+# must reject oversized attacker-written files before loading them.
+_JOURNAL_MAX_BYTES = 1024 * 1024
+_JOURNAL_SECRET_MAX_BYTES = 1024
 
 
 def test_hooks_enabled() -> bool:
@@ -140,6 +146,30 @@ def _utc_now() -> str:
 
 def _digest(data: bytes) -> str:
     return "sha256:" + hashlib.sha256(data).hexdigest()
+
+
+def _read_run_file_bounded(path: Path, *, max_bytes: int) -> bytes | None:
+    """Read a run-root file only after proving it is a small regular file.
+
+    Everything below ``DATACON_RUN_ROOT`` is attacker-writable. Rejecting an
+    oversized or non-regular file *before* opening it prevents a huge journal,
+    log or artifact from exhausting worker memory ahead of digest/HMAC checks.
+    """
+    try:
+        info = path.lstat()
+    except OSError:
+        return None
+    if not stat.S_ISREG(info.st_mode) or info.st_size > max_bytes:
+        return None
+    try:
+        with path.open("rb") as handle:
+            data = handle.read(max_bytes + 1)
+            extra = handle.read(1)
+    except OSError:
+        return None
+    if len(data) != info.st_size or extra:
+        return None
+    return data
 
 
 def _safe_name(value: str) -> str:
@@ -744,6 +774,14 @@ def _outside_run_root(path: Path, run_root: Path, label: str) -> Path:
     return resolved
 
 
+def _assert_evidence_root_outside_run_root(run_root: Path) -> Path:
+    """Fail before any archive work when the evidence root is attacker-writable."""
+    evidence_root = Path(
+        os.getenv("DATACON_EVIDENCE_ROOT", ".datacon/evidence")
+    ).expanduser()
+    return _outside_run_root(evidence_root, run_root, "DATACON_EVIDENCE_ROOT")
+
+
 def _staging_root(context: ExecutionContext) -> Path:
     """Return the private staging root used for every mounted byte.
 
@@ -983,10 +1021,7 @@ def _stage_replay_files(
 def _journal_secret_path(run_root: Path) -> Path:
     """Return the HMAC key path, enforcing that it is outside the run root."""
     explicit = os.getenv("DATACON_JOURNAL_SECRET_FILE")
-    evidence_root = Path(
-        os.getenv("DATACON_EVIDENCE_ROOT", ".datacon/evidence")
-    ).expanduser()
-    _outside_run_root(evidence_root, run_root, "DATACON_EVIDENCE_ROOT")
+    evidence_root = _assert_evidence_root_outside_run_root(run_root)
     path = Path(explicit).expanduser() if explicit else (
         evidence_root.parent / ".datacon-journal-secret"
     )
@@ -1044,7 +1079,14 @@ def _journal_secret(*, create: bool, run_root: Path) -> bytes | None:
             raise ExecutionFailed(
                 "EVIDENCE_WRITE_FAILED", "journal secret is not private"
             )
-        data = path.read_bytes()
+        data = _read_run_file_bounded(
+            path, max_bytes=_JOURNAL_SECRET_MAX_BYTES
+        )
+        if data is None:
+            raise ExecutionFailed(
+                "EVIDENCE_WRITE_FAILED",
+                "journal secret is unreadable or too large",
+            )
     except OSError as error:
         raise ExecutionFailed(
             "EVIDENCE_WRITE_FAILED", f"journal secret is unreadable: {error}"
@@ -1273,9 +1315,12 @@ def _find_reusable_journal(
         )
         if path.is_symlink() or not path.is_file():
             continue
+        data = _read_run_file_bounded(path, max_bytes=_JOURNAL_MAX_BYTES)
+        if data is None:
+            continue
         try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError, UnicodeError):
+            payload = json.loads(data.decode("utf-8"))
+        except (ValueError, UnicodeError):
             continue
         if not isinstance(payload, dict):
             continue
@@ -1656,7 +1701,10 @@ def _verified_run_file(
     path = run_root / relative
     if path.is_symlink() or not path.is_file():
         return None
-    data = path.read_bytes()
+    limit = MAX_ARTIFACT_BYTES if suffix == "/parser" else MAX_LOG_BYTES
+    data = _read_run_file_bounded(path, max_bytes=limit)
+    if data is None:
+        return None
     digests = payload.get("file_digests")
     expected = digests.get(key) if isinstance(digests, Mapping) else None
     if expected is not None and _digest(data) != expected:
@@ -1819,10 +1867,14 @@ def _archive(
     # A lease/generation failure here must reach the caller so it can return
     # STALE; every filesystem/verification failure is contained below and
     # turned into an evidence error instead of escaping into the workflow.
+    try:
+        evidence_root = _assert_evidence_root_outside_run_root(context.run_root)
+    except ExecutionFailed as error:
+        # _finish_blocked/_finish_failed/_archive_only reach this helper after
+        # loading a context; never publish a bundle into the run root even on
+        # those recovery paths.
+        return None, None, f"{error.reason_code}: {error.message}"
     state.mark_archiving(dsn, context.job_id, generation=context.generation)
-    evidence_root = Path(
-        os.getenv("DATACON_EVIDENCE_ROOT", ".datacon/evidence")
-    ).resolve()
     temporary = (
         evidence_root
         / f".{context.job_id_text}.generation-{context.generation}.tmp-{uuid.uuid4().hex}"
@@ -2128,6 +2180,37 @@ def _archive_only(dsn: str, context: ExecutionContext) -> ExecutionResult:
     )
 
 
+def _finish_evidence_path_failure(
+    dsn: str,
+    job_id: UUID,
+    generation: int,
+    error: ExecutionFailed,
+) -> ExecutionResult:
+    """Commit FAILED/EVIDENCE_WRITE_FAILED without archiving any bundle.
+
+    The evidence destination itself is untrusted in this branch, so the
+    failure must stay visible through ``status.evidence.error`` rather than
+    being written into the run root or silently dropped.
+    """
+    try:
+        state.finish_execution(
+            dsn,
+            job_id,
+            generation=generation,
+            state="FAILED",
+            reason_code=error.reason_code,
+            verdict=None,
+            verdict_reason=None,
+            evidence_status="failed",
+            evidence_error=f"{error.reason_code}: {error.message}",
+            last_error=error.message,
+            stage="failed",
+        )
+    except (state.StateError, state.StaleGeneration):
+        return ExecutionResult("STALE")
+    return ExecutionResult("FAILED", reason_code=error.reason_code)
+
+
 def run_execution(
     dsn: str,
     job_id: UUID,
@@ -2152,6 +2235,13 @@ def run_execution(
     except ExecutionFailed as error:
         return _finish_blocked_failed(dsn, job_id, generation, error)
 
+    # The evidence root must be outside the attacker-writable run root before
+    # either archive recovery or the normal path can touch any bundle.
+    try:
+        _assert_evidence_root_outside_run_root(context.run_root)
+    except ExecutionFailed as error:
+        return _finish_evidence_path_failure(dsn, job_id, generation, error)
+
     if context.job["state"] == "ARCHIVING":
         return _archive_only(dsn, context)
 
@@ -2166,23 +2256,7 @@ def run_execution(
         # archive: the evidence destination itself may be inside the untrusted
         # run root, and the failure must remain visible via
         # status.evidence.error.
-        try:
-            state.finish_execution(
-                dsn,
-                job_id,
-                generation=generation,
-                state="FAILED",
-                reason_code=error.reason_code,
-                verdict=None,
-                verdict_reason=None,
-                evidence_status="failed",
-                evidence_error=f"{error.reason_code}: {error.message}",
-                last_error=error.message,
-                stage="failed",
-            )
-        except (state.StateError, state.StaleGeneration):
-            return ExecutionResult("STALE")
-        return ExecutionResult("FAILED", reason_code=error.reason_code)
+        return _finish_evidence_path_failure(dsn, job_id, generation, error)
 
     try:
         _assert_budget(context, purpose="starting isolated execution")
@@ -2321,17 +2395,18 @@ def run_execution(
         if input_mismatch:
             # The completed result does not describe the approved bytes.
             # Never archive it as a full six-replay bundle: the verifier
-            # rejects plan-mismatched inputs, and publishing the computed
-            # verdict would be misleading.
+            # rejects plan-mismatched inputs, and there is no verifiable
+            # outcome. B3/B6 require an inconclusive state with no
+            # authoritative verdict.
             try:
                 state.finish_execution(
                     dsn,
                     context.job_id,
                     generation=context.generation,
                     state="INCONCLUSIVE",
-                    reason_code="NOT_COMPARABLE",
-                    verdict="INCONCLUSIVE",
-                    verdict_reason="NOT_COMPARABLE",
+                    reason_code="EVIDENCE_INCOMPLETE",
+                    verdict=None,
+                    verdict_reason=None,
                     evidence_status="failed",
                     evidence_error=(
                         "replay input digest does not match the approved plan"
@@ -2343,9 +2418,9 @@ def run_execution(
                 return ExecutionResult("STALE")
             return ExecutionResult(
                 "INCONCLUSIVE",
-                verdict="INCONCLUSIVE",
-                verdict_reason="NOT_COMPARABLE",
-                reason_code="NOT_COMPARABLE",
+                verdict=None,
+                verdict_reason=None,
+                reason_code="EVIDENCE_INCOMPLETE",
             )
         policy = _policy_from_context(context)
         decision = decide_verdict(
@@ -2523,7 +2598,11 @@ def _replay_log_text(
         path = run_root / relative
         if path.is_symlink() or not path.is_file():
             raise ExecutionFailed("RUN_INCOMPLETE", f"{key} evidence file is missing")
-        data = path.read_bytes()
+        data = _read_run_file_bounded(path, max_bytes=MAX_LOG_BYTES)
+        if data is None:
+            raise ExecutionFailed(
+                "RUN_INCOMPLETE", f"{key} evidence file is missing or too large"
+            )
         expected = payload.get("file_digests", {}).get(key) if isinstance(
             payload.get("file_digests"), Mapping
         ) else None
@@ -2578,7 +2657,9 @@ def _reusable_build(run_root: Path, payload: Mapping[str, Any]) -> bool:
         path = run_root / relative
         if path.is_symlink() or not path.is_file():
             return False
-        if _digest(path.read_bytes()) != digests.get(key):
+        limit = MAX_ARTIFACT_BYTES if key == "artifact" else MAX_LOG_BYTES
+        data = _read_run_file_bounded(path, max_bytes=limit)
+        if data is None or _digest(data) != digests.get(key):
             return False
     return True
 
@@ -2597,7 +2678,8 @@ def _reusable_replay(run_root: Path, payload: Mapping[str, Any]) -> bool:
         path = run_root / relative
         if path.is_symlink() or not path.is_file():
             return False
-        if _digest(path.read_bytes()) != digests.get(key):
+        data = _read_run_file_bounded(path, max_bytes=MAX_LOG_BYTES)
+        if data is None or _digest(data) != digests.get(key):
             return False
     return True
 

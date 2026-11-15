@@ -151,6 +151,7 @@ def build_record(version: str) -> dict:
         "log_truncated": False,
         "build_recipe_digest": PLAN["build_recipe_digest"],
         "build_command": ["/bin/sh", "/fixture/build.sh", version],
+        "staged_materials": dict(MATERIAL_DIGESTS),
     }
 
 
@@ -257,7 +258,16 @@ def full_artifacts() -> dict[str, tuple[str, bytes]]:
     artifacts: dict[str, tuple[str, bytes]] = {
         "plan.json": ("plan", canonical(PLAN)),
         "review.json": ("review", canonical(REVIEW)),
-        "metadata/execution.json": ("execution_metadata", b'{"generation":1}\n'),
+        "metadata/execution.json": (
+            "execution_metadata",
+            canonical(
+                {
+                    "job_id": JOB_ID,
+                    "plan_digest": PLAN_DIGEST,
+                    "generation": 1,
+                }
+            ),
+        ),
         "metadata/probe.json": ("probe", b'{"checks":{"seccomp":"2"}}\n'),
         "metadata/case.json": (
             "case_config",
@@ -390,6 +400,38 @@ def test_valid_bundle_round_trips_and_exports(tmp_path):
     assert (tmp_path / "exported" / "report.md").read_text() == "# report\n"
 
 
+def test_verify_rejects_reproduced_when_candidate_asan_is_absent(tmp_path):
+    """A plan without candidate_asan cannot support REPRODUCED.
+
+    Both vulnerable candidates carry a matching ASan log but a null exit code.
+    The old bare equality compared ``None == None`` and accepted the bundle as
+    the reviewed signature hit; the rule engine classifies it as OTHER_CRASH.
+    """
+    info = make_bundle(tmp_path)
+    plan, case_config, variant_digest = _plan_without_candidate_asan()
+    _rebind_bundle_to_plan(info.root, plan, case_config, variant_digest)
+    for phase in ("candidate_1", "candidate_2"):
+        _update_replay(info.root, "vulnerable", phase, exit_code=None)
+    with pytest.raises(BundleError) as caught:
+        verify_bundle(info.root)
+    assert caught.value.reason_code == "INVALID_MANIFEST"
+
+
+def test_verify_still_accepts_reproduced_with_expected_candidate_asan(tmp_path):
+    """The strict predicate must not reject a genuine planned ASan exit."""
+    info = make_bundle(tmp_path)
+    report = json.loads((info.root / "report.json").read_text(encoding="utf-8"))
+    assert {
+        replay["exit_code"]
+        for replay in report["replays"]
+        if replay["version"] == "vulnerable"
+        and replay["phase"].startswith("candidate")
+    } == {PLAN["expected_exit"]["candidate_asan"]}
+    verified = verify_bundle(info.root)
+    assert verified.manifest["verdict"] == "REPRODUCED"
+    assert verified.manifest["reason_code"] == "ASAN_SIGNATURE_MATCHED"
+
+
 def test_verify_accepts_valid_reproduced_bundle(tmp_path):
     info = make_bundle(tmp_path)
     verified = verify_bundle(info.root)
@@ -489,6 +531,65 @@ def _update_build(root: Path, version: str, **fields) -> None:
     _rewrite_manifested_file(root, "report.json", canonical(report))
 
 
+def _plan_without_candidate_asan() -> tuple[dict, dict, str]:
+    """Return a valid plan/case config whose expected_exit has no ASan code."""
+    plan = deepcopy(PLAN)
+    expected = dict(plan["expected_exit"])
+    expected.pop("candidate_asan")
+    plan["expected_exit"] = expected
+    case_config = deepcopy(CASE_CONFIG)
+    case_config["manifest_case"]["expected_exit"] = dict(expected)
+    plan["case_config_digest"] = jsonutil.digest_json(case_config)
+    return plan, case_config, plan_digest(plan)
+
+
+def _rebind_bundle_to_plan(
+    root: Path, plan: dict, case_config: dict, digest_value: str
+) -> None:
+    """Rewrite every plan-bound document and manifest entry consistently."""
+    _rewrite_manifested_file(root, "plan.json", canonical(plan))
+    _rewrite_manifested_file(
+        root,
+        "metadata/case.json",
+        canonical({"case_config": case_config}),
+    )
+    review = deepcopy(REVIEW)
+    review["plan_digest"] = digest_value
+    _rewrite_manifested_file(root, "review.json", canonical(review))
+    report = json.loads((root / "report.json").read_text(encoding="utf-8"))
+    report["plan_digest"] = digest_value
+    for build in report["builds"]:
+        build["plan_digest"] = digest_value
+        _rewrite_manifested_file(
+            root,
+            f"build/{build['version']}/metadata.json",
+            canonical(build),
+        )
+    for replay in report["replays"]:
+        replay["plan_digest"] = digest_value
+        _rewrite_manifested_file(
+            root,
+            f"replay/{replay['version']}/{replay['phase']}/metadata.json",
+            canonical(replay),
+        )
+    _rewrite_manifested_file(root, "report.json", canonical(report))
+    _rewrite_manifested_file(
+        root,
+        "metadata/execution.json",
+        canonical(
+            {
+                "job_id": JOB_ID,
+                "plan_digest": digest_value,
+                "generation": 1,
+            }
+        ),
+    )
+    manifest_path = root / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["plan_digest"] = digest_value
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+
 def _make_not_reproduced_bundle(tmp_path: Path, *, name: str):
     info = make_bundle(tmp_path, name=name)
     _set_verdict(info.root, "NOT_REPRODUCED", "CANDIDATE_CLEAN")
@@ -529,6 +630,80 @@ def test_verify_rejects_build_metadata_not_matching_plan(tmp_path):
     with pytest.raises(BundleError) as caught:
         verify_bundle(info.root)
     assert caught.value.reason_code in ("DIGEST_MISMATCH", "INVALID_MANIFEST")
+
+
+def test_verify_rejects_build_staged_material_not_matching_plan(tmp_path):
+    info = make_bundle(tmp_path)
+    staged = dict(MATERIAL_DIGESTS)
+    staged["harness.c"] = "sha256:" + "9" * 64
+    _update_build(info.root, "vulnerable", staged_materials=staged)
+    with pytest.raises(BundleError) as caught:
+        verify_bundle(info.root)
+    assert caught.value.reason_code == "DIGEST_MISMATCH"
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "reason"),
+    [
+        ("image_digest", "sha256:" + "9" * 64, "DIGEST_MISMATCH"),
+        ("asan_options", "detect_leaks=1:halt_on_error=1", "INVALID_MANIFEST"),
+    ],
+)
+def test_verify_rejects_replay_environment_not_matching_plan(
+    tmp_path, field, value, reason
+):
+    info = make_bundle(tmp_path)
+    _update_replay(info.root, "fixed", "candidate_2", **{field: value})
+    with pytest.raises(BundleError) as caught:
+        verify_bundle(info.root)
+    assert caught.value.reason_code == reason
+
+
+@pytest.mark.parametrize(
+    ("step", "field", "value"),
+    [
+        ("build", "plan_digest", "sha256:" + "9" * 64),
+        ("build", "job_id", str(uuid4())),
+        ("replay", "plan_digest", "sha256:" + "9" * 64),
+        ("replay", "job_id", str(uuid4())),
+    ],
+)
+def test_verify_rejects_build_or_replay_plan_provenance_mismatch(
+    tmp_path, step, field, value
+):
+    info = make_bundle(tmp_path)
+    if step == "build":
+        _update_build(info.root, "vulnerable", **{field: value})
+    else:
+        _update_replay(info.root, "vulnerable", "candidate_1", **{field: value})
+    with pytest.raises(BundleError) as caught:
+        verify_bundle(info.root)
+    assert caught.value.reason_code == "INVALID_MANIFEST"
+
+
+def test_verify_rejects_execution_metadata_not_bound_to_manifest(tmp_path):
+    info = make_bundle(tmp_path)
+    _rewrite_manifested_file(
+        info.root,
+        "metadata/execution.json",
+        canonical({"job_id": str(uuid4()), "plan_digest": PLAN_DIGEST}),
+    )
+    with pytest.raises(BundleError) as caught:
+        verify_bundle(info.root)
+    assert caught.value.reason_code == "INVALID_MANIFEST"
+
+
+def test_verify_rejects_rule_trace_that_disagrees_with_report(tmp_path):
+    info = make_bundle(tmp_path)
+    rule = {
+        "verdict": "INCONCLUSIVE",
+        "reason_code": "OTHER_CRASH",
+        "message": "mismatched audit attachment",
+    }
+    _replace_report(info.root, rule=rule)
+    with pytest.raises(BundleError) as caught:
+        verify_bundle(info.root)
+    assert caught.value.reason_code == "INVALID_MANIFEST"
 
 
 def test_verify_rejects_material_digest_not_matching_plan(tmp_path):

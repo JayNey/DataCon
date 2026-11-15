@@ -1325,9 +1325,13 @@ def test_archive_only_does_not_promote_input_mismatch(
         isolated_database, job, generation, tmp_path, sandbox, monkeypatch
     )
     assert outcome.state == "INCONCLUSIVE", outcome
-    assert outcome.verdict_reason == "NOT_COMPARABLE"
+    assert outcome.verdict is None
+    assert outcome.verdict_reason is None
+    assert outcome.reason_code == "EVIDENCE_INCOMPLETE"
     current = status(isolated_database.dsn, job["job_id"])
     assert current["state"] == "INCONCLUSIVE"
+    assert current["verdict"] is None
+    assert current["reason_code"] == "EVIDENCE_INCOMPLETE"
     assert current["evidence"]["available"] is False
 
     # The same completed results must not be promoted when archive-only
@@ -1356,9 +1360,11 @@ def test_archive_only_does_not_promote_input_mismatch(
         sandbox=ExplodingSandbox(),
     )
     assert recovered.state == "INCONCLUSIVE", recovered
-    assert recovered.verdict != "REPRODUCED"
+    assert recovered.verdict is None
+    assert recovered.reason_code == "EVIDENCE_INCOMPLETE"
     current = status(isolated_database.dsn, job["job_id"])
     assert current["state"] != "REPRODUCED"
+    assert current["verdict"] is None
     assert current["evidence"]["available"] is False
 
 
@@ -1507,6 +1513,55 @@ def test_nested_evidence_root_inside_run_root_fails_closed(
     current = status(isolated_database.dsn, job["job_id"])
     assert current["state"] in ("BLOCKED", "FAILED")
     assert current["evidence"]["error"]
+
+
+def test_archive_only_rejects_nested_evidence_root(
+    isolated_database, tmp_path, monkeypatch
+):
+    job, _, generation = prepare_approved_job(isolated_database, tmp_path)
+    job_uuid = UUID(job["job_id"])
+    isolated_database.connection.execute(
+        "UPDATE jobs SET state = 'ARCHIVING', stage = 'archive', "
+        "lease_owner = 'archive-only', lease_expires_at = now() + interval '10 minutes', "
+        "execute_deadline_at = now() - interval '1 minute' WHERE job_id = %s",
+        (job_uuid,),
+    )
+    run_root = tmp_path / "runs"
+    monkeypatch.setenv("DATACON_RUN_ROOT", str(run_root))
+    monkeypatch.setenv("DATACON_EVIDENCE_ROOT", str(run_root / "evidence"))
+    monkeypatch.delenv("DATACON_JOURNAL_SECRET_FILE", raising=False)
+
+    class ExplodingSandbox:
+        def __init__(self):
+            self.calls = []
+
+        def __getattr__(self, name):
+            def fail(*args, **kwargs):
+                self.calls.append(name)
+                raise AssertionError(
+                    f"archive recovery started a container: {name}"
+                )
+
+            return fail
+
+    sandbox = ExplodingSandbox()
+    outcome = execution.run_execution(
+        isolated_database.dsn,
+        job_uuid,
+        generation,
+        run_root=run_root,
+        sandbox=sandbox,
+    )
+    assert sandbox.calls == []
+    assert outcome.state == "FAILED", outcome
+    assert outcome.reason_code == "EVIDENCE_WRITE_FAILED"
+    current = status(isolated_database.dsn, job["job_id"])
+    assert current["state"] == "FAILED"
+    assert current["reason_code"] == "EVIDENCE_WRITE_FAILED"
+    assert current["evidence"]["available"] is False
+    assert "EVIDENCE_WRITE_FAILED" in current["evidence"]["error"]
+    assert not (run_root / "evidence").exists()
+    assert not (run_root / "evidence" / job["job_id"]).exists()
 
 
 def test_default_secret_outside_run_root_still_works(
