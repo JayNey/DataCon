@@ -11,8 +11,8 @@ from uuid import UUID
 
 import pytest
 
-from datacon import state
-from support import review, status, submit, worker, write_request
+from datacon import execution, state
+from support import cli, review, status, submit, worker, write_request
 
 pytestmark = pytest.mark.postgres
 
@@ -115,6 +115,15 @@ def test_archive_fence_extends_the_lease_and_rejects_stale_writers(
     job_id = _approved_job(isolated_database, tmp_path)
     claimed = _claim(isolated_database, job_id)
     generation = claimed["generation"]
+    # Make the lease almost expire first. If mark_archiving merely observed
+    # the lease (instead of renewing it), the assertions below would fail.
+    isolated_database.connection.execute(
+        "UPDATE jobs SET lease_expires_at = clock_timestamp() + interval '5 seconds', "
+        "execute_deadline_at = clock_timestamp() - interval '1 second' "
+        "WHERE job_id = %s",
+        (job_id,),
+    )
+    assert _lease_remaining(isolated_database, job_id) < 10
 
     assert (
         state.mark_archiving(
@@ -161,3 +170,181 @@ def test_archive_fence_extends_the_lease_and_rejects_stale_writers(
         )
     # An expired lease must never be revived by the fence.
     assert _lease_remaining(isolated_database, job_id) < 0
+
+
+# ---------------------------------------------------------------------------
+# S8: archived evidence and the current verdict share one invariant.
+# ---------------------------------------------------------------------------
+
+DIGEST = "sha256:" + "a" * 64
+
+
+def _running_generation(database, tmp_path) -> tuple[UUID, int]:
+    job_id = _approved_job(database, tmp_path)
+    claimed = _claim(database, job_id)
+    generation = claimed["generation"]
+    assert (
+        state.begin_execution(database.dsn, job_id, generation=generation)
+        is True
+    )
+    return job_id, generation
+
+
+def _archive_reproduced(database, job_id: UUID, generation: int) -> None:
+    assert state.finish_execution(
+        database.dsn,
+        job_id,
+        generation=generation,
+        state="REPRODUCED",
+        reason_code=None,
+        verdict="REPRODUCED",
+        verdict_reason="ASAN_SIGNATURE_MATCHED",
+        evidence_digest=DIGEST,
+        evidence_path=f"/tmp/datacon-bundle-{job_id}",
+        evidence_status="archived",
+    )
+
+
+def _revive(database, job_id: UUID) -> int:
+    row = database.connection.execute(
+        "SELECT generation FROM jobs WHERE job_id = %s", (job_id,)
+    ).fetchone()
+    generation = int(row[0])
+    database.connection.execute(
+        "UPDATE jobs SET state = 'RUNNING', lease_owner = 'test', "
+        "lease_expires_at = clock_timestamp() + interval '1 hour' "
+        "WHERE job_id = %s",
+        (job_id,),
+    )
+    return generation
+
+
+def test_archived_without_path_or_digest_is_rejected_by_finish_execution(
+    isolated_database, tmp_path
+):
+    job_id, generation = _running_generation(isolated_database, tmp_path)
+    with pytest.raises(state.StateError):
+        state.finish_execution(
+            isolated_database.dsn,
+            job_id,
+            generation=generation,
+            state="FAILED",
+            reason_code="EVIDENCE_WRITE_FAILED",
+            verdict="REPRODUCED",
+            verdict_reason="ASAN_SIGNATURE_MATCHED",
+            evidence_status="archived",
+            evidence_path=None,
+            evidence_digest=None,
+        )
+    with pytest.raises(state.StateError):
+        state.finish_execution(
+            isolated_database.dsn,
+            job_id,
+            generation=generation,
+            state="FAILED",
+            reason_code="EVIDENCE_WRITE_FAILED",
+            verdict="REPRODUCED",
+            verdict_reason="ASAN_SIGNATURE_MATCHED",
+            evidence_status="archived",
+            evidence_path="/tmp/bundle",
+            evidence_digest=None,
+        )
+    row = isolated_database.connection.execute(
+        "SELECT state, verdict, evidence_status, evidence_path, evidence_digest "
+        "FROM jobs WHERE job_id = %s",
+        (job_id,),
+    ).fetchone()
+    assert row[0] == "RUNNING"
+    assert row[1:] == (None, None, None, None)
+
+
+def test_failed_terminal_clears_current_verdict_and_evidence_pointer(
+    isolated_database, tmp_path
+):
+    job_id, generation = _running_generation(isolated_database, tmp_path)
+    _archive_reproduced(isolated_database, job_id, generation)
+    revived = _revive(isolated_database, job_id)
+    assert state.finish_execution(
+        isolated_database.dsn,
+        job_id,
+        generation=revived,
+        state="FAILED",
+        reason_code="EVIDENCE_WRITE_FAILED",
+        verdict=None,
+        verdict_reason=None,
+        evidence_status="failed",
+        evidence_error="archive failed",
+    )
+    row = isolated_database.connection.execute(
+        "SELECT verdict, verdict_reason, evidence_status, evidence_path, "
+        "evidence_digest FROM jobs WHERE job_id = %s",
+        (job_id,),
+    ).fetchone()
+    assert row == (None, None, "failed", None, None)
+
+
+def test_status_and_export_use_the_same_evidence_invariant(
+    isolated_database, tmp_path
+):
+    job_id, generation = _running_generation(isolated_database, tmp_path)
+    _archive_reproduced(isolated_database, job_id, generation)
+    revived = _revive(isolated_database, job_id)
+    assert state.finish_execution(
+        isolated_database.dsn,
+        job_id,
+        generation=revived,
+        state="FAILED",
+        reason_code="EVIDENCE_WRITE_FAILED",
+        verdict=None,
+        verdict_reason=None,
+        evidence_status="failed",
+    )
+
+    current = state.status(isolated_database.dsn, job_id)
+    assert current["verdict"] is None
+    assert current["verdict_current"] is False
+    assert current["evidence"]["available"] is False
+
+    exported = cli(
+        "export",
+        str(job_id),
+        "--out",
+        str(tmp_path / "exported"),
+        database_url=isolated_database.dsn,
+    )
+    assert exported.returncode == 3
+    assert "EVIDENCE_NOT_AVAILABLE" in exported.stderr
+
+
+def test_blocked_context_none_cannot_resurrect_old_reproduced_verdict(
+    isolated_database, tmp_path, monkeypatch
+):
+    job_id, generation = _running_generation(isolated_database, tmp_path)
+    _archive_reproduced(isolated_database, job_id, generation)
+    revived = _revive(isolated_database, job_id)
+
+    def no_context(*args, **kwargs):
+        raise execution.ExecutionBlocked("POLICY_DENIED", "blocked for test")
+
+    monkeypatch.setattr(execution, "_load_context", no_context)
+    result = execution._finish_blocked(
+        isolated_database.dsn,
+        job_id,
+        revived,
+        execution.ExecutionBlocked("POLICY_DENIED", "blocked for test"),
+        context=None,
+        case_root=None,
+        run_root=tmp_path / "runs",
+    )
+    assert result.state == "BLOCKED"
+    current = state.status(isolated_database.dsn, job_id)
+    assert current["state"] == "BLOCKED"
+    assert current["verdict"] is None
+    assert current["verdict_current"] is False
+    assert current["evidence"]["available"] is False
+    row = isolated_database.connection.execute(
+        "SELECT verdict, evidence_status, evidence_path, evidence_digest "
+        "FROM jobs WHERE job_id = %s",
+        (job_id,),
+    ).fetchone()
+    assert row == (None, "failed", None, None)

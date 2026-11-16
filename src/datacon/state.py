@@ -720,17 +720,34 @@ def finish_execution(
         "INCONCLUSIVE",
     ):
         raise StateError("verdict is invalid")
+    archived = evidence_status == "archived"
+    if archived:
+        if not evidence_path or not evidence_digest:
+            raise StateError(
+                "archived evidence requires both evidence_path and evidence_digest"
+            )
+    else:
+        if evidence_status not in (None, "failed"):
+            raise StateError("evidence_status must be archived or failed")
+        if verdict is not None or verdict_reason is not None:
+            raise StateError("a verdict requires archived evidence")
+        # A terminal that did not archive a bundle must not keep a previous
+        # generation's current verdict or evidence pointer. Write the cleared
+        # values explicitly instead of COALESCE-ing them back from the row.
+        evidence_status = "failed"
+        evidence_path = None
+        evidence_digest = None
     with _connect(dsn) as connection:
         job = _locked_job(connection, job_id, generation=generation)
         if job["state"] not in ("RUNNING", "ARCHIVING"):
             raise StateError(f"cannot finish execution while the job is {job['state']}")
         updated = connection.execute(
             "UPDATE jobs SET state = %s, stage = %s, reason_code = %s, "
-            "last_error = %s, verdict = COALESCE(%s, verdict), "
-            "verdict_reason = COALESCE(%s, verdict_reason), "
-            "evidence_digest = COALESCE(%s, evidence_digest), "
-            "evidence_path = COALESCE(%s, evidence_path), "
-            "evidence_status = COALESCE(%s, evidence_status), "
+            "last_error = %s, verdict = %s, "
+            "verdict_reason = %s, "
+            "evidence_digest = %s, "
+            "evidence_path = %s, "
+            "evidence_status = %s, "
             "evidence_error = %s, "
             "generation = generation + 1, state_version = state_version + 1, "
             "workflow_synced = true, lease_owner = NULL, lease_expires_at = NULL, "
@@ -1243,7 +1260,8 @@ def status(dsn: str, job_id: UUID) -> dict[str, Any] | None:
     ):
         evidence = {
             "available": row["evidence_status"] == "archived"
-            and row["evidence_path"] is not None,
+            and row["evidence_path"] is not None
+            and row["evidence_digest"] is not None,
             "status": row["evidence_status"],
             "digest": row["evidence_digest"],
             "path": row["evidence_path"],
@@ -1254,7 +1272,12 @@ def status(dsn: str, job_id: UUID) -> dict[str, Any] | None:
     # but a later failed archive advances the job to FAILED. Returning the old
     # value here would let a consumer mistake it for the current result, so the
     # public status only exposes a verdict while the evidence is archived.
-    verdict_current = row["evidence_status"] == "archived"
+    verdict_current = (
+        row["evidence_status"] == "archived"
+        and row["verdict"] is not None
+        and row["evidence_path"] is not None
+        and row["evidence_digest"] is not None
+    )
     return {
         "job_id": str(row["job_id"]),
         "state": row["state"],

@@ -826,6 +826,11 @@ def test_archive_crash_recovery_is_archive_only_and_keeps_the_verdict(
         )
         raise SystemExit(99)
 
+    isolated_database.connection.execute(
+        "UPDATE jobs SET lease_expires_at = clock_timestamp() + interval '5 seconds' "
+        "WHERE job_id = %s",
+        (job_uuid,),
+    )
     monkeypatch.setattr(execution, "_archive", crash_during_archive)
     with pytest.raises(SystemExit):
         run_with_fake(
@@ -1241,7 +1246,7 @@ def test_materialized_build_recipe_tamper_is_blocked(
     job, _, generation = prepare_approved_job(isolated_database, tmp_path)
     original = execution._materialize
 
-    def tampering_materialize(context, run_root):
+    def tampering_materialize(context, run_root, **kwargs):
         result = original(context, run_root)
         materials_dir = result[0]
         recipe = Path(materials_dir) / "build.sh"
@@ -1892,14 +1897,15 @@ def test_failed_archive_clears_the_current_verdict(
     assert current["verdict"] is None
     assert current["verdict_reason"] is None
     assert current["verdict_current"] is False
-    # The row keeps the previous archived verdict for history, but the public
-    # status must not present it as the current result.
+    # A non-archived terminal must not keep the previous generation's
+    # authoritative verdict in the row; status() and export() both rely on the
+    # archived+path+digest invariant.
     row = isolated_database.connection.execute(
-        "SELECT verdict, evidence_status FROM jobs WHERE job_id = %s",
+        "SELECT verdict, verdict_reason, evidence_status, evidence_path, "
+        "evidence_digest FROM jobs WHERE job_id = %s",
         (job_uuid,),
     ).fetchone()
-    assert row[0] == "REPRODUCED"
-    assert row[1] == "failed"
+    assert row == (None, None, "failed", None, None)
 
 
 # ---------------------------------------------------------------------------
@@ -1940,3 +1946,34 @@ def test_archive_publish_then_finish_false_rolls_back_generation_bundle(
     job_root = evidence_root / job["job_id"]
     assert not (job_root / f"generation-{generation}").exists()
     assert not _archived_manifests(evidence_root)
+
+
+# ---------------------------------------------------------------------------
+# S2: reclaim failures are visible in the archived report, not swallowed.
+# ---------------------------------------------------------------------------
+
+
+def test_reclaim_failure_is_visible_in_the_report(
+    isolated_database, tmp_path, monkeypatch
+):
+    class ReclaimFailingSandbox(FakeSandbox):
+        def reclaim_job(self):
+            raise SandboxError("reclaim could not remove an old container")
+
+    job, _, generation = prepare_approved_job(isolated_database, tmp_path)
+    outcome = run_with_fake(
+        isolated_database,
+        job,
+        generation,
+        tmp_path,
+        ReclaimFailingSandbox(),
+        monkeypatch,
+    )
+    assert outcome.state == "REPRODUCED", outcome
+    current = status(isolated_database.dsn, job["job_id"])
+    report = json.loads(
+        verify_bundle(current["evidence"]["path"]).file_data["report.json"]
+    )
+    assert report["cleanup_errors"] == [
+        "reclaim: reclaim could not remove an old container"
+    ]
