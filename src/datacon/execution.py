@@ -1693,10 +1693,25 @@ def _journal_secret_path(run_root: Path) -> Path:
             "EVIDENCE_WRITE_FAILED", "journal secret path must not be a symlink"
         )
     resolved = _outside_run_root(path, run_root, "journal secret")
+    try:
+        resolved_cwd = Path.cwd().expanduser().resolve()
+    except (OSError, RuntimeError) as error:
+        raise ExecutionFailed(
+            "EVIDENCE_WRITE_FAILED",
+            f"journal secret current working directory cannot be resolved: {error}",
+        ) from error
+    if resolved_cwd.parent == resolved_cwd:
+        raise ExecutionFailed(
+            "EVIDENCE_WRITE_FAILED",
+            "current working directory is the filesystem root ('/'), so no "
+            "journal secret path can live outside current working directory; "
+            "run datacon from a non-root working directory and set "
+            "DATACON_JOURNAL_SECRET_FILE outside that directory",
+        )
     protected_roots = [
         (evidence_root, "DATACON_EVIDENCE_ROOT"),
         (_configured_staging_path(evidence_root), "staging root"),
-        (Path.cwd(), "current working directory"),
+        (resolved_cwd, "current working directory"),
     ]
     for root, label in protected_roots:
         try:

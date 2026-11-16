@@ -2847,3 +2847,36 @@ def test_b2_wait_non_numeric_output_with_running_container_is_infra_error(
     assert result.exit_code is None
     assert getattr(result, "capture_error", None)
 
+
+def test_s2_readme_quickstart_and_cwd_filesystem_root_guidance(
+    tmp_path, monkeypatch
+):
+    work = tmp_path / "work"
+    work.mkdir()
+    outside_secret = tmp_path / "home" / ".config" / "datacon" / "journal-secret"
+    monkeypatch.chdir(work)
+    monkeypatch.setenv("DATACON_RUN_ROOT", str(work / ".datacon" / "runs"))
+    monkeypatch.setenv(
+        "DATACON_EVIDENCE_ROOT", str(work / ".datacon" / "evidence")
+    )
+    monkeypatch.setenv("DATACON_JOURNAL_SECRET_FILE", str(outside_secret))
+    monkeypatch.delenv("DATACON_STAGING_ROOT", raising=False)
+
+    path = execution._journal_secret_path(work / ".datacon" / "runs")
+    assert path == outside_secret.resolve()
+    secret = execution._journal_secret(
+        create=True, run_root=work / ".datacon" / "runs"
+    )
+    assert secret is not None and len(secret) >= 32
+
+    monkeypatch.chdir("/")
+    monkeypatch.setenv("DATACON_EVIDENCE_ROOT", str(tmp_path / "evidence"))
+    monkeypatch.setenv(
+        "DATACON_JOURNAL_SECRET_FILE", str(tmp_path / "journal-secret")
+    )
+    with pytest.raises(execution.ExecutionFailed) as caught:
+        execution._journal_secret_path(tmp_path / "runs")
+    assert caught.value.reason_code == "EVIDENCE_WRITE_FAILED"
+    assert "filesystem root" in caught.value.message
+    assert "DATACON_JOURNAL_SECRET_FILE" in caught.value.message
+
