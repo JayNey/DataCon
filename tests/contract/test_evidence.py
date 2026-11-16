@@ -282,6 +282,13 @@ REVIEW = {
     "decided_at": "2026-01-02T00:00:00Z",
 }
 
+# The report repeats the review and the budget, and carries the probe document.
+# The verifier binds all three to review.json, the plan and metadata/probe.json
+# respectively, so the fixture must use the same values.
+REPORT["budget"] = dict(PLAN["limits"])
+REPORT["review"] = dict(REVIEW)
+REPORT["environment"]["probe"] = deepcopy(PROBE)
+
 
 def canonical(data) -> bytes:
     return jsonutil.canonical_bytes(data) + b"\n"
@@ -406,8 +413,13 @@ def _rewrite_manifested_file(root: Path, relative: str, data: bytes) -> None:
 
 
 def _replace_report(root: Path, **changes) -> None:
-    report = deepcopy(REPORT)
+    report = json.loads((root / "report.json").read_text(encoding="utf-8"))
     report.update(changes)
+    # report.json is bound to report.md by digest; keep them consistent when a
+    # test rewrites the report document.
+    report["report_markdown_sha256"] = hashlib.sha256(
+        (root / "report.md").read_bytes()
+    ).hexdigest()
     _rewrite_manifested_file(root, "report.json", canonical(report))
 
 
@@ -624,6 +636,8 @@ def _rebind_bundle_to_plan(
     _rewrite_manifested_file(root, "review.json", canonical(review))
     report = json.loads((root / "report.json").read_text(encoding="utf-8"))
     report["plan_digest"] = digest_value
+    if isinstance(report.get("review"), dict):
+        report["review"]["plan_digest"] = digest_value
     for build in report["builds"]:
         build["plan_digest"] = digest_value
         _rewrite_manifested_file(
@@ -786,6 +800,16 @@ def test_verify_accepts_distinct_stable_input_aliases(tmp_path):
         replay["plan_digest"] = variant_digest
     report = deepcopy(REPORT)
     report["plan_digest"] = variant_digest
+    report["review"]["plan_digest"] = variant_digest
+    report["environment"]["probe"] = {
+        **PROBE,
+        "plan_digest": variant_digest,
+        "image_digest": plan["image_digest"],
+        "limits": {
+            field: plan["limits"][field]
+            for field in ("cpu", "memory_mib", "pids", "scratch_mib")
+        },
+    }
     report["builds"] = builds
     report["replays"] = replays
     review = deepcopy(REVIEW)
@@ -1967,3 +1991,177 @@ def test_verify_bundle_counts_directory_entries_and_fails_fast(tmp_path, monkeyp
         verify_bundle(info.root)
     assert caught.value.reason_code == "INVALID_MANIFEST"
     assert "directory entries" in caught.value.message
+
+
+# ---------------------------------------------------------------------------
+# B3: report.md is bound to report.json and pinned at its fixed path.
+# ---------------------------------------------------------------------------
+
+
+def test_verify_rejects_tampered_report_markdown_with_updated_manifest(tmp_path):
+    info = make_bundle(tmp_path)
+    # An attacker who can rewrite the manifest and report.md still cannot make
+    # the swapped verdict verify: report.json commits to the original bytes.
+    _rewrite_manifested_file(
+        info.root, "report.md", b"# report\n\n- Verdict: **NOT_REPRODUCED**\n"
+    )
+    with pytest.raises(BundleError) as caught:
+        verify_bundle(info.root)
+    assert caught.value.reason_code == "DIGEST_MISMATCH"
+
+
+def test_verify_rejects_report_markdown_replaced_with_other_role(tmp_path):
+    info = make_bundle(tmp_path)
+    root = info.root
+    (root / "notes.md").write_bytes((root / "report.md").read_bytes())
+    (root / "report.md").unlink()
+    manifest_path = root / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    replacement = next(
+        entry for entry in manifest["files"] if entry["path"] == "report.md"
+    ).copy()
+    replacement["path"] = "notes.md"
+    manifest["files"] = [
+        entry for entry in manifest["files"] if entry["path"] != "report.md"
+    ] + [replacement]
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(BundleError) as caught:
+        verify_bundle(root)
+    assert caught.value.reason_code == "INVALID_MANIFEST"
+    assert "report.md" in caught.value.message
+
+
+def test_verify_rejects_modified_report_markdown_digest(tmp_path):
+    info = make_bundle(tmp_path)
+    report = json.loads((info.root / "report.json").read_text(encoding="utf-8"))
+    report["report_markdown_sha256"] = "0" * 64
+    _rewrite_manifested_file(info.root, "report.json", canonical(report))
+    with pytest.raises(BundleError) as caught:
+        verify_bundle(info.root)
+    assert caught.value.reason_code == "DIGEST_MISMATCH"
+
+
+def test_verify_rejects_legacy_bundle_without_report_markdown_digest(tmp_path):
+    info = make_bundle(tmp_path)
+    report = json.loads((info.root / "report.json").read_text(encoding="utf-8"))
+    report.pop("report_markdown_sha256")
+    _rewrite_manifested_file(info.root, "report.json", canonical(report))
+    with pytest.raises(BundleError) as caught:
+        verify_bundle(info.root)
+    assert caught.value.reason_code == "INVALID_MANIFEST"
+
+
+# ---------------------------------------------------------------------------
+# SF1: report identity, budget, review, probe and execution metadata binding.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"case_id": "different-case"},
+        {"cve_id": "CVE-2099-9999"},
+        {"budget": {"cpu": 99, "memory_mib": 1, "pids": 1, "scratch_mib": 1}},
+    ],
+)
+def test_verify_rejects_tampered_report_identity_or_budget(tmp_path, changes):
+    info = make_bundle(tmp_path)
+    _replace_report(info.root, **changes)
+    with pytest.raises(BundleError) as caught:
+        verify_bundle(info.root)
+    assert caught.value.reason_code == "INVALID_MANIFEST"
+
+
+def test_verify_rejects_tampered_report_review(tmp_path):
+    info = make_bundle(tmp_path)
+    _replace_report(
+        info.root,
+        review={
+            "reviewer_id": "attacker",
+            "decision": "approve",
+            "plan_digest": PLAN_DIGEST,
+            "decided_at": "2026-01-02T00:00:00Z",
+        },
+    )
+    with pytest.raises(BundleError) as caught:
+        verify_bundle(info.root)
+    assert caught.value.reason_code == "INVALID_MANIFEST"
+    assert "review" in caught.value.message
+
+
+def test_verify_rejects_tampered_report_environment_probe(tmp_path):
+    info = make_bundle(tmp_path)
+
+    def mutate(report):
+        report["environment"]["probe"]["checks"]["uid"] = "0"
+
+    _mutate_report(info.root, mutate)
+    with pytest.raises(BundleError) as caught:
+        verify_bundle(info.root)
+    assert caught.value.reason_code in ("INVALID_MANIFEST", "DIGEST_MISMATCH")
+
+
+@pytest.mark.parametrize("field", ["builds", "replays"])
+def test_verify_rejects_execution_metadata_not_matching_report(tmp_path, field):
+    info = make_bundle(tmp_path)
+    execution = json.loads(
+        (info.root / "metadata/execution.json").read_text(encoding="utf-8")
+    )
+    # A present field is authoritative shape; an empty list cannot match the
+    # report's non-empty one.
+    execution[field] = []
+    _rewrite_manifested_file(
+        info.root, "metadata/execution.json", canonical(execution)
+    )
+    with pytest.raises(BundleError) as caught:
+        verify_bundle(info.root)
+    assert caught.value.reason_code == "INVALID_MANIFEST"
+
+
+# ---------------------------------------------------------------------------
+# SF3: bounded scandir enumeration stops before walking a huge flat directory.
+# ---------------------------------------------------------------------------
+
+
+def test_bundle_entry_cap_aborts_before_enumerating_flat_directory(
+    tmp_path, monkeypatch
+):
+    from datacon import evidence as evidence_module
+
+    info = make_bundle(tmp_path, name="flat-walk")
+    # A single flat directory is the case os.walk handles worst: it builds the
+    # whole name list before returning. Directories are counted by the cap but
+    # are not "extra files", so the failure proves the cap fired mid-directory.
+    flat = info.root / "bulk"
+    flat.mkdir()
+    for index in range(2000):
+        (flat / f"dir-{index}").mkdir()
+    monkeypatch.setattr(evidence_module, "MAX_BUNDLE_ENTRIES", 64)
+
+    real_scandir = os.scandir
+    yielded: list[str] = []
+
+    class CountingScandir:
+        def __init__(self, target):
+            self._iterator = real_scandir(target)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info):
+            self._iterator.close()
+
+        def __iter__(self):
+            for entry in self._iterator:
+                yielded.append(entry.name)
+                yield entry
+
+    monkeypatch.setattr(evidence_module.os, "scandir", CountingScandir)
+
+    with pytest.raises(BundleError) as caught:
+        verify_bundle(info.root)
+    assert caught.value.reason_code == "INVALID_MANIFEST"
+    assert "directory entries" in caught.value.message
+    # The scan stops at the cap instead of collecting all 2000+ entries.
+    assert len(yielded) <= evidence_module.MAX_BUNDLE_ENTRIES + 1

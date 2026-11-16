@@ -46,6 +46,15 @@ _DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
 _REQUIRED_ROLES = frozenset(
     {"report_json", "report_markdown", "plan", "review"}
 )
+# A role alone is not enough: each base document must exist at its fixed path
+# with the matching role so replacing report.md with a differently named file
+# cannot satisfy the bundle contract.
+_REQUIRED_PATHS = {
+    "report.json": "report_json",
+    "report.md": "report_markdown",
+    "plan.json": "plan",
+    "review.json": "review",
+}
 _ROLE_NAMES = frozenset(
     {
         "report_json",
@@ -286,9 +295,17 @@ def write_bundle(
     temporary.mkdir(mode=0o700)
     try:
         entries: list[dict[str, Any]] = []
+        markdown_bytes = report_markdown.encode("utf-8")
+        # Bind the human-readable report to report.json. The manifest digest
+        # already covers both files, but an attacker who rewrites the whole
+        # bundle (manifest included) would otherwise be free to swap
+        # report.md for a different verdict. The digest is written into
+        # report.json before it is serialized so the two cannot diverge.
+        report_document = dict(report)
+        report_document["report_markdown_sha256"] = _sha256(markdown_bytes)
         payloads: dict[str, bytes] = {
-            "report.json": jsonutil.canonical_bytes(report) + b"\n",
-            "report.md": report_markdown.encode("utf-8"),
+            "report.json": jsonutil.canonical_bytes(report_document) + b"\n",
+            "report.md": markdown_bytes,
         }
         for path, (role, value) in (artifacts or {}).items():
             normalized = _normalize_file_path(path)
@@ -331,6 +348,7 @@ def write_bundle(
                 "INVALID_MANIFEST",
                 "bundle is missing required roles: " + ", ".join(missing),
             )
+        _require_required_paths({entry["path"]: entry for entry in entries})
 
         manifest = {
             "schema_version": SCHEMA_VERSION,
@@ -491,6 +509,31 @@ def _require_evidence_roles(
                 "INVALID_MANIFEST",
                 f"evidence {path} has role {entry.get('role')!r}, "
                 f"expected one of {sorted(allowed_roles)}",
+            )
+
+
+def _require_required_paths(
+    listed: Mapping[str, Mapping[str, Any]],
+) -> None:
+    """Require the four base evidence files at their fixed paths.
+
+    ``_REQUIRED_ROLES`` only proves that some file carries each role. A
+    ``report_markdown`` role on ``notes.md``, or a rewritten ``report.md`` with
+    another role, must not satisfy the contract: the path and the role are both
+    part of the evidence identity.
+    """
+    for path, role in _REQUIRED_PATHS.items():
+        entry = listed.get(path)
+        if entry is None:
+            raise BundleError(
+                "INVALID_MANIFEST",
+                f"manifest is missing required evidence path: {path}",
+            )
+        if entry.get("role") != role:
+            raise BundleError(
+                "INVALID_MANIFEST",
+                f"evidence {path} must carry the {role} role, "
+                f"not {entry.get('role')!r}",
             )
 
 
@@ -1306,6 +1349,25 @@ def _verify_semantics(
         raise BundleError(
             "INVALID_MANIFEST", "report plan_digest does not match manifest"
         )
+    markdown = data.get("report.md")
+    if markdown is None:
+        raise BundleError("INVALID_MANIFEST", "report.md is missing")
+    expected_markdown = report.get("report_markdown_sha256")
+    if (
+        not isinstance(expected_markdown, str)
+        or not _SHA256_HEX.fullmatch(expected_markdown)
+    ):
+        # Old bundles predate the binding. Fail closed rather than accepting a
+        # report.md that report.json never committed to.
+        raise BundleError(
+            "INVALID_MANIFEST",
+            "report report_markdown_sha256 is missing or invalid",
+        )
+    if _sha256(markdown) != expected_markdown:
+        raise BundleError(
+            "DIGEST_MISMATCH",
+            "report.md digest does not match report.json",
+        )
     report_verdict = report.get("verdict")
     if report_verdict not in _VERDICTS:
         raise BundleError("INVALID_MANIFEST", "report verdict must be a known value")
@@ -1361,6 +1423,19 @@ def _verify_semantics(
             "plan.json content does not match the manifest plan_digest",
         )
 
+    # The case identity and budget are top-level report claims; bind them to
+    # the frozen plan instead of trusting the report's own copy.
+    for field in ("case_id", "cve_id"):
+        if report.get(field) != plan.get(field):
+            raise BundleError(
+                "INVALID_MANIFEST",
+                f"report {field} does not match the plan",
+            )
+    if report.get("budget") != plan.get("limits"):
+        raise BundleError(
+            "INVALID_MANIFEST", "report budget does not match the plan limits"
+        )
+
     review = _parse_json_file(data, "review.json")
     if review.get("decision") != "approve":
         raise BundleError(
@@ -1369,6 +1444,23 @@ def _verify_semantics(
     if review.get("plan_digest") != plan_digest:
         raise BundleError(
             "INVALID_MANIFEST", "review.json is bound to a different plan"
+        )
+    # report.json repeats the review so the report is self-describing; it must
+    # be byte-for-byte the decision shipped in review.json.
+    report_review = report.get("review")
+    if not isinstance(report_review, Mapping):
+        raise BundleError(
+            "INVALID_MANIFEST", "report review must be an object"
+        )
+    expected_review = {
+        "reviewer_id": review.get("reviewer_id"),
+        "decision": review.get("decision"),
+        "plan_digest": review.get("plan_digest"),
+        "decided_at": review.get("decided_at"),
+    }
+    if dict(report_review) != expected_review:
+        raise BundleError(
+            "INVALID_MANIFEST", "report review does not match review.json"
         )
 
     if verdict not in _FULL_EVIDENCE_VERDICTS:
@@ -1506,6 +1598,24 @@ def _verify_semantics(
             "INVALID_MANIFEST",
             "execution metadata probe does not match metadata/probe.json",
         )
+    # execution.json duplicates the probe so consumers do not need a second
+    # file; it must not become a second, unbound copy of the same facts.
+    report_environment = _mapping(report.get("environment"), "report environment")
+    if report_environment.get("probe") != probe:
+        raise BundleError(
+            "INVALID_MANIFEST",
+            "report environment probe does not match metadata/probe.json",
+        )
+    # The builds/replays lists are repeated in execution.json for operational
+    # diagnostics. When present they must be exactly the report's lists so one
+    # copy cannot be tampered with independently.
+    for field in ("builds", "replays"):
+        if field in execution_metadata:
+            if execution_metadata[field] != report.get(field):
+                raise BundleError(
+                    "INVALID_MANIFEST",
+                    f"execution metadata {field} do not match report.{field}",
+                )
 
     report_repository = report.get("repository")
     if report_repository != plan.get("repository"):
@@ -1599,37 +1709,64 @@ def verify_bundle(root: Path | str) -> BundleVerification:
         )
 
     listed = {entry["path"]: entry for entry in entries}
+    _require_required_paths(listed)
     actual: dict[str, Path] = {}
     entries_seen = 0
-    for current_root, directories, filenames in os.walk(root_path, followlinks=False):
-        current = Path(current_root)
-        # Count directories and files as we descend. A tree crafted with
-        # thousands of empty directories must fail before the walk finishes,
-        # not after every entry has been enumerated.
-        entries_seen += len(directories) + len(filenames)
-        if entries_seen > MAX_BUNDLE_ENTRIES:
+    # Walk with an explicit scandir stack instead of os.walk. os.walk collects
+    # a directory's names into lists before the caller can count them, so a
+    # single directory with millions of entries would exhaust memory before
+    # the cap was observed. Here every entry is counted as it is yielded and
+    # the scan aborts immediately once MAX_BUNDLE_ENTRIES is exceeded.
+    stack: list[Path] = [root_path]
+    while stack:
+        current = stack.pop()
+        try:
+            iterator = os.scandir(current)
+        except OSError as error:
             raise BundleError(
-                "INVALID_MANIFEST",
-                f"bundle contains more than {MAX_BUNDLE_ENTRIES} directory entries",
-            )
-        for name in directories:
-            child = current / name
-            if child.is_symlink():
-                raise BundleError("SYMLINK", f"bundle contains a symlink: {child}")
-        for name in filenames:
-            child = current / name
-            if child.is_symlink():
-                raise BundleError("SYMLINK", f"bundle contains a symlink: {child}")
-            if not child.is_file():
-                raise BundleError(
-                    "INVALID_MANIFEST", f"bundle contains a special file: {child}"
-                )
-            relative = child.relative_to(root_path).as_posix()
-            if relative == "manifest.json":
-                continue
-            if relative not in listed:
-                raise BundleError("EXTRA_FILE", f"bundle contains an extra file: {relative}")
-            actual[relative] = child
+                "INVALID_MANIFEST", f"bundle cannot be enumerated: {error}"
+            ) from error
+        with iterator:
+            for dirent in iterator:
+                entries_seen += 1
+                if entries_seen > MAX_BUNDLE_ENTRIES:
+                    raise BundleError(
+                        "INVALID_MANIFEST",
+                        f"bundle contains more than {MAX_BUNDLE_ENTRIES} "
+                        "directory entries",
+                    )
+                child = Path(dirent.path)
+                # ``is_symlink`` never follows the link, matching the previous
+                # os.walk(followlinks=False) behaviour.
+                if dirent.is_symlink():
+                    raise BundleError(
+                        "SYMLINK", f"bundle contains a symlink: {child}"
+                    )
+                try:
+                    is_directory = dirent.is_dir(follow_symlinks=False)
+                    is_file = dirent.is_file(follow_symlinks=False)
+                except OSError as error:
+                    raise BundleError(
+                        "INVALID_MANIFEST",
+                        f"bundle entry cannot be inspected: {error}",
+                    ) from error
+                if is_directory:
+                    stack.append(child)
+                    continue
+                if not is_file:
+                    raise BundleError(
+                        "INVALID_MANIFEST",
+                        f"bundle contains a special file: {child}",
+                    )
+                relative = child.relative_to(root_path).as_posix()
+                if relative == "manifest.json":
+                    continue
+                if relative not in listed:
+                    raise BundleError(
+                        "EXTRA_FILE",
+                        f"bundle contains an extra file: {relative}",
+                    )
+                actual[relative] = child
     missing = sorted(set(listed) - set(actual))
     if missing:
         raise BundleError("MISSING_FILE", "bundle is missing: " + ", ".join(missing))
