@@ -382,3 +382,21 @@ def test_priority_text_matches_the_classifier_order():
     assert "timeout" in PRIORITY[1].lower()
     assert "abnormal completed normal control" in PRIORITY[2].lower()
     assert "intermittent" in PRIORITY[3].lower()
+
+
+def test_forged_asan_source_prefix_is_rejected():
+    forged = ASanSignature(
+        error="heap-buffer-overflow",
+        operation="WRITE",
+        access_size=1,
+        function="parse_token",
+        source="totally/elsewhere/parser.c",
+    )
+    assert not signature_matches(forged, SIGNATURE)
+    assert not signature_matches(
+        forged, {**SIGNATURE, "source": "vulnerable/parser.c"}
+    )
+    # The real absolute frame path and a bare basename remain acceptable.
+    real = replace(forged, source="/fixture/vulnerable/parser.c")
+    assert signature_matches(real, SIGNATURE)
+    assert signature_matches(replace(forged, source="parser.c"), SIGNATURE)

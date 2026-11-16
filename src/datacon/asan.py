@@ -7,6 +7,7 @@ verdict rule are extracted, and the raw log is retained separately as evidence.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import posixpath
 import re
 from typing import Any, Mapping
 
@@ -79,16 +80,47 @@ def parse_asan(text: str | None) -> ASanSignature | None:
     )
 
 
+def _normalize_source(value: str) -> str:
+    normalized = value.replace("\\", "/").strip()
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    return posixpath.normpath(normalized)
+
+
 def _source_matches(expected: str, observed: str | None) -> bool:
+    """Match a reviewed source path without accepting an arbitrary prefix.
+
+    The rule is deliberately narrow:
+
+    * the normalized paths must be equal;
+    * a reviewed basename matches only a bare observed basename or an absolute
+      ASan frame path, never a relative path with a forged directory prefix;
+    * a reviewed relative path may match an absolute frame path that ends with
+      the reviewed path.
+
+    An observed basename also matches a reviewed path with directories, which
+    is the documented basename rule. ASan text is observable behavior, not an
+    authenticity proof; see the README.
+    """
     if not observed:
         return False
-    expected = expected.replace("\\", "/").lstrip("./")
-    observed = observed.replace("\\", "/")
-    return (
-        observed == expected
-        or observed.endswith("/" + expected)
-        or expected.endswith("/" + observed.lstrip("./"))
-    )
+    expected_path = _normalize_source(expected)
+    observed_path = _normalize_source(observed)
+    if expected_path.startswith("../") or observed_path.startswith("../"):
+        return False
+    if observed_path == expected_path:
+        return True
+    expected_base = posixpath.basename(expected_path)
+    observed_base = posixpath.basename(observed_path)
+    if expected_path == expected_base:
+        # Reviewed as a basename: accept the same bare basename or an absolute
+        # frame path. A relative path with extra components is a forged prefix.
+        return observed_base == expected_base and (
+            observed_path == observed_base or posixpath.isabs(observed_path)
+        )
+    if observed_path == observed_base:
+        return observed_base == expected_base
+    return observed_path.endswith("/" + expected_path)
 
 
 def signature_matches(

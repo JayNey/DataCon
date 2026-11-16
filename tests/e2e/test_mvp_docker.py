@@ -475,3 +475,111 @@ def test_reclaim_job_removes_only_older_generations_on_real_docker(
                 text=True,
                 timeout=60,
             )
+
+
+# ---------------------------------------------------------------------------
+# B3: target-written completion/exit files never decide the evidence.
+# ---------------------------------------------------------------------------
+
+PINNED_IMAGE = (
+    "silkeh/clang:19-bookworm@sha256:"
+    "f5ce959d91f059acf5a4b3f1c19f46713c4b2881c7d7cd1d5143ca1d1412277f"
+)
+
+
+def _sandbox(tmp_path, job_id):
+    policy = IsolationPolicy(
+        network="none",
+        user="65534:65534",
+        read_only_root=True,
+        cap_drop=("ALL",),
+        no_new_privileges=True,
+        seccomp="runtime/default",
+        seccomp_profile_digest=SECCOMP_PROFILE_DIGEST,
+    )
+    return DockerSandbox(
+        image=PINNED_IMAGE,
+        platform="linux/amd64",
+        policy=policy,
+        limits=ResourceLimits(cpu=2, memory_mib=2048, pids=128, scratch_mib=512),
+        job_id=job_id,
+        run_root=tmp_path / "runs",
+        generation=1,
+    )
+
+
+def _write_target(tmp_path, body: str) -> tuple[Path, Path]:
+    parser = tmp_path / "parser"
+    parser.write_text("#!/bin/sh\n" + body, encoding="utf-8")
+    parser.chmod(0o555)
+    input_file = tmp_path / "input"
+    input_file.write_text("ABCD\n", encoding="utf-8")
+    input_file.chmod(0o444)
+    return parser, input_file
+
+
+def test_target_cannot_touch_done_early_and_hide_asan(tmp_path):
+    parser, input_file = _write_target(
+        tmp_path,
+        "printf 'ABCD\\n' > /work/stdout\n"
+        "printf '0\\n' > /work/exit_code\n"
+        "touch /work/done\n"
+        "sleep 2\n"
+        "printf '==1==ERROR: AddressSanitizer: heap-buffer-overflow\\n"
+        "WRITE of size 1\\n' >&2\n"
+        "exit 1\n",
+    )
+    job_id = "b3-" + uuid.uuid4().hex
+    sandbox = _sandbox(tmp_path, job_id)
+    result = sandbox.replay(
+        "fixed",
+        "candidate_1",
+        artifact_path=parser,
+        input_path=input_file,
+        asan_options="detect_leaks=0",
+        timeout_seconds=60,
+    )
+    assert result.status == "completed"
+    assert result.exit_code == 1
+    assert b"AddressSanitizer" in result.stderr
+    assert result.signature is not None
+    # The replay is not clean regardless of what the target wrote to /work.
+    assert not (
+        result.exit_code == 0 and result.signature is None
+    )
+    leftovers = subprocess.run(
+        [
+            "docker",
+            "ps",
+            "-aq",
+            "--filter",
+            f"label=datacon.job_id={job_id}",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert leftovers.stdout.strip() == ""
+
+
+def test_replay_exit_code_comes_from_container_not_work_file(tmp_path):
+    parser, input_file = _write_target(
+        tmp_path,
+        "printf '0\\n' > /work/exit_code\n"
+        "printf 'fake clean\\n' > /work/stdout\n"
+        "touch /work/done\n"
+        "exit 7\n",
+    )
+    job_id = "b3-exit-" + uuid.uuid4().hex
+    sandbox = _sandbox(tmp_path, job_id)
+    result = sandbox.replay(
+        "vulnerable",
+        "candidate_1",
+        artifact_path=parser,
+        input_path=input_file,
+        asan_options="detect_leaks=0",
+        timeout_seconds=60,
+    )
+    assert result.exit_code == 7
+    assert result.status == "completed"
+    assert b"fake clean" not in result.stdout

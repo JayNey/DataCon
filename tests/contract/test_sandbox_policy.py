@@ -166,7 +166,19 @@ def host_config(**overrides):
         "Binds": [f"{MOUNT_SOURCE}:/fixture:ro"],
         "Tmpfs": {"/work": "rw,exec,size=496m,mode=1777", "/tmp": "rw,exec,size=16m,mode=1777"},
         "IpcMode": "private",
+        "PidMode": "",
+        "UTSMode": "",
+        "CgroupnsMode": "private",
+        "UsernsMode": "",
         "Devices": [],
+        "DeviceRequests": [],
+        "LogConfig": {
+            "Type": "json-file",
+            "Config": {
+                "max-size": str(32 * 1024 * 1024),
+                "max-file": "1",
+            },
+        },
     }
     value.update(overrides)
     return value
@@ -516,8 +528,9 @@ def test_reclaim_removes_only_older_generation(tmp_path):
         "old": "2",
         "current": "5",
         "newer": "6",
-        "newer_probe": "6",
+        "future": "999",
         "legacy": None,
+        "malformed": "two",
     }
 
     def fake_docker(command, *, timeout=60.0):
@@ -532,8 +545,6 @@ def test_reclaim_removes_only_older_generation(tmp_path):
             labels = {"datacon.job_id": "job-1234"}
             if containers[name] is not None:
                 labels["datacon.generation"] = containers[name]
-            if name.endswith("probe"):
-                labels["datacon.run"] = "probe"
             return SimpleNamespace(
                 returncode=0,
                 stdout=json.dumps([{"Config": {"Labels": labels}}]).encode(),
@@ -545,10 +556,143 @@ def test_reclaim_removes_only_older_generation(tmp_path):
         raise AssertionError(f"unexpected docker command: {command}")
 
     sandbox._docker = fake_docker
-    assert sandbox.reclaim_job() == 2
-    assert set(removed) == {"old", "legacy"}
+    with pytest.raises(SandboxError, match="missing or malformed"):
+        sandbox.reclaim_job()
+    assert set(removed) == {"old"}
     assert "current" not in removed and "newer" not in removed
-    assert "newer_probe" not in removed
+    assert "future" not in removed and "legacy" not in removed
+    assert "malformed" not in removed
+
+
+def test_reclaim_requires_an_explicit_generation(tmp_path):
+    sandbox = DockerSandbox(
+        image=IMAGE,
+        platform="linux/amd64",
+        policy=POLICY,
+        limits=LIMITS,
+        docker="docker",
+        job_id="job-1234",
+        run_root=tmp_path,
+        generation=None,
+    )
+    def empty_ps(command, *, timeout=60.0):
+        assert command[0] == "ps"
+        return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+
+    sandbox._docker = empty_ps
+    with pytest.raises(SandboxPolicyError):
+        sandbox.reclaim_job()
+
+
+def test_reclaim_does_not_count_failed_rm(tmp_path):
+    sandbox = DockerSandbox(
+        image=IMAGE,
+        platform="linux/amd64",
+        policy=POLICY,
+        limits=LIMITS,
+        docker="docker",
+        job_id="job-1234",
+        run_root=tmp_path,
+        generation=5,
+    )
+
+    def fake_docker(command, *, timeout=60.0):
+        if command[0] == "ps":
+            return SimpleNamespace(returncode=0, stdout=b"old\n", stderr=b"")
+        if command[0] == "inspect":
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps(
+                    [
+                        {
+                            "Config": {
+                                "Labels": {
+                                    "datacon.job_id": "job-1234",
+                                    "datacon.generation": "2",
+                                }
+                            }
+                        }
+                    ]
+                ).encode(),
+                stderr=b"",
+            )
+        if command[0] == "rm":
+            return SimpleNamespace(returncode=1, stdout=b"", stderr=b"device busy")
+        raise AssertionError(f"unexpected docker command: {command}")
+
+    sandbox._docker = fake_docker
+    with pytest.raises(SandboxError, match="device busy"):
+        sandbox.reclaim_job()
+    assert sandbox.cleanup_errors
+
+
+def test_reclaim_reports_ps_failure(tmp_path):
+    sandbox = DockerSandbox(
+        image=IMAGE,
+        platform="linux/amd64",
+        policy=POLICY,
+        limits=LIMITS,
+        docker="docker",
+        job_id="job-1234",
+        run_root=tmp_path,
+        generation=5,
+    )
+
+    def fake_docker(command, *, timeout=60.0):
+        if command[0] == "ps":
+            return SimpleNamespace(returncode=1, stdout=b"", stderr=b"daemon down")
+        raise AssertionError(f"unexpected docker command: {command}")
+
+    sandbox._docker = fake_docker
+    with pytest.raises(SandboxError, match="daemon down"):
+        sandbox.reclaim_job()
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"SecurityOpt": ["no-new-privileges:false", SECCOMP_OPTION]},
+        {"SecurityOpt": ["no-new-privileges:true", "apparmor=unconfined", SECCOMP_OPTION]},
+        {"SecurityOpt": ["no-new-privileges", "label=disable", SECCOMP_OPTION]},
+        {"PidMode": "host"},
+        {"UTSMode": "host"},
+        {"CgroupnsMode": "host"},
+        {"UsernsMode": "host"},
+        {"Devices": [{"PathOnHost": "/dev/kvm"}]},
+        {"DeviceRequests": [{"Driver": "nvidia"}]},
+    ],
+)
+def test_inspect_rejects_non_allowlisted_security_drift(change):
+    with pytest.raises(SandboxPolicyError):
+        validate_host_config(
+            host_config(**change), POLICY, LIMITS, mounts=declared_mounts()
+        )
+
+
+def test_inspect_requires_bounded_log_rotation():
+    config = host_config()
+    config["LogConfig"] = {"Type": "json-file", "Config": {}}
+    with pytest.raises(SandboxPolicyError, match="log rotation"):
+        validate_host_config(config, POLICY, LIMITS, mounts=declared_mounts())
+
+
+def test_create_reports_cleanup_failure(tmp_path):
+    sandbox = RecordingSandbox(tmp_path, _inspect_payload(ReadonlyRootfs=False))
+
+    def failing_remove(name, *, retries=1):
+        sandbox.cleanup_errors.append("rm failed")
+        return False, "rm failed"
+
+    sandbox._remove = failing_remove
+    with pytest.raises(SandboxPolicyError) as caught:
+        sandbox._create(
+            suffix="negative",
+            command=["/bin/true"],
+            mounts=[(MOUNT_SOURCE, "/fixture", True)],
+        )
+    notes = getattr(caught.value, "__notes__", [])
+    assert any("cleanup also failed" in note for note in notes)
+    assert sandbox.cleanup_errors
 
 
 # ---------------------------------------------------------------------------
@@ -676,6 +820,60 @@ def test_stage_replay_files_rejects_oversized_artifact_before_read(
             "bounded",
         )
     assert caught.value.reason_code == "MATERIAL_MISSING"
+
+
+def _materialize_context(tmp_path):
+    payloads = {
+        "harness.c": b"harness-body",
+        "build.sh": b"#!/bin/sh\n",
+        "dependencies.lock": b"deps",
+        "fix.patch": b"patch-body",
+        "vulnerable/parser.c": b"vuln-body",
+        "fixed/parser.c": b"fixed-body",
+        "inputs/normal.txt": b"normal-body",
+        "inputs/candidate.txt": b"candidate-body",
+    }
+    digests = {relative: _sha(data) for relative, data in payloads.items()}
+    context = SimpleNamespace(
+        case=SimpleNamespace(
+            manifest={
+                "harness": "harness.c",
+                "build_recipe": "build.sh",
+                "dependencies": "dependencies.lock",
+                "versions": {
+                    "vulnerable": "vulnerable/parser.c",
+                    "fixed": "fixed/parser.c",
+                },
+            },
+            repository={"patch": "fix.patch"},
+            read_material=lambda relative, expected: (
+                payloads[relative],
+                digests[relative],
+            ),
+        ),
+        manifest_case={
+            "inputs": {
+                "normal": "inputs/normal.txt",
+                "candidate": "inputs/candidate.txt",
+            }
+        },
+        plan={
+            "harness_digest": digests["harness.c"],
+            "build_recipe_digest": digests["build.sh"],
+            "dependencies_digest": digests["dependencies.lock"],
+            "repository": {"patch_digest": digests["fix.patch"]},
+            "inputs": {
+                "normal": digests["inputs/normal.txt"],
+                "candidate": digests["inputs/candidate.txt"],
+            },
+        },
+        materials={
+            "vulnerable/parser.c": digests["vulnerable/parser.c"],
+            "fixed/parser.c": digests["fixed/parser.c"],
+        },
+        material_payloads={},
+    )
+    return context
 
 
 def test_materialize_rechecks_an_existing_tree_with_bounded_reads(
@@ -1891,13 +2089,36 @@ def _fake_docker_sandbox(tmp_path, files):
         generation=1,
     )
     sandbox._create = lambda **kwargs: ("fake-container", {})
-    sandbox._remove = lambda name: None
-    sandbox._start_and_wait = lambda *args, **kwargs: (
-        dict(files),
-        set(),
-        {},
-        False,
-    )
+    sandbox._remove = lambda name: (True, None)
+
+    def fake_start(*args, **kwargs):
+        stdout = files.get(
+            "stdout", files.get("/work/stdout", files.get("/work/build.log", b""))
+        )
+        stderr = files.get("stderr", files.get("/work/stderr", b""))
+        parser = files.get("/work/parser")
+        if parser is not None:
+            digest = hashlib.sha256(parser).hexdigest()
+            stderr += (
+                f"\nDATACON_BUILD_RESULT code=0 size={len(parser)} "
+                f"digest={digest}\n"
+            ).encode()
+        return (
+            stdout,
+            stderr,
+            {
+                key: value
+                for key, value in files.items()
+                if key.startswith("/work/")
+            },
+            set(),
+            {},
+            False,
+            0,
+            None,
+        )
+
+    sandbox._start_and_wait = fake_start
     return sandbox
 
 
@@ -2022,3 +2243,284 @@ def test_docker_sandbox_rejects_oversized_replay_input_before_container(
 
     assert caught.value.reason_code == "MATERIAL_MISSING"
     assert created == []
+
+
+# ---------------------------------------------------------------------------
+# B4: mountinfo overmount selection follows parent_id, never max(mount_id).
+# ---------------------------------------------------------------------------
+
+
+def test_mountinfo_rejects_topmost_overmount_with_reused_lower_id():
+    text = _mountinfo(
+        "41 36 9:1 / /srv/run/sub rw - ext4 /dev/sdb1 rw",
+        "60 36 10:1 / /mnt/ev rw - ext4 /dev/sdc1 rw",
+        "5 60 9:1 / /mnt/ev rw - ext4 /dev/sdb1 rw",
+    )
+    assert execution._mountinfo_rejects(
+        Path("/mnt/ev/evidence"), Path("/srv/run"), text
+    )
+
+
+def test_mountinfo_rejects_equal_mount_ids_at_same_mount_point():
+    text = _mountinfo(
+        "60 36 10:1 / /mnt/ev rw - ext4 /dev/sdc1 rw",
+        "60 36 10:1 / /mnt/ev rw - ext4 /dev/sdc1 rw",
+    )
+    assert execution._mountinfo_rejects(
+        Path("/mnt/ev/evidence"), Path("/srv/run"), text
+    )
+
+
+@pytest.mark.parametrize("line_order", [(0, 1, 2), (2, 0, 1), (1, 2, 0)])
+def test_mountinfo_topmost_is_independent_of_mount_id_order(line_order):
+    lines = [
+        "41 36 9:1 / /srv/run/sub rw - ext4 /dev/sdb1 rw",
+        "60 36 10:1 / /mnt/ev rw - ext4 /dev/sdc1 rw",
+        "5 60 9:1 / /mnt/ev rw - ext4 /dev/sdb1 rw",
+    ]
+    text = _mountinfo(*(lines[index] for index in line_order))
+    entries = execution._parse_mountinfo(text)
+    selected = execution._mount_point_for(entries, Path("/mnt/ev/evidence"))
+    # 5 is a child of 60 at the same mount point, so it is the visible mount
+    # even though 60 has the larger numeric id.
+    assert selected is not None
+    assert selected.mount_id == 5
+    assert execution._mountinfo_rejects(
+        Path("/mnt/ev/evidence"), Path("/srv/run"), text
+    )
+
+
+def test_mountinfo_rejects_branching_or_incomplete_overmount_chain():
+    # Two children of the same lower mount are not a unique chain.
+    branching = _mountinfo(
+        "60 36 10:1 / /mnt/ev rw - ext4 /dev/sdc1 rw",
+        "61 60 9:1 / /mnt/ev rw - ext4 /dev/sdb1 rw",
+        "62 60 9:1 / /mnt/ev rw - ext4 /dev/sdb1 rw",
+    )
+    entries = execution._parse_mountinfo(branching)
+    assert execution._mount_point_for(entries, Path("/mnt/ev")) is None
+    assert execution._mountinfo_rejects(
+        Path("/mnt/ev/evidence"), Path("/srv/run"), branching
+    )
+    # A cycle has no unique root.
+    cycle = _mountinfo(
+        "60 61 10:1 / /mnt/ev rw - ext4 /dev/sdc1 rw",
+        "61 60 10:1 / /mnt/ev rw - ext4 /dev/sdc1 rw",
+    )
+    entries = execution._parse_mountinfo(cycle)
+    assert execution._mount_point_for(entries, Path("/mnt/ev")) is None
+
+
+def test_mountinfo_duplicate_ids_outside_the_target_still_fail_closed():
+    text = _mountinfo(
+        "36 1 8:1 / /data rw - ext4 /dev/sda1 rw",
+        "41 36 8:1 / /data/runs/child rw - ext4 /dev/sda1 rw",
+    )
+    # The base line already uses mount id 36; a duplicate makes every
+    # containment result unprovable, including an unrelated target.
+    assert execution._mountinfo_rejects(
+        Path("/srv/evidence"), Path("/data/runs"), text
+    )
+
+
+# ---------------------------------------------------------------------------
+# B2: the journal HMAC key is never derived inside the current directory.
+# ---------------------------------------------------------------------------
+
+
+def test_journal_secret_default_under_cwd_fails_closed(tmp_path, monkeypatch):
+    work = tmp_path / "work"
+    work.mkdir()
+    monkeypatch.chdir(work)
+    monkeypatch.delenv("DATACON_EVIDENCE_ROOT", raising=False)
+    monkeypatch.delenv("DATACON_JOURNAL_SECRET_FILE", raising=False)
+    with pytest.raises(execution.ExecutionFailed) as caught:
+        execution._journal_secret_path(tmp_path / "runs")
+    assert caught.value.reason_code == "EVIDENCE_WRITE_FAILED"
+    assert "relative DATACON_EVIDENCE_ROOT" in caught.value.message
+
+
+def test_journal_secret_explicit_inside_cwd_fails_closed(tmp_path, monkeypatch):
+    work = tmp_path / "work"
+    work.mkdir()
+    monkeypatch.chdir(work)
+    monkeypatch.setenv("DATACON_EVIDENCE_ROOT", str(tmp_path / "evidence"))
+    monkeypatch.setenv(
+        "DATACON_JOURNAL_SECRET_FILE", str(work / ".datacon-journal-secret")
+    )
+    with pytest.raises(execution.ExecutionFailed) as caught:
+        execution._journal_secret_path(tmp_path / "runs")
+    assert caught.value.reason_code == "EVIDENCE_WRITE_FAILED"
+    assert "current working directory" in caught.value.message
+
+
+def test_journal_secret_absolute_evidence_root_outside_cwd_still_works(
+    tmp_path, monkeypatch
+):
+    work = tmp_path / "work"
+    work.mkdir()
+    evidence_root = tmp_path / "evidence"
+    monkeypatch.chdir(work)
+    monkeypatch.setenv("DATACON_EVIDENCE_ROOT", str(evidence_root))
+    monkeypatch.delenv("DATACON_JOURNAL_SECRET_FILE", raising=False)
+    monkeypatch.delenv("DATACON_STAGING_ROOT", raising=False)
+
+    path = execution._journal_secret_path(tmp_path / "runs")
+    assert path.parent == evidence_root.resolve().parent
+    assert not execution._lexically_within_run_root(path, work.resolve())
+
+    secret = execution._journal_secret(create=True, run_root=tmp_path / "runs")
+    assert secret is not None and len(secret) >= 32
+    assert path.read_bytes() == secret
+
+
+def test_journal_secret_planted_by_attacker_is_not_used(tmp_path, monkeypatch):
+    work = tmp_path / "work"
+    work.mkdir()
+    evidence_root = tmp_path / "evidence"
+    monkeypatch.chdir(work)
+    monkeypatch.setenv("DATACON_EVIDENCE_ROOT", str(evidence_root))
+    monkeypatch.delenv("DATACON_JOURNAL_SECRET_FILE", raising=False)
+
+    # The attacker pre-creates the historical CWD secret path. A relative
+    # evidence root must fail before that file is ever opened.
+    planted = work / ".datacon" / ".datacon-journal-secret"
+    planted.parent.mkdir()
+    planted.write_bytes(b"attacker-secret" * 4)
+    planted.chmod(0o600)
+    monkeypatch.setenv("DATACON_EVIDENCE_ROOT", ".datacon/evidence")
+    with pytest.raises(execution.ExecutionFailed) as caught:
+        execution._journal_secret(create=True, run_root=tmp_path / "runs")
+    assert caught.value.reason_code == "EVIDENCE_WRITE_FAILED"
+    assert planted.read_bytes() == b"attacker-secret" * 4
+
+    # A symlink planted at the real default path is rejected even when the
+    # evidence root itself is outside CWD.
+    monkeypatch.setenv("DATACON_EVIDENCE_ROOT", str(evidence_root))
+    default = evidence_root.resolve().parent / ".datacon-journal-secret"
+    default.symlink_to(planted)
+    with pytest.raises(execution.ExecutionFailed) as caught:
+        execution._journal_secret(create=True, run_root=tmp_path / "runs")
+    assert caught.value.reason_code == "EVIDENCE_WRITE_FAILED"
+
+
+# ---------------------------------------------------------------------------
+# S1: run-root writes are bound to their generation and use directory fds.
+# ---------------------------------------------------------------------------
+
+
+def test_run_file_cannot_write_into_another_generation_via_symlinked_parent(
+    tmp_path,
+):
+    run_root = tmp_path / "runs"
+    generation = run_root / "generation-1"
+    other = run_root / "generation-2"
+    (other / "build" / "vulnerable").mkdir(parents=True)
+    generation.mkdir()
+    (generation / "build").symlink_to(other / "build")
+
+    target = generation / "build" / "vulnerable" / "build.log"
+    with pytest.raises(execution.ExecutionFailed) as caught:
+        execution._write_run_file(
+            run_root, target, b"old generation\n", 0o600
+        )
+    assert caught.value.reason_code == "EVIDENCE_WRITE_FAILED"
+    assert not (other / "build" / "vulnerable" / "build.log").exists()
+
+
+def test_journal_cannot_write_into_another_generation_via_symlinked_parent(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("DATACON_EVIDENCE_ROOT", str(tmp_path / "evidence"))
+    monkeypatch.delenv("DATACON_JOURNAL_SECRET_FILE", raising=False)
+    run_root = tmp_path / "runs"
+    step = "build:vulnerable"
+    scope = run_root / "steps" / "build_vulnerable" / "generation-1"
+    other = run_root / "steps" / "build_vulnerable" / "other"
+    other.mkdir(parents=True)
+    scope.parent.mkdir(parents=True, exist_ok=True)
+    scope.symlink_to(other)
+
+    with pytest.raises(execution.ExecutionFailed) as caught:
+        execution._write_journal(
+            run_root,
+            step,
+            1,
+            1,
+            {"job_id": "job", "generation": 1},
+        )
+    assert caught.value.reason_code == "EVIDENCE_WRITE_FAILED"
+    assert not (other / "attempt-1" / "run.json").exists()
+
+
+def test_materialize_rejects_symlinked_generation_root_without_writing_outside(
+    tmp_path,
+):
+    external = tmp_path / "external"
+    external.mkdir()
+    generation = tmp_path / "generation-1"
+    generation.symlink_to(external)
+
+    with pytest.raises(execution.ExecutionFailed) as caught:
+        execution._materialize(_materialize_context(tmp_path), generation)
+    assert caught.value.reason_code == "EVIDENCE_WRITE_FAILED"
+    assert list(external.iterdir()) == []
+
+
+def test_write_run_file_parent_swap_after_check_cannot_escape(
+    tmp_path, monkeypatch
+):
+    run_root = tmp_path / "runs"
+    generation = run_root / "generation-1"
+    parent = generation / "logs"
+    parent.mkdir(parents=True)
+    external = tmp_path / "external"
+    external.mkdir()
+    target = parent / "stdout.log"
+
+    real_write = execution.fileio.write_regular_file
+
+    def swap_then_write(*args, **kwargs):
+        os.rename(parent, generation / "logs-moved")
+        parent.symlink_to(external)
+        return real_write(*args, **kwargs)
+
+    monkeypatch.setattr(execution.fileio, "write_regular_file", swap_then_write)
+    with pytest.raises(execution.ExecutionFailed) as caught:
+        execution._write_run_file(run_root, target, b"payload", 0o600)
+    assert caught.value.reason_code == "EVIDENCE_WRITE_FAILED"
+    assert not (external / "stdout.log").exists()
+
+
+def test_write_journal_parent_swap_after_check_cannot_escape(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("DATACON_EVIDENCE_ROOT", str(tmp_path / "evidence"))
+    monkeypatch.delenv("DATACON_JOURNAL_SECRET_FILE", raising=False)
+    run_root = tmp_path / "runs"
+    path = execution._journal_path(run_root, "build:vulnerable", 1, 1)
+    parent = path.parent
+    parent.mkdir(parents=True)
+    external = tmp_path / "external"
+    external.mkdir()
+
+    real_write = execution.fileio.write_regular_file_atomic
+
+    def swap_then_write(*args, **kwargs):
+        os.rename(parent, parent.parent / "attempt-1-moved")
+        parent.symlink_to(external)
+        return real_write(*args, **kwargs)
+
+    monkeypatch.setattr(
+        execution.fileio, "write_regular_file_atomic", swap_then_write
+    )
+    with pytest.raises(execution.ExecutionFailed) as caught:
+        execution._write_journal(
+            run_root,
+            "build:vulnerable",
+            1,
+            1,
+            {"job_id": "job", "generation": 1},
+        )
+    assert caught.value.reason_code == "EVIDENCE_WRITE_FAILED"
+    assert not (external / "run.json").exists()

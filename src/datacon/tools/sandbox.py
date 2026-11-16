@@ -29,6 +29,10 @@ from datacon.cases import MAX_MATERIAL_BYTES
 MIB = 1024 * 1024
 MAX_LOG_BYTES = 16 * 1024 * 1024
 MAX_ARTIFACT_BYTES = 128 * 1024 * 1024
+# Docker's json-file driver rotates at this size. It bounds the disk a hostile
+# stdout/stderr producer can consume and the memory `docker logs` can return.
+LOG_MAX_BYTES = 32 * 1024 * 1024
+LOG_MAX_FILES = 1
 MAX_PREVIEW_BYTES = 512
 _IMAGE_DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
@@ -184,6 +188,7 @@ class ProbeReport:
     image_digest: str
     raw: str
     limits: dict[str, Any] = field(default_factory=dict)
+    cleanup_errors: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -312,6 +317,7 @@ def container_create_args(
     docker: str = "docker",
     job_id: str | None = None,
     generation: int | None = None,
+    log_max_bytes: int = LOG_MAX_BYTES,
 ) -> list[str]:
     """Return the exact ``docker create`` argument vector."""
     policy.validate()
@@ -359,6 +365,12 @@ def container_create_args(
         str(limits.cpu),
         "--ipc",
         "private",
+        "--log-driver",
+        "json-file",
+        "--log-opt",
+        f"max-size={log_max_bytes}b",
+        "--log-opt",
+        f"max-file={LOG_MAX_FILES}",
         "--tmpfs",
         f"/work:rw,exec,size={work_mib}m,mode=1777",
         "--tmpfs",
@@ -394,16 +406,55 @@ def _close_enough(actual: Any, expected: int) -> bool:
     return type(actual) is int and actual == expected
 
 
+def _parse_log_size(value: Any) -> int:
+    """Parse Docker's ``max-size`` value (bytes with an optional unit)."""
+    text = str(value).strip().lower()
+    if not text:
+        raise ValueError("empty log size")
+    multiplier = 1
+    if text[-1] in ("b", "k", "m", "g"):
+        suffix = text[-1]
+        text = text[:-1]
+        multiplier = {
+            "b": 1,
+            "k": 1024,
+            "m": 1024 * 1024,
+            "g": 1024 * 1024 * 1024,
+        }[suffix]
+    return int(text) * multiplier
+
+
 def _validate_security_options(
     config: Mapping[str, Any], policy: IsolationPolicy
 ) -> None:
+    """Accept exactly one no-new-privileges flag and one pinned seccomp profile.
+
+    An allowlist, not a denylist: Docker's inspect output may contain options
+    such as ``no-new-privileges:false`` or ``apparmor=unconfined`` that a
+    ``startswith`` check would happily accept. Anything beyond the exact
+    approved pair is a policy failure.
+    """
     security = [str(item) for item in config.get("SecurityOpt") or []]
-    lowered = [item.lower() for item in security]
-    if not any(item.startswith("no-new-privileges") for item in lowered):
-        raise SandboxPolicyError("no-new-privileges is not active")
-    seccomp_options = [item for item in security if item.lower().startswith("seccomp=")]
+    no_new_privileges = [
+        item
+        for item in security
+        if item.lower()
+        in ("no-new-privileges", "no-new-privileges:true", "no-new-privileges=true")
+    ]
+    if len(no_new_privileges) != 1:
+        raise SandboxPolicyError(
+            "exactly one effective no-new-privileges option is required"
+        )
+    seccomp_options = [
+        item for item in security if item.lower().startswith("seccomp=")
+    ]
     if len(seccomp_options) != 1:
         raise SandboxPolicyError("exactly one explicit seccomp profile is required")
+    if len(security) != 2:
+        raise SandboxPolicyError(
+            "container has unapproved security options: "
+            + ", ".join(security)
+        )
     value = seccomp_options[0].split("=", 1)[1]
     if value.strip().lower() in ("", "unconfined", "default", "runtime/default", "docker/default"):
         raise SandboxPolicyError(
@@ -505,6 +556,7 @@ def validate_host_config(
     limits: ResourceLimits,
     *,
     mounts: Sequence[tuple[str, str, bool]] = (),
+    log_max_bytes: int = LOG_MAX_BYTES,
 ) -> None:
     """Fail closed unless inspect output shows every requested control.
 
@@ -546,6 +598,35 @@ def validate_host_config(
         raise SandboxPolicyError("container has host devices")
     if config.get("IpcMode") not in (None, "private"):
         raise SandboxPolicyError("container IPC namespace is not private")
+    for field in ("PidMode", "UTSMode", "UsernsMode"):
+        if config.get(field) not in (None, "", "private"):
+            raise SandboxPolicyError(
+                f"container {field} must be private, not {config.get(field)!r}"
+            )
+    if config.get("CgroupnsMode") not in (None, "", "private"):
+        raise SandboxPolicyError(
+            "container cgroup namespace must be private, not "
+            f"{config.get('CgroupnsMode')!r}"
+        )
+    if config.get("Devices"):
+        raise SandboxPolicyError("container has host devices")
+    if config.get("DeviceRequests"):
+        raise SandboxPolicyError("container has host device requests")
+    log_config = config.get("LogConfig") or {}
+    if not isinstance(log_config, Mapping):
+        raise SandboxPolicyError("container log config is invalid")
+    if log_config.get("Type") not in ("json-file", "local"):
+        raise SandboxPolicyError("container log driver is not the bounded json-file")
+    log_options = log_config.get("Config") or {}
+    if not isinstance(log_options, Mapping):
+        raise SandboxPolicyError("container log options are invalid")
+    try:
+        configured_size = _parse_log_size(log_options.get("max-size"))
+        configured_files = int(str(log_options.get("max-file")))
+    except (TypeError, ValueError) as error:
+        raise SandboxPolicyError("container log rotation is not bounded") from error
+    if configured_size != log_max_bytes or configured_files != LOG_MAX_FILES:
+        raise SandboxPolicyError("container log rotation differs from the policy")
 
     _validate_mounts(config, mounts)
 
@@ -813,6 +894,7 @@ class DockerSandbox:
         self.generation = generation
         self.run_root = Path(run_root)
         self.pull_timeout = pull_timeout
+        self.cleanup_errors: list[str] = []
 
     # -- low-level helpers -------------------------------------------------
     def _name(self, suffix: str) -> str:
@@ -835,11 +917,36 @@ class DockerSandbox:
         except (ValueError, IndexError, TypeError) as error:
             raise SandboxError("docker inspect returned malformed JSON") from error
 
-    def _remove(self, name: str) -> None:
-        try:
-            self._docker(["rm", "-f", name], timeout=30)
-        except SandboxError:
-            pass
+    def _remove(self, name: str, *, retries: int = 1) -> tuple[bool, str | None]:
+        """Remove a container and report whether Docker really removed it.
+
+        ``docker rm -f`` can fail while the CLI itself exits non-zero or the
+        daemon is unavailable. Swallowing that made reclaim_job count failed
+        removals as cleaned. Return the outcome instead so callers can add a
+        note, surface a cleanup error, or refuse to claim success.
+        """
+        last_error: str | None = None
+        for attempt in range(retries + 1):
+            try:
+                result = self._docker(["rm", "-f", name], timeout=30)
+            except SandboxError as error:
+                last_error = error.message
+            else:
+                if result.returncode == 0:
+                    return True, None
+                stderr = result.stderr.decode("utf-8", "replace").strip()
+                if "no such container" in stderr.lower():
+                    return True, None
+                last_error = stderr or f"docker rm exited {result.returncode}"
+            if attempt < retries:
+                time.sleep(0.1)
+        message = f"cannot remove container {name}: {last_error}"
+        self.cleanup_errors.append(message)
+        return False, message
+
+    def _cleanup_failure(self, name: str) -> str | None:
+        ok, detail = self._remove(name)
+        return None if ok else detail
 
     def available(self) -> tuple[bool, str]:
         try:
@@ -867,14 +974,19 @@ class DockerSandbox:
             raise SandboxUnavailable("the pinned toolchain image cannot be inspected")
 
     def reclaim_job(self) -> int:
-        """Remove containers from this job that belong to older generations.
+        """Remove containers from this job that belong to strictly older generations.
 
         A worker whose lease expired may still be running containers. Those
         containers carry the generation that created them; only generations
-        strictly older than this worker (or legacy containers with no
-        generation label) are removed, so a reclaimed job never deletes the
-        current or a newer generation's probe/build/replay.
+        strictly older than this worker are removed. A missing or malformed
+        generation label is reported instead of being treated as legacy, and
+        generation=None is refused rather than deleting every generation.
         """
+        if self.generation is None:
+            raise SandboxPolicyError(
+                "reclaim_job requires an explicit generation; refusing to "
+                "delete an unbounded container set"
+            )
         result = self._docker(
             [
                 "ps",
@@ -884,34 +996,46 @@ class DockerSandbox:
             ],
             timeout=30,
         )
-        removed = 0
         if result.returncode != 0:
-            return removed
+            detail = result.stderr.decode("utf-8", "replace").strip()
+            raise SandboxError(
+                "cannot list job containers: " + (detail or "docker ps failed")
+            )
+        removed = 0
         for name in result.stdout.decode("utf-8", "replace").split():
             if not name:
                 continue
             try:
                 inspect = self._inspect(name)
-            except SandboxError:
-                # The container disappeared between ps and inspect; never let
-                # cleanup failure mask the execution path.
+            except SandboxError as error:
+                message = f"cannot inspect container {name} for reclaim: {error.message}"
+                self.cleanup_errors.append(message)
                 continue
             labels = (inspect.get("Config") or {}).get("Labels") or {}
             raw_generation = labels.get("datacon.generation")
-            if self.generation is None:
-                should_remove = True
-            elif raw_generation is None:
-                should_remove = True
-            else:
-                try:
+            try:
+                if isinstance(raw_generation, str):
                     container_generation = int(raw_generation)
-                except (TypeError, ValueError):
-                    should_remove = True
                 else:
-                    should_remove = container_generation < self.generation
-            if should_remove:
-                self._remove(name)
+                    raise ValueError("generation label is missing")
+                if not 0 <= container_generation < self.generation:
+                    continue
+            except (TypeError, ValueError):
+                self.cleanup_errors.append(
+                    f"container {name} has a missing or malformed "
+                    f"datacon.generation label: {raw_generation!r}"
+                )
+                continue
+            ok, detail = self._remove(name)
+            if ok:
                 removed += 1
+            elif detail is not None:
+                self.cleanup_errors.append(detail)
+        if self.cleanup_errors:
+            raise SandboxError(
+                "container cleanup reported errors: "
+                + "; ".join(self.cleanup_errors)
+            )
         return removed
 
     # -- containers --------------------------------------------------------
@@ -940,11 +1064,14 @@ class DockerSandbox:
         )
         created = self._docker(args[1:], timeout=120)
         if created.returncode != 0:
-            self._remove(name)
-            raise SandboxError(
+            ok, detail = self._remove(name)
+            message = (
                 "cannot create sandbox container: "
                 + created.stderr.decode("utf-8", "replace")[:500]
             )
+            if not ok and detail is not None:
+                message += f"; cleanup also failed: {detail}"
+            raise SandboxError(message)
         # Once ``docker create`` succeeds the container exists. Any inspect or
         # policy failure below must remove it before propagating, otherwise a
         # malformed container survives its generation and keeps running.
@@ -957,89 +1084,165 @@ class DockerSandbox:
                 config, self.policy, self.limits, mounts=mounts
             )
             return name, config
-        except BaseException:
-            self._remove(name)
+        except BaseException as error:
+            ok, detail = self._remove(name)
+            if not ok and detail is not None:
+                add_note = getattr(error, "add_note", None)
+                if callable(add_note):
+                    add_note(f"container cleanup also failed: {detail}")
             raise
+
+    def _copy_work_path(
+        self, name: str, relative: str, limit: int
+    ) -> tuple[bytes, int, bool]:
+        """Read one bounded tmpfs file while the container is still alive."""
+        if not relative.startswith("/work/") or any(
+            character in relative for character in " \t\r\n'\"`$;"
+        ):
+            raise SandboxPolicyError("unsafe sandbox stream path")
+        size_result = self._docker(
+            ["exec", name, "sh", "-c", f"wc -c < {relative} 2>/dev/null || echo 0"],
+            timeout=30,
+        )
+        try:
+            size = int(size_result.stdout.decode("ascii", "replace").strip())
+        except ValueError:
+            size = 0
+        data_result = self._docker(
+            ["exec", name, "sh", "-c", f"head -c {limit + 1} -- {relative}"],
+            timeout=60,
+        )
+        data = data_result.stdout if data_result.returncode == 0 else b""
+        return data[:limit], size, size > limit or len(data) > limit
 
     def _start_and_wait(
         self,
         name: str,
         *,
         deadline_seconds: float,
-        expect_done: bool = True,
-        stream: Sequence[str] = (),
-    ) -> tuple[dict[str, bytes], set[str], dict[str, Any], bool]:
-        """Start a wrapper container, collect requested /work files, release it.
+        artifact: bool = False,
+    ) -> tuple[
+        bytes,
+        bytes,
+        dict[str, bytes],
+        set[str],
+        dict[str, Any],
+        bool,
+        int | None,
+        str | None,
+    ]:
+        """Start a container and make its real exit authoritative.
 
-        The wrapper writes its outputs to a bounded tmpfs and then waits for
-        ``/work/release``. That keeps evidence retrievable even though a tmpfs
-        is unmounted when the container stops. Streams are read through a fixed
-        ``head -c`` cap so a hostile target cannot make the host buffer an
-        unbounded tmpfs. On timeout the available files are copied before the
-        container is killed.
+        The target never owns the completion signal: replay uses ``exec`` so
+        the target is PID 1 and ``docker wait`` reports its exit code. Stdout
+        and stderr are read from the bounded json-file log, so a target that
+        writes ``/work/done`` early cannot shorten the collection window.
+
+        Builds also need their parser from the tmpfs before the container
+        stops. ``/work/done`` is only an optimization that prompts an early
+        artifact copy: the wrapper prints the artifact size and digest after
+        the build command exits, the host compares them after ``docker wait``,
+        and any mismatch fails the build instead of accepting a partial file.
         """
         files: dict[str, bytes] = {}
         truncated: set[str] = set()
         timed_out = False
+        exit_code: int | None = None
+        cleanup_error: str | None = None
+        stdout = b""
+        stderr = b""
+        state: dict[str, Any] = {}
         started = time.monotonic()
         start = self._docker(["start", name], timeout=30)
         if start.returncode != 0:
-            raise SandboxError(
-                "cannot start sandbox container: "
-                + start.stderr.decode("utf-8", "replace")[:500]
-            )
-        done = False
-        while time.monotonic() - started < deadline_seconds:
-            if expect_done:
-                check = self._docker(
-                    ["exec", name, "test", "-e", "/work/done"], timeout=10
-                )
-                if check.returncode == 0:
-                    done = True
-                    break
-            else:
-                done = True
-                break
-            try:
-                running = self._inspect(name).get("State", {}).get("Running")
-            except SandboxError:
-                running = False
-            if running is False:
-                break
-            time.sleep(0.1)
-        if not done and expect_done:
-            timed_out = True
-        for relative in stream:
-            if not relative.startswith("/work/") or any(
-                character in relative for character in " \t\r\n'\"`$;"
-            ):
-                raise SandboxPolicyError("unsafe sandbox stream path")
-            limit = MAX_ARTIFACT_BYTES if relative == "/work/parser" else MAX_LOG_BYTES
-            size_result = self._docker(
-                ["exec", name, "sh", "-c", f"wc -c < {relative} 2>/dev/null || echo 0"],
-                timeout=30,
-            )
-            try:
-                size = int(size_result.stdout.decode("ascii", "replace").strip())
-            except ValueError:
-                size = 0
-            data_result = self._docker(
-                ["exec", name, "sh", "-c", f"head -c {limit} -- {relative}"],
-                timeout=60,
-            )
-            if data_result.returncode == 0:
-                files[relative] = data_result.stdout
-                if size > limit:
-                    truncated.add(relative)
-        if not timed_out:
-            self._docker(["exec", name, "touch", "/work/release"], timeout=10)
-            self._docker(["wait", name], timeout=max(1.0, deadline_seconds))
+            cleanup_error = self._cleanup_failure(name)
+            message = "cannot start sandbox container: " + start.stderr.decode(
+                "utf-8", "replace"
+            )[:500]
+            if cleanup_error is not None:
+                message += f"; cleanup also failed: {cleanup_error}"
+            raise SandboxError(message)
         try:
-            state = self._inspect(name).get("State", {})
-        except SandboxError:
-            state = {}
-        self._remove(name)
-        return files, truncated, state, timed_out
+            if artifact:
+                while time.monotonic() - started < deadline_seconds:
+                    check = self._docker(
+                        ["exec", name, "test", "-e", "/work/done"], timeout=10
+                    )
+                    if check.returncode == 0:
+                        break
+                    try:
+                        running = (
+                            self._inspect(name).get("State", {}).get("Running")
+                        )
+                    except SandboxError:
+                        running = False
+                    if running is False:
+                        break
+                    time.sleep(0.1)
+                else:
+                    timed_out = True
+                for relative, limit in (
+                    ("/work/parser", MAX_ARTIFACT_BYTES),
+                    ("/work/pids.events", MAX_LOG_BYTES),
+                    ("/work/memory.events", MAX_LOG_BYTES),
+                ):
+                    data, _size, was_truncated = self._copy_work_path(
+                        name, relative, limit
+                    )
+                    if data or was_truncated:
+                        files[relative] = data
+                        if was_truncated:
+                            truncated.add(relative)
+                if not timed_out:
+                    self._docker(
+                        ["exec", name, "touch", "/work/release"], timeout=10
+                    )
+            if timed_out:
+                try:
+                    self._docker(["kill", name], timeout=30)
+                except SandboxError:
+                    pass
+            remaining = max(1.0, deadline_seconds - (time.monotonic() - started))
+            try:
+                wait = self._docker(["wait", name], timeout=remaining)
+            except SandboxError as error:
+                if error.reason_code != "TIMEOUT":
+                    raise
+                timed_out = True
+                try:
+                    self._docker(["kill", name], timeout=30)
+                except SandboxError:
+                    pass
+                wait = self._docker(["wait", name], timeout=30)
+            if wait.returncode == 0:
+                try:
+                    exit_code = int(wait.stdout.decode("ascii", "replace").strip())
+                except ValueError:
+                    exit_code = None
+            try:
+                state = self._inspect(name).get("State", {})
+            except SandboxError:
+                state = {}
+            if exit_code is None:
+                candidate = state.get("ExitCode")
+                if type(candidate) is int:
+                    exit_code = candidate
+            logs = self._docker(["logs", name], timeout=60)
+            if logs.returncode == 0:
+                stdout = logs.stdout
+                stderr = logs.stderr
+        finally:
+            cleanup_error = self._cleanup_failure(name)
+        return (
+            stdout,
+            stderr,
+            files,
+            truncated,
+            state,
+            timed_out,
+            exit_code,
+            cleanup_error,
+        )
 
     def probe(self, *, deadline_seconds: float = _PROBE_TIMEOUT) -> ProbeReport:
         # The old implementation used the stable ``run_root/probe`` directory,
@@ -1072,6 +1275,7 @@ class DockerSandbox:
             ) from error
         self.ensure_image()
         name = self._name("probe")
+        cleanup_errors: list[str] = []
         script = r"""
 set -u
 uid=$(id -u)
@@ -1174,7 +1378,9 @@ printf 'uid=%s\nseccomp=%s\nseccomp_filters=%s\nno_new_privs=%s\ncap_eff=%s\ncgr
             inspect = self._inspect(name)
             state = inspect.get("State", {})
         finally:
-            self._remove(name)
+            ok, detail = self._remove(name)
+            if not ok and detail is not None:
+                cleanup_errors.append(detail)
             marker.unlink(missing_ok=True)
             if not probe_root.is_symlink():
                 shutil.rmtree(probe_root, ignore_errors=True)
@@ -1208,6 +1414,7 @@ printf 'uid=%s\nseccomp=%s\nseccomp_filters=%s\nno_new_privs=%s\ncap_eff=%s\ncgr
                 "pids": self.limits.pids,
                 "scratch_mib": self.limits.scratch_mib,
             },
+            cleanup_errors=tuple(cleanup_errors),
         )
 
     def build(
@@ -1250,13 +1457,24 @@ printf 'uid=%s\nseccomp=%s\nseccomp_filters=%s\nno_new_privs=%s\ncap_eff=%s\ncgr
             raise SandboxError("reviewed build recipe is missing")
         work = self.run_root / "build" / version / uuid.uuid4().hex
         work.mkdir(parents=True, exist_ok=True)
+        # The build command's stdout/stderr go to the bounded container log,
+        # not to a target-writable file. The wrapper only reports the artifact
+        # size/digest after the command exits and then waits for the host to
+        # acknowledge the copy; the host's exit code comes from docker wait.
         wrapper = (
-            f"/bin/sh /fixture/build.sh {version} > /work/build.log 2>&1; "
-            "code=$?; echo $code > /work/exit_code; "
+            f"/bin/sh /fixture/build.sh {version}; "
+            "code=$?; "
+            "if [ -f /work/parser ]; then "
+            "size=$(wc -c < /work/parser 2>/dev/null || echo 0); "
+            "digest=$(sha256sum /work/parser 2>/dev/null | cut -d' ' -f1); "
+            "else size=-1; digest=missing; fi; "
+            f"printf '\\nDATACON_BUILD_RESULT code=%s size=%s digest=%s\\n' "
+            '"$code" "$size" "$digest" >&2; '
             "cat /sys/fs/cgroup/pids.events > /work/pids.events 2>/dev/null || true; "
             "cat /sys/fs/cgroup/memory.events > /work/memory.events 2>/dev/null || true; "
             "touch /work/done; "
-            "while [ ! -e /work/release ]; do sleep 0.1; done"
+            "while [ ! -e /work/release ]; do sleep 0.1; done; "
+            "exit $code"
         )
         started = time.monotonic()
         name = None
@@ -1271,36 +1489,63 @@ printf 'uid=%s\nseccomp=%s\nseccomp_filters=%s\nno_new_privs=%s\ncap_eff=%s\ncgr
                     "ASAN_OPTIONS": "detect_leaks=0",
                 },
             )
-            files, truncated_streams, state, timed_out = self._start_and_wait(
-                name,
-                deadline_seconds=deadline_seconds,
-                stream=[
-                    "/work/build.log",
-                    "/work/exit_code",
-                    "/work/parser",
-                    "/work/pids.events",
-                    "/work/memory.events",
-                ],
+            (
+                stdout,
+                stderr,
+                files,
+                truncated_streams,
+                state,
+                timed_out,
+                exit_code,
+                cleanup_error,
+            ) = self._start_and_wait(
+                name, deadline_seconds=deadline_seconds, artifact=True
             )
             duration = time.monotonic() - started
-            log, log_truncated = _truncate_log(files.get("/work/build.log", b""))
-            truncated = log_truncated or "/work/build.log" in truncated_streams
-            exit_code = None
-            if "/work/exit_code" in files:
-                try:
-                    exit_code = int(files["/work/exit_code"].decode().strip())
-                except ValueError:
-                    exit_code = None
+            report_match = None
+            for match in re.finditer(
+                rb"DATACON_BUILD_RESULT code=(-?\d+) size=(-?\d+) digest=([0-9a-f]{64}|missing)",
+                stderr,
+            ):
+                report_match = match
+            reported_code = reported_size = reported_digest = None
+            if report_match is not None:
+                reported_code = int(report_match.group(1))
+                reported_size = int(report_match.group(2))
+                reported_digest = report_match.group(3).decode("ascii")
+            log_bytes = re.sub(
+                rb"\n?DATACON_BUILD_RESULT code=-?\d+ size=-?\d+ digest=(?:[0-9a-f]{64}|missing)\n?",
+                b"\n",
+                stdout + stderr,
+            )
+            log, log_truncated = _truncate_log(log_bytes)
+            truncated = log_truncated or "/work/parser" in truncated_streams
             artifact = files.get("/work/parser")
-            if "/work/parser" in truncated_streams:
-                artifact = None
             if artifact is not None and len(artifact) > MAX_ARTIFACT_BYTES:
-                raise SandboxError("build artifact exceeds the evidence size cap")
+                artifact = None
+                truncated = True
             artifact_digest = (
                 "sha256:" + hashlib.sha256(artifact).hexdigest()
                 if artifact is not None
                 else None
             )
+            # Early ``done`` writes are only a prompt to copy the tmpfs. The
+            # wrapper's post-command size/digest decides whether the bytes we
+            # copied are the completed artifact; a mismatch fails the build.
+            if artifact is not None and reported_digest is not None:
+                if (
+                    reported_digest == "missing"
+                    or reported_size != len(artifact)
+                    or reported_digest != artifact_digest.split(":", 1)[1]
+                    or reported_code != exit_code
+                ):
+                    artifact = None
+                    artifact_digest = None
+                    log_truncated = True
+            elif artifact is not None:
+                artifact = None
+                artifact_digest = None
+                log_truncated = True
             quota_hits = _quota_events(files)
             status = "completed" if exit_code == 0 and artifact is not None else "build_failed"
             if timed_out:
@@ -1315,6 +1560,8 @@ printf 'uid=%s\nseccomp=%s\nseccomp_filters=%s\nno_new_privs=%s\ncap_eff=%s\ncgr
                 "oom_killed": bool(state.get("OOMKilled")),
                 "limits_hit": quota_hits,
             }
+            if cleanup_error is not None:
+                metadata["cleanup_errors"] = [cleanup_error]
             return BuildResult(
                 version=version,
                 status=status,
@@ -1325,15 +1572,14 @@ printf 'uid=%s\nseccomp=%s\nseccomp_filters=%s\nno_new_privs=%s\ncap_eff=%s\ncgr
                 compile_args=tuple(compile_args),
                 artifact_digest=artifact_digest,
                 log=log,
-                log_truncated=truncated,
+                log_truncated=truncated or log_truncated,
                 artifact=artifact,
                 metadata=metadata,
             )
         finally:
-            if name:
-                self._remove(name)
-            # scratch output is collected by _start_and_wait only for temp
-            # files; artifacts are fetched below in a dedicated container.
+            # _start_and_wait already removed the container. If it could not,
+            # the error is carried in metadata/log_truncated above. A container
+            # left behind is reported through self.cleanup_errors.
             pass
 
     def replay(
@@ -1391,23 +1637,15 @@ printf 'uid=%s\nseccomp=%s\nseccomp_filters=%s\nno_new_privs=%s\ncap_eff=%s\ncgr
             timeout = min(timeout, max(0.5, deadline_seconds))
         artifact.chmod(0o555)
         input_file.chmod(0o444)
-        wrapper = (
-            "/artifact/parser < /input/input > /work/stdout 2> /work/stderr; "
-            "code=$?; echo $code > /work/exit_code; "
-            "cat /sys/fs/cgroup/pids.events > /work/pids.events 2>/dev/null || true; "
-            "cat /sys/fs/cgroup/memory.events > /work/memory.events 2>/dev/null || true; "
-            "touch /work/done; "
-            "while [ ! -e /work/release ]; do sleep 0.1; done"
-        )
-        started = time.monotonic()
+        # The target is PID 1. Its exit status is the container's status via
+        # docker wait, and its stdout/stderr go to the bounded Docker log; the
+        # target never writes a completion flag or an exit-code file.
         name = None
-        files: dict[str, bytes] = {}
-        state: dict[str, Any] = {}
-        timed_out = False
+        started = time.monotonic()
         try:
             name, _ = self._create(
                 suffix=f"replay-{version}-{phase}",
-                command=["/bin/sh", "-c", wrapper],
+                command=["/bin/sh", "-c", "exec /artifact/parser < /input/input"],
                 mounts=[
                     (str(artifact), "/artifact/parser", True),
                     (str(input_file), "/input/input", True),
@@ -1418,43 +1656,40 @@ printf 'uid=%s\nseccomp=%s\nseccomp_filters=%s\nno_new_privs=%s\ncap_eff=%s\ncgr
                     "ASAN_OPTIONS": asan_options,
                 },
             )
-            files, truncated_streams, state, timed_out = self._start_and_wait(
-                name,
-                deadline_seconds=timeout,
-                stream=[
-                    "/work/stdout",
-                    "/work/stderr",
-                    "/work/exit_code",
-                    "/work/pids.events",
-                    "/work/memory.events",
-                ],
-            )
+            (
+                raw_stdout,
+                raw_stderr,
+                _files,
+                _truncated_streams,
+                state,
+                timed_out,
+                exit_code,
+                cleanup_error,
+            ) = self._start_and_wait(name, deadline_seconds=timeout)
         finally:
-            if name:
-                self._remove(name)
+            pass
         duration = time.monotonic() - started
-        stdout, truncated_out = _truncate_log(files.get("/work/stdout", b""))
-        stderr, truncated_err = _truncate_log(files.get("/work/stderr", b""))
-        truncated_out = truncated_out or "/work/stdout" in truncated_streams
-        truncated_err = truncated_err or "/work/stderr" in truncated_streams
-        exit_code = None
-        if "/work/exit_code" in files:
-            try:
-                exit_code = int(files["/work/exit_code"].decode().strip())
-            except ValueError:
-                exit_code = None
+        stdout, truncated_out = _truncate_log(raw_stdout)
+        stderr, truncated_err = _truncate_log(raw_stderr)
         signature = parse_asan(stderr.decode("utf-8", "replace"))
-        quota_hits = _quota_events(files)
         quota_hit = (
             bool(state.get("OOMKilled"))
             or (exit_code == 137 and not timed_out)
-            or bool(quota_hits)
         )
         status = "completed"
         if timed_out:
             status = "timeout"
         elif quota_hit:
             status = "resource_limited"
+        metadata: dict[str, Any] = {
+            "image_digest": self.image_digest,
+            "asan_options": asan_options,
+            "oom_killed": bool(state.get("OOMKilled")),
+            "limits_hit": [],
+            "timeout_seconds": timeout,
+        }
+        if cleanup_error is not None:
+            metadata["cleanup_errors"] = [cleanup_error]
         return ReplayResult(
             version=version,
             phase=phase,
@@ -1469,13 +1704,7 @@ printf 'uid=%s\nseccomp=%s\nseccomp_filters=%s\nno_new_privs=%s\ncap_eff=%s\ncgr
             timed_out=timed_out,
             quota_hit=quota_hit,
             log_truncated=truncated_out or truncated_err,
-            metadata={
-                "image_digest": self.image_digest,
-                "asan_options": asan_options,
-                "oom_killed": bool(state.get("OOMKilled")),
-                "limits_hit": quota_hits,
-                "timeout_seconds": timeout,
-            },
+            metadata=metadata,
         )
 
 
