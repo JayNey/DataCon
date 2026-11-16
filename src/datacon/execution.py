@@ -2414,6 +2414,9 @@ def _build_report(
         "evidence_refs": list(evidence_refs),
         "missing": list(missing),
         "error": error,
+        "evidence_complete": (
+            decision is not None and not missing and error is None
+        ),
         "cleanup_errors": list(getattr(context, "cleanup_errors", [])),
         "created_at": _utc_now(),
     }
@@ -4031,7 +4034,14 @@ def _finish_failed(
                 builds=builds,
                 runs=runs,
                 probe=probe,
-                execution_metadata={},
+                execution_metadata={
+                    "job_id": context.job_id_text,
+                    "plan_digest": context.plan_digest,
+                    "generation": generation,
+                    "probe": probe,
+                    "builds": [dict(item) for item in builds.values()],
+                    "replays": [dict(item) for item in runs],
+                },
             ),
             verdict=terminal,
         )

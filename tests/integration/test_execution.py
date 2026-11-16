@@ -989,8 +989,10 @@ def test_step_attempts_are_bounded_across_generations(
         sandbox=final,
     )
     assert final.builds == 0, "a third attempt must not run the target"
-    assert outcome.state != "RUNNING"
-    assert outcome.state in ("FAILED", "INCONCLUSIVE")
+    assert outcome.state == "INCONCLUSIVE"
+    assert outcome.reason_code == "RUN_INCOMPLETE"
+    assert outcome.evidence_path is not None
+    assert verify_bundle(outcome.evidence_path).manifest["verdict"] == "INCONCLUSIVE"
 
 
 def _cases_with_material_subdirectory(tmp_path):
@@ -1977,3 +1979,49 @@ def test_reclaim_failure_is_visible_in_the_report(
     assert report["cleanup_errors"] == [
         "reclaim: reclaim could not remove an old container"
     ]
+
+
+
+@pytest.mark.parametrize("reason_code", ["TIMEOUT", "RUN_INCOMPLETE"])
+def test_s1_finish_failed_timeout_and_run_incomplete_archive_partial_inconclusive(
+    isolated_database, tmp_path, monkeypatch, reason_code
+):
+    class FailingBuildSandbox(FakeSandbox):
+        def build(self, version, **kwargs):
+            if reason_code == "TIMEOUT":
+                raise SandboxError(
+                    "docker build wait timed out", reason_code="TIMEOUT"
+                )
+            raise execution.ExecutionFailed(
+                "RUN_INCOMPLETE",
+                f"step build:{version} consumed both attempts without a usable result",
+            )
+
+    job, _, generation = prepare_approved_job(isolated_database, tmp_path)
+    outcome = run_with_fake(
+        isolated_database,
+        job,
+        generation,
+        tmp_path,
+        FailingBuildSandbox(),
+        monkeypatch,
+    )
+    assert outcome.state == "INCONCLUSIVE", outcome
+    assert outcome.verdict == "INCONCLUSIVE"
+    assert outcome.verdict_reason == reason_code
+    assert outcome.reason_code == reason_code
+    assert outcome.evidence_path is not None
+
+    current = status(isolated_database.dsn, job["job_id"])
+    assert current["state"] == "INCONCLUSIVE"
+    assert current["verdict"] == "INCONCLUSIVE"
+    assert current["verdict_reason"] == reason_code
+    assert current["reason_code"] == reason_code
+    assert current["evidence"]["available"] is True
+    verified = verify_bundle(current["evidence"]["path"])
+    assert verified.manifest["verdict"] == "INCONCLUSIVE"
+    assert verified.manifest["reason_code"] == reason_code
+    report = json.loads(verified.file_data["report.json"])
+    assert report["rule"] is None
+    assert report["missing"]
+    assert report["evidence_complete"] is False

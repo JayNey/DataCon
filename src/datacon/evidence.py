@@ -312,7 +312,17 @@ def write_bundle(
     error = report.get("error")
     if error is not None and not isinstance(error, str):
         raise BundleError("INVALID_MANIFEST", "report error must be text or null")
+    evidence_complete = report.get("evidence_complete")
+    if evidence_complete is not None and type(evidence_complete) is not bool:
+        raise BundleError(
+            "INVALID_MANIFEST", "report evidence_complete must be a boolean"
+        )
     if report_verdict in ("REPRODUCED", "NOT_REPRODUCED"):
+        if evidence_complete is False:
+            raise BundleError(
+                "INVALID_MANIFEST",
+                "conclusive evidence must not record evidence_complete=false",
+            )
         if missing:
             raise BundleError(
                 "INVALID_MANIFEST",
@@ -1401,6 +1411,381 @@ def _expected_stdout_from_case_config(
 
 
 
+
+
+def _verify_probe_document(
+    probe: Mapping[str, Any],
+    plan: Mapping[str, Any],
+    execution_metadata: Mapping[str, Any] | None,
+    report: Mapping[str, Any],
+    *,
+    job_id: str,
+    plan_digest: str,
+) -> None:
+    if probe.get("status") != "completed":
+        raise BundleError(
+            "INVALID_MANIFEST",
+            "probe metadata does not record a completed isolation probe",
+        )
+    if probe.get("job_id") != job_id or probe.get("plan_digest") != plan_digest:
+        raise BundleError(
+            "INVALID_MANIFEST",
+            "probe metadata job_id/plan_digest does not match manifest",
+        )
+    if execution_metadata is not None:
+        for field in ("job_id", "plan_digest"):
+            if field in execution_metadata and probe.get(field) != execution_metadata.get(field):
+                raise BundleError(
+                    "INVALID_MANIFEST",
+                    f"probe metadata {field} does not match execution metadata",
+                )
+    if probe.get("image_digest") != plan.get("image_digest"):
+        raise BundleError(
+            "DIGEST_MISMATCH",
+            "probe metadata image_digest does not match the plan",
+        )
+    probe_limits = probe.get("limits")
+    if not isinstance(probe_limits, Mapping) or set(probe_limits) != set(
+        _PROBE_LIMIT_FIELDS
+    ):
+        raise BundleError(
+            "INVALID_MANIFEST",
+            "probe metadata limits must contain exactly "
+            + ", ".join(_PROBE_LIMIT_FIELDS),
+        )
+    plan_limits = plan.get("limits")
+    if not isinstance(plan_limits, Mapping):
+        raise BundleError("INVALID_MANIFEST", "plan limits are missing")
+    for field in _PROBE_LIMIT_FIELDS:
+        if (
+            type(probe_limits[field]) is not int
+            or probe_limits[field] != plan_limits.get(field)
+        ):
+            raise BundleError(
+                "INVALID_MANIFEST",
+                f"probe metadata limit {field} does not match the plan",
+            )
+    probe_checks = probe.get("checks")
+    if not isinstance(probe_checks, Mapping) or not probe_checks:
+        raise BundleError(
+            "INVALID_MANIFEST", "probe metadata checks must be a non-empty object"
+        )
+    missing_checks = [
+        field for field in _PROBE_CHECK_FIELDS if field not in probe_checks
+    ]
+    if missing_checks:
+        raise BundleError(
+            "INVALID_MANIFEST",
+            "probe metadata is missing security checks: "
+            + ", ".join(missing_checks),
+        )
+    if "errors" in probe_checks and probe_checks["errors"] != []:
+        raise BundleError(
+            "INVALID_MANIFEST",
+            "probe metadata records failed security checks",
+        )
+    plan_isolation = plan.get("isolation")
+    if not isinstance(plan_isolation, Mapping):
+        raise BundleError("INVALID_MANIFEST", "plan isolation is missing")
+    expected_uid = str(plan_isolation.get("user", "")).split(":")[0]
+    if probe_checks["uid"] != expected_uid:
+        raise BundleError(
+            "INVALID_MANIFEST", "probe metadata uid does not match the plan"
+        )
+    if probe_checks["seccomp"] != "2":
+        raise BundleError(
+            "INVALID_MANIFEST", "probe metadata seccomp mode is not enabled"
+        )
+    if probe_checks["no_new_privs"] != "1":
+        raise BundleError(
+            "INVALID_MANIFEST",
+            "probe metadata no_new_privs is not effective",
+        )
+    try:
+        effective_capabilities = int(str(probe_checks["cap_eff"]), 16)
+    except (TypeError, ValueError) as error:
+        raise BundleError(
+            "INVALID_MANIFEST",
+            "probe metadata cap_eff is not a hexadecimal value",
+        ) from error
+    if effective_capabilities != 0:
+        raise BundleError(
+            "INVALID_MANIFEST", "probe metadata cap_eff is not empty"
+        )
+    if str(probe_checks["cgroup_version"]) not in ("1", "2"):
+        raise BundleError(
+            "INVALID_MANIFEST", "probe metadata cgroup_version is not supported"
+        )
+    if (
+        execution_metadata is not None
+        and "probe" in execution_metadata
+        and execution_metadata["probe"] is not None
+        and execution_metadata["probe"] != probe
+    ):
+        raise BundleError(
+            "INVALID_MANIFEST",
+            "execution metadata probe does not match metadata/probe.json",
+        )
+    report_environment = _mapping(report.get("environment"), "report environment")
+    if report_environment.get("probe") != probe:
+        raise BundleError(
+            "INVALID_MANIFEST",
+            "report environment probe does not match metadata/probe.json",
+        )
+
+
+def _verify_partial_inconclusive(
+    *,
+    plan: Mapping[str, Any],
+    verdict: str,
+    report: Mapping[str, Any],
+    listed: Mapping[str, Mapping[str, Any]],
+    data: Mapping[str, bytes],
+    job_id: str,
+    plan_digest: str,
+) -> None:
+    """Verify an INCONCLUSIVE bundle archived from an incomplete execution.
+
+    When execution fails mid-run with TIMEOUT, RUN_INCOMPLETE or NOT_COMPARABLE,
+    fewer than two builds or six replays may exist and the probe may not have
+    completed. The bundle is still bound to the approved plan, review,
+    report.md conclusion, and every material, probe, build or replay artifact
+    that was actually archived.
+    """
+    if report.get("repository") != plan.get("repository"):
+        raise BundleError(
+            "INVALID_MANIFEST", "report repository does not match the plan"
+        )
+    if report.get("versions") != plan.get("revisions"):
+        raise BundleError(
+            "INVALID_MANIFEST", "report revisions do not match the plan"
+        )
+    if report.get("inputs") != plan.get("inputs"):
+        raise BundleError("INVALID_MANIFEST", "report inputs do not match the plan")
+    if report.get("signature") != plan.get("asan_signature"):
+        raise BundleError(
+            "INVALID_MANIFEST", "report signature does not match the plan"
+        )
+    environment = _mapping(report.get("environment"), "report environment")
+    if environment.get("image_digest") != plan.get("image_digest"):
+        raise BundleError(
+            "INVALID_MANIFEST", "report environment image does not match the plan"
+        )
+    if environment.get("platform") != plan.get("platform"):
+        raise BundleError(
+            "INVALID_MANIFEST", "report environment platform does not match the plan"
+        )
+    if environment.get("toolchain") != plan.get("toolchain"):
+        raise BundleError(
+            "INVALID_MANIFEST", "report environment toolchain does not match the plan"
+        )
+    if environment.get("asan_options") != plan.get("asan_options"):
+        raise BundleError(
+            "INVALID_MANIFEST", "report environment ASan options do not match the plan"
+        )
+    if environment.get("isolation") != plan.get("isolation"):
+        raise BundleError(
+            "INVALID_MANIFEST",
+            "report environment isolation does not match the plan",
+        )
+
+    execution_metadata: dict[str, Any] | None = None
+    if "metadata/execution.json" in listed:
+        if listed["metadata/execution.json"].get("role") != "execution_metadata":
+            raise BundleError(
+                "INVALID_MANIFEST",
+                "metadata/execution.json must carry the execution_metadata role",
+            )
+        execution_metadata = _parse_json_file(data, "metadata/execution.json")
+        if execution_metadata:
+            if (
+                execution_metadata.get("job_id") != job_id
+                or execution_metadata.get("plan_digest") != plan_digest
+            ):
+                raise BundleError(
+                    "INVALID_MANIFEST",
+                    "execution metadata does not match manifest job_id/plan_digest",
+                )
+            for field in ("builds", "replays"):
+                if (
+                    field in execution_metadata
+                    and execution_metadata[field] != report.get(field)
+                ):
+                    raise BundleError(
+                        "INVALID_MANIFEST",
+                        f"execution metadata {field} do not match report.{field}",
+                    )
+
+    if "metadata/probe.json" in listed or environment.get("probe") is not None:
+        _require_evidence_roles(
+            listed, {"metadata/probe.json": frozenset({"probe"})}
+        )
+        probe = _parse_json_file(data, "metadata/probe.json")
+        _verify_probe_document(
+            probe,
+            plan,
+            execution_metadata,
+            report,
+            job_id=job_id,
+            plan_digest=plan_digest,
+        )
+
+    materials: Mapping[str, str] | None = None
+    expected_compile_args: list[str] | None = None
+    if "metadata/case.json" in listed:
+        case_config, materials, recipe = _case_binding(plan, listed, data)
+        _expected_stdout_from_case_config(case_config)
+        _verify_materials(plan, listed, data, case_config, materials)
+        expected_compile_args = _compile_args_from_recipe(recipe)
+        if list(environment.get("compile_args") or []) != expected_compile_args:
+            raise BundleError(
+                "INVALID_MANIFEST",
+                "report environment compile args do not match the reviewed recipe",
+            )
+    elif _material_entries(listed):
+        raise BundleError(
+            "INVALID_MANIFEST",
+            "materials/* evidence requires metadata/case.json",
+        )
+
+    builds = report.get("builds")
+    if not isinstance(builds, list) or len(builds) > 2:
+        raise BundleError("INVALID_MANIFEST", "report builds must be a list of at most 2 items")
+    seen_builds: set[str] = set()
+    build_artifacts: dict[str, Any] = {}
+    for build in builds:
+        if not isinstance(build, Mapping):
+            raise BundleError("INVALID_MANIFEST", "report build must be an object")
+        version = build.get("version")
+        if version not in _REPLAY_VERSIONS or version in seen_builds:
+            raise BundleError(
+                "INVALID_MANIFEST", f"report build has an invalid version: {version}"
+            )
+        seen_builds.add(version)
+        if build.get("plan_digest") != plan_digest or build.get("job_id") != job_id:
+            raise BundleError(
+                "INVALID_MANIFEST", f"{version} build provenance does not match"
+            )
+        if build.get("image_digest") != plan.get("image_digest"):
+            raise BundleError(
+                "DIGEST_MISMATCH", f"{version} build image does not match the plan"
+            )
+        if build.get("build_recipe_digest") != plan.get("build_recipe_digest"):
+            raise BundleError(
+                "DIGEST_MISMATCH", f"{version} build recipe does not match the plan"
+            )
+        meta_path = _build_evidence_path(version, "metadata.json")
+        if meta_path in data:
+            metadata = _parse_json_file(data, meta_path)
+            if dict(metadata) != dict(build):
+                raise BundleError(
+                    "INVALID_MANIFEST",
+                    f"{version} build metadata does not match report.builds",
+                )
+        log_path = _build_evidence_path(version, "build.log")
+        if log_path in data and _digest(data[log_path]) != build.get("log_digest"):
+            raise BundleError(
+                "DIGEST_MISMATCH", f"{version} build log digest does not match"
+            )
+        artifact_path = _build_evidence_path(version, "parser")
+        if artifact_path in data and _digest(data[artifact_path]) != build.get("artifact_digest"):
+            raise BundleError(
+                "DIGEST_MISMATCH", f"{version} build artifact digest does not match"
+            )
+        build_artifacts[version] = build.get("artifact_digest")
+
+    replays = report.get("replays")
+    if not isinstance(replays, list) or len(replays) > 6:
+        raise BundleError("INVALID_MANIFEST", "report replays must be a list of at most 6 items")
+    seen_replays: set[tuple[str, str]] = set()
+    for item in replays:
+        if not isinstance(item, Mapping):
+            raise BundleError("INVALID_MANIFEST", "report replay must be an object")
+        version = item.get("version")
+        phase = item.get("phase")
+        if version not in _REPLAY_VERSIONS or phase not in _REPLAY_PHASES:
+            raise BundleError(
+                "INVALID_MANIFEST",
+                f"report replay has an unknown version/phase: {version}/{phase}",
+            )
+        key = (version, phase)
+        if key in seen_replays:
+            raise BundleError(
+                "INVALID_MANIFEST",
+                f"report contains a duplicate replay: {version}/{phase}",
+            )
+        seen_replays.add(key)
+        status = item.get("status")
+        if not isinstance(status, str) or not replay_status_allowed(verdict, status):
+            raise BundleError(
+                "INVALID_MANIFEST",
+                f"replay {version}/{phase} has an invalid status: {status!r}",
+            )
+        capture_error = item.get("capture_error")
+        if capture_error is not None and (
+            not isinstance(capture_error, str) or not capture_error.strip()
+        ):
+            raise BundleError(
+                "INVALID_MANIFEST",
+                f"replay {version}/{phase} capture_error must be a non-empty string or null",
+            )
+        if status == "completed" and capture_error is not None:
+            raise BundleError(
+                "INVALID_MANIFEST",
+                f"completed replay {version}/{phase} must not record capture_error",
+            )
+        if item.get("plan_digest") != plan_digest or item.get("job_id") != job_id:
+            raise BundleError(
+                "INVALID_MANIFEST",
+                f"replay {version}/{phase} provenance does not match",
+            )
+        if item.get("image_digest") != plan.get("image_digest"):
+            raise BundleError(
+                "DIGEST_MISMATCH",
+                f"replay {version}/{phase} image does not match plan",
+            )
+        if item.get("asan_options") != plan.get("asan_options"):
+            raise BundleError(
+                "INVALID_MANIFEST",
+                f"replay {version}/{phase} ASan options do not match plan",
+            )
+        expected_input = (
+            plan.get("inputs", {}).get("normal")
+            if phase == "normal"
+            else plan.get("inputs", {}).get("candidate")
+        )
+        if item.get("input_digest") != expected_input:
+            raise BundleError(
+                "DIGEST_MISMATCH",
+                f"replay {version}/{phase} input does not match the plan",
+            )
+        if version in build_artifacts and item.get("artifact_digest") != build_artifacts[version]:
+            raise BundleError(
+                "DIGEST_MISMATCH",
+                f"replay {version}/{phase} artifact does not match the {version} build",
+            )
+        stdout_path = _replay_evidence_path(version, phase, "stdout.log")
+        stderr_path = _replay_evidence_path(version, phase, "stderr.log")
+        meta_path = _replay_evidence_path(version, phase, "metadata.json")
+        if stdout_path in data and item.get("stdout_sha256") != _digest(data[stdout_path]):
+            raise BundleError(
+                "DIGEST_MISMATCH",
+                f"replay {version}/{phase} stdout digest does not match",
+            )
+        if stderr_path in data and item.get("stderr_sha256") != _digest(data[stderr_path]):
+            raise BundleError(
+                "DIGEST_MISMATCH",
+                f"replay {version}/{phase} stderr digest does not match",
+            )
+        if meta_path in data:
+            metadata = _parse_json_file(data, meta_path)
+            if dict(metadata) != dict(item):
+                raise BundleError(
+                    "INVALID_MANIFEST",
+                    f"replay {version}/{phase} metadata does not match report.replays",
+                )
+
+
 def _verify_semantics(
     *,
     job_id: str,
@@ -1456,7 +1841,17 @@ def _verify_semantics(
     report_error = report.get("error")
     if report_error is not None and not isinstance(report_error, str):
         raise BundleError("INVALID_MANIFEST", "report error must be text or null")
+    evidence_complete = report.get("evidence_complete")
+    if evidence_complete is not None and type(evidence_complete) is not bool:
+        raise BundleError(
+            "INVALID_MANIFEST", "report evidence_complete must be a boolean"
+        )
     if report_verdict in ("REPRODUCED", "NOT_REPRODUCED"):
+        if evidence_complete is False:
+            raise BundleError(
+                "INVALID_MANIFEST",
+                "conclusive evidence must not record evidence_complete=false",
+            )
         if missing:
             raise BundleError(
                 "INVALID_MANIFEST",
@@ -1571,6 +1966,45 @@ def _verify_semantics(
         )
 
     if verdict not in _FULL_EVIDENCE_VERDICTS:
+        return
+
+    partial_inconclusive = (
+        verdict == "INCONCLUSIVE"
+        and rule is None
+        and (bool(missing) or report_error is not None)
+    )
+    if partial_inconclusive and evidence_complete is True:
+        raise BundleError(
+            "INVALID_MANIFEST",
+            "partial inconclusive evidence must not record evidence_complete=true",
+        )
+    if not partial_inconclusive and evidence_complete is False:
+        raise BundleError(
+            "INVALID_MANIFEST",
+            "complete evidence must not record evidence_complete=false",
+        )
+    has_full_runs = (
+        isinstance(report.get("builds"), list)
+        and len(report.get("builds")) == 2
+        and all(
+            isinstance(item, Mapping) and item.get("status") == "completed"
+            for item in report.get("builds")
+        )
+        and isinstance(report.get("replays"), list)
+        and len(report.get("replays")) == 6
+        and "metadata/probe.json" in listed
+        and "metadata/case.json" in listed
+    )
+    if partial_inconclusive and not has_full_runs:
+        _verify_partial_inconclusive(
+            plan=plan,
+            verdict=verdict,
+            report=report,
+            listed=listed,
+            data=data,
+            job_id=job_id,
+            plan_digest=plan_digest,
+        )
         return
 
     expected: dict[str, frozenset[str]] = {

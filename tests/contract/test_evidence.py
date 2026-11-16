@@ -2546,3 +2546,184 @@ def test_b1_verify_bundle_rejects_completed_replay_with_capture_error(tmp_path):
     assert caught.value.reason_code == "INVALID_MANIFEST"
     assert "capture_error" in caught.value.message
 
+
+def test_s1_partial_inconclusive_bundle_archives_and_verifies(tmp_path):
+    partial_report = deepcopy(REPORT)
+    partial_report["verdict"] = "INCONCLUSIVE"
+    partial_report["state"] = "INCONCLUSIVE"
+    partial_report["reason_code"] = "TIMEOUT"
+    partial_report["rule"] = None
+    partial_report["builds"] = []
+    partial_report["replays"] = []
+    partial_report["missing"] = ["required replay evidence is incomplete"]
+    partial_report["error"] = "TIMEOUT: docker wait timed out"
+    partial_report["environment"]["probe"] = None
+
+    info = write_bundle(
+        tmp_path / "partial-inconclusive",
+        job_id=partial_report["job_id"],
+        plan_digest=partial_report["plan_digest"],
+        report=partial_report,
+        report_markdown=report_markdown("INCONCLUSIVE", "TIMEOUT"),
+        artifacts={
+            "plan.json": ("plan", canonical(PLAN)),
+            "review.json": ("review", canonical(REVIEW)),
+            "metadata/execution.json": (
+                "execution_metadata",
+                canonical(
+                    {
+                        "job_id": JOB_ID,
+                        "plan_digest": PLAN_DIGEST,
+                        "generation": 1,
+                        "probe": None,
+                        "builds": [],
+                        "replays": [],
+                    }
+                ),
+            ),
+            "metadata/case.json": (
+                "case_config",
+                canonical({"case_config": CASE_CONFIG}),
+            ),
+            **{
+                f"materials/{relative}": (MATERIAL_ROLES[relative], data)
+                for relative, data in MATERIALS.items()
+            },
+        },
+        verdict="INCONCLUSIVE",
+        verify=verify_bundle,
+    )
+    verified = verify_bundle(info.root)
+    assert verified.manifest["verdict"] == "INCONCLUSIVE"
+    assert verified.manifest["reason_code"] == "TIMEOUT"
+
+
+def test_s1_partial_inconclusive_still_enforces_plan_review_and_material_bindings(
+    tmp_path,
+):
+    partial_report = deepcopy(REPORT)
+    partial_report["verdict"] = "INCONCLUSIVE"
+    partial_report["state"] = "INCONCLUSIVE"
+    partial_report["reason_code"] = "RUN_INCOMPLETE"
+    partial_report["rule"] = None
+    partial_report["builds"] = []
+    partial_report["replays"] = []
+    partial_report["missing"] = ["required replay evidence is incomplete"]
+    partial_report["error"] = "RUN_INCOMPLETE: step build:vulnerable consumed both attempts"
+    partial_report["environment"]["probe"] = None
+
+    info = write_bundle(
+        tmp_path / "partial-bindings",
+        job_id=partial_report["job_id"],
+        plan_digest=partial_report["plan_digest"],
+        report=partial_report,
+        report_markdown=report_markdown("INCONCLUSIVE", "RUN_INCOMPLETE"),
+        artifacts={
+            "plan.json": ("plan", canonical(PLAN)),
+            "review.json": ("review", canonical(REVIEW)),
+            "metadata/case.json": (
+                "case_config",
+                canonical({"case_config": CASE_CONFIG}),
+            ),
+            **{
+                f"materials/{relative}": (MATERIAL_ROLES[relative], data)
+                for relative, data in MATERIALS.items()
+            },
+        },
+        verdict="INCONCLUSIVE",
+        verify=verify_bundle,
+    )
+    _rewrite_manifested_file(
+        info.root, "materials/build.sh", b"#!/bin/sh\necho tampered\n"
+    )
+    with pytest.raises(BundleError) as caught:
+        verify_bundle(info.root)
+    assert caught.value.reason_code in ("DIGEST_MISMATCH", "INVALID_MANIFEST")
+
+
+
+@pytest.mark.parametrize("reason_code", ["TIMEOUT", "RUN_INCOMPLETE"])
+def test_s1_finish_failed_archives_partial_inconclusive(
+    tmp_path, monkeypatch, reason_code
+):
+    from datetime import datetime, timezone
+    from types import SimpleNamespace
+    from uuid import UUID
+    from datacon import execution
+
+    run_root = tmp_path / "runs"
+    evidence_root = tmp_path / "evidence"
+    monkeypatch.setenv("DATACON_RUN_ROOT", str(run_root))
+    monkeypatch.setenv("DATACON_EVIDENCE_ROOT", str(evidence_root))
+    monkeypatch.setattr(execution.state, "mark_archiving", lambda *a, **kw: True)
+    monkeypatch.setattr(
+        execution.state, "assert_archive_fence", lambda *a, **kw: True
+    )
+    committed: list[dict] = []
+
+    def fake_finish(dsn, job_id, **kwargs):
+        committed.append(kwargs)
+        return True
+
+    monkeypatch.setattr(execution.state, "finish_execution", fake_finish)
+
+    manifest = {
+        "harness": "harness.c",
+        "build_recipe": "build.sh",
+        "dependencies": "dependencies.lock",
+        "versions": {
+            "vulnerable": "vulnerable/parser.c",
+            "fixed": "fixed/parser.c",
+        },
+    }
+    context = SimpleNamespace(
+        job_id=UUID(JOB_ID),
+        job_id_text=JOB_ID,
+        generation=1,
+        job={"request": {"target": {"kind": "source", "case_id": PLAN["case_id"]}}},
+        plan=deepcopy(PLAN),
+        plan_digest=PLAN_DIGEST,
+        review={
+            "reviewer_id": REVIEW["reviewer_id"],
+            "decision": REVIEW["decision"],
+            "decided_at": datetime(2026, 1, 2, tzinfo=timezone.utc),
+            "plan_digest": PLAN_DIGEST,
+        },
+        case=SimpleNamespace(
+            manifest=manifest,
+            repository={"patch": "fix.patch"},
+            read_material=lambda rel, exp: (MATERIALS[rel], MATERIAL_DIGESTS[rel]),
+        ),
+        manifest_case=deepcopy(CASE_CONFIG["manifest_case"]),
+        materials=dict(MATERIAL_DIGESTS),
+        case_config=deepcopy(CASE_CONFIG),
+        run_root=run_root,
+        image="silkeh/clang:19-bookworm@" + PLAN["image_digest"],
+        compile_args=tuple(COMPILE_ARGS),
+        material_payloads=dict(MATERIALS),
+        cleanup_errors=[],
+    )
+
+    outcome = execution._finish_failed(
+        "unused-dsn",
+        UUID(JOB_ID),
+        1,
+        execution.ExecutionFailed(reason_code, f"injected {reason_code}"),
+        context=context,
+        probe=deepcopy(PROBE),
+        builds={},
+        runs=[],
+    )
+    assert outcome.state == "INCONCLUSIVE"
+    assert outcome.verdict == "INCONCLUSIVE"
+    assert outcome.verdict_reason == reason_code
+    assert outcome.reason_code == reason_code
+    assert outcome.evidence_path is not None
+    assert outcome.evidence_digest is not None
+    verified = verify_bundle(outcome.evidence_path)
+    assert verified.manifest["verdict"] == "INCONCLUSIVE"
+    assert verified.manifest["reason_code"] == reason_code
+    assert len(committed) == 1
+    assert committed[0]["state"] == "INCONCLUSIVE"
+    assert committed[0]["reason_code"] == reason_code
+    assert committed[0]["evidence_status"] == "archived"
