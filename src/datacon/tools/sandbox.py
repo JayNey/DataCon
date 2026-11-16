@@ -29,10 +29,11 @@ from datacon.cases import MAX_MATERIAL_BYTES
 MIB = 1024 * 1024
 MAX_LOG_BYTES = 16 * 1024 * 1024
 MAX_ARTIFACT_BYTES = 128 * 1024 * 1024
-# Docker's json-file driver rotates at this size. It bounds the disk a hostile
-# stdout/stderr producer can consume and the memory `docker logs` can return.
+# Docker's json-file driver rotates at LOG_MAX_BYTES and keeps at most
+# LOG_MAX_FILES files (up to 64 MiB on disk per container). Keeping one
+# rotated sibling (.1) makes any log rotation observable via container inspect.
 LOG_MAX_BYTES = 32 * 1024 * 1024
-LOG_MAX_FILES = 1
+LOG_MAX_FILES = 2
 MAX_PREVIEW_BYTES = 512
 _IMAGE_DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
@@ -682,6 +683,107 @@ def _truncate_log(data: bytes) -> tuple[bytes, bool]:
     return data[:MAX_LOG_BYTES], True
 
 
+def _rotated_log_candidates(log_path: str) -> tuple[str, ...]:
+    candidates = [f"{log_path}.1"]
+    if log_path.endswith(".json"):
+        base = log_path[:-5]
+        candidates.extend([f"{base}.json.1", f"{base}.1.json"])
+    elif log_path.endswith(".log"):
+        base = log_path[:-4]
+        candidates.extend([f"{base}.log.1", f"{base}.1.log"])
+    return tuple(dict.fromkeys(candidates))
+
+
+def _inspect_log_rotation(
+    inspect_payload: Mapping[str, Any] | None,
+    *,
+    log_max_bytes: int = LOG_MAX_BYTES,
+) -> tuple[bool, bool]:
+    """Return ``(rotated, unverified)`` from container inspect metadata.
+
+    Docker's ``json-file`` driver rotates ``<LogPath>`` to ``<LogPath>.1`` at
+    ``max-size``. Even when the active log file after rotation is smaller than
+    ``MAX_LOG_BYTES``, the presence of ``.1`` (or an active file that has
+    reached ``max-size``) proves that prefix bytes were rotated out of the
+    current file. When ``inspect`` or ``.LogPath`` is unavailable, the caller
+    must not claim that a completed replay captured a full log.
+    """
+    if not isinstance(inspect_payload, Mapping):
+        return False, True
+    max_size = log_max_bytes
+    host_config = inspect_payload.get("HostConfig")
+    if isinstance(host_config, Mapping):
+        log_config = host_config.get("LogConfig")
+        if isinstance(log_config, Mapping):
+            options = log_config.get("Config")
+            if isinstance(options, Mapping) and options.get("max-size") is not None:
+                try:
+                    max_size = _parse_log_size(options.get("max-size"))
+                except (TypeError, ValueError):
+                    max_size = log_max_bytes
+    log_path = inspect_payload.get("LogPath")
+    if not isinstance(log_path, str) or not log_path.strip():
+        return False, True
+    log_path = log_path.strip()
+    siblings = _rotated_log_candidates(log_path)
+    for sibling in siblings:
+        try:
+            os.lstat(sibling)
+            return True, False
+        except FileNotFoundError:
+            continue
+        except PermissionError:
+            break
+        except OSError:
+            return False, True
+    try:
+        info = os.lstat(log_path)
+    except PermissionError:
+        if (
+            log_path.startswith("/var/lib/docker/")
+            and hasattr(os, "geteuid")
+            and os.geteuid() != 0
+        ):
+            try:
+                probe = subprocess.run(
+                    [
+                        "sudo",
+                        "-n",
+                        "sh",
+                        "-c",
+                        'if [ ! -f "$1" ]; then exit 2; fi; '
+                        'for s in "$1.1" "${1%.json}.json.1" "${1%.json}.1.json" '
+                        '"${1%.log}.log.1" "${1%.log}.1.log"; do '
+                        'if [ -e "$s" ]; then echo rotated; exit 0; fi; '
+                        'done; wc -c < "$1"',
+                        "sh",
+                        log_path,
+                    ],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=5,
+                    check=False,
+                )
+            except (OSError, subprocess.SubprocessError):
+                return False, True
+            if probe.returncode == 0:
+                text = probe.stdout.decode("ascii", "replace").strip()
+                if text == "rotated":
+                    return True, False
+                try:
+                    return int(text) >= max_size, False
+                except ValueError:
+                    return False, True
+        return False, True
+    except OSError:
+        return False, True
+    if not stat.S_ISREG(info.st_mode):
+        return False, True
+    if info.st_size >= max_size:
+        return True, False
+    return False, False
+
+
 def _read_bounded_file(
     path: Path, *, max_bytes: int, label: str, reason_code: str
 ) -> bytes:
@@ -1267,6 +1369,11 @@ class DockerSandbox:
                             f"Status={state.get('Status')!r}"
                         )
                     capture_errors.append(reason)
+            log_rotated, log_unverified = _inspect_log_rotation(inspect_payload)
+            if log_rotated:
+                truncated.add("log_rotated")
+            if log_unverified:
+                truncated.add("log_unverified")
             logs = self._docker(["logs", name], timeout=60)
             if logs.returncode == 0:
                 stdout = logs.stdout

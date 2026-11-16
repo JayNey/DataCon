@@ -583,3 +583,99 @@ def test_replay_exit_code_comes_from_container_not_work_file(tmp_path):
     assert result.exit_code == 7
     assert result.status == "completed"
     assert b"fake clean" not in result.stdout
+
+
+
+def test_s3_real_docker_40mib_stderr_rotation_marks_truncated_and_blocks_reproduced(
+    tmp_path,
+):
+    from dataclasses import replace
+    from datacon.verdict import VerdictPolicy, decide_verdict, observation_from_run
+
+    parser, input_file = _write_target(
+        tmp_path,
+        "printf '==1==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x502000000014\n"
+        "WRITE of size 1 at 0x502000000014 thread T0\n"
+        "    #0 0x55555565fadf in parse_token /fixture/vulnerable/parser.c:22:17\n"
+        "SUMMARY: AddressSanitizer: heap-buffer-overflow /fixture/vulnerable/parser.c:22:17 in parse_token\n' >&2
+"
+        "dd if=/dev/zero bs=1048576 count=40 2>/dev/null | tr '\\0' 'X' >&2
+"
+        "exit 86
+",
+    )
+    job_id = "s3-rot-" + uuid.uuid4().hex
+    sandbox = _sandbox(tmp_path, job_id)
+    result = sandbox.replay(
+        "vulnerable",
+        "candidate_1",
+        artifact_path=parser,
+        input_path=input_file,
+        asan_options="detect_leaks=0",
+        timeout_seconds=120,
+    )
+    assert result.exit_code == 86
+    assert result.log_truncated is True
+
+    policy = VerdictPolicy(
+        signature={
+            "error": "heap-buffer-overflow",
+            "operation": "WRITE",
+            "access_size": 1,
+            "function": "parse_token",
+            "source": "parser.c",
+        },
+        expected_exit={"normal": 0, "candidate_clean": 0, "candidate_asan": 86},
+        expected_stdout={"normal": "OK\n", "candidate_clean": "ABCD\n"},
+    )
+    obs = observation_from_run(result.as_dict())
+    runs = [
+        obs,
+        replace(obs, phase="candidate_2"),
+        replace(
+            obs,
+            phase="normal",
+            status="completed",
+            exit_code=0,
+            stdout="OK\n",
+            stderr="",
+            signature=None,
+            log_truncated=False,
+        ),
+        replace(
+            obs,
+            version="fixed",
+            phase="normal",
+            status="completed",
+            exit_code=0,
+            stdout="OK\n",
+            stderr="",
+            signature=None,
+            log_truncated=False,
+        ),
+        replace(
+            obs,
+            version="fixed",
+            phase="candidate_1",
+            status="completed",
+            exit_code=0,
+            stdout="ABCD\n",
+            stderr="",
+            signature=None,
+            log_truncated=False,
+        ),
+        replace(
+            obs,
+            version="fixed",
+            phase="candidate_2",
+            status="completed",
+            exit_code=0,
+            stdout="ABCD\n",
+            stderr="",
+            signature=None,
+            log_truncated=False,
+        ),
+    ]
+    decision = decide_verdict(policy, runs)
+    assert decision.verdict == "INCONCLUSIVE"
+    assert decision.reason_code == "EVIDENCE_INCOMPLETE"

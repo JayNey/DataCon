@@ -176,7 +176,7 @@ def host_config(**overrides):
             "Type": "json-file",
             "Config": {
                 "max-size": str(32 * 1024 * 1024),
-                "max-file": "1",
+                "max-file": "2",
             },
         },
     }
@@ -2879,4 +2879,112 @@ def test_s2_readme_quickstart_and_cwd_filesystem_root_guidance(
     assert caught.value.reason_code == "EVIDENCE_WRITE_FAILED"
     assert "filesystem root" in caught.value.message
     assert "DATACON_JOURNAL_SECRET_FILE" in caught.value.message
+
+
+def test_s3_rotated_sibling_log_marks_replay_truncated_and_blocks_reproduced(
+    tmp_path,
+):
+    from datacon.verdict import VerdictPolicy, decide_verdict, observation_from_run
+
+    artifact, input_file = _prepare_replay_files(tmp_path)
+    log_file = tmp_path / "container-json.log"
+    log_file.write_bytes(b'{"log":"tail\\n","stream":"stderr"}\n')
+    rotated_file = tmp_path / "container-json.log.1"
+    rotated_file.write_bytes(b'{"log":"asan prefix\\n","stream":"stderr"}\n')
+
+    asan_stderr = (
+        b"==7==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x502000000014\n"
+        b"WRITE of size 1 at 0x502000000014 thread T0\n"
+        b"    #0 0x55555565fadf in parse_token /fixture/vulnerable/parser.c:22:17\n"
+        b"SUMMARY: AddressSanitizer: heap-buffer-overflow /fixture/vulnerable/parser.c:22:17 in parse_token\n"
+    )
+    sandbox = _make_fake_cli_sandbox(
+        tmp_path,
+        wait_rc=0,
+        wait_stdout=b"86\n",
+        logs_rc=0,
+        logs_stderr=asan_stderr,
+        state={"ExitCode": 86, "Running": False, "Status": "exited"},
+        log_path=str(log_file),
+    )
+    result = sandbox.replay(
+        "vulnerable",
+        "candidate_1",
+        artifact_path=artifact,
+        input_path=input_file,
+        asan_options="detect_leaks=0",
+        timeout_seconds=5.0,
+    )
+    assert result.log_truncated is True
+
+    policy = VerdictPolicy(
+        signature={
+            "error": "heap-buffer-overflow",
+            "operation": "WRITE",
+            "access_size": 1,
+            "function": "parse_token",
+            "source": "parser.c",
+        },
+        expected_exit={"normal": 0, "candidate_clean": 0, "candidate_asan": 86},
+        expected_stdout={"normal": "OK\n", "candidate_clean": "ABCD\n"},
+    )
+    obs = observation_from_run(result.as_dict())
+    runs = [
+        obs,
+        replace(obs, phase="candidate_2"),
+        replace(obs, phase="normal", exit_code=0, stdout="OK\n", stderr="", signature=None, log_truncated=False),
+        replace(obs, version="fixed", phase="normal", exit_code=0, stdout="OK\n", stderr="", signature=None, log_truncated=False),
+        replace(obs, version="fixed", phase="candidate_1", exit_code=0, stdout="ABCD\n", stderr="", signature=None, log_truncated=False),
+        replace(obs, version="fixed", phase="candidate_2", exit_code=0, stdout="ABCD\n", stderr="", signature=None, log_truncated=False),
+    ]
+    decision = decide_verdict(policy, runs)
+    assert decision.verdict == "INCONCLUSIVE"
+    assert decision.reason_code == "EVIDENCE_INCOMPLETE"
+
+
+def test_s3_log_file_at_max_size_marks_replay_truncated(tmp_path):
+    from datacon.tools.sandbox import LOG_MAX_BYTES
+
+    artifact, input_file = _prepare_replay_files(tmp_path)
+    log_file = tmp_path / "full-json.log"
+    log_file.write_bytes(b"x")
+    os.truncate(log_file, LOG_MAX_BYTES)
+    sandbox = _make_fake_cli_sandbox(
+        tmp_path,
+        wait_rc=0,
+        wait_stdout=b"0\n",
+        logs_rc=0,
+        logs_stdout=b"ABCD\n",
+        log_path=str(log_file),
+    )
+    result = sandbox.replay(
+        "fixed",
+        "candidate_1",
+        artifact_path=artifact,
+        input_path=input_file,
+        asan_options="detect_leaks=0",
+        timeout_seconds=5.0,
+    )
+    assert result.log_truncated is True
+
+
+def test_s3_missing_log_path_marks_replay_truncated(tmp_path):
+    artifact, input_file = _prepare_replay_files(tmp_path)
+    sandbox = _make_fake_cli_sandbox(
+        tmp_path,
+        wait_rc=0,
+        wait_stdout=b"0\n",
+        logs_rc=0,
+        logs_stdout=b"ABCD\n",
+        log_path=None,
+    )
+    result = sandbox.replay(
+        "fixed",
+        "candidate_1",
+        artifact_path=artifact,
+        input_path=input_file,
+        asan_options="detect_leaks=0",
+        timeout_seconds=5.0,
+    )
+    assert result.log_truncated is True
 
