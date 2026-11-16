@@ -1605,6 +1605,17 @@ def _finish_returns_false(monkeypatch):
     )
 
 
+def _archive_error(monkeypatch):
+    calls = []
+
+    def fail(*args, **kwargs):
+        calls.append(True)
+        return (None, None, "EVIDENCE_WRITE_FAILED: injected archive failure")
+
+    monkeypatch.setattr(execution, "_archive", fail)
+    return calls
+
+
 def test_evidence_path_failure_returns_stale_when_finish_is_not_committed(
     isolated_database, tmp_path, monkeypatch
 ):
@@ -1704,15 +1715,7 @@ def test_archive_only_archive_error_returns_stale_when_finish_is_not_committed(
         "execute_deadline_at = now() - interval '1 minute' WHERE job_id = %s",
         (generation, job_uuid),
     )
-    monkeypatch.setattr(
-        execution,
-        "_archive",
-        lambda *args, **kwargs: (
-            None,
-            None,
-            "EVIDENCE_WRITE_FAILED: injected archive failure",
-        ),
-    )
+    archive_calls = _archive_error(monkeypatch)
     _finish_returns_false(monkeypatch)
 
     outcome = execution.run_execution(
@@ -1724,6 +1727,7 @@ def test_archive_only_archive_error_returns_stale_when_finish_is_not_committed(
     )
 
     assert outcome.state == "STALE"
+    assert archive_calls
     current = status(isolated_database.dsn, job["job_id"])
     assert current["state"] == "ARCHIVING"
 
@@ -1732,15 +1736,7 @@ def test_blocked_archive_error_returns_stale_when_finish_is_not_committed(
     isolated_database, tmp_path, monkeypatch
 ):
     job, _, generation = prepare_approved_job(isolated_database, tmp_path)
-    monkeypatch.setattr(
-        execution,
-        "_archive",
-        lambda *args, **kwargs: (
-            None,
-            None,
-            "EVIDENCE_WRITE_FAILED: injected archive failure",
-        ),
-    )
+    archive_calls = _archive_error(monkeypatch)
     _finish_returns_false(monkeypatch)
 
     outcome = run_with_fake(
@@ -1753,6 +1749,7 @@ def test_blocked_archive_error_returns_stale_when_finish_is_not_committed(
     )
 
     assert outcome.state == "STALE"
+    assert archive_calls
     current = status(isolated_database.dsn, job["job_id"])
     assert current["state"] == "RUNNING"
 
@@ -1761,15 +1758,7 @@ def test_failed_archive_error_returns_stale_when_finish_is_not_committed(
     isolated_database, tmp_path, monkeypatch
 ):
     job, _, generation = prepare_approved_job(isolated_database, tmp_path)
-    monkeypatch.setattr(
-        execution,
-        "_archive",
-        lambda *args, **kwargs: (
-            None,
-            None,
-            "EVIDENCE_WRITE_FAILED: injected archive failure",
-        ),
-    )
+    archive_calls = _archive_error(monkeypatch)
     _finish_returns_false(monkeypatch)
 
     outcome = run_with_fake(
@@ -1782,6 +1771,7 @@ def test_failed_archive_error_returns_stale_when_finish_is_not_committed(
     )
 
     assert outcome.state == "STALE"
+    assert archive_calls
     current = status(isolated_database.dsn, job["job_id"])
     assert current["state"] == "RUNNING"
 
@@ -1790,15 +1780,7 @@ def test_normal_archive_error_returns_stale_when_finish_is_not_committed(
     isolated_database, tmp_path, monkeypatch
 ):
     job, _, generation = prepare_approved_job(isolated_database, tmp_path)
-    monkeypatch.setattr(
-        execution,
-        "_archive",
-        lambda *args, **kwargs: (
-            None,
-            None,
-            "EVIDENCE_WRITE_FAILED: injected archive failure",
-        ),
-    )
+    archive_calls = _archive_error(monkeypatch)
     _finish_returns_false(monkeypatch)
 
     outcome = run_with_fake(
@@ -1806,6 +1788,7 @@ def test_normal_archive_error_returns_stale_when_finish_is_not_committed(
     )
 
     assert outcome.state == "STALE"
+    assert archive_calls
     current = status(isolated_database.dsn, job["job_id"])
     assert current["state"] == "RUNNING"
 

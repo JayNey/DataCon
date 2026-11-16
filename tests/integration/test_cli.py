@@ -88,6 +88,7 @@ def test_submit_and_status_in_separate_processes(database, postgres_dsn, tmp_pat
         "evidence_refs": [],
         "verdict": None,
         "verdict_reason": None,
+        "verdict_current": False,
         "evidence": None,
     }
 
@@ -125,6 +126,7 @@ def test_binary_submit_is_archived_as_blocked(database, postgres_dsn, tmp_path):
         "evidence_refs": [],
         "verdict": None,
         "verdict_reason": None,
+        "verdict_current": False,
         "evidence": None,
     }
 
