@@ -243,12 +243,17 @@ def _inside_run_root(path: Path, run_root: Path, label: str) -> bool:
 
 @dataclass(frozen=True)
 class _MountPoint:
-    """The subset of a ``/proc/self/mountinfo`` line used for containment."""
+    """The subset of a ``/proc/self/mountinfo`` line used for containment.
+
+    ``root`` is ``None`` for pseudo filesystems whose mount root is not a path
+    (for example ``nsfs`` reports ``net:[4026532313]``). Such a mount cannot
+    prove containment and is rejected when it is relevant to the target.
+    """
 
     mount_id: int
     parent_id: int
     major_minor: str
-    root: Path
+    root: Path | None
     mount_point: Path
 
 
@@ -288,10 +293,11 @@ def _parse_mountinfo(text: str) -> tuple[_MountPoint, ...]:
         major_minor = fields[2]
         if ":" not in major_minor:
             raise ValueError("mountinfo device is malformed")
-        root = Path(_unescape_mountinfo(fields[3]))
+        root_value = _unescape_mountinfo(fields[3])
+        root = Path(root_value) if root_value.startswith("/") else None
         mount_point = Path(_unescape_mountinfo(fields[4]))
-        if not root.is_absolute() or not mount_point.is_absolute():
-            raise ValueError("mountinfo paths are not absolute")
+        if not mount_point.is_absolute():
+            raise ValueError("mountinfo mount point is not absolute")
         entries.append(
             _MountPoint(
                 mount_id=mount_id,
@@ -335,6 +341,8 @@ def _mountinfo_rejects(path: Path, run_root: Path, text: str) -> bool:
     root_mount = _mount_point_for(entries, run_root)
     if target_mount is None or root_mount is None:
         return True
+    if target_mount.root is None or root_mount.root is None:
+        return True
     if target_mount.major_minor != root_mount.major_minor:
         return False
     try:
@@ -358,6 +366,8 @@ def _mountinfo_rejects(path: Path, run_root: Path, text: str) -> bool:
             continue
         if entry.major_minor != root_mount.major_minor:
             continue
+        if entry.root is None:
+            return True
         if _lexically_within_run_root(entry.root, root_physical):
             return True
     return False

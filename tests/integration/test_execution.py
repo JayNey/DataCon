@@ -236,7 +236,10 @@ def test_reproduced_execution_archives_six_replays(isolated_database, tmp_path, 
         isolated_database, job, generation, tmp_path, sandbox, monkeypatch
     )
 
-    assert outcome.state == "REPRODUCED"
+    assert outcome.state == "REPRODUCED", (
+        outcome,
+        status(isolated_database.dsn, job["job_id"]),
+    )
     assert outcome.verdict == "REPRODUCED"
     assert sandbox.probes == 1
     assert sandbox.builds == 2
@@ -1212,7 +1215,10 @@ def test_archive_only_without_evidence_is_inconclusive_not_blocked(
         run_root=tmp_path / "runs",
         sandbox=ExplodingSandbox(),
     )
-    assert outcome.state == "INCONCLUSIVE", outcome
+    assert outcome.state == "INCONCLUSIVE", (
+        outcome,
+        status(isolated_database.dsn, job["job_id"]),
+    )
     assert outcome.reason_code == "EVIDENCE_INCOMPLETE"
     current = status(isolated_database.dsn, job["job_id"])
     assert current["state"] == "INCONCLUSIVE"

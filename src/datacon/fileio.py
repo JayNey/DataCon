@@ -252,6 +252,20 @@ def write_regular_file_atomic(
         finally:
             os.close(descriptor)
         os.replace(temporary, target)
+    except UnsafeFileError:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
+    except OSError as error:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise UnsafeFileError(
+            "UNWRITABLE", f"cannot write temporary file: {error}"
+        ) from error
     except BaseException:
         try:
             os.unlink(temporary)

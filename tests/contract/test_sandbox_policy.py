@@ -1637,3 +1637,23 @@ def test_write_run_file_rejects_a_fifo_without_blocking(tmp_path):
         execution._write_run_file(run_root, target, b"tampered", 0o600)
 
     assert caught.value.reason_code == "EVIDENCE_WRITE_FAILED"
+
+
+def test_mountinfo_tolerates_unrelated_pseudo_filesystem_roots():
+    # nsfs reports a non-path root such as net:[4026532313]; it must not make
+    # an unrelated target unverifiable.
+    text = _mountinfo(
+        "60 35 0:5 net:[4026532313] /run/docker/netns/abc rw - nsfs nsfs rw"
+    )
+    assert not execution._mountinfo_rejects(
+        Path("/tmp/evidence"), Path("/tmp/runs"), text
+    )
+
+
+def test_mountinfo_rejects_a_pseudo_filesystem_ancestor():
+    text = _mountinfo(
+        "60 35 0:5 net:[4026532313] /run/docker/netns/abc rw - nsfs nsfs rw"
+    )
+    assert execution._mountinfo_rejects(
+        Path("/run/docker/netns/abc/evidence"), Path("/tmp/runs"), text
+    )
