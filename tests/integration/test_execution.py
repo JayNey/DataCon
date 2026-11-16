@@ -1930,10 +1930,10 @@ def test_archive_publish_then_finish_false_rolls_back_generation_bundle(
         "WHERE job_id = %s",
         (UUID(job["job_id"]),),
     ).fetchone()
-    assert row["state"] == "ARCHIVING"
-    assert row["evidence_path"] is None
-    assert row["evidence_status"] is None
-    assert row["verdict"] is None
+    assert row[0] == "ARCHIVING"
+    assert row[1] is None
+    assert row[2] is None
+    assert row[3] is None
 
     # The published generation directory was this worker's own; it must be
     # removed, and no other generation directory may exist.
