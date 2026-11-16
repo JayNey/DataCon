@@ -79,11 +79,15 @@ def replay_status_allowed(verdict: str, status: str) -> bool:
 
 
 PRIORITY = (
-    "INCONCLUSIVE: missing/incomparable evidence, abnormal control, "
-    "intermittent trigger, other crash, timeout or resource exhaustion",
+    "INCONCLUSIVE: missing/incomparable evidence or truncated logs",
+    "INCONCLUSIVE: timeout or resource exhaustion (including a control that "
+    "did not complete)",
+    "INCONCLUSIVE: abnormal completed normal control "
+    "(wrong exit, stdout or an ASan diagnostic)",
+    "INCONCLUSIVE: intermittent trigger, other crash or fixed still vulnerable",
     "REPRODUCED: vulnerable hits the reviewed signature twice and fixed is clean twice",
     "NOT_REPRODUCED: both versions are clean on the candidate twice",
-    "INCONCLUSIVE: every other complete combination (including fixed still vulnerable)",
+    "INCONCLUSIVE: every other complete combination",
 )
 
 

@@ -250,7 +250,9 @@ REPORT = {
     "cve_id": PLAN["cve_id"],
     "case_id": PLAN["case_id"],
     "verdict": "REPRODUCED",
+    "state": "REPRODUCED",
     "reason_code": REASONS["REPRODUCED"],
+    "error": None,
     "rule": {
         "verdict": "REPRODUCED",
         "reason_code": REASONS["REPRODUCED"],
@@ -294,6 +296,15 @@ def canonical(data) -> bytes:
     return jsonutil.canonical_bytes(data) + b"\n"
 
 
+def report_markdown(verdict, reason) -> str:
+    """Render the same conclusion lines that execution writes into report.md."""
+    return (
+        "# DataCon evidence report\n\n"
+        f"- Verdict: **{verdict if verdict else 'PENDING'}**\n"
+        f"- Reason: `{reason if reason is not None else ''}`\n"
+    )
+
+
 def full_artifacts() -> dict[str, tuple[str, bytes]]:
     artifacts: dict[str, tuple[str, bytes]] = {
         "plan.json": ("plan", canonical(PLAN)),
@@ -305,6 +316,8 @@ def full_artifacts() -> dict[str, tuple[str, bytes]]:
                     "job_id": JOB_ID,
                     "plan_digest": PLAN_DIGEST,
                     "generation": 1,
+                    "builds": [dict(build) for build in BUILDS],
+                    "replays": [dict(replay) for replay in REPLAYS],
                 }
             ),
         ),
@@ -386,7 +399,9 @@ def make_bundle(
         job_id=report_value["job_id"],
         plan_digest=report_value["plan_digest"],
         report=report_value,
-        report_markdown="# report\n",
+        report_markdown=report_markdown(
+            report_value.get("verdict"), report_value.get("reason_code")
+        ),
         artifacts=artifacts,
     )
 
@@ -412,6 +427,19 @@ def _rewrite_manifested_file(root: Path, relative: str, data: bytes) -> None:
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
 
 
+def _sync_execution_lists(root: Path, report) -> None:
+    """Keep metadata/execution.json's diagnostic copies equal to the report."""
+    path = root / "metadata/execution.json"
+    if not path.is_file():
+        return
+    execution = json.loads(path.read_text(encoding="utf-8"))
+    execution["builds"] = [deepcopy(item) for item in report.get("builds", [])]
+    execution["replays"] = [deepcopy(item) for item in report.get("replays", [])]
+    _rewrite_manifested_file(
+        root, "metadata/execution.json", canonical(execution)
+    )
+
+
 def _replace_report(root: Path, **changes) -> None:
     report = json.loads((root / "report.json").read_text(encoding="utf-8"))
     report.update(changes)
@@ -420,6 +448,7 @@ def _replace_report(root: Path, **changes) -> None:
     report["report_markdown_sha256"] = hashlib.sha256(
         (root / "report.md").read_bytes()
     ).hexdigest()
+    _sync_execution_lists(root, report)
     _rewrite_manifested_file(root, "report.json", canonical(report))
 
 
@@ -445,7 +474,7 @@ def test_valid_bundle_round_trips_and_exports(tmp_path):
     exported = export_bundle(info.root, tmp_path / "exported")
     assert exported.manifest_digest == info.manifest_digest
     assert (tmp_path / "exported" / "manifest.json").is_file()
-    assert (tmp_path / "exported" / "report.md").read_text() == "# report\n"
+    assert "- Verdict: **REPRODUCED**" in (tmp_path / "exported" / "report.md").read_text()
 
 
 def test_verify_rejects_reproduced_when_candidate_asan_is_absent(tmp_path):
@@ -520,6 +549,7 @@ def test_verify_accepts_valid_reproduced_bundle(tmp_path):
 def _mutate_report(root: Path, mutate) -> None:
     report = json.loads((root / "report.json").read_text(encoding="utf-8"))
     mutate(report)
+    _sync_execution_lists(root, report)
     _rewrite_manifested_file(root, "report.json", canonical(report))
 
 
@@ -538,12 +568,19 @@ def _set_verdict(root: Path, verdict: str, reason: str | None) -> None:
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
     report = json.loads((root / "report.json").read_text(encoding="utf-8"))
     report["verdict"] = verdict
+    report["state"] = verdict
     report["reason_code"] = reason
+    report["missing"] = []
+    report["error"] = None
     report["rule"] = (
         {"verdict": verdict, "reason_code": reason}
         if verdict in ("REPRODUCED", "NOT_REPRODUCED")
         else None
     )
+    markdown = report_markdown(verdict, reason).encode("utf-8")
+    _rewrite_manifested_file(root, "report.md", markdown)
+    report["report_markdown_sha256"] = hashlib.sha256(markdown).hexdigest()
+    _sync_execution_lists(root, report)
     _rewrite_manifested_file(root, "report.json", canonical(report))
 
 
@@ -594,6 +631,7 @@ def _update_replay(
     _rewrite_manifested_file(
         root, f"replay/{version}/{phase}/metadata.json", canonical(item)
     )
+    _sync_execution_lists(root, report)
     _rewrite_manifested_file(root, "report.json", canonical(report))
 
 
@@ -606,6 +644,7 @@ def _update_build(root: Path, version: str, **fields) -> None:
     _rewrite_manifested_file(
         root, f"build/{version}/metadata.json", canonical(item)
     )
+    _sync_execution_lists(root, report)
     _rewrite_manifested_file(root, "report.json", canonical(report))
 
 
@@ -661,6 +700,8 @@ def _rebind_bundle_to_plan(
                 "job_id": JOB_ID,
                 "plan_digest": digest_value,
                 "generation": 1,
+                "builds": [deepcopy(item) for item in report["builds"]],
+                "replays": [deepcopy(item) for item in report["replays"]],
             }
         ),
     )
@@ -839,6 +880,8 @@ def test_verify_accepts_distinct_stable_input_aliases(tmp_path):
                 "job_id": JOB_ID,
                 "plan_digest": variant_digest,
                 "generation": 1,
+                "builds": [deepcopy(item) for item in builds],
+                "replays": [deepcopy(item) for item in replays],
             }
         ),
     )
@@ -871,7 +914,7 @@ def test_verify_accepts_distinct_stable_input_aliases(tmp_path):
         job_id=JOB_ID,
         plan_digest=variant_digest,
         report=report,
-        report_markdown="# report\n",
+        report_markdown=report_markdown("REPRODUCED", REASONS["REPRODUCED"]),
         artifacts=artifacts,
     )
     verified = verify_bundle(info.root)
@@ -1406,6 +1449,7 @@ def test_reproduced_bundle_with_only_four_base_roles_is_rejected(tmp_path):
 def test_minimal_blocked_or_failed_bundle_is_accepted(tmp_path, verdict):
     report = deepcopy(REPORT)
     report["verdict"] = verdict
+    report["state"] = verdict
     report["reason_code"] = "POLICY_DENIED" if verdict == "BLOCKED" else "EVIDENCE_WRITE_FAILED"
     report["rule"] = None
     report["replays"] = []
@@ -1648,14 +1692,14 @@ def test_report_bytes_obey_the_evidence_size_cap(tmp_path, monkeypatch):
 
     monkeypatch.setattr(evidence, "MAX_FILE_BYTES", 4096)
     report = deepcopy(REPORT)
-    report["error"] = "x" * 8192
+    report["padding"] = "x" * 8192
     with pytest.raises(BundleError) as caught:
         write_bundle(
             tmp_path / "oversized",
             job_id=report["job_id"],
             plan_digest=report["plan_digest"],
             report=report,
-            report_markdown="# report\n",
+            report_markdown=report_markdown("REPRODUCED", REASONS["REPRODUCED"]),
             artifacts={
                 "plan.json": ("plan", canonical(PLAN)),
                 "review.json": ("review", canonical(REVIEW)),
@@ -1675,7 +1719,8 @@ def test_report_markdown_obeys_the_evidence_size_cap(tmp_path, monkeypatch):
             job_id=REPORT["job_id"],
             plan_digest=REPORT["plan_digest"],
             report=REPORT,
-            report_markdown="# " + ("x" * 8192),
+            report_markdown=report_markdown("REPRODUCED", REASONS["REPRODUCED"])
+            + "# " + ("x" * 8192),
             artifacts={
                 "plan.json": ("plan", canonical(PLAN)),
                 "review.json": ("review", canonical(REVIEW)),
@@ -1860,6 +1905,7 @@ def test_not_reproduced_rejects_wrong_candidate_stdout(tmp_path):
 def test_blocked_material_io_error_bundle_verifies(tmp_path):
     report = deepcopy(REPORT)
     report["verdict"] = "BLOCKED"
+    report["state"] = "BLOCKED"
     report["reason_code"] = "MATERIAL_IO_ERROR"
     report["rule"] = None
     report["replays"] = []
@@ -1887,7 +1933,7 @@ def test_legacy_bundle_without_case_binding_fails_diagnosably(
         job_id=JOB_ID,
         plan_digest=PLAN_DIGEST,
         report=REPORT,
-        report_markdown="# report\n",
+        report_markdown=report_markdown("REPRODUCED", REASONS["REPRODUCED"]),
         artifacts=artifacts,
     )
     with pytest.raises(BundleError) as caught:
@@ -1906,7 +1952,7 @@ def test_cli_verify_bundle_reports_legacy_bundle_without_type_error(tmp_path, ca
         job_id=JOB_ID,
         plan_digest=PLAN_DIGEST,
         report=REPORT,
-        report_markdown="# report\n",
+        report_markdown=report_markdown("REPRODUCED", REASONS["REPRODUCED"]),
         artifacts=artifacts,
     )
     capsys.readouterr()
@@ -2000,14 +2046,19 @@ def test_verify_bundle_counts_directory_entries_and_fails_fast(tmp_path, monkeyp
 
 def test_verify_rejects_tampered_report_markdown_with_updated_manifest(tmp_path):
     info = make_bundle(tmp_path)
-    # An attacker who can rewrite the manifest and report.md still cannot make
-    # the swapped verdict verify: report.json commits to the original bytes.
-    _rewrite_manifested_file(
-        info.root, "report.md", b"# report\n\n- Verdict: **NOT_REPRODUCED**\n"
+    # The attacker also rewrites report.json's markdown digest and the
+    # manifest entry, so this is the semantic verdict-binding check and not
+    # merely the byte digest check.
+    report = json.loads((info.root / "report.json").read_text(encoding="utf-8"))
+    _rewrite_report_and_markdown(
+        info.root,
+        report,
+        report_markdown("NOT_REPRODUCED", "CANDIDATE_CLEAN").encode(),
     )
     with pytest.raises(BundleError) as caught:
         verify_bundle(info.root)
-    assert caught.value.reason_code == "DIGEST_MISMATCH"
+    assert caught.value.reason_code == "INVALID_MANIFEST"
+    assert "report.md verdict" in caught.value.message
 
 
 def test_verify_rejects_report_markdown_replaced_with_other_role(tmp_path):
@@ -2165,3 +2216,254 @@ def test_bundle_entry_cap_aborts_before_enumerating_flat_directory(
     assert "directory entries" in caught.value.message
     # The scan stops at the cap instead of collecting all 2000+ entries.
     assert len(yielded) <= evidence_module.MAX_BUNDLE_ENTRIES + 1
+
+
+# ---------------------------------------------------------------------------
+# B1: report.md renders the conclusion and is not an independent document.
+# ---------------------------------------------------------------------------
+
+
+def _rewrite_report_and_markdown(root: Path, report: dict, markdown: bytes) -> None:
+    """Rewrite report.json/report.md and their manifest entries consistently."""
+    report = deepcopy(report)
+    report["report_markdown_sha256"] = hashlib.sha256(markdown).hexdigest()
+    _rewrite_manifested_file(root, "report.md", markdown)
+    _rewrite_manifested_file(root, "report.json", canonical(report))
+
+
+def test_verify_rejects_report_markdown_verdict_mismatch_after_full_rewrite(tmp_path):
+    info = make_bundle(tmp_path)
+    report = json.loads((info.root / "report.json").read_text(encoding="utf-8"))
+    forged = (
+        "# DataCon evidence report\n\n"
+        "- Verdict: **NOT_REPRODUCED**\n"
+        "- Reason: `NO_ASAN_SIGNATURE`\n"
+    ).encode()
+    _rewrite_report_and_markdown(info.root, report, forged)
+    with pytest.raises(BundleError) as caught:
+        verify_bundle(info.root)
+    assert caught.value.reason_code == "INVALID_MANIFEST"
+    assert "report.md verdict" in caught.value.message
+
+
+@pytest.mark.parametrize(
+    "markdown",
+    [
+        # Missing verdict line.
+        b"- Reason: `ASAN_SIGNATURE_MATCHED`\n",
+        # Two verdict lines.
+        b"- Verdict: **REPRODUCED**\n- Verdict: **REPRODUCED**\n"
+        b"- Reason: `ASAN_SIGNATURE_MATCHED`\n",
+        # Lower-case variant.
+        b"- verdict: **REPRODUCED**\n- Reason: `ASAN_SIGNATURE_MATCHED`\n",
+        # Extra spaces around the value.
+        b"- Verdict:  **REPRODUCED**\n- Reason: `ASAN_SIGNATURE_MATCHED`\n",
+        # Missing reason line.
+        b"- Verdict: **REPRODUCED**\n",
+        # Lower-case reason value.
+        b"- Verdict: **REPRODUCED**\n- Reason: `asan_signature_matched`\n",
+    ],
+)
+def test_verify_rejects_missing_or_multiple_verdict_lines(tmp_path, markdown):
+    info = make_bundle(tmp_path, name="forged-markdown")
+    report = json.loads((info.root / "report.json").read_text(encoding="utf-8"))
+    _rewrite_report_and_markdown(info.root, report, markdown)
+    with pytest.raises(BundleError) as caught:
+        verify_bundle(info.root)
+    assert caught.value.reason_code == "INVALID_MANIFEST"
+
+
+def test_verify_accepts_crlf_report_markdown(tmp_path):
+    info = make_bundle(tmp_path, name="crlf-markdown")
+    report = json.loads((info.root / "report.json").read_text(encoding="utf-8"))
+    markdown = report_markdown("REPRODUCED", REASONS["REPRODUCED"]).replace(
+        "\n", "\r\n"
+    ).encode()
+    _rewrite_report_and_markdown(info.root, report, markdown)
+    verify_bundle(info.root)
+
+
+def test_write_bundle_rejects_inconsistent_report_markdown(tmp_path):
+    with pytest.raises(BundleError) as caught:
+        write_bundle(
+            tmp_path / "inconsistent",
+            job_id=REPORT["job_id"],
+            plan_digest=REPORT["plan_digest"],
+            report=REPORT,
+            report_markdown=report_markdown("NOT_REPRODUCED", "CANDIDATE_CLEAN"),
+            artifacts=full_artifacts(),
+        )
+    assert caught.value.reason_code == "INVALID_MANIFEST"
+    assert not (tmp_path / "inconsistent").exists()
+
+
+# ---------------------------------------------------------------------------
+# S3: strict report/manifest schema.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("state", None),
+        ("state", "INCONCLUSIVE"),
+        ("missing", ["a required replay is missing"]),
+        ("error", "boom"),
+        ("schema_version", True),
+        ("verdict", []),
+        ("verdict", {"verdict": "REPRODUCED"}),
+    ],
+)
+def test_verify_rejects_malformed_report_header(tmp_path, field, value):
+    info = make_bundle(tmp_path, name="bad-report-header")
+    report = json.loads((info.root / "report.json").read_text(encoding="utf-8"))
+    if value is None:
+        report.pop(field, None)
+    else:
+        report[field] = value
+    # Keep report.md's rendering consistent with the report document so the
+    # failure is the header check, not an unrelated markdown digest.
+    markdown = report_markdown(
+        report.get("verdict") if isinstance(report.get("verdict"), str) else None,
+        report.get("reason_code") if isinstance(report.get("reason_code"), str) else None,
+    ).encode()
+    _rewrite_report_and_markdown(info.root, report, markdown)
+    with pytest.raises(BundleError) as caught:
+        verify_bundle(info.root)
+    assert caught.value.reason_code == "INVALID_MANIFEST"
+
+
+@pytest.mark.parametrize("field", ["builds", "replays"])
+def test_verify_requires_execution_builds_and_replays(tmp_path, field):
+    info = make_bundle(tmp_path, name=f"missing-exec-{field}")
+    execution = json.loads(
+        (info.root / "metadata/execution.json").read_text(encoding="utf-8")
+    )
+    execution.pop(field)
+    _rewrite_manifested_file(
+        info.root, "metadata/execution.json", canonical(execution)
+    )
+    with pytest.raises(BundleError) as caught:
+        verify_bundle(info.root)
+    assert caught.value.reason_code == "INVALID_MANIFEST"
+    assert field in caught.value.message
+
+
+@pytest.mark.parametrize("exit_code", ["zero", True, 1, 0.0, None])
+def test_verify_rejects_completed_build_without_integer_zero_exit(
+    tmp_path, exit_code
+):
+    info = make_bundle(tmp_path, name="bad-build-exit")
+    _update_build(info.root, "vulnerable", exit_code=exit_code)
+    with pytest.raises(BundleError) as caught:
+        verify_bundle(info.root)
+    assert caught.value.reason_code == "INVALID_MANIFEST"
+
+
+def test_verify_rejects_boolean_manifest_schema_version(tmp_path):
+    info = make_bundle(tmp_path, name="boolean-schema")
+    manifest_path = info.root / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["schema_version"] = True
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(BundleError) as caught:
+        verify_bundle(info.root)
+    assert caught.value.reason_code == "INVALID_MANIFEST"
+
+
+def test_verify_rejects_list_manifest_verdict_without_type_error(tmp_path):
+    info = make_bundle(tmp_path, name="list-verdict")
+    manifest_path = info.root / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["verdict"] = []
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(BundleError) as caught:
+        verify_bundle(info.root)
+    assert caught.value.reason_code == "INVALID_MANIFEST"
+
+
+# ---------------------------------------------------------------------------
+# S4: full evidence re-derives the INCONCLUSIVE reason from the six replays.
+# ---------------------------------------------------------------------------
+
+
+def test_inconclusive_reason_contradicting_six_replays_is_rejected(tmp_path):
+    info = make_bundle(tmp_path, name="contradict-other-crash")
+    _set_verdict(info.root, "INCONCLUSIVE", "OTHER_CRASH")
+    with pytest.raises(BundleError) as caught:
+        verify_bundle(info.root)
+    assert caught.value.reason_code == "INVALID_MANIFEST"
+    assert "contradicts the six replays" in caught.value.message
+
+
+def test_inconclusive_intermittent_requires_hit_and_clean(tmp_path):
+    info = make_bundle(tmp_path, name="contradict-intermittent")
+    _set_verdict(info.root, "INCONCLUSIVE", "INTERMITTENT")
+    with pytest.raises(BundleError) as caught:
+        verify_bundle(info.root)
+    assert caught.value.reason_code == "INVALID_MANIFEST"
+
+
+def test_inconclusive_fixed_still_vulnerable_requires_fixed_hit(tmp_path):
+    info = make_bundle(tmp_path, name="contradict-fixed-hit")
+    _set_verdict(info.root, "INCONCLUSIVE", "FIXED_STILL_VULNERABLE")
+    with pytest.raises(BundleError) as caught:
+        verify_bundle(info.root)
+    assert caught.value.reason_code == "INVALID_MANIFEST"
+
+
+# ---------------------------------------------------------------------------
+# S6: file and directory budgets are independent.
+# ---------------------------------------------------------------------------
+
+
+def test_entry_cap_accepts_4096_files_with_many_directories(tmp_path):
+    report = deepcopy(REPORT)
+    report["verdict"] = "BLOCKED"
+    report["state"] = "BLOCKED"
+    report["reason_code"] = "POLICY_DENIED"
+    report["rule"] = None
+    report["replays"] = []
+    report["builds"] = []
+    # report.json, report.md, plan.json, review.json and execution.json are
+    # the five non-extra files; fill the remaining 4091 file slots.
+    extra = {}
+    for index in range(4091):
+        extra[f"extra/d{index % 65:02d}/f{index:04d}.log"] = (
+            "replay_stdout",
+            b"x",
+        )
+    info = make_bundle(
+        tmp_path,
+        report=report,
+        full=False,
+        extra=extra,
+        name="many-dirs",
+    )
+    verified = verify_bundle(info.root)
+    assert verified.manifest["verdict"] == "BLOCKED"
+
+
+def test_entry_cap_rejects_directory_flood_before_full_enumeration(tmp_path):
+    from datacon import evidence as evidence_module
+
+    info = make_bundle(tmp_path, name="dir-flood")
+    flood = info.root / "flood"
+    flood.mkdir()
+    for index in range(evidence_module.MAX_DIRECTORIES + 10):
+        (flood / f"d{index}").mkdir()
+    with pytest.raises(BundleError) as caught:
+        verify_bundle(info.root)
+    assert caught.value.reason_code == "INVALID_MANIFEST"
+    assert "directories" in caught.value.message
+
+
+def test_entry_cap_rejects_file_flood(tmp_path, monkeypatch):
+    from datacon import evidence as evidence_module
+
+    info = make_bundle(tmp_path, name="file-flood")
+    monkeypatch.setattr(evidence_module, "MAX_FILES", 4)
+    with pytest.raises(BundleError) as caught:
+        verify_bundle(info.root)
+    assert caught.value.reason_code == "INVALID_MANIFEST"
+    assert "files" in caught.value.message

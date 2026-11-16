@@ -315,3 +315,70 @@ def test_boolean_exit_cannot_satisfy_an_integer_planned_exit():
     decision = decide_verdict(policy, runs, builds=builds())
     assert decision.verdict == "INCONCLUSIVE"
     assert decision.checks["vulnerable_candidates"] == ["other", "other"]
+
+
+# ---------------------------------------------------------------------------
+# S5: the documented priority and the verifier share one ordering.
+# ---------------------------------------------------------------------------
+
+
+def test_control_timeout_is_timeout_not_control_failed():
+    runs = six_runs()
+    runs = [
+        replace(item, status="timeout", exit_code=None)
+        if item.version == "vulnerable" and item.phase == "normal"
+        else item
+        for item in runs
+    ]
+    decision = decide_verdict(POLICY, runs, builds=builds())
+    assert decision.verdict == "INCONCLUSIVE"
+    assert decision.reason_code == "TIMEOUT"
+
+
+def test_completed_control_failure_is_control_failed():
+    runs = six_runs()
+    runs = [
+        replace(item, exit_code=2)
+        if item.version == "vulnerable" and item.phase == "normal"
+        else item
+        for item in runs
+    ]
+    decision = decide_verdict(POLICY, runs, builds=builds())
+    assert decision.reason_code == "CONTROL_FAILED"
+
+
+def test_timeout_wins_over_a_completed_abnormal_control():
+    """The S5 construction: bad control exit plus a candidate timeout."""
+    runs = six_runs()
+    runs = [
+        replace(item, exit_code=2)
+        if item.version == "vulnerable" and item.phase == "normal"
+        else replace(item, status="timeout", exit_code=None)
+        if item.version == "fixed" and item.phase == "candidate_1"
+        else item
+        for item in runs
+    ]
+    decision = decide_verdict(POLICY, runs, builds=builds())
+    assert decision.verdict == "INCONCLUSIVE"
+    assert decision.reason_code == "TIMEOUT"
+
+
+def test_truncation_wins_over_timeout_and_control_failure():
+    runs = six_runs()
+    runs[0] = replace(runs[0], log_truncated=True)
+    runs = [
+        replace(item, status="timeout", exit_code=None)
+        if item.version == "vulnerable" and item.phase == "candidate_1"
+        else item
+        for item in runs
+    ]
+    decision = decide_verdict(POLICY, runs, builds=builds())
+    assert decision.reason_code == "EVIDENCE_INCOMPLETE"
+
+
+def test_priority_text_matches_the_classifier_order():
+    from datacon.verdict import PRIORITY
+
+    assert "timeout" in PRIORITY[1].lower()
+    assert "abnormal completed normal control" in PRIORITY[2].lower()
+    assert "intermittent" in PRIORITY[3].lower()

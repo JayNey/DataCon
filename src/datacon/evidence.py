@@ -22,6 +22,9 @@ from typing import Any, Callable, Mapping
 from datacon import contracts, fileio, jsonutil
 from datacon.asan import has_asan_diagnostic, parse_asan, signature_matches
 from datacon.verdict import (
+    RunObservation,
+    VerdictPolicy,
+    decide_verdict,
     reason_allowed,
     replay_status_allowed,
 )
@@ -33,11 +36,13 @@ MAX_FILE_BYTES = 128 * 1024 * 1024
 # offline verifier allocate MAX_FILES * MAX_FILE_BYTES.
 MAX_TOTAL_BYTES = 256 * 1024 * 1024
 MAX_FILES = 4096
-# ``os.walk`` sees directories as well as files, and a verifier must not
-# traverse an unbounded tree before reporting an extra entry. A small margin
-# above the manifest cap keeps legitimate bundles with helper directories
-# verifiable while still failing fast.
-MAX_BUNDLE_ENTRIES = MAX_FILES + 64
+# Directories are budgeted separately from regular files. A legitimate bundle
+# may need many helper directories (one per build/replay phase), so charging
+# directories against the file allowance would reject a valid 4096-file
+# bundle. The total cap still lets the scan abort before enumerating a
+# pathological flat tree.
+MAX_DIRECTORIES = 1024
+MAX_BUNDLE_ENTRIES = MAX_FILES + MAX_DIRECTORIES + 1  # + manifest.json
 MAX_ROLE_LENGTH = 64
 import re
 
@@ -108,6 +113,14 @@ _PROBE_CHECK_FIELDS = (
 )
 _REASON_CODE = re.compile(r"[A-Z][A-Z0-9_]{0,63}")
 _WINDOWS_DRIVE = re.compile(r"^[A-Za-z]:")
+# report.md is a rendering of report.json, not an independent conclusion.
+# These patterns are intentionally anchored: a missing line, a second line,
+# differing case/spacing, or any extra decoration around the value fails
+# closed instead of being "close enough".
+_REPORT_VERDICT_LINE = re.compile(
+    r"^- Verdict: \*\*(?P<verdict>[A-Z_]+|PENDING)\*\*$"
+)
+_REPORT_REASON_LINE = re.compile(r"^- Reason: `(?P<reason>[A-Z0-9_]*)`$")
 
 
 class BundleError(RuntimeError):
@@ -274,7 +287,7 @@ def write_bundle(
     if report.get("plan_digest") != plan_digest:
         raise BundleError("INVALID_MANIFEST", "report plan_digest does not match")
     report_verdict = report.get("verdict")
-    if report_verdict not in _VERDICTS:
+    if not isinstance(report_verdict, str) or report_verdict not in _VERDICTS:
         raise BundleError("INVALID_MANIFEST", "report verdict must be a known value")
     report_reason = report.get("reason_code")
     if report_reason is not None and (
@@ -282,6 +295,34 @@ def write_bundle(
         or not _REASON_CODE.fullmatch(report_reason)
     ):
         raise BundleError("INVALID_MANIFEST", "report reason_code is invalid")
+    if (
+        type(report.get("schema_version")) is not int
+        or report.get("schema_version") != SCHEMA_VERSION
+    ):
+        raise BundleError("INVALID_MANIFEST", "report schema_version must be 1")
+    if report.get("state") != report_verdict:
+        raise BundleError(
+            "INVALID_MANIFEST", "report state must equal report verdict"
+        )
+    missing = report.get("missing")
+    if not isinstance(missing, list) or not all(
+        isinstance(item, str) for item in missing
+    ):
+        raise BundleError("INVALID_MANIFEST", "report missing must be a list of strings")
+    error = report.get("error")
+    if error is not None and not isinstance(error, str):
+        raise BundleError("INVALID_MANIFEST", "report error must be text or null")
+    if report_verdict in ("REPRODUCED", "NOT_REPRODUCED"):
+        if missing:
+            raise BundleError(
+                "INVALID_MANIFEST",
+                "conclusive evidence must not record missing inputs",
+            )
+        if error is not None:
+            raise BundleError(
+                "INVALID_MANIFEST",
+                "conclusive evidence must not record an error",
+            )
 
     target = Path(root)
     if target.exists() or target.is_symlink():
@@ -296,6 +337,13 @@ def write_bundle(
     try:
         entries: list[dict[str, Any]] = []
         markdown_bytes = report_markdown.encode("utf-8")
+        # report.md is a rendering of report.json, not an independent
+        # conclusion. Refuse to publish a bundle whose human-readable
+        # conclusion disagrees with the machine-readable one, even though the
+        # producer could have hashed the divergent markdown consistently.
+        _verify_report_markdown(
+            markdown_bytes, report_verdict, report_reason
+        )
         # Bind the human-readable report to report.json. The manifest digest
         # already covers both files, but an attacker who rewrites the whole
         # bundle (manifest included) would otherwise be free to swap
@@ -414,7 +462,10 @@ def _load_manifest(root: Path) -> tuple[dict[str, Any], bytes]:
 def _validate_manifest_header(
     manifest: Mapping[str, Any],
 ) -> tuple[str, str, list[dict[str, Any]], str, str | None]:
-    if manifest.get("schema_version") != SCHEMA_VERSION:
+    if (
+        type(manifest.get("schema_version")) is not int
+        or manifest.get("schema_version") != SCHEMA_VERSION
+    ):
         raise BundleError("INVALID_MANIFEST", "manifest schema_version must be 1")
     try:
         job_id = str(uuid.UUID(str(manifest.get("job_id"))))
@@ -424,7 +475,7 @@ def _validate_manifest_header(
     if not isinstance(plan_digest, str) or not _DIGEST.fullmatch(plan_digest):
         raise BundleError("INVALID_MANIFEST", "manifest plan_digest is invalid")
     verdict = manifest.get("verdict")
-    if verdict not in _VERDICTS:
+    if not isinstance(verdict, str) or verdict not in _VERDICTS:
         raise BundleError("INVALID_MANIFEST", "manifest verdict is invalid")
     reason_code = manifest.get("reason_code")
     if reason_code is not None and (
@@ -492,6 +543,58 @@ def _reason_code_valid(report: Mapping[str, Any]) -> str | None:
     if not isinstance(reason, str) or not _REASON_CODE.fullmatch(reason):
         raise BundleError("INVALID_MANIFEST", "report reason_code is invalid")
     return reason
+
+
+def _verify_report_markdown(
+    markdown: bytes, verdict: str | None, reason_code: str | None
+) -> None:
+    """Require report.md to render exactly the machine-readable conclusion.
+
+    The manifest digest binds report.md's bytes, but not its meaning: an
+    attacker who rewrites report.md, report.json's ``report_markdown_sha256``
+    and every manifest size/digest would otherwise be able to publish a clean
+    rendering next to a REPRODUCED report.json. The rendered conclusion is
+    therefore compared value-for-value with report.json.
+    """
+    try:
+        text = markdown.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise BundleError(
+            "INVALID_MANIFEST", "report.md is not valid UTF-8"
+        ) from error
+    verdict_values: list[str] = []
+    reason_values: list[str] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        verdict_match = _REPORT_VERDICT_LINE.fullmatch(stripped)
+        if verdict_match is not None:
+            verdict_values.append(verdict_match.group("verdict"))
+            continue
+        reason_match = _REPORT_REASON_LINE.fullmatch(stripped)
+        if reason_match is not None:
+            reason_values.append(reason_match.group("reason"))
+    if len(verdict_values) != 1:
+        raise BundleError(
+            "INVALID_MANIFEST",
+            "report.md must contain exactly one '- Verdict: **VALUE**' line",
+        )
+    if len(reason_values) != 1:
+        raise BundleError(
+            "INVALID_MANIFEST",
+            "report.md must contain exactly one '- Reason: `VALUE`' line",
+        )
+    expected_verdict = verdict if verdict else "PENDING"
+    expected_reason = reason_code if reason_code is not None else ""
+    if verdict_values[0] != expected_verdict:
+        raise BundleError(
+            "INVALID_MANIFEST",
+            "report.md verdict does not match report.json verdict",
+        )
+    if reason_values[0] != expected_reason:
+        raise BundleError(
+            "INVALID_MANIFEST",
+            "report.md reason does not match report.json reason_code",
+        )
 
 
 def _require_evidence_roles(
@@ -790,6 +893,14 @@ def _verify_builds(
         if build.get("status") != "completed":
             raise BundleError(
                 "INVALID_MANIFEST", f"{version} build did not complete"
+            )
+        # A completed build must have exited with the expected success code.
+        # ``True`` is an int subclass, so use ``type(...) is int`` rather than
+        # isinstance: a boolean or a string must never satisfy a build gate.
+        if type(build.get("exit_code")) is not int or build.get("exit_code") != 0:
+            raise BundleError(
+                "INVALID_MANIFEST",
+                f"{version} completed build must record integer exit_code 0",
             )
         if build.get("plan_digest") != plan_digest or build.get("job_id") != job_id:
             raise BundleError(
@@ -1172,139 +1283,72 @@ def _verify_outcome(
     observations: Mapping[tuple[str, str], Mapping[str, Any]],
     expected_stdout: Mapping[str, str],
 ) -> None:
-    expected_exit = plan.get("expected_exit") or {}
-    reason = report.get("reason_code")
-    normal_stdout = expected_stdout.get("normal")
-    if not isinstance(normal_stdout, str):
+    """Re-derive the verdict from the six replays with the execution rule.
+
+    The verifier must not maintain a second, subtly different copy of the
+    priority rules: a report that ``decide_verdict`` would never produce is
+    rejected, and any combination the executor can legitimately produce is
+    accepted. ``_verify_builds`` and ``_verify_replays`` already checked every
+    byte-level binding before this point.
+    """
+    expected_exit = plan.get("expected_exit")
+    signature = plan.get("asan_signature")
+    if not isinstance(expected_exit, Mapping) or not isinstance(
+        signature, Mapping
+    ):
         raise BundleError(
-            "INVALID_MANIFEST", "case config has no normal expected stdout"
+            "INVALID_MANIFEST", "plan rule inputs are missing or malformed"
         )
-
-    if verdict in ("REPRODUCED", "NOT_REPRODUCED"):
-        # A positive outcome must never be supported by a degraded control.
-        for version in _REPLAY_VERSIONS:
-            _require_normal_control(
-                version,
-                observations[(version, "normal")],
-                expected_exit,
-                expected_stdout,
-            )
-    elif reason == "CONTROL_FAILED":
-        # CONTROL_FAILED is only meaningful when at least one normal control
-        # actually failed on exit, stdout or an ASan diagnostic.
-        failed = False
-        for version in _REPLAY_VERSIONS:
-            control = observations[(version, "normal")]
-            mismatch = _control_mismatch(control, expected_exit, expected_stdout)
-            if mismatch == "status":
-                raise BundleError(
-                    "INVALID_MANIFEST",
-                    f"{version} normal control did not complete under CONTROL_FAILED",
-                )
-            if mismatch is not None:
-                failed = True
-        if not failed:
+    policy = VerdictPolicy(
+        signature=signature,
+        expected_exit=expected_exit,
+        expected_stdout=expected_stdout,
+    )
+    builds = {
+        build.get("version"): build
+        for build in report.get("builds") or []
+        if isinstance(build, Mapping)
+    }
+    runs: list[RunObservation] = []
+    replays = report.get("replays")
+    if not isinstance(replays, list):
+        raise BundleError("INVALID_MANIFEST", "report replays must be a list")
+    for item in replays:
+        if not isinstance(item, Mapping):
+            raise BundleError("INVALID_MANIFEST", "report replay must be an object")
+        key = (item.get("version"), item.get("phase"))
+        observation = observations.get(key)
+        if observation is None:
             raise BundleError(
-                "INVALID_MANIFEST",
-                "CONTROL_FAILED has no failed normal control",
+                "INVALID_MANIFEST", f"replay evidence is missing for {key}"
             )
-    elif reason in ("TIMEOUT", "RESOURCE_LIMITED", "EVIDENCE_INCOMPLETE"):
-        statuses = {item["status"] for item in observations.values()}
-        if reason == "TIMEOUT" and "timeout" not in statuses:
-            raise BundleError(
-                "INVALID_MANIFEST", "TIMEOUT verdict has no timeout replay"
+        runs.append(
+            RunObservation(
+                version=str(item.get("version")),
+                phase=str(item.get("phase")),
+                status=str(observation["status"]),
+                exit_code=observation.get("exit_code"),
+                stdout=str(observation.get("stdout", "")),
+                stderr=str(observation.get("stderr", "")),
+                signature=observation.get("signature"),
+                input_digest=item.get("input_digest"),
+                log_truncated=bool(observation.get("log_truncated")),
             )
-        if reason == "RESOURCE_LIMITED" and "resource_limited" not in statuses:
-            raise BundleError(
-                "INVALID_MANIFEST",
-                "RESOURCE_LIMITED verdict has no resource-limited replay",
-            )
-        allowed_noncompleted = {
-            "TIMEOUT": frozenset({"timeout"}),
-            "RESOURCE_LIMITED": frozenset({"resource_limited"}),
-            "EVIDENCE_INCOMPLETE": frozenset(
-                {"infra_error", "timeout", "resource_limited"}
-            ),
-        }[reason]
-        truncation_allowed = _truncation_allowed(verdict, report)
-        for version in _REPLAY_VERSIONS:
-            control = observations[(version, "normal")]
-            status = control.get("status")
-            if status == "completed":
-                # A completed control still has to prove the planned exit.
-                if not _exit_code_matches(
-                    control.get("exit_code"), expected_exit.get("normal")
-                ):
-                    raise BundleError(
-                        "INVALID_MANIFEST",
-                        f"{version} normal control exit does not match",
-                    )
-                if control.get("log_truncated") and truncation_allowed:
-                    # The stream is intentionally incomplete; its digest and
-                    # byte count were already checked above.
-                    continue
-                if control.get("stdout") != normal_stdout:
-                    raise BundleError(
-                        "INVALID_MANIFEST",
-                        f"{version} normal control stdout does not match",
-                    )
-                if has_asan_diagnostic(control.get("stderr")):
-                    raise BundleError(
-                        "INVALID_MANIFEST",
-                        f"{version} normal control emitted an ASan diagnostic",
-                    )
-            elif status not in allowed_noncompleted:
-                raise BundleError(
-                    "INVALID_MANIFEST",
-                    f"{version} normal control status {status!r} is not "
-                    f"allowed for {reason}",
-                )
-    else:
-        for version in _REPLAY_VERSIONS:
-            _require_normal_control(
-                version,
-                observations[(version, "normal")],
-                expected_exit,
-                expected_stdout,
-            )
-
-    if verdict == "REPRODUCED":
-        # The rule engine only classifies target_signature with an integer
-        # planned candidate exit code. A plan without one can never support a
-        # REPRODUCED verdict, even when an ASan log and a null exit code line
-        # up by accident.
-        if type(expected_exit.get("candidate_asan")) is not int:
-            raise BundleError(
-                "INVALID_MANIFEST",
-                "REPRODUCED requires an integer planned candidate ASan exit code",
-            )
-        for version in _REPLAY_VERSIONS:
-            for phase in _CANDIDATE_PHASES:
-                kind = _candidate_kind(
-                    plan, observations[(version, phase)], expected_stdout
-                )
-                if version == "vulnerable" and kind != "target_signature":
-                    raise BundleError(
-                        "INVALID_MANIFEST",
-                        f"vulnerable {phase} is not the reviewed ASan hit",
-                    )
-                if version == "fixed" and kind != "clean":
-                    raise BundleError(
-                        "INVALID_MANIFEST",
-                        f"fixed {phase} is not clean",
-                    )
-        return
-    if verdict == "NOT_REPRODUCED":
-        for version in _REPLAY_VERSIONS:
-            for phase in _CANDIDATE_PHASES:
-                if _candidate_kind(
-                    plan, observations[(version, phase)], expected_stdout
-                ) != "clean":
-                    raise BundleError(
-                        "INVALID_MANIFEST",
-                        f"{version} {phase} is not a clean candidate run",
-                    )
-        return
+        )
+    try:
+        decision = decide_verdict(policy, runs, builds=builds)
+    except (KeyError, TypeError, ValueError) as error:
+        raise BundleError(
+            "INVALID_MANIFEST", f"outcome cannot be re-derived: {error}"
+        ) from error
+    if decision.verdict != verdict or decision.reason_code != report.get(
+        "reason_code"
+    ):
+        raise BundleError(
+            "INVALID_MANIFEST",
+            "report verdict/reason contradicts the six replays: "
+            f"re-derived {decision.verdict}/{decision.reason_code}",
+        )
 
 
 def _expected_stdout_from_case_config(
@@ -1343,12 +1387,56 @@ def _verify_semantics(
     report and (for outcome verdicts) the complete execution evidence tree.
     """
     report = _parse_json_file(data, "report.json")
+    if (
+        type(report.get("schema_version")) is not int
+        or report.get("schema_version") != SCHEMA_VERSION
+    ):
+        raise BundleError(
+            "INVALID_MANIFEST", "report schema_version must be 1"
+        )
     if report.get("job_id") != job_id:
         raise BundleError("INVALID_MANIFEST", "report job_id does not match manifest")
     if report.get("plan_digest") != plan_digest:
         raise BundleError(
             "INVALID_MANIFEST", "report plan_digest does not match manifest"
         )
+    report_verdict = report.get("verdict")
+    if not isinstance(report_verdict, str) or report_verdict not in _VERDICTS:
+        raise BundleError("INVALID_MANIFEST", "report verdict must be a known value")
+    if report_verdict != verdict:
+        raise BundleError(
+            "INVALID_MANIFEST", "manifest verdict does not match report verdict"
+        )
+    if report.get("state") != report_verdict:
+        raise BundleError(
+            "INVALID_MANIFEST", "report state must equal report verdict"
+        )
+    report_reason = _reason_code_valid(report)
+    if manifest_reason != report_reason:
+        raise BundleError(
+            "INVALID_MANIFEST", "manifest reason_code does not match report"
+        )
+    missing = report.get("missing")
+    if not isinstance(missing, list) or not all(
+        isinstance(item, str) for item in missing
+    ):
+        raise BundleError(
+            "INVALID_MANIFEST", "report missing must be a list of strings"
+        )
+    report_error = report.get("error")
+    if report_error is not None and not isinstance(report_error, str):
+        raise BundleError("INVALID_MANIFEST", "report error must be text or null")
+    if report_verdict in ("REPRODUCED", "NOT_REPRODUCED"):
+        if missing:
+            raise BundleError(
+                "INVALID_MANIFEST",
+                "conclusive evidence must not record missing inputs",
+            )
+        if report_error is not None:
+            raise BundleError(
+                "INVALID_MANIFEST",
+                "conclusive evidence must not record an error",
+            )
     markdown = data.get("report.md")
     if markdown is None:
         raise BundleError("INVALID_MANIFEST", "report.md is missing")
@@ -1368,18 +1456,7 @@ def _verify_semantics(
             "DIGEST_MISMATCH",
             "report.md digest does not match report.json",
         )
-    report_verdict = report.get("verdict")
-    if report_verdict not in _VERDICTS:
-        raise BundleError("INVALID_MANIFEST", "report verdict must be a known value")
-    if report_verdict != verdict:
-        raise BundleError(
-            "INVALID_MANIFEST", "manifest verdict does not match report verdict"
-        )
-    report_reason = _reason_code_valid(report)
-    if manifest_reason != report_reason:
-        raise BundleError(
-            "INVALID_MANIFEST", "manifest reason_code does not match report"
-        )
+    _verify_report_markdown(markdown, report_verdict, report_reason)
     rule = report.get("rule")
     if rule is not None and not isinstance(rule, Mapping):
         raise BundleError(
@@ -1607,15 +1684,20 @@ def _verify_semantics(
             "report environment probe does not match metadata/probe.json",
         )
     # The builds/replays lists are repeated in execution.json for operational
-    # diagnostics. When present they must be exactly the report's lists so one
-    # copy cannot be tampered with independently.
+    # diagnostics. Full evidence must carry both lists, and they must be
+    # exactly the report's lists so one copy cannot be omitted or tampered
+    # with independently.
     for field in ("builds", "replays"):
-        if field in execution_metadata:
-            if execution_metadata[field] != report.get(field):
-                raise BundleError(
-                    "INVALID_MANIFEST",
-                    f"execution metadata {field} do not match report.{field}",
-                )
+        if field not in execution_metadata:
+            raise BundleError(
+                "INVALID_MANIFEST",
+                f"execution metadata is missing {field}",
+            )
+        if execution_metadata[field] != report.get(field):
+            raise BundleError(
+                "INVALID_MANIFEST",
+                f"execution metadata {field} do not match report.{field}",
+            )
 
     report_repository = report.get("repository")
     if report_repository != plan.get("repository"):
@@ -1712,11 +1794,14 @@ def verify_bundle(root: Path | str) -> BundleVerification:
     _require_required_paths(listed)
     actual: dict[str, Path] = {}
     entries_seen = 0
+    files_seen = 0
+    directories_seen = 0
     # Walk with an explicit scandir stack instead of os.walk. os.walk collects
     # a directory's names into lists before the caller can count them, so a
     # single directory with millions of entries would exhaust memory before
-    # the cap was observed. Here every entry is counted as it is yielded and
-    # the scan aborts immediately once MAX_BUNDLE_ENTRIES is exceeded.
+    # the cap was observed. Files and directories have independent budgets:
+    # charging helper directories against MAX_FILES would reject a legitimate
+    # bundle that uses all 4096 file slots.
     stack: list[Path] = [root_path]
     while stack:
         current = stack.pop()
@@ -1751,6 +1836,13 @@ def verify_bundle(root: Path | str) -> BundleVerification:
                         f"bundle entry cannot be inspected: {error}",
                     ) from error
                 if is_directory:
+                    directories_seen += 1
+                    if directories_seen > MAX_DIRECTORIES:
+                        raise BundleError(
+                            "INVALID_MANIFEST",
+                            f"bundle contains more than {MAX_DIRECTORIES} "
+                            "directories",
+                        )
                     stack.append(child)
                     continue
                 if not is_file:
@@ -1761,6 +1853,12 @@ def verify_bundle(root: Path | str) -> BundleVerification:
                 relative = child.relative_to(root_path).as_posix()
                 if relative == "manifest.json":
                     continue
+                files_seen += 1
+                if files_seen > MAX_FILES:
+                    raise BundleError(
+                        "INVALID_MANIFEST",
+                        f"bundle contains more than {MAX_FILES} files",
+                    )
                 if relative not in listed:
                     raise BundleError(
                         "EXTRA_FILE",
