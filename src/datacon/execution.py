@@ -130,6 +130,7 @@ class ExecutionContext:
     deadline_at: datetime
     reserve_seconds: float
     material_payloads: dict[str, bytes] = field(default_factory=dict)
+    cleanup_errors: list[str] = field(default_factory=list)
 
     @property
     def job_id_text(self) -> str:
@@ -311,23 +312,67 @@ def _parse_mountinfo(text: str) -> tuple[_MountPoint, ...]:
     return tuple(entries)
 
 
-def _mount_point_for(entries: Sequence[_MountPoint], path: Path) -> _MountPoint | None:
-    """Return the mount that contains ``path``.
+def _mount_point_for(
+    entries: Sequence[_MountPoint], path: Path
+) -> _MountPoint | None:
+    """Return the topmost mount that contains ``path``, or ``None``.
 
-    The deepest mount point wins. For overmounts (multiple entries on the same
-    mount point) the entry with the largest ``mount_id`` is the topmost one and
-    therefore the mount whose contents are actually visible. The choice must
-    not depend on mountinfo line order.
+    Overmounts share a mount point. The visible mount is the leaf of the
+    ``parent_id`` chain rooted at the mount that was covered first, not the
+    entry with the largest ``mount_id``: mount IDs are reused and are not
+    ordered. Any ambiguity (duplicate IDs, multiple roots or leaves, a cycle,
+    or a gap in the chain) makes containment unprovable, so the caller must
+    fail closed instead of guessing.
     """
-    best: _MountPoint | None = None
-    best_key: tuple[int, int] | None = None
-    for entry in entries:
-        if path == entry.mount_point or entry.mount_point in path.parents:
-            key = (len(entry.mount_point.parts), entry.mount_id)
-            if best is None or best_key is None or key > best_key:
-                best = entry
-                best_key = key
-    return best
+    if not entries:
+        return None
+    mount_ids = [entry.mount_id for entry in entries]
+    if len(set(mount_ids)) != len(mount_ids):
+        return None
+    candidates = [
+        entry
+        for entry in entries
+        if path == entry.mount_point or entry.mount_point in path.parents
+    ]
+    if not candidates:
+        return None
+    depth = max(len(entry.mount_point.parts) for entry in candidates)
+    deepest = {
+        entry.mount_point
+        for entry in candidates
+        if len(entry.mount_point.parts) == depth
+    }
+    if len(deepest) != 1:
+        return None
+    mount_point = next(iter(deepest))
+    group = [entry for entry in candidates if entry.mount_point == mount_point]
+    if len(group) == 1:
+        return group[0]
+    by_id = {entry.mount_id: entry for entry in group}
+    children: dict[int, list[int]] = {}
+    roots: list[int] = []
+    for entry in group:
+        if entry.parent_id in by_id:
+            children.setdefault(entry.parent_id, []).append(entry.mount_id)
+        else:
+            roots.append(entry.mount_id)
+    if len(roots) != 1:
+        return None
+    visited: list[int] = []
+    seen: set[int] = set()
+    current: int | None = roots[0]
+    while current is not None:
+        if current in seen:
+            return None
+        seen.add(current)
+        visited.append(current)
+        next_ids = children.get(current, [])
+        if len(next_ids) > 1:
+            return None
+        current = next_ids[0] if next_ids else None
+    if set(visited) != set(by_id):
+        return None
+    return by_id[visited[-1]]
 
 
 def _mountinfo_rejects(path: Path, run_root: Path, text: str) -> bool:
@@ -800,16 +845,288 @@ def _assert_context_unchanged(
         _verify_materialized_tree(materials_dir, material_digests)
 
 
-def _materialize(
-    context: ExecutionContext, run_root: Path
-) -> tuple[Path, dict[str, Path], dict[str, str]]:
-    """Write the approved materials and inputs as read-only files.
+_GENERATION_COMPONENT = re.compile(r"generation-[0-9]+")
 
-    ``run_root`` is the generation-scoped directory. Every byte written here
-    is re-hashed immediately before a target container mounts it, so a writer
-    cannot silently replace the reviewed recipe, harness, source or inputs.
+
+def _ensure_run_anchor(anchor: Path, label: str) -> None:
+    """Create the trusted anchor if needed, but never accept a symlink."""
+    try:
+        anchor.mkdir(parents=True, exist_ok=True)
+        info = anchor.lstat()
+    except OSError as error:
+        raise ExecutionFailed(
+            "EVIDENCE_WRITE_FAILED", f"{label} is unavailable: {error}"
+        ) from error
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        raise ExecutionFailed(
+            "EVIDENCE_WRITE_FAILED", f"{label} is not a real directory"
+        )
+
+
+def _generation_components(
+    anchor: Path, path: Path, label: str
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Split ``path`` into generation-scope components and the remainder.
+
+    Every run-root write must be bound to a ``generation-<n>`` directory (for
+    journals, ``steps/<key>/generation-<n>``). A path without one cannot be
+    attributed to a single generation, so it is rejected rather than being
+    written into the shared job directory.
     """
-    target = run_root / "materials"
+    try:
+        relative = path.relative_to(anchor)
+    except ValueError as error:
+        raise ExecutionFailed(
+            "EVIDENCE_WRITE_FAILED", f"{label} escaped the run root"
+        ) from error
+    parts = relative.parts
+    if not parts or any(
+        part in ("", ".", "..") or "/" in part or "\x00" in part
+        for part in parts
+    ):
+        raise ExecutionFailed(
+            "EVIDENCE_WRITE_FAILED", f"{label} has an unsafe run-root path"
+        )
+    for index, part in enumerate(parts):
+        if _GENERATION_COMPONENT.fullmatch(part):
+            return parts[: index + 1], parts[index + 1 :]
+    raise ExecutionFailed(
+        "EVIDENCE_WRITE_FAILED",
+        f"{label} is not scoped to a generation directory",
+    )
+
+
+def _open_chain(
+    anchor: Path,
+    parts: Sequence[str],
+    *,
+    create: bool,
+    label: str,
+) -> tuple[int, Path]:
+    """Open ``anchor/parts...`` one component at a time with no symlink following."""
+    _ensure_run_anchor(anchor, label)
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        descriptor = os.open(anchor, flags)
+    except OSError as error:
+        raise ExecutionFailed(
+            "EVIDENCE_WRITE_FAILED", f"{label} cannot be opened: {error}"
+        ) from error
+    current = anchor
+    try:
+        for part in parts:
+            if part in ("", ".", "..") or "/" in part or "\x00" in part:
+                raise ExecutionFailed(
+                    "EVIDENCE_WRITE_FAILED", f"{label} has an unsafe component"
+                )
+            try:
+                child = os.open(part, flags, dir_fd=descriptor)
+            except FileNotFoundError:
+                if not create:
+                    raise
+                try:
+                    os.mkdir(part, 0o700, dir_fd=descriptor)
+                except FileExistsError:
+                    pass
+                child = os.open(part, flags, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = child
+            current = current / part
+        info = os.fstat(descriptor)
+        by_path = os.lstat(current)
+        if (info.st_dev, info.st_ino) != (by_path.st_dev, by_path.st_ino):
+            raise ExecutionFailed(
+                "EVIDENCE_WRITE_FAILED", f"{label} parent changed while opening"
+            )
+        return descriptor, current
+    except ExecutionFailed:
+        os.close(descriptor)
+        raise
+    except OSError as error:
+        os.close(descriptor)
+        raise ExecutionFailed(
+            "EVIDENCE_WRITE_FAILED",
+            f"{label} cannot be opened without following a symlink: {error}",
+        ) from error
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _prepare_shared_directory(anchor: Path, directory: Path, label: str) -> Path:
+    """Create a shared (pre-generation) run-root directory safely."""
+    try:
+        relative = directory.relative_to(anchor)
+    except ValueError as error:
+        raise ExecutionFailed(
+            "EVIDENCE_WRITE_FAILED", f"{label} escaped the run root"
+        ) from error
+    descriptor, _ = _open_chain(
+        anchor, relative.parts, create=True, label=label
+    )
+    os.close(descriptor)
+    return directory
+
+
+def _prepare_run_directory(
+    anchor: Path,
+    directory: Path,
+    label: str,
+    *,
+    scope_root: Path | None = None,
+) -> Path:
+    """Create a generation-scoped directory and prove it is a real directory."""
+    if scope_root is None:
+        scope_parts, _ = _generation_components(anchor, directory, label)
+    else:
+        scope_parts, _ = _generation_components(anchor, scope_root, label)
+    try:
+        relative = directory.relative_to(anchor)
+    except ValueError as error:
+        raise ExecutionFailed(
+            "EVIDENCE_WRITE_FAILED", f"{label} escaped the run root"
+        ) from error
+    parts = relative.parts
+    if parts[: len(scope_parts)] != scope_parts:
+        raise ExecutionFailed(
+            "EVIDENCE_WRITE_FAILED", f"{label} escaped its generation scope"
+        )
+    descriptor, _ = _open_chain(anchor, parts, create=True, label=label)
+    os.close(descriptor)
+    return directory
+
+
+def _open_run_parent_fd(
+    anchor: Path,
+    path: Path,
+    label: str,
+    *,
+    scope_root: Path | None = None,
+) -> tuple[int, Path]:
+    """Open ``path.parent`` relative to a generation-scoped trusted chain."""
+    if scope_root is None:
+        scope_parts, _ = _generation_components(anchor, path, label)
+    else:
+        scope_parts, _ = _generation_components(anchor, scope_root, label)
+    try:
+        relative = path.relative_to(anchor)
+    except ValueError as error:
+        raise ExecutionFailed(
+            "EVIDENCE_WRITE_FAILED", f"{label} escaped the run root"
+        ) from error
+    parts = relative.parts
+    if parts[: len(scope_parts)] != scope_parts:
+        raise ExecutionFailed(
+            "EVIDENCE_WRITE_FAILED", f"{label} escaped its generation scope"
+        )
+    parent_parts = parts[:-1]
+    descriptor, parent = _open_chain(
+        anchor, parent_parts, create=True, label=label
+    )
+    try:
+        fileio._assert_dir_fd_matches_parent(descriptor, parent)
+    except fileio.UnsafeFileError as error:
+        os.close(descriptor)
+        raise ExecutionFailed(
+            "EVIDENCE_WRITE_FAILED", f"{label}: {error.message}"
+        ) from error
+    return descriptor, parent
+
+
+def _write_tree_file(
+    descriptor: int,
+    root: Path,
+    relative: str,
+    data: bytes,
+    mode: int,
+    label: str,
+) -> None:
+    """Write ``relative`` below an already-open, trusted directory descriptor."""
+    parts = Path(relative).parts
+    if not parts or any(
+        part in ("", ".", "..") or "/" in part for part in parts
+    ):
+        raise ExecutionFailed(
+            "EVIDENCE_WRITE_FAILED", f"{label} has an unsafe path"
+        )
+    current = root
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    fd = os.dup(descriptor)
+    try:
+        for part in parts[:-1]:
+            try:
+                child = os.open(part, flags, dir_fd=fd)
+            except FileNotFoundError:
+                os.mkdir(part, 0o755, dir_fd=fd)
+                child = os.open(part, flags, dir_fd=fd)
+            os.close(fd)
+            fd = child
+            current = current / part
+        fileio.write_regular_file(
+            parts[-1],
+            data,
+            mode=mode,
+            dir_fd=fd,
+            parent_path=current,
+        )
+    except fileio.UnsafeFileError as error:
+        raise ExecutionFailed(
+            "EVIDENCE_WRITE_FAILED", f"{label}: {error.message}"
+        ) from error
+    except OSError as error:
+        raise ExecutionFailed(
+            "EVIDENCE_WRITE_FAILED", f"{label}: {error}"
+        ) from error
+    finally:
+        os.close(fd)
+
+
+def _materialize(
+    context: ExecutionContext,
+    run_root: Path,
+    *,
+    anchor: Path | None = None,
+) -> tuple[Path, dict[str, Path], dict[str, str]]:
+    """Write approved materials into a generation-scoped, symlink-safe tree.
+
+    ``run_root`` is the generation-scoped directory. The generation root and
+    every parent below it are opened one component at a time with
+    ``O_DIRECTORY|O_NOFOLLOW``; temporary files and the final rename are
+    performed relative to those descriptors. A symlinked generation root or a
+    parent directory swapped after the check therefore fails closed instead of
+    redirecting reviewed bytes outside the run root.
+    """
+    generation_root = run_root
+    trusted_anchor = anchor if anchor is not None else generation_root.parent
+    _prepare_run_directory(
+        trusted_anchor, generation_root, "materialized generation root"
+    )
+    scope_parts, _ = _generation_components(
+        trusted_anchor, generation_root, "materialized generation root"
+    )
+    generation_fd, _ = _open_chain(
+        trusted_anchor, scope_parts, create=False, label="materialized generation root"
+    )
+    try:
+        return _materialize_into_generation(
+            context, generation_root, generation_fd
+        )
+    finally:
+        os.close(generation_fd)
+
+
+def _materialize_into_generation(
+    context: ExecutionContext, generation_root: Path, generation_fd: int
+) -> tuple[Path, dict[str, Path], dict[str, str]]:
+    target = generation_root / "materials"
     expected = {
         "harness": (context.case.manifest["harness"], context.plan["harness_digest"]),
         "build_recipe": (
@@ -856,8 +1173,6 @@ def _materialize(
 
     candidate_path = target / "inputs" / "candidate.txt"
     normal_path = target / "inputs" / "normal.txt"
-    # Input paths from the manifest are preserved for evidence; the replay
-    # command always uses these two stable names.
     for label, destination, relative in (
         ("candidate", candidate_path, context.manifest_case["inputs"]["candidate"]),
         ("normal", normal_path, context.manifest_case["inputs"]["normal"]),
@@ -868,10 +1183,21 @@ def _materialize(
                 "MATERIAL_MISSING", f"{label} input digest drifted"
             )
 
+    if target.is_symlink():
+        raise ExecutionBlocked(
+            "MATERIAL_MISSING", "materialized directory must not be a symlink"
+        )
     if target.exists():
-        target.chmod(0o755)
+        try:
+            os.chmod(
+                "materials", 0o755, dir_fd=generation_fd, follow_symlinks=False
+            )
+        except OSError as error:
+            raise ExecutionBlocked(
+                "MATERIAL_MISSING", f"materialized directory is not accessible: {error}"
+            ) from error
         _verify_materialized(target, payloads)
-        for label, path, expected in (
+        for label, path, expected_digest in (
             ("candidate", candidate_path, context.plan["inputs"]["candidate"]),
             ("normal", normal_path, context.plan["inputs"]["normal"]),
         ):
@@ -881,44 +1207,82 @@ def _materialize(
                     "MATERIAL_MISSING",
                     f"materialized {label} input is missing or too large",
                 )
-            if _digest(data) != expected:
+            if _digest(data) != expected_digest:
                 raise ExecutionBlocked("MATERIAL_MISSING", f"materialized {label} input drifted")
         return target, {
             "candidate": candidate_path,
             "normal": normal_path,
             "build_recipe": target / context.case.manifest["build_recipe"],
         }, _material_digests(context, payloads)
-    temporary = target.parent / f".materials-tmp-{uuid.uuid4().hex}"
-    if temporary.exists():
-        raise ExecutionBlocked("MATERIAL_MISSING", "temporary material path exists")
-    temporary.mkdir(mode=0o755, parents=True)
+
+    temporary = generation_root / f".materials-tmp-{uuid.uuid4().hex}"
+    temporary_name = temporary.name
     try:
+        os.mkdir(temporary_name, 0o755, dir_fd=generation_fd)
+    except FileExistsError as error:
+        raise ExecutionBlocked(
+            "MATERIAL_MISSING", "temporary material path exists"
+        ) from error
+    temporary_fd: int | None = None
+    try:
+        temporary_fd = os.open(
+            temporary_name,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=generation_fd,
+        )
         for relative, data in payloads.items():
-            output = temporary / Path(relative)
-            output.parent.mkdir(parents=True, exist_ok=True)
-            output.write_bytes(data)
-            output.chmod(0o444)
-        build_recipe = temporary / context.case.manifest["build_recipe"]
-        build_recipe.chmod(0o555)
-        (temporary / "inputs").mkdir(parents=True, exist_ok=True)
-        candidate_path = temporary / "inputs" / "candidate.txt"
-        normal_path = temporary / "inputs" / "normal.txt"
+            mode = (
+                0o555
+                if relative == context.case.manifest["build_recipe"]
+                else 0o444
+            )
+            _write_tree_file(
+                temporary_fd, temporary, relative, data, mode, "materialized file"
+            )
         for path, data in (
             (candidate_path, payloads[context.manifest_case["inputs"]["candidate"]]),
             (normal_path, payloads[context.manifest_case["inputs"]["normal"]]),
         ):
-            if path.exists():
-                path.chmod(0o644)
-            path.write_bytes(data)
-            path.chmod(0o444)
-        temporary.chmod(0o755)
-        temporary.rename(target)
+            _write_tree_file(
+                temporary_fd,
+                temporary,
+                str(path.relative_to(target)),
+                data,
+                0o444,
+                "materialized input",
+            )
+        os.chmod("inputs", 0o755, dir_fd=temporary_fd, follow_symlinks=False)
+        os.chmod(temporary_name, 0o755, dir_fd=generation_fd, follow_symlinks=False)
+        os.close(temporary_fd)
+        temporary_fd = None
+        os.replace(
+            temporary_name,
+            "materials",
+            src_dir_fd=generation_fd,
+            dst_dir_fd=generation_fd,
+        )
+    except (ExecutionBlocked, ExecutionFailed):
+        if temporary_fd is not None:
+            os.close(temporary_fd)
+        shutil.rmtree(temporary, ignore_errors=True)
+        raise
+    except OSError as error:
+        if temporary_fd is not None:
+            os.close(temporary_fd)
+        shutil.rmtree(temporary, ignore_errors=True)
+        raise ExecutionFailed(
+            "EVIDENCE_WRITE_FAILED", f"cannot materialize reviewed bytes: {error}"
+        ) from error
     except BaseException:
+        if temporary_fd is not None:
+            os.close(temporary_fd)
         shutil.rmtree(temporary, ignore_errors=True)
         raise
     return target, {
-        "candidate": target / "inputs" / "candidate.txt",
-        "normal": target / "inputs" / "normal.txt",
+        "candidate": candidate_path,
+        "normal": normal_path,
         "build_recipe": target / context.case.manifest["build_recipe"],
     }, _material_digests(context, payloads)
 
@@ -1300,13 +1664,24 @@ def _configured_staging_path(evidence_root: Path) -> Path:
 def _journal_secret_path(run_root: Path) -> Path:
     """Return the HMAC key path, enforcing that it is outside sensitive roots.
 
-    Besides the run root, an explicit ``DATACON_JOURNAL_SECRET_FILE`` must not
-    live inside the evidence root or the staging root: both are attacker-facing
-    trees whose contents are published or mounted. The default path
-    (``evidence_root.parent/.datacon-journal-secret``) remains usable because
-    it is a sibling of both.
+    A journal secret must not be readable by the same-UID writer that can
+    modify the run root, the evidence root, the staging root or the current
+    working directory. The historical default
+    (``evidence_root.parent/.datacon-journal-secret``) is only safe when the
+    evidence root is absolute and outside CWD; with the default relative
+    evidence root it would place the key inside CWD, so that configuration
+    fails closed and requires an explicit secret path instead.
     """
     explicit = os.getenv("DATACON_JOURNAL_SECRET_FILE")
+    raw_evidence = os.getenv("DATACON_EVIDENCE_ROOT", ".datacon/evidence")
+    configured_evidence = Path(raw_evidence).expanduser()
+    if explicit is None and not configured_evidence.is_absolute():
+        raise ExecutionFailed(
+            "EVIDENCE_WRITE_FAILED",
+            "a relative DATACON_EVIDENCE_ROOT cannot derive a safe journal "
+            "secret; set DATACON_JOURNAL_SECRET_FILE or an absolute evidence "
+            "root outside the current working directory",
+        )
     evidence_root = _assert_evidence_root_outside_run_root(run_root)
     path = (
         Path(explicit).expanduser()
@@ -1318,10 +1693,12 @@ def _journal_secret_path(run_root: Path) -> Path:
             "EVIDENCE_WRITE_FAILED", "journal secret path must not be a symlink"
         )
     resolved = _outside_run_root(path, run_root, "journal secret")
-    for root, label in (
+    protected_roots = [
         (evidence_root, "DATACON_EVIDENCE_ROOT"),
         (_configured_staging_path(evidence_root), "staging root"),
-    ):
+        (Path.cwd(), "current working directory"),
+    ]
+    for root, label in protected_roots:
         try:
             resolved_root = root.expanduser().resolve()
         except (OSError, RuntimeError) as error:
@@ -1329,13 +1706,20 @@ def _journal_secret_path(run_root: Path) -> Path:
                 "EVIDENCE_WRITE_FAILED",
                 f"journal secret {label} cannot be resolved: {error}",
             ) from error
+        # Check both lexical normalization (case/NFC variants) and the final
+        # inode identity. A symlinked ancestor must not turn the path into one
+        # of the protected trees after the string comparison.
         if _lexically_within_run_root(resolved, resolved_root):
             raise ExecutionFailed(
                 "EVIDENCE_WRITE_FAILED",
                 f"journal secret must live outside {label}",
             )
-    # The final inode may have moved after the path-level check.
-    return _outside_run_root(resolved, run_root, "journal secret")
+        if _inside_run_root(resolved, resolved_root, "journal secret"):
+            raise ExecutionFailed(
+                "EVIDENCE_WRITE_FAILED",
+                f"journal secret must live outside {label}",
+            )
+    return resolved
 
 
 def _assert_journal_paths(run_root: Path) -> None:
@@ -1375,9 +1759,11 @@ def _journal_secret(*, create: bool, run_root: Path) -> bytes | None:
                 "EVIDENCE_WRITE_FAILED",
                 f"journal secret is unavailable: {error}",
             ) from error
-    # The file may have been created after the path-level check. Re-check the
-    # final inode so a path that landed inside the run root is never read.
-    path = _outside_run_root(path, run_root, "journal secret")
+    # The file may have been created (or its parent swapped) after the
+    # path-level check. Re-run every protected-root check, then inspect the
+    # final inode so a path that landed inside the run root, evidence root,
+    # staging root or CWD is never read.
+    path = _journal_secret_path(run_root)
     try:
         info = path.lstat()
         if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
@@ -1604,36 +1990,46 @@ def _write_journal(
     attempt_no: int,
     generation: int,
     payload: Mapping[str, Any],
+    *,
+    anchor: Path | None = None,
 ) -> Path:
     path = _journal_path(run_root, step_key, attempt_no, generation)
-    # The lexical check is not enough: a mount or a case-only alias can make
-    # the resolved string disagree with the directory identity. Reuse the
-    # device/inode containment check *before* mkdir so a symlinked parent can
-    # never be followed to create an external directory.
-    parent = _prepare_run_parent(path, run_root, "journal path")
-    if not _inside_run_root(parent, run_root.resolve(), "journal path"):
-        raise ExecutionFailed(
-            "EVIDENCE_WRITE_FAILED", "journal path escaped the run root"
-        )
-    secret = _journal_secret(create=True, run_root=run_root)
-    if secret is None:
-        raise ExecutionFailed(
-            "EVIDENCE_WRITE_FAILED", "journal secret is unavailable"
-        )
-    document = dict(payload)
-    document["hmac"] = _journal_hmac(document, secret)
+    trusted_anchor = anchor if anchor is not None else run_root
+    scope_root = (
+        run_root
+        / "steps"
+        / _safe_name(step_key)
+        / f"generation-{generation}"
+    )
+    descriptor, parent = _open_run_parent_fd(
+        trusted_anchor,
+        path,
+        "journal path",
+        scope_root=scope_root,
+    )
     try:
+        secret = _journal_secret(create=True, run_root=run_root)
+        if secret is None:
+            raise ExecutionFailed(
+                "EVIDENCE_WRITE_FAILED", "journal secret is unavailable"
+            )
+        document = dict(payload)
+        document["hmac"] = _journal_hmac(document, secret)
         fileio.write_regular_file_atomic(
-            path,
+            path.name,
             json.dumps(document, ensure_ascii=False, sort_keys=True).encode(
                 "utf-8"
             ),
             mode=0o600,
+            dir_fd=descriptor,
+            parent_path=parent,
         )
     except fileio.UnsafeFileError as error:
         raise ExecutionFailed(
             "EVIDENCE_WRITE_FAILED", f"cannot write journal: {error.message}"
         ) from error
+    finally:
+        os.close(descriptor)
     return path
 
 
@@ -1719,24 +2115,46 @@ def _find_reusable_journal(
 
 
 def _write_run_file(
-    run_root: Path, path: Path, data: bytes, mode: int
+    run_root: Path,
+    path: Path,
+    data: bytes,
+    mode: int,
+    *,
+    scope_root: Path | None = None,
+    anchor: Path | None = None,
 ) -> None:
-    """Write a file under the run root without following a planted symlink.
+    """Write a file under a generation scope without following a symlink.
 
-    The leaf is opened with ``O_NOFOLLOW`` and the descriptor is used for
-    ``fchmod``/write, so the previous ``is_symlink``/``unlink``/``write_bytes``
-    sequence can no longer be redirected to an external target. A legacy mode
-    ``0555`` file is opened read-only and chmodded through its own descriptor
-    before the write is retried; a symlink or hard link always fails with
-    ``EVIDENCE_WRITE_FAILED``.
+    The parent is opened from the trusted run-root anchor one component at a
+    time. The leaf open, write, chmod and replace all use the verified
+    directory descriptor, so neither a pre-existing symlink nor a parent
+    renamed after the check can redirect the write outside the generation.
     """
-    _prepare_run_parent(path, run_root, "run evidence path")
+    trusted_anchor = anchor if anchor is not None else run_root
+    descriptor, parent = _open_run_parent_fd(
+        trusted_anchor,
+        path,
+        "run evidence path",
+        scope_root=scope_root,
+    )
     try:
-        fileio.write_regular_file(path, data, mode=mode)
+        fileio.write_regular_file(
+            path.name,
+            data,
+            mode=mode,
+            dir_fd=descriptor,
+            parent_path=parent,
+        )
+        # A parent swapped after the pre-write check cannot redirect the
+        # descriptor write, but the operation is still reported as failed so
+        # the worker does not treat a moved directory as the approved scope.
+        fileio._assert_dir_fd_matches_parent(descriptor, parent)
     except fileio.UnsafeFileError as error:
         raise ExecutionFailed(
             "EVIDENCE_WRITE_FAILED", f"cannot write run evidence: {error.message}"
         ) from error
+    finally:
+        os.close(descriptor)
 
 
 def _persist_build(
@@ -1749,13 +2167,31 @@ def _persist_build(
     staged_materials: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     run_root = _work_root(context)
-    directory = _generation_root(context) / "build" / result.version
-    directory.mkdir(parents=True, exist_ok=True)
+    generation_root = _generation_root(context)
+    directory = generation_root / "build" / result.version
+    _prepare_run_directory(
+        context.run_root, directory, "build evidence directory",
+        scope_root=generation_root,
+    )
     log_path = directory / "build.log"
-    _write_run_file(run_root, log_path, result.log, 0o600)
+    _write_run_file(
+        run_root,
+        log_path,
+        result.log,
+        0o600,
+        scope_root=generation_root,
+        anchor=context.run_root,
+    )
     artifact_path = directory / "parser"
     if result.artifact is not None and result.artifact_digest is not None:
-        _write_run_file(run_root, artifact_path, result.artifact, 0o555)
+        _write_run_file(
+            run_root,
+            artifact_path,
+            result.artifact,
+            0o555,
+            scope_root=generation_root,
+            anchor=context.run_root,
+        )
         if _digest(result.artifact) != result.artifact_digest:
             raise ExecutionFailed("BUILD_FAILED", "build artifact digest changed")
     updated = state.record_attempt(
@@ -1806,6 +2242,7 @@ def _persist_build(
         attempt_no,
         context.generation,
         payload,
+        anchor=context.run_root,
     )
     return {
         key: value for key, value in payload.items() if key != "attempt_token"
@@ -1822,12 +2259,30 @@ def _persist_replay(
     artifact_digest: str | None = None,
 ) -> dict[str, Any]:
     run_root = _work_root(context)
-    directory = _generation_root(context) / "replay" / result.version / result.phase
-    directory.mkdir(parents=True, exist_ok=True)
+    generation_root = _generation_root(context)
+    directory = generation_root / "replay" / result.version / result.phase
+    _prepare_run_directory(
+        context.run_root, directory, "replay evidence directory",
+        scope_root=generation_root,
+    )
     stdout_path = directory / "stdout.log"
     stderr_path = directory / "stderr.log"
-    _write_run_file(run_root, stdout_path, result.stdout, 0o600)
-    _write_run_file(run_root, stderr_path, result.stderr, 0o600)
+    _write_run_file(
+        run_root,
+        stdout_path,
+        result.stdout,
+        0o600,
+        scope_root=generation_root,
+        anchor=context.run_root,
+    )
+    _write_run_file(
+        run_root,
+        stderr_path,
+        result.stderr,
+        0o600,
+        scope_root=generation_root,
+        anchor=context.run_root,
+    )
     updated = state.record_attempt(
         dsn,
         context.job_id,
@@ -1875,6 +2330,7 @@ def _persist_replay(
         attempt_no,
         context.generation,
         payload,
+        anchor=context.run_root,
     )
     return {
         key: value for key, value in payload.items() if key != "attempt_token"
@@ -1958,6 +2414,7 @@ def _build_report(
         "evidence_refs": list(evidence_refs),
         "missing": list(missing),
         "error": error,
+        "cleanup_errors": list(getattr(context, "cleanup_errors", [])),
         "created_at": _utc_now(),
     }
     lines = [
@@ -2034,6 +2491,11 @@ def _build_report(
             lines.append(f"- `{item}`")
     if error:
         lines.extend(["", "## Error", "", error])
+    cleanup_errors = list(getattr(context, "cleanup_errors", []))
+    if cleanup_errors:
+        lines.extend(["", "## Cleanup", ""])
+        for item in cleanup_errors:
+            lines.append(f"- `{item}`")
     lines.extend(
         [
             "",
@@ -2714,17 +3176,17 @@ def run_execution(
         return _finish_blocked(dsn, job_id, generation, error, context=context)
 
     work_root = context.run_root / context.job_id_text / context.plan_digest.split(":")[1]
-    work_root.mkdir(parents=True, exist_ok=True)
-    work_root.chmod(0o700)
+    _prepare_shared_directory(context.run_root, work_root, "work root")
     build_root = work_root / "run"
-    build_root.mkdir(parents=True, exist_ok=True)
-    build_root.chmod(0o700)
+    _prepare_shared_directory(context.run_root, build_root, "sandbox run root")
     generation_root = _generation_root(context)
-    generation_root.mkdir(parents=True, exist_ok=True)
-    generation_root.chmod(0o700)
+    _prepare_run_directory(
+        context.run_root, generation_root, "generation root",
+        scope_root=generation_root,
+    )
     try:
         materials_dir, inputs, material_digests = _materialize(
-            context, generation_root
+            context, generation_root, anchor=context.run_root
         )
     except ExecutionBlocked as error:
         return _finish_blocked(dsn, job_id, generation, error, context=context)
@@ -2743,8 +3205,11 @@ def run_execution(
     if callable(reclaim):
         try:
             reclaim()
-        except SandboxError:
-            pass
+        except SandboxError as error:
+            # Cleanup failure is not a reason to silently continue: record it
+            # on the context so the archived report exposes the condition, and
+            # keep the current generation's containers untouched.
+            context.cleanup_errors.append(f"reclaim: {error.message}")
 
     probe_payload: dict[str, Any] | None = None
     builds: dict[str, dict[str, Any]] = {}
@@ -3155,6 +3620,7 @@ def _do_probe(context: ExecutionContext, sandbox: Any) -> dict[str, Any]:
         "image_digest": report.image_digest,
         "limits": report.limits,
         "raw": report.raw[-64 * 1024 :],
+        "cleanup_errors": list(report.cleanup_errors),
     }
 
 
@@ -3390,6 +3856,8 @@ def _finish_blocked(
                 reason_code=error.reason_code,
                 verdict=None,
                 verdict_reason=None,
+                evidence_status="failed",
+                evidence_error=error.message,
                 last_error=error.message,
                 stage="blocked",
             )
@@ -3500,6 +3968,8 @@ def _finish_blocked_failed(
             reason_code=error.reason_code,
             verdict=None,
             verdict_reason=None,
+            evidence_status="failed",
+            evidence_error=error.message,
             last_error=error.message,
             stage="failed",
         )

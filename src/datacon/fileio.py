@@ -30,6 +30,46 @@ def _final_flags(extra: int) -> int:
     return extra | getattr(os, "O_NOFOLLOW", 0)
 
 
+def _assert_dir_fd_matches_parent(dir_fd: int, parent_path: Path | str) -> None:
+    """Prove ``dir_fd`` still names the directory reached through ``parent_path``.
+
+    The caller opens the parent with ``O_DIRECTORY|O_NOFOLLOW`` and keeps the
+    descriptor. Before every operation that is performed relative to that
+    descriptor, compare its ``(st_dev, st_ino)`` pair with the current path.
+    A rename-and-replace after the check cannot redirect the descriptor, and a
+    mismatch is reported instead of silently writing through a swapped path.
+    """
+    try:
+        by_fd = os.fstat(dir_fd)
+        by_path = os.lstat(parent_path)
+    except OSError as error:
+        raise UnsafeFileError(
+            "PARENT_UNVERIFIED", f"write parent cannot be inspected: {error}"
+        ) from error
+    if not stat.S_ISDIR(by_path.st_mode):
+        raise UnsafeFileError(
+            "PARENT_CHANGED", f"write parent is not a real directory: {parent_path}"
+        )
+    if (by_fd.st_dev, by_fd.st_ino) != (by_path.st_dev, by_path.st_ino):
+        raise UnsafeFileError(
+            "PARENT_CHANGED",
+            f"write parent changed after it was opened: {parent_path}",
+        )
+
+
+def _relative_name(path: Path | str) -> str:
+    target = Path(path)
+    if target.is_absolute() or target.parent != Path(".") or target.name in (
+        "",
+        ".",
+        "..",
+    ):
+        raise UnsafeFileError(
+            "UNSAFE_PATH", "dir_fd writes require a single relative file name"
+        )
+    return target.name
+
+
 def read_regular_file_bounded(path: Path | str, *, max_bytes: int) -> bytes:
     """Return a regular file's bytes without following symlinks or blocking.
 
@@ -100,7 +140,9 @@ def read_regular_file_bounded(path: Path | str, *, max_bytes: int) -> bytes:
         os.close(descriptor)
 
 
-def _make_owner_writable(path: Path | str) -> None:
+def _make_owner_writable(
+    path: Path | str, *, dir_fd: int | None = None
+) -> None:
     """Make an existing regular file owner-writable without following a link.
 
     A previous attempt may have written evidence with mode ``0555``. Opening
@@ -109,7 +151,7 @@ def _make_owner_writable(path: Path | str) -> None:
     """
     flags = _final_flags(os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
     try:
-        descriptor = os.open(path, flags)
+        descriptor = os.open(path, flags, dir_fd=dir_fd)
     except OSError as error:
         if error.errno == errno.ELOOP:
             raise UnsafeFileError(
@@ -142,7 +184,12 @@ def _make_owner_writable(path: Path | str) -> None:
 
 
 def write_regular_file(
-    path: Path | str, data: bytes, *, mode: int
+    path: Path | str,
+    data: bytes,
+    *,
+    mode: int,
+    dir_fd: int | None = None,
+    parent_path: Path | str | None = None,
 ) -> None:
     """Create or replace a regular file without following a symlink.
 
@@ -151,6 +198,15 @@ def write_regular_file(
     redirect either operation. A read-only legacy file is made writable through
     its own descriptor and the open is retried once.
     """
+    if dir_fd is not None:
+        if parent_path is None:
+            raise UnsafeFileError(
+                "PARENT_UNVERIFIED", "dir_fd writes require parent_path"
+            )
+        _assert_dir_fd_matches_parent(dir_fd, parent_path)
+        name = _relative_name(path)
+    else:
+        name = path
     # Deliberately *not* O_TRUNC: truncation happens only after fstat confirms
     # a single-link regular file. O_TRUNC would empty the inode (including an
     # externally hard-linked name) before the link check could reject it.
@@ -160,7 +216,7 @@ def write_regular_file(
     descriptor: int | None = None
     try:
         try:
-            descriptor = os.open(path, flags, 0o600)
+            descriptor = os.open(name, flags, 0o600, dir_fd=dir_fd)
         except OSError as error:
             if error.errno == errno.ELOOP:
                 raise UnsafeFileError(
@@ -170,9 +226,9 @@ def write_regular_file(
                 raise UnsafeFileError(
                     "UNWRITABLE", f"cannot write file: {error}"
                 ) from error
-            _make_owner_writable(path)
+            _make_owner_writable(name, dir_fd=dir_fd)
             try:
-                descriptor = os.open(path, flags, 0o600)
+                descriptor = os.open(name, flags, 0o600, dir_fd=dir_fd)
             except OSError as retry_error:
                 if retry_error.errno == errno.ELOOP:
                     raise UnsafeFileError(
@@ -216,24 +272,44 @@ def write_regular_file(
 
 
 def write_regular_file_atomic(
-    path: Path | str, data: bytes, *, mode: int, suffix: str = ".tmp"
+    path: Path | str,
+    data: bytes,
+    *,
+    mode: int,
+    suffix: str = ".tmp",
+    dir_fd: int | None = None,
+    parent_path: Path | str | None = None,
 ) -> None:
     """Atomically replace ``path`` through a ``O_EXCL|O_NOFOLLOW`` temp file.
 
     A stale temp entry is unlinked first (unlinking a symlink removes the link,
     not its target). ``O_EXCL`` then guarantees the create cannot follow a link
-    planted between the unlink and the open; such a race fails closed.
+    planted between the unlink and the open; such a race fails closed. With
+    ``dir_fd`` every unlink/open/replace is relative to the already-verified
+    parent descriptor, so a rename of the parent after the check cannot
+    redirect the operation.
     """
     target = Path(path)
-    temporary = target.with_suffix(suffix)
+    if dir_fd is not None:
+        if parent_path is None:
+            raise UnsafeFileError(
+                "PARENT_UNVERIFIED", "dir_fd writes require parent_path"
+            )
+        _assert_dir_fd_matches_parent(dir_fd, parent_path)
+        target_name = _relative_name(target)
+        temporary_name: str | Path = Path(target_name).with_suffix(suffix).name
+    else:
+        temporary = target.with_suffix(suffix)
+        target_name = target
+        temporary_name = temporary
     try:
-        os.unlink(temporary)
+        os.unlink(temporary_name, dir_fd=dir_fd)
     except FileNotFoundError:
         pass
     except OSError as error:
         if error.errno == errno.ELOOP:
             raise UnsafeFileError(
-                "SYMLINK", f"temporary path is a symlink: {temporary}"
+                "SYMLINK", f"temporary path is a symlink: {temporary_name}"
             ) from error
         raise UnsafeFileError(
             "UNWRITABLE", f"cannot clear temporary file: {error}"
@@ -242,11 +318,11 @@ def write_regular_file_atomic(
         os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NONBLOCK", 0)
     )
     try:
-        descriptor = os.open(temporary, flags, 0o600)
+        descriptor = os.open(temporary_name, flags, 0o600, dir_fd=dir_fd)
     except OSError as error:
         if error.errno == errno.ELOOP:
             raise UnsafeFileError(
-                "SYMLINK", f"temporary path is a symlink: {temporary}"
+                "SYMLINK", f"temporary path is a symlink: {temporary_name}"
             ) from error
         raise UnsafeFileError(
             "UNWRITABLE", f"cannot create temporary file: {error}"
@@ -256,7 +332,8 @@ def write_regular_file_atomic(
             info = os.fstat(descriptor)
             if not stat.S_ISREG(info.st_mode):
                 raise UnsafeFileError(
-                    "NOT_REGULAR", f"temporary path is not a regular file: {temporary}"
+                    "NOT_REGULAR",
+                    f"temporary path is not a regular file: {temporary_name}",
                 )
             os.fchmod(descriptor, mode)
             view = memoryview(data)
@@ -264,21 +341,27 @@ def write_regular_file_atomic(
                 written = os.write(descriptor, view)
                 if written <= 0:
                     raise UnsafeFileError(
-                        "UNWRITABLE", f"short write for temporary file: {temporary}"
+                        "UNWRITABLE",
+                        f"short write for temporary file: {temporary_name}",
                     )
                 view = view[written:]
         finally:
             os.close(descriptor)
-        os.replace(temporary, target)
+        os.replace(
+            temporary_name,
+            target_name,
+            src_dir_fd=dir_fd,
+            dst_dir_fd=dir_fd,
+        )
     except UnsafeFileError:
         try:
-            os.unlink(temporary)
+            os.unlink(temporary_name, dir_fd=dir_fd)
         except OSError:
             pass
         raise
     except OSError as error:
         try:
-            os.unlink(temporary)
+            os.unlink(temporary_name, dir_fd=dir_fd)
         except OSError:
             pass
         raise UnsafeFileError(
@@ -286,7 +369,7 @@ def write_regular_file_atomic(
         ) from error
     except BaseException:
         try:
-            os.unlink(temporary)
+            os.unlink(temporary_name, dir_fd=dir_fd)
         except OSError:
             pass
         raise
