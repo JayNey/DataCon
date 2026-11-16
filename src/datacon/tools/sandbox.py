@@ -24,6 +24,7 @@ from typing import Any, Iterable, Mapping, Sequence
 
 from datacon import fileio
 from datacon.asan import ASanSignature, parse_asan
+from datacon.cases import MAX_MATERIAL_BYTES
 
 MIB = 1024 * 1024
 MAX_LOG_BYTES = 16 * 1024 * 1024
@@ -590,6 +591,22 @@ def _truncate_log(data: bytes) -> tuple[bytes, bool]:
     if len(data) <= MAX_LOG_BYTES:
         return data, False
     return data[:MAX_LOG_BYTES], True
+
+
+def _read_bounded_file(
+    path: Path, *, max_bytes: int, label: str, reason_code: str
+) -> bytes:
+    """Read an untrusted input through the shared bounded, no-follow reader.
+
+    The material, artifact and input paths can be replaced by a symlink, a FIFO
+    or an oversized file. ``read_regular_file_bounded`` rejects all three
+    before the payload is buffered; map its failure to the existing sandbox
+    reason codes instead of letting a raw OSError or MemoryError escape.
+    """
+    try:
+        return fileio.read_regular_file_bounded(path, max_bytes=max_bytes)
+    except fileio.UnsafeFileError as error:
+        raise SandboxError(f"{label}: {error.message}", reason_code=reason_code) from error
 
 
 def _extract_compile_args(recipe: bytes) -> tuple[str, ...]:
@@ -1217,7 +1234,13 @@ printf 'uid=%s\nseccomp=%s\nseccomp_filters=%s\nno_new_privs=%s\ncap_eff=%s\ncgr
                     f"reviewed material is missing: {relative}",
                     reason_code="MATERIAL_MISSING",
                 )
-            actual = "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
+            data = _read_bounded_file(
+                path,
+                max_bytes=MAX_MATERIAL_BYTES,
+                label=f"reviewed material is not readable: {relative}",
+                reason_code="MATERIAL_MISSING",
+            )
+            actual = "sha256:" + hashlib.sha256(data).hexdigest()
             if actual != digest:
                 raise SandboxError(
                     f"reviewed material changed before build: {relative}",
@@ -1331,7 +1354,13 @@ printf 'uid=%s\nseccomp=%s\nseccomp_filters=%s\nno_new_privs=%s\ncap_eff=%s\ncgr
         if not artifact.is_file() or artifact.is_symlink():
             raise SandboxError("built artifact is missing")
         if expected_artifact_digest is not None:
-            actual = "sha256:" + hashlib.sha256(artifact.read_bytes()).hexdigest()
+            artifact_bytes = _read_bounded_file(
+                artifact,
+                max_bytes=MAX_ARTIFACT_BYTES,
+                label="built artifact is not readable",
+                reason_code="EVIDENCE_WRITE_FAILED",
+            )
+            actual = "sha256:" + hashlib.sha256(artifact_bytes).hexdigest()
             if actual != expected_artifact_digest:
                 raise SandboxError(
                     "built artifact changed before replay",
@@ -1342,9 +1371,13 @@ printf 'uid=%s\nseccomp=%s\nseccomp_filters=%s\nno_new_privs=%s\ncap_eff=%s\ncgr
         # Hash the exact bytes before the container exists. The result records
         # this digest instead of re-reading the input after the run, so a
         # post-run replacement cannot be mistaken for the executed bytes.
-        input_digest = "sha256:" + hashlib.sha256(
-            input_file.read_bytes()
-        ).hexdigest()
+        input_bytes = _read_bounded_file(
+            input_file,
+            max_bytes=MAX_MATERIAL_BYTES,
+            label="replay input is not readable",
+            reason_code="MATERIAL_MISSING",
+        )
+        input_digest = "sha256:" + hashlib.sha256(input_bytes).hexdigest()
         if (
             expected_input_digest is not None
             and input_digest != expected_input_digest
@@ -1447,4 +1480,10 @@ printf 'uid=%s\nseccomp=%s\nseccomp_filters=%s\nno_new_privs=%s\ncap_eff=%s\ncgr
 
 
 def _digest_bytes(path: Path) -> str:
-    return "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
+    data = _read_bounded_file(
+        path,
+        max_bytes=MAX_MATERIAL_BYTES,
+        label="build recipe is not readable",
+        reason_code="MATERIAL_MISSING",
+    )
+    return "sha256:" + hashlib.sha256(data).hexdigest()

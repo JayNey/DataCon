@@ -296,33 +296,45 @@ def _remove_security_opt(args, value):
 
 
 NEGATIVE_MUTATIONS = [
-    ("read-only-root", lambda args: args.remove("--read-only")),
-    ("user-root", lambda args: _set_option(args, "--user", "0:0")),
-    ("network-bridge", lambda args: _set_option(args, "--network", "bridge")),
+    (
+        "read-only-root",
+        lambda args: args.remove("--read-only"),
+        "root filesystem",
+    ),
+    ("user-root", lambda args: _set_option(args, "--user", "0:0"), "user"),
+    (
+        "network-bridge",
+        lambda args: _set_option(args, "--network", "bridge"),
+        "network mode",
+    ),
     (
         "no-new-privileges",
         lambda args: _remove_security_opt(args, "no-new-privileges"),
+        "no-new-privileges",
     ),
-    ("seccomp-missing", _seccomp_missing),
-    ("seccomp-unconfined", _seccomp_unconfined),
-    ("pids-limit", lambda args: _remove_option(args, "--pids-limit")),
+    ("seccomp-missing", _seccomp_missing, "seccomp"),
+    ("seccomp-unconfined", _seccomp_unconfined, "seccomp"),
+    ("pids-limit", lambda args: _remove_option(args, "--pids-limit"), "PID limit"),
     (
         "memory-limit",
         lambda args: (
             _remove_option(args, "--memory-swap"),
             _remove_option(args, "--memory"),
         ),
+        "memory",
     ),
-    ("cpu-limit", lambda args: _remove_option(args, "--cpus")),
-    ("tmpfs-limit", _tmpfs_unbounded),
+    ("cpu-limit", lambda args: _remove_option(args, "--cpus"), "CPU limit"),
+    ("tmpfs-limit", _tmpfs_unbounded, "bounded"),
 ]
 
 
 @pytest.mark.parametrize(
-    "mutation", [item[1] for item in NEGATIVE_MUTATIONS], ids=[item[0] for item in NEGATIVE_MUTATIONS]
+    "label,mutation,expected",
+    NEGATIVE_MUTATIONS,
+    ids=[item[0] for item in NEGATIVE_MUTATIONS],
 )
 def test_mvp04_single_control_drift_is_rejected_and_cleaned_up(
-    tmp_path, monkeypatch, mutation
+    tmp_path, monkeypatch, label, mutation, expected
 ):
     policy = IsolationPolicy(
         network="none",
@@ -360,12 +372,15 @@ def test_mvp04_single_control_drift_is_rejected_and_cleaned_up(
     monkeypatch.setattr(
         sandbox_module, "container_create_args", drifted_create_args
     )
-    with pytest.raises(SandboxPolicyError):
+    with pytest.raises(SandboxPolicyError) as caught:
         sandbox._create(
             suffix="negative",
             command=["/bin/true"],
             mounts=[(str(fixture), "/fixture", True)],
         )
+    assert expected in str(caught.value), (
+        f"{label} drift was rejected for the wrong reason: {caught.value}"
+    )
     leftovers = subprocess.run(
         ["docker", "ps", "-aq", "--filter", f"label=datacon.job_id={job_id}"],
         capture_output=True,

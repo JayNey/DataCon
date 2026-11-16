@@ -124,6 +124,13 @@ def _make_owner_writable(path: Path | str) -> None:
             raise UnsafeFileError(
                 "NOT_REGULAR", f"path is not a regular file: {path}"
             )
+        # O_NOFOLLOW stops a symlink but not a hard link. A link planted inside
+        # the run root would let this descriptor rewrite an inode that also has
+        # a name outside it, so only a single-link file may be modified.
+        if info.st_nlink != 1:
+            raise UnsafeFileError(
+                "HARDLINK", f"path has {info.st_nlink} hard links: {path}"
+            )
         try:
             os.fchmod(descriptor, 0o600)
         except OSError as error:
@@ -144,8 +151,11 @@ def write_regular_file(
     redirect either operation. A read-only legacy file is made writable through
     its own descriptor and the open is retried once.
     """
+    # Deliberately *not* O_TRUNC: truncation happens only after fstat confirms
+    # a single-link regular file. O_TRUNC would empty the inode (including an
+    # externally hard-linked name) before the link check could reject it.
     flags = _final_flags(
-        os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NONBLOCK", 0)
+        os.O_WRONLY | os.O_CREAT | getattr(os, "O_NONBLOCK", 0)
     )
     descriptor: int | None = None
     try:
@@ -177,6 +187,14 @@ def write_regular_file(
                 raise UnsafeFileError(
                     "NOT_REGULAR", f"path is not a regular file: {path}"
                 )
+            # A hard link is invisible to O_NOFOLLOW: writing through it would
+            # reach the same inode under a path outside the run root. Reject
+            # every multi-link leaf before fchmod or any payload write.
+            if info.st_nlink != 1:
+                raise UnsafeFileError(
+                    "HARDLINK", f"path has {info.st_nlink} hard links: {path}"
+                )
+            os.ftruncate(descriptor, 0)
             os.fchmod(descriptor, mode)
             view = memoryview(data)
             while view:
