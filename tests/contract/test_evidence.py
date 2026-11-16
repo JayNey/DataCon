@@ -2467,3 +2467,62 @@ def test_entry_cap_rejects_file_flood(tmp_path, monkeypatch):
         verify_bundle(info.root)
     assert caught.value.reason_code == "INVALID_MANIFEST"
     assert "files" in caught.value.message
+
+
+
+def test_inconclusive_timeout_with_abnormal_completed_control_is_accepted(tmp_path):
+    """S5: a candidate timeout outranks a completed-but-wrong control.
+
+    ``decide_verdict`` returns TIMEOUT for this legal six-replay shape. The
+    verifier must accept it instead of re-imposing the normal-control exit
+    check that the higher-priority TIMEOUT rule already shadowed.
+    """
+    info = make_bundle(tmp_path, name="timeout-over-control")
+    _set_verdict(info.root, "INCONCLUSIVE", "TIMEOUT")
+    _update_replay(info.root, "vulnerable", "normal", exit_code=2)
+    _update_replay(
+        info.root,
+        "fixed",
+        "candidate_1",
+        status="timeout",
+        exit_code=None,
+        timed_out=True,
+    )
+    verified = verify_bundle(info.root)
+    assert verified.manifest["reason_code"] == "TIMEOUT"
+
+
+def test_inconclusive_resource_limited_with_abnormal_completed_control_is_accepted(
+    tmp_path,
+):
+    info = make_bundle(tmp_path, name="resource-over-control")
+    _set_verdict(info.root, "INCONCLUSIVE", "RESOURCE_LIMITED")
+    _update_replay(info.root, "vulnerable", "normal", exit_code=2)
+    _update_replay(
+        info.root,
+        "fixed",
+        "candidate_2",
+        status="resource_limited",
+        exit_code=137,
+        timed_out=False,
+    )
+    verified = verify_bundle(info.root)
+    assert verified.manifest["reason_code"] == "RESOURCE_LIMITED"
+
+
+def test_inconclusive_evidence_incomplete_with_abnormal_completed_control_is_accepted(
+    tmp_path,
+):
+    info = make_bundle(tmp_path, name="incomplete-over-control")
+    _set_verdict(info.root, "INCONCLUSIVE", "EVIDENCE_INCOMPLETE")
+    _update_replay(info.root, "vulnerable", "normal", exit_code=2)
+    _update_replay(
+        info.root,
+        "fixed",
+        "candidate_2",
+        status="infra_error",
+        exit_code=None,
+        timed_out=False,
+    )
+    verified = verify_bundle(info.root)
+    assert verified.manifest["reason_code"] == "EVIDENCE_INCOMPLETE"
