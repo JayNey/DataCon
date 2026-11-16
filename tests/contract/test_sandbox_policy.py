@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import stat
+import sys
 import threading
 from types import SimpleNamespace
 import unicodedata
@@ -386,24 +387,26 @@ def test_create_removes_the_container_when_validation_fails(tmp_path):
     sandbox = RecordingSandbox(
         tmp_path, _inspect_payload(ReadonlyRootfs=False)
     )
-    with pytest.raises(SandboxPolicyError):
+    with pytest.raises(SandboxPolicyError) as caught:
         sandbox._create(
             suffix="negative",
             command=["/bin/true"],
             mounts=[(MOUNT_SOURCE, "/fixture", True)],
         )
+    assert "root filesystem" in str(caught.value)
     assert sandbox.removed(), "created container was not removed"
     assert any(call[1] == "-f" for call in sandbox.removed())
 
 
 def test_create_removes_the_container_when_inspect_fails(tmp_path):
     sandbox = RecordingSandbox(tmp_path, {}, inspect_error=True)
-    with pytest.raises(SandboxError):
+    with pytest.raises(SandboxError) as caught:
         sandbox._create(
             suffix="negative",
             command=["/bin/true"],
             mounts=[(MOUNT_SOURCE, "/fixture", True)],
         )
+    assert "inspect" in str(caught.value)
     assert sandbox.removed(), "created container was not removed"
 
 
@@ -415,12 +418,13 @@ def test_create_removes_the_container_when_create_is_rejected(tmp_path):
         return SimpleNamespace(returncode=1, stdout=b"", stderr=b"bad create")
 
     sandbox._docker = reject
-    with pytest.raises(SandboxError):
+    with pytest.raises(SandboxError) as caught:
         sandbox._create(
             suffix="negative",
             command=["/bin/true"],
             mounts=[(MOUNT_SOURCE, "/fixture", True)],
         )
+    assert "bad create" in str(caught.value)
     assert any(call and call[0] == "rm" for call in sandbox.calls)
 
 
@@ -1594,12 +1598,60 @@ def test_mountinfo_accepts_a_lexically_outside_target_on_the_same_device():
     )
 
 
-def test_mountinfo_treats_a_different_device_as_provably_outside():
+def test_mountinfo_allows_a_different_device_with_no_run_root_mount():
+    # A different device is only provably outside when the run root contains
+    # no mount of that device.
     text = _mountinfo(
         "39 36 9:1 / /mnt/other rw - ext4 /dev/sdb1 rw"
     )
     assert not execution._mountinfo_rejects(
         Path("/mnt/other/evidence"), Path("/data/runs"), text
+    )
+
+
+def test_mountinfo_rejects_a_different_device_when_run_root_contains_it():
+    # /data/runs/child is a mount of the same device as /mnt/other. Content
+    # from below the run root can therefore be rebound at the target path even
+    # though the device numbers differ.
+    text = _mountinfo(
+        "39 36 9:1 / /mnt/other rw - ext4 /dev/sdb1 rw",
+        "41 36 9:1 / /data/runs/child rw - ext4 /dev/sdb1 rw",
+    )
+    assert execution._mountinfo_rejects(
+        Path("/mnt/other/evidence"), Path("/data/runs"), text
+    )
+
+
+def test_mountinfo_rejects_a_nested_different_device_bind():
+    text = _mountinfo(
+        "41 36 9:1 / /data/runs/child rw - ext4 /dev/sdb1 rw",
+        "42 36 9:1 /data/runs/child /mnt/ev rw - ext4 /dev/sdb1 rw",
+    )
+    assert execution._mountinfo_rejects(
+        Path("/mnt/ev/evidence"), Path("/data/runs"), text
+    )
+
+
+def test_mountinfo_rejects_an_overmount_at_the_target_path():
+    # The lower entry at /mnt/ev binds a run-root subtree; the upper entry is
+    # an unrelated filesystem. The topmost (largest mount_id) mount alone
+    # would look safe, so the lower entry must still be inspected.
+    text = _mountinfo(
+        "43 36 8:1 /data/runs/child /mnt/ev rw - ext4 /dev/sda1 rw",
+        "44 43 9:1 / /mnt/ev rw - ext4 /dev/sdb1 rw",
+    )
+    assert execution._mountinfo_rejects(
+        Path("/mnt/ev/evidence"), Path("/data/runs"), text
+    )
+
+
+def test_mountinfo_overmount_rejection_does_not_depend_on_line_order():
+    text = _mountinfo(
+        "44 43 9:1 / /mnt/ev rw - ext4 /dev/sdb1 rw",
+        "43 36 8:1 /data/runs/child /mnt/ev rw - ext4 /dev/sda1 rw",
+    )
+    assert execution._mountinfo_rejects(
+        Path("/mnt/ev/evidence"), Path("/data/runs"), text
     )
 
 
@@ -1657,3 +1709,316 @@ def test_mountinfo_rejects_a_pseudo_filesystem_ancestor():
     assert execution._mountinfo_rejects(
         Path("/run/docker/netns/abc/evidence"), Path("/tmp/runs"), text
     )
+
+
+# ---------------------------------------------------------------------------
+# SF2: Linux must not silently skip a missing mountinfo document.
+# ---------------------------------------------------------------------------
+
+
+def _missing_mountinfo(self, *args, **kwargs):
+    raise FileNotFoundError("/proc/self/mountinfo")
+
+
+def test_mountinfo_missing_fails_closed_on_linux(monkeypatch):
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(Path, "read_text", _missing_mountinfo)
+    with pytest.raises(execution.ExecutionFailed) as caught:
+        execution._mountinfo_document()
+    assert caught.value.reason_code == "EVIDENCE_WRITE_FAILED"
+    assert "mountinfo" in caught.value.message
+
+
+def test_mountinfo_missing_is_optional_off_linux(monkeypatch):
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(Path, "read_text", _missing_mountinfo)
+    assert execution._mountinfo_document() is None
+
+
+# ---------------------------------------------------------------------------
+# SF4: hard links are not covered by O_NOFOLLOW.
+# ---------------------------------------------------------------------------
+
+
+def test_write_run_file_rejects_a_hardlink_to_an_external_file(tmp_path):
+    run_root = tmp_path / "runs"
+    (run_root / "generation-1").mkdir(parents=True)
+    outside = tmp_path / "outside.txt"
+    outside.write_bytes(b"original")
+    target = run_root / "generation-1" / "parser"
+    os.link(outside, target)
+
+    with pytest.raises(execution.ExecutionFailed) as caught:
+        execution._write_run_file(run_root, target, b"tampered", 0o555)
+
+    assert caught.value.reason_code == "EVIDENCE_WRITE_FAILED"
+    assert outside.read_bytes() == b"original"
+
+
+def test_write_run_file_rejects_a_hardlink_inside_the_run_root(tmp_path):
+    run_root = tmp_path / "runs"
+    (run_root / "generation-1").mkdir(parents=True)
+    sibling = run_root / "generation-1" / "sibling.log"
+    sibling.write_bytes(b"original")
+    target = run_root / "generation-1" / "parser"
+    os.link(sibling, target)
+
+    with pytest.raises(execution.ExecutionFailed) as caught:
+        execution._write_run_file(run_root, target, b"tampered", 0o555)
+
+    assert caught.value.reason_code == "EVIDENCE_WRITE_FAILED"
+    assert sibling.read_bytes() == b"original"
+
+
+# ---------------------------------------------------------------------------
+# SF5: containment must be checked before mkdir follows a symlinked parent.
+# ---------------------------------------------------------------------------
+
+
+def test_write_run_file_checks_symlinked_parent_before_mkdir(tmp_path):
+    run_root = tmp_path / "runs"
+    (run_root / "generation-1").mkdir(parents=True)
+    external = tmp_path / "external"
+    external.mkdir()
+    (run_root / "generation-1" / "logs").symlink_to(
+        external, target_is_directory=True
+    )
+    target = run_root / "generation-1" / "logs" / "nested" / "stdout.log"
+
+    with pytest.raises(execution.ExecutionFailed) as caught:
+        execution._write_run_file(run_root, target, b"tampered", 0o600)
+
+    assert caught.value.reason_code == "EVIDENCE_WRITE_FAILED"
+    assert not (external / "nested").exists()
+
+
+def test_write_journal_checks_symlinked_parent_before_mkdir(tmp_path, monkeypatch):
+    run_root = tmp_path / "runs"
+    (run_root / "steps").mkdir(parents=True)
+    external = tmp_path / "external"
+    external.mkdir()
+    (run_root / "steps" / "build_parser").symlink_to(
+        external, target_is_directory=True
+    )
+    monkeypatch.setenv("DATACON_EVIDENCE_ROOT", str(tmp_path / "evidence"))
+    monkeypatch.delenv("DATACON_JOURNAL_SECRET_FILE", raising=False)
+
+    with pytest.raises(execution.ExecutionFailed) as caught:
+        execution._write_journal(
+            run_root,
+            "build:parser",
+            1,
+            1,
+            {"job_id": "job", "generation": 1},
+        )
+
+    assert caught.value.reason_code == "EVIDENCE_WRITE_FAILED"
+    assert not (external / "generation-1").exists()
+
+
+# ---------------------------------------------------------------------------
+# SF6: the journal secret must stay out of the evidence and staging roots.
+# ---------------------------------------------------------------------------
+
+
+def test_journal_secret_rejects_explicit_path_inside_evidence_root(
+    tmp_path, monkeypatch
+):
+    evidence_root = tmp_path / "evidence"
+    secret = evidence_root / "secret"
+    monkeypatch.setenv("DATACON_EVIDENCE_ROOT", str(evidence_root))
+    monkeypatch.setenv("DATACON_JOURNAL_SECRET_FILE", str(secret))
+
+    with pytest.raises(execution.ExecutionFailed) as caught:
+        execution._journal_secret_path(tmp_path / "runs")
+
+    assert caught.value.reason_code == "EVIDENCE_WRITE_FAILED"
+    assert "EVIDENCE_ROOT" in caught.value.message
+
+
+def test_journal_secret_rejects_explicit_path_inside_staging_root(
+    tmp_path, monkeypatch
+):
+    staging_root = tmp_path / "staging"
+    secret = staging_root / "secret"
+    monkeypatch.setenv("DATACON_EVIDENCE_ROOT", str(tmp_path / "evidence"))
+    monkeypatch.setenv("DATACON_STAGING_ROOT", str(staging_root))
+    monkeypatch.setenv("DATACON_JOURNAL_SECRET_FILE", str(secret))
+
+    with pytest.raises(execution.ExecutionFailed) as caught:
+        execution._journal_secret_path(tmp_path / "runs")
+
+    assert caught.value.reason_code == "EVIDENCE_WRITE_FAILED"
+    assert "staging root" in caught.value.message
+
+
+def test_journal_secret_default_sibling_remains_usable(tmp_path, monkeypatch):
+    evidence_root = tmp_path / "evidence"
+    monkeypatch.setenv("DATACON_EVIDENCE_ROOT", str(evidence_root))
+    monkeypatch.delenv("DATACON_JOURNAL_SECRET_FILE", raising=False)
+    monkeypatch.delenv("DATACON_STAGING_ROOT", raising=False)
+
+    path = execution._journal_secret_path(tmp_path / "runs")
+
+    assert path.name == ".datacon-journal-secret"
+    assert path.parent == evidence_root.resolve().parent
+
+
+# ---------------------------------------------------------------------------
+# SF9: DockerSandbox build/replay use bounded readers, not Path.read_bytes.
+# ---------------------------------------------------------------------------
+
+
+def _fake_docker_sandbox(tmp_path, files):
+    sandbox = DockerSandbox(
+        image=(
+            "silkeh/clang:19-bookworm@sha256:"
+            "f5ce959d91f059acf5a4b3f1c19f46713c4b2881c7d7cd1d5143ca1d1412277f"
+        ),
+        platform="linux/amd64",
+        policy=IsolationPolicy(
+            network="none",
+            user="65534:65534",
+            read_only_root=True,
+            cap_drop=("ALL",),
+            no_new_privileges=True,
+            seccomp="runtime/default",
+            seccomp_profile_digest=SECCOMP_PROFILE_DIGEST,
+        ),
+        limits=ResourceLimits(cpu=2, memory_mib=2048, pids=128, scratch_mib=512),
+        job_id="job-sf9",
+        run_root=tmp_path / "runs",
+        generation=1,
+    )
+    sandbox._create = lambda **kwargs: ("fake-container", {})
+    sandbox._remove = lambda name: None
+    sandbox._start_and_wait = lambda *args, **kwargs: (
+        dict(files),
+        set(),
+        {},
+        False,
+    )
+    return sandbox
+
+
+def _materials(tmp_path, recipe=b"#!/bin/sh\nexit 0\n"):
+    materials = tmp_path / "materials"
+    materials.mkdir()
+    (materials / "build.sh").write_bytes(recipe)
+    return materials
+
+
+def test_docker_sandbox_build_does_not_call_path_read_bytes(tmp_path, monkeypatch):
+    materials = _materials(tmp_path)
+    recipe_digest = "sha256:" + hashlib.sha256(
+        (materials / "build.sh").read_bytes()
+    ).hexdigest()
+    sandbox = _fake_docker_sandbox(
+        tmp_path,
+        {
+            "/work/build.log": b"ok",
+            "/work/exit_code": b"0",
+            "/work/parser": b"parser-bytes",
+        },
+    )
+
+    def forbid_read_bytes(self):
+        raise AssertionError(f"build must not call Path.read_bytes: {self}")
+
+    monkeypatch.setattr(Path, "read_bytes", forbid_read_bytes)
+    result = sandbox.build(
+        "vulnerable",
+        materials_dir=materials,
+        compile_args=("-std=c11",),
+        deadline_seconds=5,
+        expected_materials={"build.sh": recipe_digest},
+    )
+
+    assert result.status == "completed"
+    assert result.artifact == b"parser-bytes"
+
+
+def test_docker_sandbox_replay_does_not_call_path_read_bytes(tmp_path, monkeypatch):
+    artifact = tmp_path / "parser"
+    artifact.write_bytes(b"parser-bytes")
+    input_file = tmp_path / "input"
+    input_file.write_bytes(b"ABCD\n")
+    sandbox = _fake_docker_sandbox(
+        tmp_path,
+        {
+            "/work/stdout": b"",
+            "/work/stderr": b"",
+            "/work/exit_code": b"0",
+        },
+    )
+
+    def forbid_read_bytes(self):
+        raise AssertionError(f"replay must not call Path.read_bytes: {self}")
+
+    monkeypatch.setattr(Path, "read_bytes", forbid_read_bytes)
+    result = sandbox.replay(
+        "vulnerable",
+        "candidate_1",
+        artifact_path=artifact,
+        input_path=input_file,
+        asan_options="detect_leaks=0",
+        timeout_seconds=5,
+        expected_artifact_digest="sha256:"
+        + hashlib.sha256(b"parser-bytes").hexdigest(),
+        expected_input_digest="sha256:" + hashlib.sha256(b"ABCD\n").hexdigest(),
+    )
+
+    assert result.status == "completed"
+    assert result.input_digest == "sha256:" + hashlib.sha256(b"ABCD\n").hexdigest()
+
+
+def test_docker_sandbox_rejects_oversized_material_before_reading(
+    tmp_path, monkeypatch
+):
+    import datacon.tools.sandbox as sandbox_module
+
+    materials = _materials(tmp_path, recipe=b"x" * 4096)
+    created: list[str] = []
+    sandbox = _fake_docker_sandbox(tmp_path, {})
+    sandbox._create = lambda **kwargs: created.append("create") or ("cid", {})
+    monkeypatch.setattr(sandbox_module, "MAX_MATERIAL_BYTES", 8)
+
+    with pytest.raises(SandboxError) as caught:
+        sandbox.build(
+            "vulnerable",
+            materials_dir=materials,
+            compile_args=(),
+            deadline_seconds=5,
+            expected_materials={"build.sh": "sha256:" + "0" * 64},
+        )
+
+    assert caught.value.reason_code == "MATERIAL_MISSING"
+    assert created == []
+
+
+def test_docker_sandbox_rejects_oversized_replay_input_before_container(
+    tmp_path, monkeypatch
+):
+    import datacon.tools.sandbox as sandbox_module
+
+    artifact = tmp_path / "parser"
+    artifact.write_bytes(b"parser-bytes")
+    input_file = tmp_path / "input"
+    input_file.write_bytes(b"x" * 4096)
+    created: list[str] = []
+    sandbox = _fake_docker_sandbox(tmp_path, {})
+    sandbox._create = lambda **kwargs: created.append("create") or ("cid", {})
+    monkeypatch.setattr(sandbox_module, "MAX_MATERIAL_BYTES", 8)
+
+    with pytest.raises(SandboxError) as caught:
+        sandbox.replay(
+            "vulnerable",
+            "candidate_1",
+            artifact_path=artifact,
+            input_path=input_file,
+            asan_options="detect_leaks=0",
+            timeout_seconds=5,
+        )
+
+    assert caught.value.reason_code == "MATERIAL_MISSING"
+    assert created == []

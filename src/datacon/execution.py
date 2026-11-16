@@ -18,6 +18,7 @@ from pathlib import Path
 import re
 import shutil
 import stat
+import sys
 import unicodedata
 import uuid
 from typing import Any, Callable, Mapping, Sequence
@@ -311,13 +312,21 @@ def _parse_mountinfo(text: str) -> tuple[_MountPoint, ...]:
 
 
 def _mount_point_for(entries: Sequence[_MountPoint], path: Path) -> _MountPoint | None:
+    """Return the mount that contains ``path``.
+
+    The deepest mount point wins. For overmounts (multiple entries on the same
+    mount point) the entry with the largest ``mount_id`` is the topmost one and
+    therefore the mount whose contents are actually visible. The choice must
+    not depend on mountinfo line order.
+    """
     best: _MountPoint | None = None
+    best_key: tuple[int, int] | None = None
     for entry in entries:
         if path == entry.mount_point or entry.mount_point in path.parents:
-            if best is None or len(entry.mount_point.parts) > len(
-                best.mount_point.parts
-            ):
+            key = (len(entry.mount_point.parts), entry.mount_id)
+            if best is None or best_key is None or key > best_key:
                 best = entry
+                best_key = key
     return best
 
 
@@ -327,9 +336,11 @@ def _mountinfo_rejects(path: Path, run_root: Path, text: str) -> bool:
     A bind mount whose source subtree lives below the run root can expose
     run-root content at a completely different path. For the mount that
     contains ``path`` and the mount that contains ``run_root`` we reconstruct
-    each physical path from the mount root and compare them on the same
-    device. Different devices cannot contain each other, so that case is
-    provably outside. Anything unparseable or unprovable is rejected.
+    each physical path from the mount root and compare them. A different
+    device number is **not** proof of isolation: a nested mount below the run
+    root can share that device and be rebound elsewhere, so that case is
+    rejected whenever the run root contains any mount of the target's device.
+    Anything unparseable or unprovable is rejected.
     """
     try:
         entries = _parse_mountinfo(text)
@@ -343,8 +354,6 @@ def _mountinfo_rejects(path: Path, run_root: Path, text: str) -> bool:
         return True
     if target_mount.root is None or root_mount.root is None:
         return True
-    if target_mount.major_minor != root_mount.major_minor:
-        return False
     try:
         target_physical = target_mount.root / path.relative_to(
             target_mount.mount_point
@@ -356,30 +365,55 @@ def _mountinfo_rejects(path: Path, run_root: Path, text: str) -> bool:
         return True
     if _lexically_within_run_root(target_physical, root_physical):
         return True
-    # Check every mount that is an ancestor of the target as well. A bind
-    # mount whose source subtree lives below the run root is suspicious even
-    # when a deeper mount currently hides it; rejecting it is the fail-closed
-    # choice and costs nothing for ordinary system mounts (root "/" is never
-    # inside the run root).
+    # The bind source itself may live below the run root even when the
+    # reconstructed physical path is on another device.
+    if _lexically_within_run_root(target_mount.root, run_root):
+        return True
+    # Check every mount that is an ancestor of the target, not only the
+    # deepest one. An overmount at the same path can hide a lower bind whose
+    # source is the run root, so every entry on every ancestor mount point is
+    # inspected. A non-path root (for example nsfs) cannot prove anything.
     for entry in entries:
         if not (path == entry.mount_point or entry.mount_point in path.parents):
             continue
-        if entry.major_minor != root_mount.major_minor:
-            continue
         if entry.root is None:
             return True
-        if _lexically_within_run_root(entry.root, root_physical):
+        if _lexically_within_run_root(entry.root, run_root):
             return True
+        if entry.major_minor == root_mount.major_minor and (
+            _lexically_within_run_root(entry.root, root_physical)
+        ):
+            return True
+    if target_mount.major_minor != root_mount.major_minor:
+        # A genuinely unrelated filesystem is allowed only when the run root
+        # does not itself contain a mount of that device. Otherwise a nested
+        # different-device mount can be rebound at the target path.
+        for entry in entries:
+            if entry.major_minor != target_mount.major_minor:
+                continue
+            if entry.mount_point == run_root or run_root in entry.mount_point.parents:
+                return True
     return False
 
 
 def _mountinfo_document() -> str | None:
-    """Read Linux mountinfo, or return ``None`` where the kernel lacks it."""
+    """Read Linux mountinfo, or return ``None`` where the kernel lacks it.
+
+    Linux must always expose the document: a missing ``/proc/self/mountinfo``
+    means containment cannot be proven, so the caller must fail closed. Only
+    non-Linux platforms legitimately skip the check.
+    """
     try:
         return Path("/proc/self/mountinfo").read_text(
             encoding="utf-8", errors="replace"
         )
-    except FileNotFoundError:
+    except FileNotFoundError as error:
+        if sys.platform.startswith("linux"):
+            raise ExecutionFailed(
+                "EVIDENCE_WRITE_FAILED",
+                "mount relationships cannot be inspected: "
+                "/proc/self/mountinfo is missing",
+            ) from error
         return None
     except OSError as error:
         raise ExecutionFailed(
@@ -1035,15 +1069,10 @@ def _staging_root(context: ExecutionContext) -> Path:
     per-attempt directory is traversable by the non-root container user while
     the private parent stays hidden from other host users.
     """
-    explicit = os.getenv(STAGING_ROOT_ENV)
     evidence_root = Path(
         os.getenv("DATACON_EVIDENCE_ROOT", ".datacon/evidence")
     ).expanduser()
-    raw = (
-        Path(explicit).expanduser()
-        if explicit
-        else evidence_root.parent / ".datacon-staging"
-    )
+    raw = _configured_staging_path(evidence_root)
     if raw.is_symlink():
         raise ExecutionFailed(
             "EVIDENCE_WRITE_FAILED", "staging root must not be a symlink"
@@ -1258,18 +1287,55 @@ def _stage_replay_files(
         raise
 
 
+def _configured_staging_path(evidence_root: Path) -> Path:
+    """Return the configured staging root without creating it."""
+    explicit = os.getenv(STAGING_ROOT_ENV)
+    return (
+        Path(explicit).expanduser()
+        if explicit
+        else evidence_root.parent / ".datacon-staging"
+    )
+
+
 def _journal_secret_path(run_root: Path) -> Path:
-    """Return the HMAC key path, enforcing that it is outside the run root."""
+    """Return the HMAC key path, enforcing that it is outside sensitive roots.
+
+    Besides the run root, an explicit ``DATACON_JOURNAL_SECRET_FILE`` must not
+    live inside the evidence root or the staging root: both are attacker-facing
+    trees whose contents are published or mounted. The default path
+    (``evidence_root.parent/.datacon-journal-secret``) remains usable because
+    it is a sibling of both.
+    """
     explicit = os.getenv("DATACON_JOURNAL_SECRET_FILE")
     evidence_root = _assert_evidence_root_outside_run_root(run_root)
-    path = Path(explicit).expanduser() if explicit else (
-        evidence_root.parent / ".datacon-journal-secret"
+    path = (
+        Path(explicit).expanduser()
+        if explicit
+        else evidence_root.parent / ".datacon-journal-secret"
     )
     if path.is_symlink():
         raise ExecutionFailed(
             "EVIDENCE_WRITE_FAILED", "journal secret path must not be a symlink"
         )
-    return _outside_run_root(path, run_root, "journal secret")
+    resolved = _outside_run_root(path, run_root, "journal secret")
+    for root, label in (
+        (evidence_root, "DATACON_EVIDENCE_ROOT"),
+        (_configured_staging_path(evidence_root), "staging root"),
+    ):
+        try:
+            resolved_root = root.expanduser().resolve()
+        except (OSError, RuntimeError) as error:
+            raise ExecutionFailed(
+                "EVIDENCE_WRITE_FAILED",
+                f"journal secret {label} cannot be resolved: {error}",
+            ) from error
+        if _lexically_within_run_root(resolved, resolved_root):
+            raise ExecutionFailed(
+                "EVIDENCE_WRITE_FAILED",
+                f"journal secret must live outside {label}",
+            )
+    # The final inode may have moved after the path-level check.
+    return _outside_run_root(resolved, run_root, "journal secret")
 
 
 def _assert_journal_paths(run_root: Path) -> None:
@@ -1491,6 +1557,47 @@ def _journal_path(
     )
 
 
+def _prepare_run_parent(
+    path: Path, run_root: Path, label: str
+) -> Path:
+    """Create ``path.parent`` only after proving it stays inside the run root.
+
+    The check runs before ``mkdir`` so a symlinked parent is rejected without
+    creating anything outside. ``resolve(strict=False)`` follows every existing
+    ancestor, which is exactly the "deepest existing ancestor" rule used by
+    ``_inside_run_root``. The parent is resolved again after creation to close
+    the window between the check and the ``mkdir``.
+    """
+    root = run_root.resolve()
+    try:
+        before = path.parent.resolve()
+    except (OSError, RuntimeError) as error:
+        raise ExecutionFailed(
+            "EVIDENCE_WRITE_FAILED", f"{label} cannot be resolved: {error}"
+        ) from error
+    if not _inside_run_root(before, root, label):
+        raise ExecutionFailed(
+            "EVIDENCE_WRITE_FAILED", f"{label} escaped the run root"
+        )
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as error:
+        raise ExecutionFailed(
+            "EVIDENCE_WRITE_FAILED", f"{label} parent cannot be created: {error}"
+        ) from error
+    try:
+        after = path.parent.resolve()
+    except (OSError, RuntimeError) as error:
+        raise ExecutionFailed(
+            "EVIDENCE_WRITE_FAILED", f"{label} cannot be resolved: {error}"
+        ) from error
+    if not _inside_run_root(after, root, label):
+        raise ExecutionFailed(
+            "EVIDENCE_WRITE_FAILED", f"{label} escaped the run root"
+        )
+    return after
+
+
 def _write_journal(
     run_root: Path,
     step_key: str,
@@ -1499,13 +1606,12 @@ def _write_journal(
     payload: Mapping[str, Any],
 ) -> Path:
     path = _journal_path(run_root, step_key, attempt_no, generation)
-    root = run_root.resolve()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    parent = path.parent.resolve()
     # The lexical check is not enough: a mount or a case-only alias can make
     # the resolved string disagree with the directory identity. Reuse the
-    # device/inode containment check before writing any journal bytes.
-    if not _inside_run_root(parent, root, "journal path"):
+    # device/inode containment check *before* mkdir so a symlinked parent can
+    # never be followed to create an external directory.
+    parent = _prepare_run_parent(path, run_root, "journal path")
+    if not _inside_run_root(parent, run_root.resolve(), "journal path"):
         raise ExecutionFailed(
             "EVIDENCE_WRITE_FAILED", "journal path escaped the run root"
         )
@@ -1621,16 +1727,10 @@ def _write_run_file(
     ``fchmod``/write, so the previous ``is_symlink``/``unlink``/``write_bytes``
     sequence can no longer be redirected to an external target. A legacy mode
     ``0555`` file is opened read-only and chmodded through its own descriptor
-    before the write is retried; a symlink always fails with
+    before the write is retried; a symlink or hard link always fails with
     ``EVIDENCE_WRITE_FAILED``.
     """
-    root = run_root.resolve()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    parent = path.parent.resolve()
-    if parent != root and root not in parent.parents:
-        raise ExecutionFailed("EVIDENCE_WRITE_FAILED", "run evidence path escaped its root")
-    if not _inside_run_root(parent, root, "run evidence path"):
-        raise ExecutionFailed("EVIDENCE_WRITE_FAILED", "run evidence path escaped its root")
+    _prepare_run_parent(path, run_root, "run evidence path")
     try:
         fileio.write_regular_file(path, data, mode=mode)
     except fileio.UnsafeFileError as error:
@@ -2141,6 +2241,25 @@ def _evidence_artifacts(
     return artifacts
 
 
+def _discard_published_bundle(path: str | None) -> None:
+    """Best-effort removal of a bundle this generation just published.
+
+    Only a generation-scoped directory is removed. The shared job directory and
+    other generations (including the legacy flat ``evidence/<job_id>`` layout)
+    are never touched, so a stale worker can clean up after itself without
+    racing a newer generation that is about to publish.
+    """
+    if not path:
+        return
+    try:
+        target = Path(path)
+        if not target.name.startswith("generation-"):
+            return
+        shutil.rmtree(target, ignore_errors=True)
+    except OSError:
+        pass
+
+
 def _archive(
     dsn: str,
     context: ExecutionContext,
@@ -2161,13 +2280,19 @@ def _archive(
         # those recovery paths.
         return None, None, f"{error.reason_code}: {error.message}"
     state.mark_archiving(dsn, context.job_id, generation=context.generation)
+    # Every generation publishes into its own directory below the job
+    # directory. A worker that passed the fence and was then paused can only
+    # ever replace its own generation; it can never overwrite a newer
+    # generation's evidence path.
+    job_root = evidence_root / context.job_id_text
+    bundle = job_root / f"generation-{context.generation}"
     temporary = (
         evidence_root
         / f".{context.job_id_text}.generation-{context.generation}.tmp-{uuid.uuid4().hex}"
     )
     backup = (
-        evidence_root
-        / f".{context.job_id_text}.generation-{context.generation}.old-{uuid.uuid4().hex}"
+        job_root
+        / f".generation-{context.generation}.old-{uuid.uuid4().hex}"
     )
     try:
         evidence_root.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -2184,9 +2309,16 @@ def _archive(
                 None,
                 "EVIDENCE_WRITE_FAILED: evidence root changed after creation",
             )
-        bundle = evidence_root / context.job_id_text
-        if bundle.is_symlink():
+        if job_root.is_symlink():
             raise BundleError("SYMLINK", "evidence destination is a symlink")
+        job_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        job_info = job_root.lstat()
+        if stat.S_ISLNK(job_info.st_mode) or not stat.S_ISDIR(job_info.st_mode):
+            raise BundleError(
+                "SYMLINK", "evidence destination is not a directory"
+            )
+        if bundle.is_symlink():
+            raise BundleError("SYMLINK", "evidence generation is a symlink")
         info = write_bundle(
             temporary,
             job_id=context.job_id,
@@ -2217,13 +2349,11 @@ def _archive(
         return info.manifest_digest, str(bundle.resolve()), None
     except BundleError as error:
         shutil.rmtree(temporary, ignore_errors=True)
-        bundle = evidence_root / context.job_id_text
         if backup.exists() and not bundle.exists():
             backup.rename(bundle)
         return None, None, f"{error.reason_code}: {error.message}"
     except OSError as error:
         shutil.rmtree(temporary, ignore_errors=True)
-        bundle = evidence_root / context.job_id_text
         if backup.exists() and not bundle.exists():
             backup.rename(bundle)
         return None, None, f"EVIDENCE_WRITE_FAILED: {error}"
@@ -2409,8 +2539,11 @@ def _archive_only(dsn: str, context: ExecutionContext) -> ExecutionResult:
             "generation": context.generation,
             "recovered_archive_only": True,
             "probe": probe,
-            "builds": builds,
-            "replays": runs,
+            # Duplicated in report.json for diagnostics. Keep the exact same
+            # list shape so the verifier can require byte-level agreement
+            # instead of maintaining two unbound copies.
+            "builds": [dict(item) for item in builds.values()],
+            "replays": [dict(item) for item in runs],
             "attempts": attempt_rows,
         },
     )
@@ -2468,9 +2601,14 @@ def _archive_only(dsn: str, context: ExecutionContext) -> ExecutionResult:
             evidence_status="archived",
             stage="done",
         )
-    except state.StaleGeneration:
+    except (state.StateError, state.StaleGeneration):
+        # The bundle was published but the terminal row was not committed.
+        # Remove only this generation's directory so it cannot be cited as
+        # evidence for a state the database never accepted.
+        _discard_published_bundle(path)
         return ExecutionResult("STALE")
     if not finished:
+        _discard_published_bundle(path)
         return ExecutionResult("STALE")
     return ExecutionResult(
         final_state,
@@ -2803,8 +2941,10 @@ def run_execution(
         "plan_digest": context.plan_digest,
         "generation": generation,
         "probe": probe_payload,
-        "builds": builds,
-        "replays": runs,
+        # Mirror the report's list shapes exactly; _verify_semantics rejects a
+        # bundle whose execution metadata and report disagree.
+        "builds": [dict(item) for item in builds.values()],
+        "replays": [dict(item) for item in runs],
         "attempts": attempt_rows,
     }
     evidence_refs = [
@@ -2888,9 +3028,11 @@ def run_execution(
             evidence_status="archived",
             stage="done",
         )
-    except state.StaleGeneration:
+    except (state.StateError, state.StaleGeneration):
+        _discard_published_bundle(path)
         return ExecutionResult("STALE")
     if not finished:
+        _discard_published_bundle(path)
         return ExecutionResult("STALE")
     return ExecutionResult(
         final_state,
@@ -3332,9 +3474,11 @@ def _finish_blocked(
             last_error=error.message,
             stage="blocked",
         )
-    except state.StaleGeneration:
+    except (state.StateError, state.StaleGeneration):
+        _discard_published_bundle(path)
         return ExecutionResult("STALE")
     if not finished:
+        _discard_published_bundle(path)
         return ExecutionResult("STALE")
     return ExecutionResult(
         "BLOCKED",
@@ -3454,9 +3598,11 @@ def _finish_failed(
             last_error=error.message,
             stage="failed",
         )
-    except state.StaleGeneration:
+    except (state.StateError, state.StaleGeneration):
+        _discard_published_bundle(path)
         return ExecutionResult("STALE")
     if not finished:
+        _discard_published_bundle(path)
         return ExecutionResult("STALE")
     return ExecutionResult(
         terminal,

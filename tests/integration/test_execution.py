@@ -228,6 +228,14 @@ def run_with_fake(database, job, generation, tmp_path, sandbox, monkeypatch):
     )
 
 
+def _archived_manifests(evidence_root: Path):
+    """Return every published manifest below an evidence root, if any."""
+    root = Path(evidence_root)
+    if not root.exists() or not root.is_dir():
+        return []
+    return list(root.rglob("manifest.json"))
+
+
 def test_reproduced_execution_archives_six_replays(isolated_database, tmp_path, monkeypatch):
     job, digest, generation = prepare_approved_job(isolated_database, tmp_path)
     sandbox = FakeSandbox()
@@ -558,7 +566,7 @@ def test_archive_verifies_the_staged_bundle_before_publishing(
     assert current["state"] == "FAILED"
     assert current["evidence"]["available"] is False
     assert current["evidence"]["error"]
-    assert not (evidence_root / job["job_id"]).exists()
+    assert not _archived_manifests(evidence_root)
 
 
 @pytest.mark.parametrize("error_type", ["StaleGeneration", "StateError"])
@@ -1169,7 +1177,7 @@ def test_report_size_cap_prevents_archiving_an_invalid_bundle(
     assert current["evidence"]["available"] is False
     assert current["evidence"]["status"] != "archived"
     assert current["evidence"]["error"]
-    assert not (tmp_path / "evidence" / job["job_id"]).exists()
+    assert not _archived_manifests(tmp_path / "evidence")
 
 
 def test_attempt_result_metadata_is_bounded(isolated_database, tmp_path):
@@ -1332,7 +1340,7 @@ def test_archive_fence_loss_returns_stale_without_publishing(
     current = status(isolated_database.dsn, job["job_id"])
     assert current["state"] == "ARCHIVING"
     assert current["verdict"] is None
-    assert not (tmp_path / "evidence" / job["job_id"]).exists()
+    assert not _archived_manifests(tmp_path / "evidence")
     assert not list((tmp_path / "evidence").glob(".*.generation-*.tmp-*"))
 
 
@@ -1581,7 +1589,7 @@ def test_archive_only_rejects_nested_evidence_root(
     assert current["evidence"]["available"] is False
     assert "EVIDENCE_WRITE_FAILED" in current["evidence"]["error"]
     assert not (run_root / "evidence").exists()
-    assert not (run_root / "evidence" / job["job_id"]).exists()
+    assert not _archived_manifests(run_root / "evidence")
 
 
 def test_default_secret_outside_run_root_still_works(
@@ -1643,7 +1651,7 @@ def test_evidence_path_failure_returns_stale_when_finish_is_not_committed(
     assert outcome.state == "STALE"
     current = status(isolated_database.dsn, job["job_id"])
     assert current["state"] == "RUNNING"
-    assert not (run_root / "evidence" / job["job_id"]).exists()
+    assert not _archived_manifests(run_root / "evidence")
 
 
 def test_blocked_context_reload_failure_returns_stale_when_finish_is_not_committed(
@@ -1841,7 +1849,7 @@ def test_blocked_reload_uses_the_callers_run_root(
     assert current["evidence"]["available"] is False
     assert "EVIDENCE_WRITE_FAILED" in current["evidence"]["error"]
     assert not evidence_root.exists()
-    assert not (run_root / "evidence" / job["job_id"]).exists()
+    assert not _archived_manifests(run_root / "evidence")
 
 
 def test_failed_archive_clears_the_current_verdict(
@@ -1892,3 +1900,43 @@ def test_failed_archive_clears_the_current_verdict(
     ).fetchone()
     assert row[0] == "REPRODUCED"
     assert row[1] == "failed"
+
+
+# ---------------------------------------------------------------------------
+# B1/SF8: evidence is generation-scoped and rolled back when the terminal row
+# was not committed.
+# ---------------------------------------------------------------------------
+
+
+def test_archive_publish_then_finish_false_rolls_back_generation_bundle(
+    isolated_database, tmp_path, monkeypatch
+):
+    job, _, generation = prepare_approved_job(isolated_database, tmp_path)
+    evidence_root = tmp_path / "evidence"
+    _finish_returns_false(monkeypatch)
+
+    outcome = run_with_fake(
+        isolated_database, job, generation, tmp_path, FakeSandbox(), monkeypatch
+    )
+
+    assert outcome.state == "STALE", outcome
+    current = status(isolated_database.dsn, job["job_id"])
+    assert current["state"] == "ARCHIVING"
+    assert current["verdict"] is None
+    assert current["evidence"] is None or current["evidence"]["available"] is False
+
+    row = isolated_database.connection.execute(
+        "SELECT state, evidence_path, evidence_status, verdict FROM jobs "
+        "WHERE job_id = %s",
+        (UUID(job["job_id"]),),
+    ).fetchone()
+    assert row["state"] == "ARCHIVING"
+    assert row["evidence_path"] is None
+    assert row["evidence_status"] is None
+    assert row["verdict"] is None
+
+    # The published generation directory was this worker's own; it must be
+    # removed, and no other generation directory may exist.
+    job_root = evidence_root / job["job_id"]
+    assert not (job_root / f"generation-{generation}").exists()
+    assert not _archived_manifests(evidence_root)
