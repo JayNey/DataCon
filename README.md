@@ -66,7 +66,7 @@ for migration in migrations/*.sql; do
 done
 ```
 
-本机有 `psql` 时也可以逐个执行 `psql -v ON_ERROR_STOP=1 "$DATACON_DATABASE_URL" -f "$migration"`。六个迁移都可重复执行，但任一语句失败会立即中止并返回非 0；`001`、`002` 只增量加列和表，不删除 T01/T02 的任务；`003` 在不丢数据的前提下把旧 `002` 的 `attempts` 唯一键升级为包含 `generation` 的形状；`004` 只把旧 binary 任务的 `workflow_synced` 回填为 `true`；`005` 只增加 `verdict`、`verdict_reason` 和证据归档字段及约束；`006` 只增加可为空的 `attempts.attempt_token` 与索引，旧任务保持有效且不会被复用为无 provenance 的 journal。`005` / `006` 在事务开头取 `pg_advisory_xact_lock(hashtext('datacon:migrations'))`，并发执行同一迁移会串行等待，不会因 `ADD CONSTRAINT` 竞态失败。
+本机有 `psql` 时也可以逐个执行 `psql -v ON_ERROR_STOP=1 "$DATACON_DATABASE_URL" -f "$migration"`。七个迁移都可重复执行，但任一语句失败会立即中止并返回非 0；`001`、`002` 只增量加列和表，不删除 T01/T02 的任务；`003` 在不丢数据的前提下把旧 `002` 的 `attempts` 唯一键升级为包含 `generation` 的形状；`004` 只把旧 binary 任务的 `workflow_synced` 回填为 `true`；`005` 只增加 `verdict`、`verdict_reason` 和证据归档字段及约束；`006` 只增加可为空的 `attempts.attempt_token` 与索引，旧任务保持有效且不会被复用为无 provenance 的 journal；`007` 先把违反“归档证据不变量”（`evidence_status = 'archived'` 但缺 `evidence_path` / `evidence_digest`，或非 `'archived'` 却残留 `verdict` / `verdict_reason` / `evidence_path` / `evidence_digest`）的旧行清理为 `evidence_status = 'failed'` 且相关列置空，再添加 `jobs_archived_evidence_check` 与 `jobs_failed_evidence_no_verdict_check` 约束。`005` / `006` / `007` 在事务开头取 `pg_advisory_xact_lock(hashtext('datacon:migrations'))`，并发执行同一迁移会串行等待，不会因 `ADD CONSTRAINT` 竞态失败。
 
 发布说明（迁移锁）：`002` 的 `CREATE INDEX` 会短暂阻塞写入，`003` 的 `ADD CONSTRAINT ... UNIQUE` 需要扫描并重写 `attempts` 的索引，在大型表上会持有强锁。对已有大量数据的部署应在维护窗口执行，或先评估“`CREATE UNIQUE INDEX CONCURRENTLY` + 以现有唯一索引挂接约束”的方案；`CONCURRENTLY` 不能在事务块内运行，也不能与当前按文件整段执行的迁移脚本混用。本仓库的合成数据集很小，不在迁移中自动切换，以免改变可审计的建表顺序。
 
@@ -325,7 +325,7 @@ src/datacon/
   tools/sandbox.py      一次性 Docker 隔离探针、构建与回放
   data/cases/           wheel 默认案例注册表与合成材料
   data/seccomp/         固定 seccomp profile（计划记录其 canonical 摘要）
-migrations/             001 任务表、002 工作流增量、003 attempts 代次键升级、004 旧 binary 回填、005 判定 / 证据、006 journal provenance token
+migrations/             001 任务表、002 工作流增量、003 attempts 代次键升级、004 旧 binary 回填、005 判定 / 证据、006 journal provenance token、007 归档证据不变量修复与 CHECK
 examples/               示例请求
 tests/contract/         请求、计划、Agent、分析、判定、证据、沙箱策略、wheel 与案例材料 / B03
 tests/integration/      真实 PostgreSQL CLI / 审核 / 恢复 / 重试 / 迁移 / 执行 / ASan 回放

@@ -49,7 +49,10 @@ BEGIN
           AND conname = 'jobs_failed_evidence_no_verdict_check'
     ) THEN
         ALTER TABLE jobs ADD CONSTRAINT jobs_failed_evidence_no_verdict_check
-            CHECK (NOT (evidence_status = 'failed' AND verdict IS NOT NULL));
+            CHECK (
+                (verdict IS NULL AND verdict_reason IS NULL)
+                OR evidence_status = 'archived'
+            );
     END IF;
 END $$;
 
