@@ -19,7 +19,7 @@ import stat
 import uuid
 from typing import Any, Callable, Mapping
 
-from datacon import contracts, jsonutil
+from datacon import contracts, fileio, jsonutil
 from datacon.asan import has_asan_diagnostic, parse_asan, signature_matches
 from datacon.verdict import (
     reason_allowed,
@@ -33,6 +33,11 @@ MAX_FILE_BYTES = 128 * 1024 * 1024
 # offline verifier allocate MAX_FILES * MAX_FILE_BYTES.
 MAX_TOTAL_BYTES = 256 * 1024 * 1024
 MAX_FILES = 4096
+# ``os.walk`` sees directories as well as files, and a verifier must not
+# traverse an unbounded tree before reporting an extra entry. A small margin
+# above the manifest cap keeps legitimate bundles with helper directories
+# verifiable while still failing fast.
+MAX_BUNDLE_ENTRIES = MAX_FILES + 64
 MAX_ROLE_LENGTH = 64
 import re
 
@@ -80,6 +85,18 @@ _FULL_EVIDENCE_VERDICTS = frozenset(
 _REPLAY_VERSIONS = ("vulnerable", "fixed")
 _REPLAY_PHASES = ("normal", "candidate_1", "candidate_2")
 _CANDIDATE_PHASES = ("candidate_1", "candidate_2")
+# The probe report only carries the resource fields the container actually
+# observed; the plan additionally contains timing budgets.
+_PROBE_LIMIT_FIELDS = ("cpu", "memory_mib", "pids", "scratch_mib")
+# A completed probe must prove the controls the executor relies on. Extra
+# fields are allowed so the probe can grow, but these cannot be omitted.
+_PROBE_CHECK_FIELDS = (
+    "uid",
+    "seccomp",
+    "no_new_privs",
+    "cap_eff",
+    "cgroup_version",
+)
 _REASON_CODE = re.compile(r"[A-Z][A-Z0-9_]{0,63}")
 _WINDOWS_DRIVE = re.compile(r"^[A-Za-z]:")
 
@@ -164,12 +181,28 @@ def _read_artifact(value: bytes | bytearray | memoryview | Path | str) -> bytes:
         data = bytes(value)
     else:
         path = Path(value)
-        if path.is_symlink():
-            raise BundleError("SYMLINK", f"artifact is a symlink: {path}")
+        # Bound the read from the actual inode instead of calling
+        # ``read_bytes`` first: a huge artifact must not be loaded into memory
+        # just to be rejected against the size cap.
         try:
-            data = path.read_bytes()
+            info = path.lstat()
         except OSError as error:
-            raise BundleError("MISSING_FILE", f"artifact is not readable: {error}") from error
+            raise BundleError(
+                "MISSING_FILE", f"artifact is not readable: {error}"
+            ) from error
+        if stat.S_ISLNK(info.st_mode):
+            raise BundleError("SYMLINK", f"artifact is a symlink: {path}")
+        if not stat.S_ISREG(info.st_mode):
+            raise BundleError(
+                "MISSING_FILE", f"artifact is not a regular file: {path}"
+            )
+        if info.st_size > MAX_FILE_BYTES:
+            raise BundleError("FILE_TOO_LARGE", "bundle file exceeds the size cap")
+        data = _read_bounded(path, expected_size=info.st_size)
+        if len(data) != info.st_size:
+            raise BundleError(
+                "DIGEST_MISMATCH", f"artifact changed while reading: {path}"
+            )
     if len(data) > MAX_FILE_BYTES:
         raise BundleError("FILE_TOO_LARGE", "bundle file exceeds the size cap")
     return data
@@ -178,19 +211,29 @@ def _read_artifact(value: bytes | bytearray | memoryview | Path | str) -> bytes:
 def _read_bounded(path: Path, *, expected_size: int) -> bytes:
     """Read at most ``expected_size + 1`` bytes from a regular file.
 
-    Callers stat the file first, but a concurrent writer can still grow it.
-    The bounded read guarantees the verifier never buffers more than the
-    manifest declares (plus one byte to detect growth).
+    Callers stat the file first, but a concurrent writer can still swap the
+    path for a FIFO or grow it. The shared ``fileio`` helper opens with
+    ``O_NOFOLLOW|O_NONBLOCK`` and checks ``fstat`` before reading, so a FIFO can
+    never block the offline verifier and a symlink is rejected outright. The
+    bounded read guarantees the verifier never buffers more than the manifest
+    declares (plus one byte to detect growth).
     """
     try:
-        with path.open("rb") as handle:
-            data = handle.read(expected_size + 1)
-            extra = handle.read(1)
-    except OSError as error:
-        raise BundleError("MISSING_FILE", f"file is not readable: {path}") from error
-    if extra:
-        raise BundleError("DIGEST_MISMATCH", f"file grew while reading: {path}")
-    return data
+        return fileio.read_regular_file_bounded(path, max_bytes=expected_size)
+    except fileio.UnsafeFileError as error:
+        if error.kind == "SYMLINK":
+            raise BundleError("SYMLINK", f"file is a symlink: {path}") from error
+        if error.kind == "NOT_REGULAR":
+            raise BundleError(
+                "INVALID_MANIFEST", f"file is not a regular file: {path}"
+            ) from error
+        if error.kind in ("TOO_LARGE", "CHANGED"):
+            raise BundleError(
+                "DIGEST_MISMATCH", f"file changed while reading: {path}"
+            ) from error
+        raise BundleError(
+            "MISSING_FILE", f"file is not readable: {path}"
+        ) from error
 
 
 def write_bundle(
@@ -431,35 +474,6 @@ def _reason_code_valid(report: Mapping[str, Any]) -> str | None:
     if not isinstance(reason, str) or not _REASON_CODE.fullmatch(reason):
         raise BundleError("INVALID_MANIFEST", "report reason_code is invalid")
     return reason
-
-
-def _validate_report_replays(report: Mapping[str, Any]) -> set[tuple[str, str]]:
-    replays = report.get("replays")
-    if not isinstance(replays, list):
-        raise BundleError("INVALID_MANIFEST", "report replays must be a list")
-    keys: set[tuple[str, str]] = set()
-    for item in replays:
-        if not isinstance(item, Mapping):
-            raise BundleError("INVALID_MANIFEST", "report replay must be an object")
-        version = item.get("version")
-        phase = item.get("phase")
-        if version not in _REPLAY_VERSIONS or phase not in _REPLAY_PHASES:
-            raise BundleError(
-                "INVALID_MANIFEST",
-                f"report replay has an unknown version/phase: {version}/{phase}",
-            )
-        key = (version, phase)
-        if key in keys:
-            raise BundleError(
-                "INVALID_MANIFEST",
-                f"report contains a duplicate replay: {version}/{phase}",
-            )
-        keys.add(key)
-        if not isinstance(item.get("status"), str):
-            raise BundleError(
-                "INVALID_MANIFEST", f"report replay {version}/{phase} has no status"
-            )
-    return keys
 
 
 def _require_evidence_roles(
@@ -1402,6 +1416,96 @@ def _verify_semantics(
                 "INVALID_MANIFEST",
                 f"probe metadata {field} does not match execution metadata",
             )
+    # A completed probe is only evidence of the approved environment if every
+    # observed control is bound to the frozen plan. A probe that merely ran is
+    # not enough: image, resource limits and the security checks must match.
+    probe_image = probe.get("image_digest")
+    if probe_image != plan.get("image_digest"):
+        raise BundleError(
+            "DIGEST_MISMATCH",
+            "probe metadata image_digest does not match the plan",
+        )
+    probe_limits = probe.get("limits")
+    if not isinstance(probe_limits, Mapping) or set(probe_limits) != set(
+        _PROBE_LIMIT_FIELDS
+    ):
+        raise BundleError(
+            "INVALID_MANIFEST",
+            "probe metadata limits must contain exactly "
+            + ", ".join(_PROBE_LIMIT_FIELDS),
+        )
+    plan_limits = plan.get("limits")
+    if not isinstance(plan_limits, Mapping):
+        raise BundleError("INVALID_MANIFEST", "plan limits are missing")
+    for field in _PROBE_LIMIT_FIELDS:
+        if (
+            type(probe_limits[field]) is not int
+            or probe_limits[field] != plan_limits.get(field)
+        ):
+            raise BundleError(
+                "INVALID_MANIFEST",
+                f"probe metadata limit {field} does not match the plan",
+            )
+    probe_checks = probe.get("checks")
+    if not isinstance(probe_checks, Mapping) or not probe_checks:
+        raise BundleError(
+            "INVALID_MANIFEST", "probe metadata checks must be a non-empty object"
+        )
+    missing_checks = [
+        field for field in _PROBE_CHECK_FIELDS if field not in probe_checks
+    ]
+    if missing_checks:
+        raise BundleError(
+            "INVALID_MANIFEST",
+            "probe metadata is missing security checks: "
+            + ", ".join(missing_checks),
+        )
+    if "errors" in probe_checks and probe_checks["errors"] != []:
+        raise BundleError(
+            "INVALID_MANIFEST",
+            "probe metadata records failed security checks",
+        )
+    plan_isolation = plan.get("isolation")
+    if not isinstance(plan_isolation, Mapping):
+        raise BundleError("INVALID_MANIFEST", "plan isolation is missing")
+    expected_uid = str(plan_isolation.get("user", "")).split(":")[0]
+    if probe_checks["uid"] != expected_uid:
+        raise BundleError(
+            "INVALID_MANIFEST", "probe metadata uid does not match the plan"
+        )
+    if probe_checks["seccomp"] != "2":
+        raise BundleError(
+            "INVALID_MANIFEST", "probe metadata seccomp mode is not enabled"
+        )
+    if probe_checks["no_new_privs"] != "1":
+        raise BundleError(
+            "INVALID_MANIFEST",
+            "probe metadata no_new_privs is not effective",
+        )
+    try:
+        effective_capabilities = int(str(probe_checks["cap_eff"]), 16)
+    except (TypeError, ValueError) as error:
+        raise BundleError(
+            "INVALID_MANIFEST",
+            "probe metadata cap_eff is not a hexadecimal value",
+        ) from error
+    if effective_capabilities != 0:
+        raise BundleError(
+            "INVALID_MANIFEST", "probe metadata cap_eff is not empty"
+        )
+    if str(probe_checks["cgroup_version"]) not in ("1", "2"):
+        raise BundleError(
+            "INVALID_MANIFEST", "probe metadata cgroup_version is not supported"
+        )
+    if (
+        "probe" in execution_metadata
+        and execution_metadata["probe"] is not None
+        and execution_metadata["probe"] != probe
+    ):
+        raise BundleError(
+            "INVALID_MANIFEST",
+            "execution metadata probe does not match metadata/probe.json",
+        )
 
     report_repository = report.get("repository")
     if report_repository != plan.get("repository"):
@@ -1434,6 +1538,11 @@ def _verify_semantics(
     if environment.get("asan_options") != plan.get("asan_options"):
         raise BundleError(
             "INVALID_MANIFEST", "report environment ASan options do not match the plan"
+        )
+    if environment.get("isolation") != plan.get("isolation"):
+        raise BundleError(
+            "INVALID_MANIFEST",
+            "report environment isolation does not match the plan",
         )
 
     case_config, materials, recipe = _case_binding(plan, listed, data)
@@ -1491,8 +1600,18 @@ def verify_bundle(root: Path | str) -> BundleVerification:
 
     listed = {entry["path"]: entry for entry in entries}
     actual: dict[str, Path] = {}
+    entries_seen = 0
     for current_root, directories, filenames in os.walk(root_path, followlinks=False):
         current = Path(current_root)
+        # Count directories and files as we descend. A tree crafted with
+        # thousands of empty directories must fail before the walk finishes,
+        # not after every entry has been enumerated.
+        entries_seen += len(directories) + len(filenames)
+        if entries_seen > MAX_BUNDLE_ENTRIES:
+            raise BundleError(
+                "INVALID_MANIFEST",
+                f"bundle contains more than {MAX_BUNDLE_ENTRIES} directory entries",
+            )
         for name in directories:
             child = current / name
             if child.is_symlink():

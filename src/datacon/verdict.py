@@ -203,7 +203,7 @@ def decide_verdict(
     runs: Sequence[RunObservation],
     *,
     builds: Mapping[str, Mapping[str, Any]] | None = None,
-    expected_inputs: Mapping[str, str] | None = None,
+    expected_inputs: Mapping[str | tuple[str, str], str] | None = None,
 ) -> VerdictDecision:
     """Apply the SRS priority order to the six required observations."""
     checks: dict[str, Any] = {

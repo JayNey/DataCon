@@ -77,11 +77,25 @@ class FakeSandbox:
         self.probes += 1
         return ProbeReport(
             ok=True,
-            checks={"uid": "65534", "seccomp": "2", "routes": ""},
+            checks={
+                "uid": "65534",
+                "seccomp": "2",
+                "seccomp_filters": "1",
+                "no_new_privs": "1",
+                "cap_eff": "0",
+                "cgroup_version": "2",
+                "routes": "",
+                "errors": [],
+            },
             compiler_version="Debian clang version 19.1.7",
-            image_digest="sha256:" + "a" * 64,
+            image_digest=IMAGE_DIGEST,
             raw="uid=65534\nseccomp=2\n",
-            limits={},
+            limits={
+                "cpu": 2,
+                "memory_mib": 2048,
+                "pids": 128,
+                "scratch_mib": 512,
+            },
         )
 
     def build(
@@ -1573,3 +1587,319 @@ def test_default_secret_outside_run_root_still_works(
     )
     assert outcome.state == "REPRODUCED", outcome
     assert (tmp_path / ".datacon-journal-secret").is_file()
+
+
+class ProbePolicySandbox(FakeSandbox):
+    def probe(self, *, deadline_seconds):
+        raise SandboxPolicyError("injected isolation failure")
+
+
+class BuildFailureSandbox(FakeSandbox):
+    def build(self, *args, **kwargs):
+        raise execution.ExecutionFailed("BUILD_FAILED", "injected build failure")
+
+
+def _finish_returns_false(monkeypatch):
+    monkeypatch.setattr(
+        execution.state, "finish_execution", lambda *args, **kwargs: False
+    )
+
+
+def test_evidence_path_failure_returns_stale_when_finish_is_not_committed(
+    isolated_database, tmp_path, monkeypatch
+):
+    job, _, generation = prepare_approved_job(isolated_database, tmp_path)
+    run_root = tmp_path / "runs"
+    monkeypatch.setenv("DATACON_RUN_ROOT", str(run_root))
+    monkeypatch.setenv("DATACON_EVIDENCE_ROOT", str(run_root / "evidence"))
+    monkeypatch.delenv("DATACON_JOURNAL_SECRET_FILE", raising=False)
+    _finish_returns_false(monkeypatch)
+
+    outcome = execution.run_execution(
+        isolated_database.dsn,
+        UUID(job["job_id"]),
+        generation,
+        run_root=run_root,
+        sandbox=FakeSandbox(),
+    )
+
+    assert outcome.state == "STALE"
+    current = status(isolated_database.dsn, job["job_id"])
+    assert current["state"] == "RUNNING"
+    assert not (run_root / "evidence" / job["job_id"]).exists()
+
+
+def test_blocked_context_reload_failure_returns_stale_when_finish_is_not_committed(
+    isolated_database, tmp_path, monkeypatch
+):
+    job, _, generation = prepare_approved_job(isolated_database, tmp_path)
+
+    def block(*args, **kwargs):
+        raise execution.ExecutionBlocked("POLICY_DENIED", "injected block")
+
+    monkeypatch.setattr(execution, "_load_context", block)
+    _finish_returns_false(monkeypatch)
+
+    outcome = execution.run_execution(
+        isolated_database.dsn,
+        UUID(job["job_id"]),
+        generation,
+        run_root=tmp_path / "runs",
+        sandbox=FakeSandbox(),
+    )
+
+    assert outcome.state == "STALE"
+    current = status(isolated_database.dsn, job["job_id"])
+    assert current["state"] == "RUNNING"
+
+
+def test_archive_only_incomplete_returns_stale_when_finish_is_not_committed(
+    isolated_database, tmp_path, monkeypatch
+):
+    job, _, generation = prepare_approved_job(isolated_database, tmp_path)
+    job_uuid = UUID(job["job_id"])
+    isolated_database.connection.execute(
+        "UPDATE jobs SET state = 'ARCHIVING', stage = 'archive', "
+        "lease_owner = 'archive-only', lease_expires_at = now() + interval '10 minutes', "
+        "execute_deadline_at = now() - interval '1 minute' WHERE job_id = %s",
+        (job_uuid,),
+    )
+    run_root = tmp_path / "runs"
+    monkeypatch.setenv("DATACON_EVIDENCE_ROOT", str(tmp_path / "evidence"))
+    monkeypatch.delenv("DATACON_JOURNAL_SECRET_FILE", raising=False)
+    _finish_returns_false(monkeypatch)
+
+    class ExplodingSandbox:
+        def __getattr__(self, name):
+            def fail(*args, **kwargs):
+                raise AssertionError(f"archive recovery started a container: {name}")
+
+            return fail
+
+    outcome = execution.run_execution(
+        isolated_database.dsn,
+        job_uuid,
+        generation,
+        run_root=run_root,
+        sandbox=ExplodingSandbox(),
+    )
+
+    assert outcome.state == "STALE"
+    current = status(isolated_database.dsn, job["job_id"])
+    assert current["state"] == "ARCHIVING"
+
+
+def test_archive_only_archive_error_returns_stale_when_finish_is_not_committed(
+    isolated_database, tmp_path, monkeypatch
+):
+    job, _, generation = prepare_approved_job(isolated_database, tmp_path)
+    first = run_with_fake(
+        isolated_database, job, generation, tmp_path, FakeSandbox(), monkeypatch
+    )
+    assert first.state == "REPRODUCED", first
+    job_uuid = UUID(job["job_id"])
+    isolated_database.connection.execute(
+        "UPDATE jobs SET state = 'ARCHIVING', stage = 'archive', generation = %s, "
+        "lease_owner = 'archive-only', lease_expires_at = now() + interval '10 minutes', "
+        "execute_deadline_at = now() - interval '1 minute' WHERE job_id = %s",
+        (generation, job_uuid),
+    )
+    monkeypatch.setattr(
+        execution,
+        "_archive",
+        lambda *args, **kwargs: (
+            None,
+            None,
+            "EVIDENCE_WRITE_FAILED: injected archive failure",
+        ),
+    )
+    _finish_returns_false(monkeypatch)
+
+    outcome = execution.run_execution(
+        isolated_database.dsn,
+        job_uuid,
+        generation,
+        run_root=tmp_path / "runs",
+        sandbox=FakeSandbox(),
+    )
+
+    assert outcome.state == "STALE"
+    current = status(isolated_database.dsn, job["job_id"])
+    assert current["state"] == "ARCHIVING"
+
+
+def test_blocked_archive_error_returns_stale_when_finish_is_not_committed(
+    isolated_database, tmp_path, monkeypatch
+):
+    job, _, generation = prepare_approved_job(isolated_database, tmp_path)
+    monkeypatch.setattr(
+        execution,
+        "_archive",
+        lambda *args, **kwargs: (
+            None,
+            None,
+            "EVIDENCE_WRITE_FAILED: injected archive failure",
+        ),
+    )
+    _finish_returns_false(monkeypatch)
+
+    outcome = run_with_fake(
+        isolated_database,
+        job,
+        generation,
+        tmp_path,
+        ProbePolicySandbox(),
+        monkeypatch,
+    )
+
+    assert outcome.state == "STALE"
+    current = status(isolated_database.dsn, job["job_id"])
+    assert current["state"] == "RUNNING"
+
+
+def test_failed_archive_error_returns_stale_when_finish_is_not_committed(
+    isolated_database, tmp_path, monkeypatch
+):
+    job, _, generation = prepare_approved_job(isolated_database, tmp_path)
+    monkeypatch.setattr(
+        execution,
+        "_archive",
+        lambda *args, **kwargs: (
+            None,
+            None,
+            "EVIDENCE_WRITE_FAILED: injected archive failure",
+        ),
+    )
+    _finish_returns_false(monkeypatch)
+
+    outcome = run_with_fake(
+        isolated_database,
+        job,
+        generation,
+        tmp_path,
+        BuildFailureSandbox(),
+        monkeypatch,
+    )
+
+    assert outcome.state == "STALE"
+    current = status(isolated_database.dsn, job["job_id"])
+    assert current["state"] == "RUNNING"
+
+
+def test_normal_archive_error_returns_stale_when_finish_is_not_committed(
+    isolated_database, tmp_path, monkeypatch
+):
+    job, _, generation = prepare_approved_job(isolated_database, tmp_path)
+    monkeypatch.setattr(
+        execution,
+        "_archive",
+        lambda *args, **kwargs: (
+            None,
+            None,
+            "EVIDENCE_WRITE_FAILED: injected archive failure",
+        ),
+    )
+    _finish_returns_false(monkeypatch)
+
+    outcome = run_with_fake(
+        isolated_database, job, generation, tmp_path, FakeSandbox(), monkeypatch
+    )
+
+    assert outcome.state == "STALE"
+    current = status(isolated_database.dsn, job["job_id"])
+    assert current["state"] == "RUNNING"
+
+
+def test_blocked_reload_uses_the_callers_run_root(
+    isolated_database, tmp_path, monkeypatch
+):
+    job, _, generation = prepare_approved_job(isolated_database, tmp_path)
+    run_root = tmp_path / "custom-runs"
+    evidence_root = run_root / "evidence"
+    monkeypatch.setenv("DATACON_EVIDENCE_ROOT", str(evidence_root))
+    monkeypatch.delenv("DATACON_JOURNAL_SECRET_FILE", raising=False)
+    real_load = execution._load_context
+    calls = []
+
+    def fail_once(dsn, job_id, generation_value, *, case_root, run_root):
+        calls.append({"case_root": case_root, "run_root": run_root})
+        if len(calls) == 1:
+            raise execution.ExecutionBlocked("POLICY_DENIED", "transient block")
+        return real_load(
+            dsn,
+            job_id,
+            generation_value,
+            case_root=case_root,
+            run_root=run_root,
+        )
+
+    monkeypatch.setattr(execution, "_load_context", fail_once)
+
+    outcome = execution.run_execution(
+        isolated_database.dsn,
+        UUID(job["job_id"]),
+        generation,
+        run_root=run_root,
+        sandbox=FakeSandbox(),
+    )
+
+    assert outcome.state == "FAILED"
+    assert outcome.reason_code == "EVIDENCE_WRITE_FAILED"
+    assert len(calls) >= 2
+    assert calls[1]["run_root"] == run_root
+    current = status(isolated_database.dsn, job["job_id"])
+    assert current["state"] == "FAILED"
+    assert current["evidence"]["available"] is False
+    assert "EVIDENCE_WRITE_FAILED" in current["evidence"]["error"]
+    assert not evidence_root.exists()
+    assert not (run_root / "evidence" / job["job_id"]).exists()
+
+
+def test_failed_archive_clears_the_current_verdict(
+    isolated_database, tmp_path, monkeypatch
+):
+    job, _, generation = prepare_approved_job(isolated_database, tmp_path)
+    first = run_with_fake(
+        isolated_database, job, generation, tmp_path, FakeSandbox(), monkeypatch
+    )
+    assert first.state == "REPRODUCED", first
+    current = status(isolated_database.dsn, job["job_id"])
+    assert current["verdict"] == "REPRODUCED"
+    assert current["verdict_current"] is True
+
+    job_uuid = UUID(job["job_id"])
+    isolated_database.connection.execute(
+        "UPDATE jobs SET state = 'RUNNING', stage = 'execute', generation = %s, "
+        "lease_owner = 'retrying-worker', "
+        "lease_expires_at = now() + interval '10 minutes', "
+        "execute_deadline_at = now() + interval '10 minutes', "
+        "workflow_synced = false WHERE job_id = %s",
+        (generation + 1, job_uuid),
+    )
+    evidence_file = tmp_path / "not-a-directory"
+    evidence_file.write_text("occupied", encoding="utf-8")
+    monkeypatch.setenv("DATACON_EVIDENCE_ROOT", str(evidence_file))
+    second = execution.run_execution(
+        isolated_database.dsn,
+        job_uuid,
+        generation + 1,
+        run_root=tmp_path / "runs",
+        sandbox=FakeSandbox(),
+    )
+    assert second.state == "FAILED", second
+    assert second.reason_code == "EVIDENCE_WRITE_FAILED"
+
+    current = status(isolated_database.dsn, job["job_id"])
+    assert current["state"] == "FAILED"
+    assert current["evidence"]["available"] is False
+    assert current["verdict"] is None
+    assert current["verdict_reason"] is None
+    assert current["verdict_current"] is False
+    # The row keeps the previous archived verdict for history, but the public
+    # status must not present it as the current result.
+    row = isolated_database.connection.execute(
+        "SELECT verdict, evidence_status FROM jobs WHERE job_id = %s",
+        (job_uuid,),
+    ).fetchone()
+    assert row[0] == "REPRODUCED"
+    assert row[1] == "failed"

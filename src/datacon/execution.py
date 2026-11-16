@@ -15,6 +15,7 @@ import hmac
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import stat
 import unicodedata
@@ -22,7 +23,7 @@ import uuid
 from typing import Any, Callable, Mapping, Sequence
 from uuid import UUID
 
-from datacon import contracts, jsonutil, state
+from datacon import contracts, fileio, jsonutil, state
 from datacon.cases import (
     MAX_MATERIAL_BYTES,
     CaseConfigurationError,
@@ -157,46 +158,17 @@ def _digest(data: bytes) -> str:
 def _read_run_file_bounded(path: Path, *, max_bytes: int) -> bytes | None:
     """Read a run-root file only after proving it is a small regular file.
 
-    Everything below ``DATACON_RUN_ROOT`` is attacker-writable. The file is
-    opened with ``O_NOFOLLOW`` and ``O_NONBLOCK`` and then checked with
-    ``fstat`` so a symlink swap or FIFO can neither redirect the read nor block
-    the worker. Rejecting an oversized or non-regular file *before* reading
-    prevents a huge journal, log or artifact from exhausting memory ahead of
-    digest/HMAC checks.
+    Everything below ``DATACON_RUN_ROOT`` is attacker-writable. The shared
+    ``fileio`` helper opens the leaf with ``O_NOFOLLOW`` and ``O_NONBLOCK`` and
+    then checks it with ``fstat`` so a symlink swap or FIFO can neither redirect
+    the read nor block the worker. Rejecting an oversized or non-regular file
+    *before* reading prevents a huge journal, log or artifact from exhausting
+    memory ahead of digest/HMAC checks.
     """
-    flags = (
-        os.O_RDONLY
-        | getattr(os, "O_NOFOLLOW", 0)
-        | getattr(os, "O_NONBLOCK", 0)
-    )
     try:
-        descriptor = os.open(path, flags)
-    except OSError:
+        return fileio.read_regular_file_bounded(path, max_bytes=max_bytes)
+    except fileio.UnsafeFileError:
         return None
-    try:
-        info = os.fstat(descriptor)
-        if not stat.S_ISREG(info.st_mode) or info.st_size > max_bytes:
-            return None
-        remaining = max_bytes + 1
-        chunks: list[bytes] = []
-        while remaining > 0:
-            chunk = os.read(descriptor, remaining)
-            if not chunk:
-                break
-            chunks.append(chunk)
-            remaining -= len(chunk)
-        data = b"".join(chunks)
-        if len(data) > max_bytes:
-            return None
-        if os.read(descriptor, 1):
-            return None
-        if len(data) != info.st_size:
-            return None
-        return data
-    except OSError:
-        return None
-    finally:
-        os.close(descriptor)
 
 
 def _stat_identity(path: Path, label: str) -> tuple[int, int] | None:
@@ -267,6 +239,143 @@ def _inside_run_root(path: Path, run_root: Path, label: str) -> bool:
         if parent == probe:
             return False
         probe = parent
+
+
+@dataclass(frozen=True)
+class _MountPoint:
+    """The subset of a ``/proc/self/mountinfo`` line used for containment."""
+
+    mount_id: int
+    parent_id: int
+    major_minor: str
+    root: Path
+    mount_point: Path
+
+
+_MOUNTINFO_ESCAPE = re.compile(r"\\([0-7]{3})")
+
+
+def _unescape_mountinfo(value: str) -> str:
+    def replace(match: re.Match[str]) -> str:
+        return chr(int(match.group(1), 8))
+
+    return _MOUNTINFO_ESCAPE.sub(replace, value)
+
+
+def _parse_mountinfo(text: str) -> tuple[_MountPoint, ...]:
+    """Parse mount IDs, roots and mount points from ``/proc/self/mountinfo``.
+
+    The parser is deliberately strict: a line that cannot be understood makes
+    the caller fail closed instead of silently dropping a mount that might
+    redirect the target under the run root.
+    """
+    entries: list[_MountPoint] = []
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        fields = line.split()
+        try:
+            separator = fields.index("-")
+        except ValueError as error:
+            raise ValueError("mountinfo line has no separator") from error
+        if separator < 6 or len(fields) < 7:
+            raise ValueError("mountinfo line is too short")
+        try:
+            mount_id = int(fields[0])
+            parent_id = int(fields[1])
+        except ValueError as error:
+            raise ValueError("mountinfo mount IDs are not integers") from error
+        major_minor = fields[2]
+        if ":" not in major_minor:
+            raise ValueError("mountinfo device is malformed")
+        root = Path(_unescape_mountinfo(fields[3]))
+        mount_point = Path(_unescape_mountinfo(fields[4]))
+        if not root.is_absolute() or not mount_point.is_absolute():
+            raise ValueError("mountinfo paths are not absolute")
+        entries.append(
+            _MountPoint(
+                mount_id=mount_id,
+                parent_id=parent_id,
+                major_minor=major_minor,
+                root=root,
+                mount_point=mount_point,
+            )
+        )
+    return tuple(entries)
+
+
+def _mount_point_for(entries: Sequence[_MountPoint], path: Path) -> _MountPoint | None:
+    best: _MountPoint | None = None
+    for entry in entries:
+        if path == entry.mount_point or entry.mount_point in path.parents:
+            if best is None or len(entry.mount_point.parts) > len(
+                best.mount_point.parts
+            ):
+                best = entry
+    return best
+
+
+def _mountinfo_rejects(path: Path, run_root: Path, text: str) -> bool:
+    """Return whether mount relationships cannot prove ``path`` is outside.
+
+    A bind mount whose source subtree lives below the run root can expose
+    run-root content at a completely different path. For the mount that
+    contains ``path`` and the mount that contains ``run_root`` we reconstruct
+    each physical path from the mount root and compare them on the same
+    device. Different devices cannot contain each other, so that case is
+    provably outside. Anything unparseable or unprovable is rejected.
+    """
+    try:
+        entries = _parse_mountinfo(text)
+    except ValueError:
+        return True
+    if not entries:
+        return True
+    target_mount = _mount_point_for(entries, path)
+    root_mount = _mount_point_for(entries, run_root)
+    if target_mount is None or root_mount is None:
+        return True
+    if target_mount.major_minor != root_mount.major_minor:
+        return False
+    try:
+        target_physical = target_mount.root / path.relative_to(
+            target_mount.mount_point
+        )
+        root_physical = root_mount.root / run_root.relative_to(
+            root_mount.mount_point
+        )
+    except ValueError:
+        return True
+    if _lexically_within_run_root(target_physical, root_physical):
+        return True
+    # Check every mount that is an ancestor of the target as well. A bind
+    # mount whose source subtree lives below the run root is suspicious even
+    # when a deeper mount currently hides it; rejecting it is the fail-closed
+    # choice and costs nothing for ordinary system mounts (root "/" is never
+    # inside the run root).
+    for entry in entries:
+        if not (path == entry.mount_point or entry.mount_point in path.parents):
+            continue
+        if entry.major_minor != root_mount.major_minor:
+            continue
+        if _lexically_within_run_root(entry.root, root_physical):
+            return True
+    return False
+
+
+def _mountinfo_document() -> str | None:
+    """Read Linux mountinfo, or return ``None`` where the kernel lacks it."""
+    try:
+        return Path("/proc/self/mountinfo").read_text(
+            encoding="utf-8", errors="replace"
+        )
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        raise ExecutionFailed(
+            "EVIDENCE_WRITE_FAILED",
+            f"mount relationships cannot be inspected: {error}",
+        ) from error
 
 
 def _safe_name(value: str) -> str:
@@ -887,6 +996,15 @@ def _outside_run_root(path: Path, run_root: Path, label: str) -> Path:
             "EVIDENCE_WRITE_FAILED",
             f"{label} must live outside DATACON_RUN_ROOT",
         )
+    mountinfo = _mountinfo_document()
+    if mountinfo is not None and _mountinfo_rejects(
+        resolved, resolved_root, mountinfo
+    ):
+        raise ExecutionFailed(
+            "EVIDENCE_WRITE_FAILED",
+            f"{label} mount relationships cannot prove it lives outside "
+            "DATACON_RUN_ROOT",
+        )
     return resolved
 
 
@@ -1374,21 +1492,32 @@ def _write_journal(
     root = run_root.resolve()
     path.parent.mkdir(parents=True, exist_ok=True)
     parent = path.parent.resolve()
-    if parent != root and root not in parent.parents:
+    # The lexical check is not enough: a mount or a case-only alias can make
+    # the resolved string disagree with the directory identity. Reuse the
+    # device/inode containment check before writing any journal bytes.
+    if not _inside_run_root(parent, root, "journal path"):
         raise ExecutionFailed(
             "EVIDENCE_WRITE_FAILED", "journal path escaped the run root"
         )
     secret = _journal_secret(create=True, run_root=run_root)
-    assert secret is not None
+    if secret is None:
+        raise ExecutionFailed(
+            "EVIDENCE_WRITE_FAILED", "journal secret is unavailable"
+        )
     document = dict(payload)
     document["hmac"] = _journal_hmac(document, secret)
-    temporary = path.with_suffix(".tmp")
-    if temporary.is_symlink():
-        temporary.unlink()
-    temporary.write_text(
-        json.dumps(document, ensure_ascii=False, sort_keys=True), encoding="utf-8"
-    )
-    temporary.replace(path)
+    try:
+        fileio.write_regular_file_atomic(
+            path,
+            json.dumps(document, ensure_ascii=False, sort_keys=True).encode(
+                "utf-8"
+            ),
+            mode=0o600,
+        )
+    except fileio.UnsafeFileError as error:
+        raise ExecutionFailed(
+            "EVIDENCE_WRITE_FAILED", f"cannot write journal: {error.message}"
+        ) from error
     return path
 
 
@@ -1476,28 +1605,27 @@ def _find_reusable_journal(
 def _write_run_file(
     run_root: Path, path: Path, data: bytes, mode: int
 ) -> None:
-    """Write a file under the run root without following a planted symlink."""
+    """Write a file under the run root without following a planted symlink.
+
+    The leaf is opened with ``O_NOFOLLOW`` and the descriptor is used for
+    ``fchmod``/write, so the previous ``is_symlink``/``unlink``/``write_bytes``
+    sequence can no longer be redirected to an external target. A legacy mode
+    ``0555`` file is opened read-only and chmodded through its own descriptor
+    before the write is retried; a symlink always fails with
+    ``EVIDENCE_WRITE_FAILED``.
+    """
     root = run_root.resolve()
     path.parent.mkdir(parents=True, exist_ok=True)
     parent = path.parent.resolve()
     if parent != root and root not in parent.parents:
         raise ExecutionFailed("EVIDENCE_WRITE_FAILED", "run evidence path escaped its root")
-    if path.is_symlink():
-        path.unlink()
-    elif path.exists():
-        if path.is_dir():
-            raise ExecutionFailed(
-                "EVIDENCE_WRITE_FAILED", "run evidence path is a directory"
-            )
-        # A prior attempt may have chmod 0555 evidence. Replacing it must not
-        # follow a symlink or honour the old read-only mode.
-        path.unlink()
+    if not _inside_run_root(parent, root, "run evidence path"):
+        raise ExecutionFailed("EVIDENCE_WRITE_FAILED", "run evidence path escaped its root")
     try:
-        path.write_bytes(data)
-        path.chmod(mode)
-    except OSError as error:
+        fileio.write_regular_file(path, data, mode=mode)
+    except fileio.UnsafeFileError as error:
         raise ExecutionFailed(
-            "EVIDENCE_WRITE_FAILED", f"cannot write run evidence: {error}"
+            "EVIDENCE_WRITE_FAILED", f"cannot write run evidence: {error.message}"
         ) from error
 
 
@@ -2220,7 +2348,7 @@ def _archive_only(dsn: str, context: ExecutionContext) -> ExecutionResult:
         # any verdict already committed by a previous archive.
         reason = "EVIDENCE_INCOMPLETE: " + "; ".join(missing)
         try:
-            state.finish_execution(
+            finished = state.finish_execution(
                 dsn,
                 context.job_id,
                 generation=context.generation,
@@ -2234,6 +2362,8 @@ def _archive_only(dsn: str, context: ExecutionContext) -> ExecutionResult:
                 stage="failed",
             )
         except (state.StateError, state.StaleGeneration):
+            return ExecutionResult("STALE")
+        if not finished:
             return ExecutionResult("STALE")
         return ExecutionResult("INCONCLUSIVE", reason_code="EVIDENCE_INCOMPLETE")
 
@@ -2290,7 +2420,7 @@ def _archive_only(dsn: str, context: ExecutionContext) -> ExecutionResult:
         return ExecutionResult("STALE")
     if archive_error is not None:
         try:
-            state.finish_execution(
+            finished = state.finish_execution(
                 dsn,
                 context.job_id,
                 generation=context.generation,
@@ -2304,6 +2434,8 @@ def _archive_only(dsn: str, context: ExecutionContext) -> ExecutionResult:
                 stage="failed",
             )
         except (state.StateError, state.StaleGeneration):
+            return ExecutionResult("STALE")
+        if not finished:
             return ExecutionResult("STALE")
         return ExecutionResult("FAILED", reason_code="EVIDENCE_WRITE_FAILED")
     final_state = decision.verdict
@@ -2353,7 +2485,7 @@ def _finish_evidence_path_failure(
     being written into the run root or silently dropped.
     """
     try:
-        state.finish_execution(
+        finished = state.finish_execution(
             dsn,
             job_id,
             generation=generation,
@@ -2367,6 +2499,8 @@ def _finish_evidence_path_failure(
             stage="failed",
         )
     except (state.StateError, state.StaleGeneration):
+        return ExecutionResult("STALE")
+    if not finished:
         return ExecutionResult("STALE")
     return ExecutionResult("FAILED", reason_code=error.reason_code)
 
@@ -2390,8 +2524,16 @@ def run_execution(
         return ExecutionResult("STALE")
     except ExecutionBlocked as error:
         # The execution cannot start. The claim still has a lease, so archive
-        # the blocking reason and commit BLOCKED.
-        return _finish_blocked(dsn, job_id, generation, error)
+        # the blocking reason and commit BLOCKED. Reuse the caller's roots so
+        # a reload cannot drift to environment defaults.
+        return _finish_blocked(
+            dsn,
+            job_id,
+            generation,
+            error,
+            case_root=case_root,
+            run_root=run_root,
+        )
     except ExecutionFailed as error:
         return _finish_blocked_failed(dsn, job_id, generation, error)
 
@@ -2559,7 +2701,7 @@ def run_execution(
             # outcome. B3/B6 require an inconclusive state with no
             # authoritative verdict.
             try:
-                state.finish_execution(
+                finished = state.finish_execution(
                     dsn,
                     context.job_id,
                     generation=context.generation,
@@ -2575,6 +2717,8 @@ def run_execution(
                     stage="done",
                 )
             except (state.StateError, state.StaleGeneration):
+                return ExecutionResult("STALE")
+            if not finished:
                 return ExecutionResult("STALE")
             return ExecutionResult(
                 "INCONCLUSIVE",
@@ -2697,7 +2841,7 @@ def run_execution(
             # The computed decision is not published as authoritative until a
             # verifiable bundle exists. COALESCE in finish_execution therefore
             # only preserves a verdict from an earlier successful archive.
-            state.finish_execution(
+            finished = state.finish_execution(
                 dsn,
                 job_id,
                 generation=context.generation,
@@ -2714,6 +2858,8 @@ def run_execution(
             # Another generation owns the job now (or the lease expired while
             # archiving). Never let this escape to the workflow's generic
             # handler, which would leave the job looking recoverable RUNNING.
+            return ExecutionResult("STALE")
+        if not finished:
             return ExecutionResult("STALE")
         return ExecutionResult("FAILED", reason_code="EVIDENCE_WRITE_FAILED")
     final_state = decision.verdict
@@ -3037,6 +3183,8 @@ def _finish_blocked(
     generation: int,
     error: ExecutionBlocked,
     *,
+    case_root: str | None = None,
+    run_root: Path | str | None = None,
     context: ExecutionContext | None = None,
     probe: Mapping[str, Any] | None = None,
     builds: Mapping[str, Mapping[str, Any]] | None = None,
@@ -3045,18 +3193,44 @@ def _finish_blocked(
     """Archive the blocking reason, then commit BLOCKED.
 
     A block before the plan can be loaded still has a claimed RUNNING job; the
-    context is loaded again if possible so the report carries the target.
+    context is loaded again if possible so the report carries the target. The
+    caller's ``case_root``/``run_root`` are reused here: falling back to the
+    environment defaults would make ``_archive`` compare the evidence root
+    against a different run root and could publish a BLOCKED bundle into the
+    real run root.
     """
     if context is None:
         try:
             context = _load_context(
-                dsn, job_id, generation, case_root=None, run_root=None
+                dsn,
+                job_id,
+                generation,
+                case_root=case_root,
+                run_root=run_root,
             )
-        except (ExecutionBlocked, ExecutionFailed, state.StaleGeneration):
+        except state.StaleGeneration:
+            return ExecutionResult("STALE")
+        except ExecutionFailed as reload_error:
+            # The blocking context could not be reconstructed with the caller's
+            # roots. Never archive against guessed roots; keep the failure
+            # visible instead of publishing a bundle to the wrong tree.
+            return _finish_evidence_path_failure(
+                dsn,
+                job_id,
+                generation,
+                ExecutionFailed(
+                    "EVIDENCE_WRITE_FAILED",
+                    "execution context could not be reconstructed: "
+                    f"{reload_error.message}",
+                ),
+            )
+        except ExecutionBlocked:
+            # The same (or another) business block prevents reconstruction.
+            # There is no archive to misplace, so the original reason stands.
             context = None
     if context is None:
         try:
-            state.finish_execution(
+            finished = state.finish_execution(
                 dsn,
                 job_id,
                 generation=generation,
@@ -3068,6 +3242,8 @@ def _finish_blocked(
                 stage="blocked",
             )
         except (state.StateError, state.StaleGeneration):
+            return ExecutionResult("STALE")
+        if not finished:
             return ExecutionResult("STALE")
         return ExecutionResult("BLOCKED", reason_code=error.reason_code)
     work_root = context.run_root / context.job_id_text / context.plan_digest.split(":")[1]
@@ -3115,7 +3291,7 @@ def _finish_blocked(
             "last_error": error.message,
         }
         try:
-            state.finish_execution(
+            finished = state.finish_execution(
                 dsn,
                 job_id,
                 generation=generation,
@@ -3127,7 +3303,9 @@ def _finish_blocked(
                 **kwargs,
             )
         except (state.StateError, state.StaleGeneration):
-            pass
+            return ExecutionResult("STALE")
+        if not finished:
+            return ExecutionResult("STALE")
         return ExecutionResult("FAILED", reason_code="EVIDENCE_WRITE_FAILED")
     try:
         finished = state.finish_execution(
@@ -3160,7 +3338,7 @@ def _finish_blocked_failed(
     dsn: str, job_id: UUID, generation: int, error: ExecutionFailed
 ) -> ExecutionResult:
     try:
-        state.finish_execution(
+        finished = state.finish_execution(
             dsn,
             job_id,
             generation=generation,
@@ -3172,6 +3350,8 @@ def _finish_blocked_failed(
             stage="failed",
         )
     except (state.StateError, state.StaleGeneration):
+        return ExecutionResult("STALE")
+    if not finished:
         return ExecutionResult("STALE")
     return ExecutionResult("FAILED", reason_code=error.reason_code)
 
@@ -3231,7 +3411,7 @@ def _finish_failed(
         archive_error = str(archive_failure)
     if archive_error is not None:
         try:
-            state.finish_execution(
+            finished = state.finish_execution(
                 dsn,
                 job_id,
                 generation=generation,
@@ -3245,7 +3425,9 @@ def _finish_failed(
                 stage="failed",
             )
         except (state.StateError, state.StaleGeneration):
-            pass
+            return ExecutionResult("STALE")
+        if not finished:
+            return ExecutionResult("STALE")
         return ExecutionResult("FAILED", reason_code="EVIDENCE_WRITE_FAILED")
     try:
         finished = state.finish_execution(
@@ -3264,8 +3446,10 @@ def _finish_failed(
         )
     except state.StaleGeneration:
         return ExecutionResult("STALE")
+    if not finished:
+        return ExecutionResult("STALE")
     return ExecutionResult(
-        (terminal if finished else "STALE"),
+        terminal,
         verdict=terminal if incomplete else None,
         verdict_reason=error.reason_code if incomplete else None,
         reason_code=error.reason_code,

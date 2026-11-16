@@ -17,6 +17,8 @@ from datacon.contracts import plan_digest
 from datacon.evidence import (
     BundleError,
     _control_mismatch,
+    _read_artifact,
+    _read_bounded,
     canonical_manifest_digest,
     export_bundle,
     verify_bundle,
@@ -219,6 +221,28 @@ REPLAYS = [
     for phase in ("normal", "candidate_1", "candidate_2")
 ]
 
+PROBE = {
+    "tool_id": "sandbox.probe",
+    "job_id": JOB_ID,
+    "plan_digest": PLAN_DIGEST,
+    "generation": 1,
+    "status": "completed",
+    "image_digest": PLAN["image_digest"],
+    "limits": {
+        field: PLAN["limits"][field]
+        for field in ("cpu", "memory_mib", "pids", "scratch_mib")
+    },
+    "checks": {
+        "uid": "65534",
+        "seccomp": "2",
+        "seccomp_filters": "1",
+        "no_new_privs": "1",
+        "cap_eff": "0",
+        "cgroup_version": "2",
+        "errors": [],
+    },
+}
+
 REPORT = {
     "schema_version": 1,
     "job_id": JOB_ID,
@@ -243,6 +267,7 @@ REPORT = {
         "toolchain": dict(PLAN["toolchain"]),
         "asan_options": PLAN["asan_options"],
         "compile_args": list(COMPILE_ARGS),
+        "isolation": dict(PLAN["isolation"]),
         "probe": {"checks": {"seccomp": "2"}},
     },
     "builds": BUILDS,
@@ -278,16 +303,7 @@ def full_artifacts() -> dict[str, tuple[str, bytes]]:
         ),
         "metadata/probe.json": (
             "probe",
-            canonical(
-                {
-                    "tool_id": "sandbox.probe",
-                    "job_id": JOB_ID,
-                    "plan_digest": PLAN_DIGEST,
-                    "generation": 1,
-                    "status": "completed",
-                    "checks": {"seccomp": "2"},
-                }
-            ),
+            canonical(PROBE),
         ),
         "metadata/case.json": (
             "case_config",
@@ -806,12 +822,13 @@ def test_verify_accepts_distinct_stable_input_aliases(tmp_path):
         "probe",
         canonical(
             {
-                "tool_id": "sandbox.probe",
-                "job_id": JOB_ID,
+                **PROBE,
                 "plan_digest": variant_digest,
-                "generation": 1,
-                "status": "completed",
-                "checks": {"seccomp": "2"},
+                "image_digest": plan["image_digest"],
+                "limits": {
+                    field: plan["limits"][field]
+                    for field in ("cpu", "memory_mib", "pids", "scratch_mib")
+                },
             }
         ),
     )
@@ -934,6 +951,102 @@ def test_verify_rejects_probe_metadata_not_bound_to_execution(tmp_path):
     with pytest.raises(BundleError) as caught:
         verify_bundle(info.root)
     assert caught.value.reason_code == "INVALID_MANIFEST"
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"image_digest": None},
+        {"image_digest": "sha256:" + "9" * 64},
+        {"image_digest": "not-a-digest"},
+    ],
+    ids=["missing-image", "different-image", "malformed-image"],
+)
+def test_verify_rejects_probe_image_not_bound_to_plan(tmp_path, change):
+    info = make_bundle(tmp_path, name=f"probe-image-{uuid4().hex}")
+    probe = deepcopy(PROBE)
+    probe.update(change)
+    _rewrite_manifested_file(info.root, "metadata/probe.json", canonical(probe))
+    with pytest.raises(BundleError) as caught:
+        verify_bundle(info.root)
+    assert caught.value.reason_code == "DIGEST_MISMATCH"
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda probe: probe["limits"].pop("cpu"),
+        lambda probe: probe["limits"].update(cpu=1),
+        lambda probe: probe.update(limits={}),
+        lambda probe: probe.update(limits=None),
+    ],
+    ids=["missing-limit", "different-limit", "empty-limits", "null-limits"],
+)
+def test_verify_rejects_probe_limits_not_bound_to_plan(tmp_path, mutate):
+    info = make_bundle(tmp_path, name=f"probe-limits-{uuid4().hex}")
+    probe = deepcopy(PROBE)
+    mutate(probe)
+    _rewrite_manifested_file(info.root, "metadata/probe.json", canonical(probe))
+    with pytest.raises(BundleError) as caught:
+        verify_bundle(info.root)
+    assert caught.value.reason_code == "INVALID_MANIFEST"
+
+
+@pytest.mark.parametrize(
+    "checks",
+    [
+        {},
+        {"uid": "65534"},
+        {"uid": "65534", "seccomp": "2", "no_new_privs": "1", "cap_eff": "0"},
+        {
+            "uid": "65534",
+            "seccomp": "2",
+            "no_new_privs": "1",
+            "cap_eff": "0",
+            "cgroup_version": "2",
+            "errors": ["container uid is not the planned uid"],
+        },
+    ],
+    ids=["empty", "single-key", "missing-cgroup", "failed-check"],
+)
+def test_verify_rejects_incomplete_probe_checks(tmp_path, checks):
+    info = make_bundle(tmp_path, name=f"probe-checks-{uuid4().hex}")
+    probe = deepcopy(PROBE)
+    probe["checks"] = checks
+    _rewrite_manifested_file(info.root, "metadata/probe.json", canonical(probe))
+    with pytest.raises(BundleError) as caught:
+        verify_bundle(info.root)
+    assert caught.value.reason_code == "INVALID_MANIFEST"
+
+
+def test_verify_rejects_execution_probe_not_matching_probe_metadata(tmp_path):
+    info = make_bundle(tmp_path, name=f"probe-exec-{uuid4().hex}")
+    execution_metadata = {
+        "job_id": JOB_ID,
+        "plan_digest": PLAN_DIGEST,
+        "generation": 1,
+        "probe": {**PROBE, "generation": 2},
+    }
+    _rewrite_manifested_file(
+        info.root, "metadata/execution.json", canonical(execution_metadata)
+    )
+    with pytest.raises(BundleError) as caught:
+        verify_bundle(info.root)
+    assert caught.value.reason_code == "INVALID_MANIFEST"
+
+
+def test_verify_rejects_report_isolation_not_matching_plan(tmp_path):
+    info = make_bundle(tmp_path, name=f"probe-isolation-{uuid4().hex}")
+    report = json.loads((info.root / "report.json").read_text(encoding="utf-8"))
+    report["environment"]["isolation"] = {
+        **PLAN["isolation"],
+        "network": "bridge",
+    }
+    _rewrite_manifested_file(info.root, "report.json", canonical(report))
+    with pytest.raises(BundleError) as caught:
+        verify_bundle(info.root)
+    assert caught.value.reason_code == "INVALID_MANIFEST"
+    assert "isolation" in caught.value.message
 
 
 @pytest.mark.parametrize(
@@ -1801,3 +1914,56 @@ def test_truncated_replay_log_still_must_match_its_output_digests(tmp_path):
     with pytest.raises(BundleError) as caught:
         verify_bundle(info.root)
     assert caught.value.reason_code == "DIGEST_MISMATCH"
+
+
+def test_read_bounded_rejects_a_fifo_without_blocking(tmp_path):
+    fifo = tmp_path / "fifo"
+    os.mkfifo(fifo)
+
+    with pytest.raises(BundleError) as caught:
+        _read_bounded(fifo, expected_size=16)
+
+    assert caught.value.reason_code == "INVALID_MANIFEST"
+
+
+def test_read_bounded_uses_os_open_not_path_open(tmp_path, monkeypatch):
+    path = tmp_path / "artifact"
+    path.write_bytes(b"bounded")
+
+    def forbid_open(self, *args, **kwargs):
+        raise AssertionError("_read_bounded must not use Path.open")
+
+    monkeypatch.setattr(Path, "open", forbid_open)
+    assert _read_bounded(path, expected_size=7) == b"bounded"
+
+
+def test_read_bounded_detects_growth_after_the_stat(tmp_path):
+    path = tmp_path / "artifact"
+    path.write_bytes(b"1234567890")
+
+    with pytest.raises(BundleError) as caught:
+        _read_bounded(path, expected_size=4)
+
+    assert caught.value.reason_code == "DIGEST_MISMATCH"
+
+
+def test_read_artifact_does_not_read_bytes_a_large_path(tmp_path, monkeypatch):
+    path = tmp_path / "artifact"
+    path.write_bytes(b"artifact")
+
+    def forbid_read_bytes(self):
+        raise AssertionError("_read_artifact must not call Path.read_bytes")
+
+    monkeypatch.setattr(Path, "read_bytes", forbid_read_bytes)
+    assert _read_artifact(path) == b"artifact"
+
+
+def test_verify_bundle_counts_directory_entries_and_fails_fast(tmp_path, monkeypatch):
+    from datacon import evidence as evidence_module
+
+    info = make_bundle(tmp_path, name="bounded-walk")
+    monkeypatch.setattr(evidence_module, "MAX_BUNDLE_ENTRIES", 4)
+    with pytest.raises(BundleError) as caught:
+        verify_bundle(info.root)
+    assert caught.value.reason_code == "INVALID_MANIFEST"
+    assert "directory entries" in caught.value.message

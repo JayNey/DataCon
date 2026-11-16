@@ -15,11 +15,14 @@ import json
 import os
 import re
 import shlex
+import shutil
+import stat
 import subprocess
 import time
 import uuid
 from typing import Any, Iterable, Mapping, Sequence
 
+from datacon import fileio
 from datacon.asan import ASanSignature, parse_asan
 
 MIB = 1024 * 1024
@@ -1022,13 +1025,35 @@ class DockerSandbox:
         return files, truncated, state, timed_out
 
     def probe(self, *, deadline_seconds: float = _PROBE_TIMEOUT) -> ProbeReport:
-        self.ensure_image()
-        probe_root = self.run_root / "probe"
-        probe_root.mkdir(parents=True, exist_ok=True)
+        # The old implementation used the stable ``run_root/probe`` directory,
+        # which let an attacker pre-plant a symlink before mkdir/chmod/write.
+        # A fresh one-shot directory cannot be predicted, and the legacy name
+        # is rejected if it is a symlink so an old layout is never followed.
+        legacy = self.run_root / "probe"
+        if legacy.is_symlink():
+            raise SandboxPolicyError("the probe directory must not be a symlink")
+        probe_root = self.run_root / f"probe-{uuid.uuid4().hex}"
+        self.run_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        try:
+            probe_root.mkdir(mode=0o755)
+        except FileExistsError as error:
+            raise SandboxPolicyError(
+                "the one-shot probe directory already exists"
+            ) from error
+        info = probe_root.lstat()
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            raise SandboxPolicyError("the probe directory is not a real directory")
         probe_root.chmod(0o755)
         marker = probe_root / "marker.txt"
-        marker.write_text("read-only probe\n", encoding="utf-8")
-        marker.chmod(0o444)
+        try:
+            fileio.write_regular_file(
+                marker, b"read-only probe\n", mode=0o444
+            )
+        except fileio.UnsafeFileError as error:
+            raise SandboxPolicyError(
+                f"the probe marker cannot be written safely: {error.message}"
+            ) from error
+        self.ensure_image()
         name = self._name("probe")
         script = r"""
 set -u
@@ -1134,6 +1159,8 @@ printf 'uid=%s\nseccomp=%s\nseccomp_filters=%s\nno_new_privs=%s\ncap_eff=%s\ncgr
         finally:
             self._remove(name)
             marker.unlink(missing_ok=True)
+            if not probe_root.is_symlink():
+                shutil.rmtree(probe_root, ignore_errors=True)
         values: dict[str, str] = {}
         for line in raw.splitlines():
             key, separator, value = line.partition("=")

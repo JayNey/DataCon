@@ -707,7 +707,10 @@ def finish_execution(
 
     The generation is advanced so a worker that lost the lease can never write
     again. A failed archive keeps the previously recorded verdict in the row
-    while the job itself becomes ``FAILED`` with ``EVIDENCE_WRITE_FAILED``.
+    for history while the job itself becomes ``FAILED`` with
+    ``EVIDENCE_WRITE_FAILED``; ``status`` only exposes a verdict while
+    ``evidence_status == "archived"`` so consumers cannot mistake that old
+    value for the current result.
     """
     if state not in ("REPRODUCED", "NOT_REPRODUCED", "INCONCLUSIVE", "BLOCKED", "FAILED"):
         raise StateError("execution terminal state is invalid")
@@ -1246,6 +1249,12 @@ def status(dsn: str, job_id: UUID) -> dict[str, Any] | None:
             "path": row["evidence_path"],
             "error": row["evidence_error"],
         }
+    # A verdict is authoritative only for an archived bundle. ``finish_execution``
+    # keeps a previously archived verdict in the row so history is not lost,
+    # but a later failed archive advances the job to FAILED. Returning the old
+    # value here would let a consumer mistake it for the current result, so the
+    # public status only exposes a verdict while the evidence is archived.
+    verdict_current = row["evidence_status"] == "archived"
     return {
         "job_id": str(row["job_id"]),
         "state": row["state"],
@@ -1255,7 +1264,8 @@ def status(dsn: str, job_id: UUID) -> dict[str, Any] | None:
         "reason_code": row["reason_code"],
         "last_error": row["last_error"],
         "evidence_refs": evidence_refs,
-        "verdict": row["verdict"],
-        "verdict_reason": row["verdict_reason"],
+        "verdict": row["verdict"] if verdict_current else None,
+        "verdict_reason": row["verdict_reason"] if verdict_current else None,
+        "verdict_current": verdict_current,
         "evidence": evidence,
     }

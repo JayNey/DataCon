@@ -345,6 +345,7 @@ def test_mvp04_single_control_drift_is_rejected_and_cleaned_up(
         limits=limits,
         job_id=job_id,
         run_root=tmp_path / "runs",
+        generation=7,
     )
     fixture = tmp_path / "fixture"
     fixture.mkdir()
@@ -373,3 +374,89 @@ def test_mvp04_single_control_drift_is_rejected_and_cleaned_up(
     )
     assert leftovers.returncode == 0
     assert leftovers.stdout.strip() == "", "a drifted container was not removed"
+
+
+def test_reclaim_job_removes_only_older_generations_on_real_docker(
+    isolated_database, tmp_path
+):
+    """Prove generation labels and reclaim semantics with the real daemon.
+
+    The fake-docker contract test covers the label parsing; this test creates
+    real containers for three generations and checks that ``reclaim_job``
+    deletes only the older one while leaving the current and newer containers
+    (and their labels) intact.
+    """
+    job_id = f"reclaim-{uuid.uuid4().hex}"
+    image = (
+        "silkeh/clang:19-bookworm@sha256:"
+        "f5ce959d91f059acf5a4b3f1c19f46713c4b2881c7d7cd1d5143ca1d1412277f"
+    )
+    policy = IsolationPolicy(
+        network="none",
+        user="65534:65534",
+        read_only_root=True,
+        cap_drop=("ALL",),
+        no_new_privileges=True,
+        seccomp="runtime/default",
+        seccomp_profile_digest=SECCOMP_PROFILE_DIGEST,
+    )
+    limits = ResourceLimits(cpu=2, memory_mib=2048, pids=128, scratch_mib=512)
+    run_root = tmp_path / "reclaim-runs"
+
+    def sandbox_for(generation):
+        return DockerSandbox(
+            image=image,
+            platform="linux/amd64",
+            policy=policy,
+            limits=limits,
+            job_id=job_id,
+            run_root=run_root,
+            generation=generation,
+        )
+
+    containers = {}
+    try:
+        for generation in (1, 2, 3):
+            sandbox = sandbox_for(generation)
+            sandbox.ensure_image()
+            name, _ = sandbox._create(
+                suffix=f"generation-{generation}",
+                command=["/bin/sleep", "60"],
+                mounts=[],
+            )
+            containers[generation] = name
+
+        removed = sandbox_for(2).reclaim_job()
+        assert removed == 1
+
+        present = subprocess.run(
+            ["docker", "inspect", containers[2], containers[3]],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert present.returncode == 0, present.stderr
+        listed = json.loads(present.stdout)
+        labels = {
+            item["Name"].lstrip("/"): item["Config"]["Labels"] for item in listed
+        }
+        for generation in (2, 3):
+            label = labels[containers[generation]]
+            assert label["datacon.job_id"] == job_id
+            assert label["datacon.generation"] == str(generation)
+
+        removed_container = subprocess.run(
+            ["docker", "inspect", containers[1]],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert removed_container.returncode != 0
+    finally:
+        if containers:
+            subprocess.run(
+                ["docker", "rm", "-f", *containers.values()],
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )

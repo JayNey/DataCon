@@ -453,16 +453,7 @@ def test_docker_sandbox_create_labels_the_generation(tmp_path):
 
 def test_docker_sandbox_probe_labels_the_generation(tmp_path):
     sandbox = RecordingSandbox(tmp_path, _inspect_payload(), generation=7)
-    probe_root = tmp_path / "probe"
     payload = _inspect_payload()
-    payload["Mounts"] = [
-        {
-            "Type": "bind",
-            "Source": str(probe_root),
-            "Destination": "/fixture",
-            "RW": False,
-        }
-    ]
     success = SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
 
     def fake_docker(command, *, timeout=60.0):
@@ -470,6 +461,18 @@ def test_docker_sandbox_probe_labels_the_generation(tmp_path):
         if command[0] == "image":
             return success
         if command[0] == "create":
+            mount = command[command.index("--mount") + 1]
+            source = next(
+                part[4:] for part in mount.split(",") if part.startswith("src=")
+            )
+            payload["Mounts"] = [
+                {
+                    "Type": "bind",
+                    "Source": source,
+                    "Destination": "/fixture",
+                    "RW": False,
+                }
+            ]
             return SimpleNamespace(returncode=0, stdout=b"cid", stderr=b"")
         if command[0] == "inspect":
             return SimpleNamespace(
@@ -1504,3 +1507,133 @@ def test_evidence_materials_use_the_verified_snapshot_not_the_case_source():
     )
     materials = execution._case_materials(context)
     assert {relative: data for relative, (_, data) in materials.items()} == payloads
+
+
+def test_probe_rejects_symlinked_legacy_directory_without_writing(tmp_path):
+    external = tmp_path / "external"
+    external.mkdir(mode=0o700)
+    before = stat.S_IMODE(external.stat().st_mode)
+    (tmp_path / "probe").symlink_to(external, target_is_directory=True)
+    sandbox = RecordingSandbox(tmp_path, _inspect_payload())
+
+    with pytest.raises(SandboxPolicyError):
+        sandbox.probe()
+
+    assert not (external / "marker.txt").exists()
+    assert stat.S_IMODE(external.stat().st_mode) == before
+    assert sandbox.calls == []
+
+
+def test_write_run_file_rejects_a_planted_symlink(tmp_path):
+    run_root = tmp_path / "runs"
+    (run_root / "generation-1").mkdir(parents=True)
+    outside = tmp_path / "outside.txt"
+    outside.write_bytes(b"original")
+    target = run_root / "generation-1" / "parser"
+    target.symlink_to(outside)
+
+    with pytest.raises(execution.ExecutionFailed) as caught:
+        execution._write_run_file(run_root, target, b"tampered", 0o555)
+
+    assert caught.value.reason_code == "EVIDENCE_WRITE_FAILED"
+    assert outside.read_bytes() == b"original"
+
+
+def test_write_run_file_replaces_a_read_only_legacy_file(tmp_path):
+    run_root = tmp_path / "runs"
+    (run_root / "generation-1").mkdir(parents=True)
+    target = run_root / "generation-1" / "parser"
+    execution._write_run_file(run_root, target, b"first", 0o555)
+    assert stat.S_IMODE(target.stat().st_mode) == 0o555
+
+    execution._write_run_file(run_root, target, b"second", 0o600)
+
+    assert target.read_bytes() == b"second"
+    assert stat.S_IMODE(target.stat().st_mode) == 0o600
+
+
+def test_write_journal_does_not_follow_a_planted_tmp_symlink(tmp_path, monkeypatch):
+    run_root = tmp_path / "runs"
+    evidence_root = tmp_path / "evidence"
+    monkeypatch.setenv("DATACON_EVIDENCE_ROOT", str(evidence_root))
+    monkeypatch.delenv("DATACON_JOURNAL_SECRET_FILE", raising=False)
+    path = execution._journal_path(run_root, "build:vulnerable", 1, 1)
+    path.parent.mkdir(parents=True)
+    outside = tmp_path / "outside.json"
+    outside.write_bytes(b"original")
+    temporary = path.with_suffix(".tmp")
+    temporary.symlink_to(outside)
+
+    written = execution._write_journal(
+        run_root, "build:vulnerable", 1, 1, {"job_id": "job", "generation": 1}
+    )
+
+    assert written == path
+    assert path.is_file()
+    assert outside.read_bytes() == b"original"
+    assert not temporary.is_symlink()
+
+
+def _mountinfo(*lines: str) -> str:
+    return "\n".join(("36 1 8:1 / / rw - ext4 /dev/sda1 rw", *lines)) + "\n"
+
+
+def test_mountinfo_rejects_a_bind_mount_sourced_from_the_run_root():
+    text = _mountinfo(
+        "37 36 8:1 /data/runs/child /mnt/bind rw - ext4 /dev/sda1 rw"
+    )
+    assert execution._mountinfo_rejects(
+        Path("/mnt/bind/evidence"), Path("/data/runs"), text
+    )
+
+
+def test_mountinfo_accepts_a_lexically_outside_target_on_the_same_device():
+    text = _mountinfo()
+    assert not execution._mountinfo_rejects(
+        Path("/srv/evidence"), Path("/data/runs"), text
+    )
+
+
+def test_mountinfo_treats_a_different_device_as_provably_outside():
+    text = _mountinfo(
+        "39 36 9:1 / /mnt/other rw - ext4 /dev/sdb1 rw"
+    )
+    assert not execution._mountinfo_rejects(
+        Path("/mnt/other/evidence"), Path("/data/runs"), text
+    )
+
+
+def test_mountinfo_escapes_mount_point_and_root():
+    text = _mountinfo(
+        "40 36 8:1 /data/runs/child\\040dir /mnt/a\\040b rw - ext4 /dev/sda1 rw"
+    )
+    assert execution._mountinfo_rejects(
+        Path("/mnt/a b/evidence"), Path("/data/runs"), text
+    )
+
+
+def test_mountinfo_rejects_an_unparseable_document():
+    assert execution._mountinfo_rejects(
+        Path("/srv/evidence"), Path("/data/runs"), "not mountinfo\n"
+    )
+
+
+def test_mountinfo_checks_run_root_itself_through_its_mount():
+    text = _mountinfo(
+        "41 36 8:1 /srv/data /mnt/data rw - ext4 /dev/sda1 rw"
+    )
+    assert execution._mountinfo_rejects(
+        Path("/mnt/data/runs/evidence"), Path("/mnt/data/runs"), text
+    )
+
+
+def test_write_run_file_rejects_a_fifo_without_blocking(tmp_path):
+    run_root = tmp_path / "runs"
+    (run_root / "generation-1").mkdir(parents=True)
+    target = run_root / "generation-1" / "stdout.log"
+    os.mkfifo(target)
+
+    with pytest.raises(execution.ExecutionFailed) as caught:
+        execution._write_run_file(run_root, target, b"tampered", 0o600)
+
+    assert caught.value.reason_code == "EVIDENCE_WRITE_FAILED"
