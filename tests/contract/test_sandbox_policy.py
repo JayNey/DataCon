@@ -2524,3 +2524,326 @@ def test_write_journal_parent_swap_after_check_cannot_escape(
         )
     assert caught.value.reason_code == "EVIDENCE_WRITE_FAILED"
     assert not (external / "run.json").exists()
+
+
+# ---------------------------------------------------------------------------
+# PR #6 review regressions: B1, B2, S2, S3
+# ---------------------------------------------------------------------------
+
+
+def _make_fake_cli_sandbox(
+    tmp_path: Path,
+    *,
+    wait_rc: int = 0,
+    wait_stdout: bytes = b"0\n",
+    wait_stderr: bytes = b"",
+    logs_rc: int = 0,
+    logs_stdout: bytes = b"",
+    logs_stderr: bytes = b"",
+    state: dict | None = None,
+    log_path: str | None = "DEFAULT",
+    inspect_after_wait_error: bool = False,
+):
+    default_log_file = tmp_path / "container-json.log"
+    if not default_log_file.exists():
+        default_log_file.write_bytes(b'{"log":"ok\\n","stream":"stdout"}\n')
+    effective_log_path = (
+        str(default_log_file) if log_path == "DEFAULT" else log_path
+    )
+    effective_state = (
+        {"Status": "exited", "Running": False, "ExitCode": 0, "OOMKilled": False}
+        if state is None
+        else dict(state)
+    )
+
+    class FakeCliSandbox(DockerSandbox):
+        def __init__(self):
+            super().__init__(
+                image=IMAGE,
+                platform="linux/amd64",
+                policy=POLICY,
+                limits=LIMITS,
+                docker="docker",
+                job_id="job-pr6",
+                run_root=tmp_path / "runs",
+                generation=1,
+            )
+            self.calls: list[list[str]] = []
+            self.inspect_calls = 0
+
+        def _docker(self, command, *, timeout=60.0):
+            self.calls.append(list(command))
+            verb = command[0]
+            if verb == "create":
+                mounts = []
+                for idx, token in enumerate(command):
+                    if token == "--mount":
+                        spec = command[idx + 1]
+                        parts = dict(
+                            item.split("=", 1)
+                            for item in spec.split(",")
+                            if "=" in item
+                        )
+                        mounts.append(
+                            {
+                                "Type": "bind",
+                                "Source": parts["src"],
+                                "Destination": parts["dst"],
+                                "RW": "readonly" not in spec.split(","),
+                            }
+                        )
+                self._mounts = mounts
+                return SimpleNamespace(returncode=0, stdout=b"cid\n", stderr=b"")
+            if verb == "inspect":
+                self.inspect_calls += 1
+                if self.inspect_calls > 1 and inspect_after_wait_error:
+                    return SimpleNamespace(
+                        returncode=1, stdout=b"", stderr=b"inspect failed"
+                    )
+                payload = _inspect_payload()
+                payload["Mounts"] = getattr(self, "_mounts", payload["Mounts"])
+                payload["State"] = dict(effective_state)
+                if effective_log_path is not None:
+                    payload["LogPath"] = effective_log_path
+                else:
+                    payload.pop("LogPath", None)
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=json.dumps([payload]).encode("utf-8"),
+                    stderr=b"",
+                )
+            if verb == "start":
+                return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+            if verb == "exec":
+                return SimpleNamespace(returncode=0, stdout=b"0\n", stderr=b"")
+            if verb == "wait":
+                return SimpleNamespace(
+                    returncode=wait_rc, stdout=wait_stdout, stderr=wait_stderr
+                )
+            if verb == "logs":
+                return SimpleNamespace(
+                    returncode=logs_rc, stdout=logs_stdout, stderr=logs_stderr
+                )
+            if verb == "rm":
+                return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+            raise AssertionError(f"unexpected docker command: {command}")
+
+    return FakeCliSandbox()
+
+
+def _prepare_replay_files(tmp_path: Path) -> tuple[Path, Path]:
+    artifact = tmp_path / "parser"
+    artifact.write_bytes(b"parser-binary")
+    input_file = tmp_path / "input"
+    input_file.write_bytes(b"ABCD\n")
+    return artifact, input_file
+
+
+def test_b1_replay_logs_failure_is_infra_error_and_evidence_incomplete(tmp_path):
+    from datacon.verdict import VerdictPolicy, decide_verdict, observation_from_run
+
+    artifact, input_file = _prepare_replay_files(tmp_path)
+    sandbox = _make_fake_cli_sandbox(
+        tmp_path,
+        wait_rc=0,
+        wait_stdout=b"0\n",
+        logs_rc=1,
+        logs_stderr=b"log driver read error",
+    )
+    result = sandbox.replay(
+        "vulnerable",
+        "candidate_1",
+        artifact_path=artifact,
+        input_path=input_file,
+        asan_options="detect_leaks=0",
+        timeout_seconds=5.0,
+    )
+    assert result.status == "infra_error"
+    assert result.log_truncated is True
+    assert getattr(result, "capture_error", None)
+    assert "docker logs" in result.capture_error
+    assert result.as_dict().get("capture_error") == result.capture_error
+
+    policy = VerdictPolicy(
+        signature={
+            "error": "heap-buffer-overflow",
+            "function": "parse_token",
+            "source": "parser.c",
+        },
+        expected_exit={"normal": 0, "candidate_clean": 0, "candidate_asan": 86},
+        expected_stdout={"normal": "OK\n", "candidate_clean": "ABCD\n"},
+    )
+    obs = observation_from_run(result.as_dict())
+    runs = [
+        obs,
+        replace(obs, phase="candidate_2"),
+        replace(obs, phase="normal", status="completed", exit_code=0, stdout="OK\n", stderr="", log_truncated=False, capture_error=None),
+        replace(obs, version="fixed", phase="normal", status="completed", exit_code=0, stdout="OK\n", stderr="", log_truncated=False, capture_error=None),
+        replace(obs, version="fixed", phase="candidate_1", status="completed", exit_code=0, stdout="ABCD\n", stderr="", log_truncated=False, capture_error=None),
+        replace(obs, version="fixed", phase="candidate_2", status="completed", exit_code=0, stdout="ABCD\n", stderr="", log_truncated=False, capture_error=None),
+    ]
+    decision = decide_verdict(policy, runs)
+    assert decision.verdict == "INCONCLUSIVE"
+    assert decision.reason_code == "EVIDENCE_INCOMPLETE"
+
+
+def test_b1_logs_failure_with_empty_expected_stdout_is_never_not_reproduced(
+    tmp_path,
+):
+    from datacon.verdict import VerdictPolicy, decide_verdict, observation_from_run
+
+    artifact, input_file = _prepare_replay_files(tmp_path)
+    sandbox = _make_fake_cli_sandbox(
+        tmp_path,
+        wait_rc=0,
+        wait_stdout=b"0\n",
+        logs_rc=1,
+        logs_stderr=b"log driver read error",
+    )
+    empty_policy = VerdictPolicy(
+        signature={
+            "error": "heap-buffer-overflow",
+            "function": "parse_token",
+            "source": "parser.c",
+        },
+        expected_exit={"normal": 0, "candidate_clean": 0, "candidate_asan": 86},
+        expected_stdout={"normal": "", "candidate_clean": ""},
+    )
+    runs = []
+    for version in ("vulnerable", "fixed"):
+        for phase in ("normal", "candidate_1", "candidate_2"):
+            replay = sandbox.replay(
+                version,
+                phase,
+                artifact_path=artifact,
+                input_path=input_file,
+                asan_options="detect_leaks=0",
+                timeout_seconds=5.0,
+            )
+            runs.append(observation_from_run(replay.as_dict()))
+    decision = decide_verdict(empty_policy, runs)
+    assert decision.verdict != "NOT_REPRODUCED"
+    assert decision.verdict == "INCONCLUSIVE"
+    assert decision.reason_code == "EVIDENCE_INCOMPLETE"
+
+
+def test_b1_logs_failure_with_non_empty_expected_stdout_is_evidence_incomplete_not_control_failed(
+    tmp_path,
+):
+    from datacon.verdict import VerdictPolicy, decide_verdict, observation_from_run
+
+    artifact, input_file = _prepare_replay_files(tmp_path)
+    sandbox = _make_fake_cli_sandbox(
+        tmp_path,
+        wait_rc=0,
+        wait_stdout=b"0\n",
+        logs_rc=1,
+        logs_stderr=b"log driver read error",
+    )
+    non_empty_policy = VerdictPolicy(
+        signature={
+            "error": "heap-buffer-overflow",
+            "function": "parse_token",
+            "source": "parser.c",
+        },
+        expected_exit={"normal": 0, "candidate_clean": 0, "candidate_asan": 86},
+        expected_stdout={"normal": "OK\n", "candidate_clean": "ABCD\n"},
+    )
+    runs = []
+    for version in ("vulnerable", "fixed"):
+        for phase in ("normal", "candidate_1", "candidate_2"):
+            replay = sandbox.replay(
+                version,
+                phase,
+                artifact_path=artifact,
+                input_path=input_file,
+                asan_options="detect_leaks=0",
+                timeout_seconds=5.0,
+            )
+            runs.append(observation_from_run(replay.as_dict()))
+    decision = decide_verdict(non_empty_policy, runs)
+    assert decision.verdict == "INCONCLUSIVE"
+    assert decision.reason_code == "EVIDENCE_INCOMPLETE"
+
+
+def test_b1_build_logs_failure_is_not_completed(tmp_path):
+    materials = _materials(tmp_path)
+    sandbox = _make_fake_cli_sandbox(
+        tmp_path,
+        wait_rc=0,
+        wait_stdout=b"0\n",
+        logs_rc=1,
+        logs_stderr=b"build logs unavailable",
+    )
+    result = sandbox.build(
+        "vulnerable",
+        materials_dir=materials,
+        compile_args=("-std=c11",),
+        deadline_seconds=5.0,
+    )
+    assert result.status != "completed"
+    assert result.log_truncated is True
+    assert getattr(result, "capture_error", None)
+
+
+def test_b2_wait_fallback_requires_exited_container_state(tmp_path):
+    artifact, input_file = _prepare_replay_files(tmp_path)
+    running_sandbox = _make_fake_cli_sandbox(
+        tmp_path,
+        wait_rc=1,
+        wait_stderr=b"context deadline exceeded",
+        state={"ExitCode": 0, "Running": True, "Status": "running"},
+    )
+    running_result = running_sandbox.replay(
+        "vulnerable",
+        "candidate_1",
+        artifact_path=artifact,
+        input_path=input_file,
+        asan_options="detect_leaks=0",
+        timeout_seconds=5.0,
+    )
+    assert running_result.status != "completed"
+    assert running_result.exit_code is None
+    assert getattr(running_result, "capture_error", None)
+
+    exited_sandbox = _make_fake_cli_sandbox(
+        tmp_path,
+        wait_rc=1,
+        wait_stderr=b"connection reset",
+        state={"ExitCode": 7, "Running": False, "Status": "exited"},
+    )
+    exited_result = exited_sandbox.replay(
+        "vulnerable",
+        "candidate_1",
+        artifact_path=artifact,
+        input_path=input_file,
+        asan_options="detect_leaks=0",
+        timeout_seconds=5.0,
+    )
+    assert exited_result.status == "completed"
+    assert exited_result.exit_code == 7
+    assert getattr(exited_result, "capture_error", None) is None
+
+
+def test_b2_wait_non_numeric_output_with_running_container_is_infra_error(
+    tmp_path,
+):
+    artifact, input_file = _prepare_replay_files(tmp_path)
+    sandbox = _make_fake_cli_sandbox(
+        tmp_path,
+        wait_rc=0,
+        wait_stdout=b"not-an-int\n",
+        state={"ExitCode": 0, "Running": True, "Status": "running"},
+    )
+    result = sandbox.replay(
+        "vulnerable",
+        "candidate_1",
+        artifact_path=artifact,
+        input_path=input_file,
+        asan_options="detect_leaks=0",
+        timeout_seconds=5.0,
+    )
+    assert result.status != "completed"
+    assert result.exit_code is None
+    assert getattr(result, "capture_error", None)
+

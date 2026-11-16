@@ -205,9 +205,10 @@ class BuildResult:
     log_truncated: bool
     artifact: bytes | None
     metadata: dict[str, Any]
+    capture_error: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
-        return {
+        payload = {
             "version": self.version,
             "status": self.status,
             "exit_code": self.exit_code,
@@ -218,8 +219,11 @@ class BuildResult:
             "artifact_digest": self.artifact_digest,
             "log_digest": "sha256:" + hashlib.sha256(self.log).hexdigest(),
             "log_truncated": self.log_truncated,
+            "capture_error": self.capture_error,
             **self.metadata,
         }
+        payload["capture_error"] = self.capture_error
+        return payload
 
 
 @dataclass(frozen=True)
@@ -238,13 +242,14 @@ class ReplayResult:
     quota_hit: bool
     log_truncated: bool
     metadata: dict[str, Any]
+    capture_error: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
         # Raw stdout/stderr are evidence files, not metadata. Keeping the full
         # text here would copy every log into the report, execution metadata and
         # the database attempt row. Record only stable digests, lengths and a
         # bounded preview; readers reconstruct observations from the files.
-        return {
+        payload = {
             "version": self.version,
             "phase": self.phase,
             "status": self.status,
@@ -266,8 +271,11 @@ class ReplayResult:
             "timed_out": self.timed_out,
             "quota_hit": self.quota_hit,
             "log_truncated": self.log_truncated,
+            "capture_error": self.capture_error,
             **self.metadata,
         }
+        payload["capture_error"] = self.capture_error
+        return payload
 
 
 def _absolute_mount(source: str | os.PathLike[str]) -> str:
@@ -1203,6 +1211,7 @@ class DockerSandbox:
                 except SandboxError:
                     pass
             remaining = max(1.0, deadline_seconds - (time.monotonic() - started))
+            wait_error: str | None = None
             try:
                 wait = self._docker(["wait", name], timeout=remaining)
             except SandboxError as error:
@@ -1215,22 +1224,62 @@ class DockerSandbox:
                     pass
                 wait = self._docker(["wait", name], timeout=30)
             if wait.returncode == 0:
+                raw_wait = wait.stdout.decode("ascii", "replace").strip()
                 try:
-                    exit_code = int(wait.stdout.decode("ascii", "replace").strip())
+                    exit_code = int(raw_wait)
                 except ValueError:
                     exit_code = None
+                    wait_error = (
+                        "docker wait returned a non-integer exit code: "
+                        f"{raw_wait[:120]!r}"
+                    )
+            else:
+                detail = wait.stderr.decode("utf-8", "replace").strip()
+                wait_error = (
+                    f"docker wait failed (rc={wait.returncode}): "
+                    + (detail[:300] or "no stderr")
+                )
+            inspect_payload: dict[str, Any] | None = None
+            inspect_error: str | None = None
             try:
-                state = self._inspect(name).get("State", {})
-            except SandboxError:
+                inspect_payload = self._inspect(name)
+                raw_state = inspect_payload.get("State")
+                state = dict(raw_state) if isinstance(raw_state, Mapping) else {}
+            except SandboxError as error:
                 state = {}
+                inspect_error = error.message
+            capture_errors: list[str] = []
             if exit_code is None:
                 candidate = state.get("ExitCode")
-                if type(candidate) is int:
+                if (
+                    state.get("Running") is False
+                    and state.get("Status") in ("exited", "dead")
+                    and type(candidate) is int
+                ):
                     exit_code = candidate
+                elif not timed_out:
+                    reason = wait_error or "docker wait did not report an exit code"
+                    if inspect_error is not None:
+                        reason += f"; inspect failed: {inspect_error}"
+                    else:
+                        reason += (
+                            f"; container state Running={state.get('Running')!r} "
+                            f"Status={state.get('Status')!r}"
+                        )
+                    capture_errors.append(reason)
             logs = self._docker(["logs", name], timeout=60)
             if logs.returncode == 0:
                 stdout = logs.stdout
                 stderr = logs.stderr
+            else:
+                detail = logs.stderr.decode("utf-8", "replace").strip()
+                capture_errors.append(
+                    f"docker logs failed (rc={logs.returncode}): "
+                    + (detail[:300] or "no stderr")
+                )
+                truncated.add("logs")
+            if capture_errors:
+                state["_capture_error"] = "; ".join(capture_errors)
         finally:
             cleanup_error = self._cleanup_failure(name)
         return (
@@ -1518,10 +1567,14 @@ printf 'uid=%s\nseccomp=%s\nseccomp_filters=%s\nno_new_privs=%s\ncap_eff=%s\ncgr
                 b"\n",
                 stdout + stderr,
             )
+            capture_error = state.pop("_capture_error", None)
             log, log_truncated = _truncate_log(log_bytes)
-            truncated = log_truncated or "/work/parser" in truncated_streams
+            truncated = log_truncated or bool(truncated_streams)
             artifact = files.get("/work/parser")
             if artifact is not None and len(artifact) > MAX_ARTIFACT_BYTES:
+                artifact = None
+                truncated = True
+            if capture_error is not None:
                 artifact = None
                 truncated = True
             artifact_digest = (
@@ -1547,11 +1600,17 @@ printf 'uid=%s\nseccomp=%s\nseccomp_filters=%s\nno_new_privs=%s\ncap_eff=%s\ncgr
                 artifact_digest = None
                 log_truncated = True
             quota_hits = _quota_events(files)
-            status = "completed" if exit_code == 0 and artifact is not None else "build_failed"
+            status = (
+                "completed"
+                if exit_code == 0 and artifact is not None and capture_error is None
+                else "build_failed"
+            )
             if timed_out:
                 status = "timeout"
             elif state.get("OOMKilled") or quota_hits:
                 status = "resource_limited"
+            elif capture_error is not None:
+                status = "infra_error"
             metadata = {
                 "build_command": ["/bin/sh", "/fixture/build.sh", version],
                 "build_recipe_digest": _digest_bytes(materials / "build.sh"),
@@ -1560,6 +1619,8 @@ printf 'uid=%s\nseccomp=%s\nseccomp_filters=%s\nno_new_privs=%s\ncap_eff=%s\ncgr
                 "oom_killed": bool(state.get("OOMKilled")),
                 "limits_hit": quota_hits,
             }
+            if capture_error is not None:
+                metadata["capture_error"] = capture_error
             if cleanup_error is not None:
                 metadata["cleanup_errors"] = [cleanup_error]
             return BuildResult(
@@ -1575,6 +1636,7 @@ printf 'uid=%s\nseccomp=%s\nseccomp_filters=%s\nno_new_privs=%s\ncap_eff=%s\ncgr
                 log_truncated=truncated or log_truncated,
                 artifact=artifact,
                 metadata=metadata,
+                capture_error=capture_error,
             )
         finally:
             # _start_and_wait already removed the container. If it could not,
@@ -1669,8 +1731,12 @@ printf 'uid=%s\nseccomp=%s\nseccomp_filters=%s\nno_new_privs=%s\ncap_eff=%s\ncgr
         finally:
             pass
         duration = time.monotonic() - started
+        capture_error = state.pop("_capture_error", None)
         stdout, truncated_out = _truncate_log(raw_stdout)
         stderr, truncated_err = _truncate_log(raw_stderr)
+        log_truncated = (
+            truncated_out or truncated_err or bool(_truncated_streams)
+        )
         signature = parse_asan(stderr.decode("utf-8", "replace"))
         quota_hit = (
             bool(state.get("OOMKilled"))
@@ -1681,6 +1747,8 @@ printf 'uid=%s\nseccomp=%s\nseccomp_filters=%s\nno_new_privs=%s\ncap_eff=%s\ncgr
             status = "timeout"
         elif quota_hit:
             status = "resource_limited"
+        elif capture_error is not None or exit_code is None:
+            status = "infra_error"
         metadata: dict[str, Any] = {
             "image_digest": self.image_digest,
             "asan_options": asan_options,
@@ -1688,6 +1756,8 @@ printf 'uid=%s\nseccomp=%s\nseccomp_filters=%s\nno_new_privs=%s\ncap_eff=%s\ncgr
             "limits_hit": [],
             "timeout_seconds": timeout,
         }
+        if capture_error is not None:
+            metadata["capture_error"] = capture_error
         if cleanup_error is not None:
             metadata["cleanup_errors"] = [cleanup_error]
         return ReplayResult(
@@ -1703,8 +1773,9 @@ printf 'uid=%s\nseccomp=%s\nseccomp_filters=%s\nno_new_privs=%s\ncap_eff=%s\ncgr
             signature=signature,
             timed_out=timed_out,
             quota_hit=quota_hit,
-            log_truncated=truncated_out or truncated_err,
+            log_truncated=log_truncated,
             metadata=metadata,
+            capture_error=capture_error,
         )
 
 

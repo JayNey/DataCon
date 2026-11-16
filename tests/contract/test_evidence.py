@@ -2526,3 +2526,23 @@ def test_inconclusive_evidence_incomplete_with_abnormal_completed_control_is_acc
     )
     verified = verify_bundle(info.root)
     assert verified.manifest["reason_code"] == "EVIDENCE_INCOMPLETE"
+
+
+# ---------------------------------------------------------------------------
+# PR #6 review regressions: B1 capture_error validation and S1 partial bundle
+# ---------------------------------------------------------------------------
+
+
+def test_b1_verify_bundle_rejects_completed_replay_with_capture_error(tmp_path):
+    info = make_bundle(tmp_path, name="completed-capture-error")
+    _update_replay(
+        info.root,
+        "vulnerable",
+        "normal",
+        capture_error="docker logs failed (rc=1): daemon error",
+    )
+    with pytest.raises(BundleError) as caught:
+        verify_bundle(info.root)
+    assert caught.value.reason_code == "INVALID_MANIFEST"
+    assert "capture_error" in caught.value.message
+

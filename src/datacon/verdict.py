@@ -117,6 +117,7 @@ class RunObservation:
     input_digest: str | None = None
     duration_seconds: float | None = None
     log_truncated: bool = False
+    capture_error: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -130,6 +131,7 @@ class RunObservation:
             "input_digest": self.input_digest,
             "duration_seconds": self.duration_seconds,
             "log_truncated": self.log_truncated,
+            "capture_error": self.capture_error,
         }
 
 
@@ -170,6 +172,8 @@ def _compare_builds(builds: Mapping[str, Mapping[str, Any]] | None) -> str | Non
         build = builds.get(version)
         if not isinstance(build, Mapping) or build.get("status") != "completed":
             return f"{version} build did not complete"
+        if build.get("capture_error"):
+            return f"{version} build log or exit capture failed"
         if build.get("log_truncated"):
             return f"{version} build log was truncated"
     vulnerable = builds["vulnerable"]
@@ -266,6 +270,14 @@ def decide_verdict(
                 )
 
     for run in runs:
+        if run.capture_error:
+            checks["capture_error"] = f"{run.version}/{run.phase}"
+            return _inconclusive(
+                "EVIDENCE_INCOMPLETE",
+                f"{run.version}/{run.phase} log or exit capture failed: "
+                f"{run.capture_error}",
+                checks,
+            )
         if run.log_truncated:
             return _inconclusive(
                 "EVIDENCE_INCOMPLETE",
@@ -404,6 +416,7 @@ def observation_from_run(run: Mapping[str, Any]) -> RunObservation:
             function=signature.get("function"),
             source=signature.get("source"),
         )
+    capture_error = run.get("capture_error")
     return RunObservation(
         version=str(run.get("version", "")),
         phase=str(run.get("phase", "")),
@@ -415,6 +428,9 @@ def observation_from_run(run: Mapping[str, Any]) -> RunObservation:
         input_digest=run.get("input_digest"),
         duration_seconds=run.get("duration_seconds"),
         log_truncated=bool(run.get("log_truncated", False)),
+        capture_error=(
+            str(capture_error) if capture_error is not None else None
+        ),
     )
 
 

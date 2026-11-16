@@ -894,6 +894,11 @@ def _verify_builds(
             raise BundleError(
                 "INVALID_MANIFEST", f"{version} build did not complete"
             )
+        if build.get("capture_error") is not None:
+            raise BundleError(
+                "INVALID_MANIFEST",
+                f"{version} completed build must not record capture_error",
+            )
         # A completed build must have exited with the expected success code.
         # ``True`` is an int subclass, so use ``type(...) is int`` rather than
         # isinstance: a boolean or a string must never satisfy a build gate.
@@ -1078,6 +1083,29 @@ def _verify_replays(
                 "INVALID_MANIFEST",
                 f"completed replay {version}/{phase} must record an integer exit_code",
             )
+        capture_error = item.get("capture_error")
+        if capture_error is not None and (
+            not isinstance(capture_error, str) or not capture_error.strip()
+        ):
+            raise BundleError(
+                "INVALID_MANIFEST",
+                f"replay {version}/{phase} capture_error must be a non-empty string or null",
+            )
+        if status == "completed" and capture_error is not None:
+            raise BundleError(
+                "INVALID_MANIFEST",
+                f"completed replay {version}/{phase} must not record capture_error",
+            )
+        if (status == "infra_error" or capture_error is not None) and (
+            verdict != "INCONCLUSIVE"
+            or report.get("reason_code")
+            not in ("EVIDENCE_INCOMPLETE", "NOT_COMPARABLE")
+        ):
+            raise BundleError(
+                "INVALID_MANIFEST",
+                f"replay {version}/{phase} infra_error/capture_error requires "
+                "INCONCLUSIVE/EVIDENCE_INCOMPLETE",
+            )
         for field in ("stdout_bytes", "stderr_bytes"):
             value = item.get(field)
             if type(value) is not int or value < 0:
@@ -1197,6 +1225,7 @@ def _verify_replays(
             "signature": parsed,
             "stdout": stdout.decode("utf-8", "replace"),
             "log_truncated": bool(item.get("log_truncated")),
+            "capture_error": capture_error,
         }
     required = {
         (version, phase)
@@ -1333,6 +1362,7 @@ def _verify_outcome(
                 signature=observation.get("signature"),
                 input_digest=item.get("input_digest"),
                 log_truncated=bool(observation.get("log_truncated")),
+                capture_error=observation.get("capture_error"),
             )
         )
     try:

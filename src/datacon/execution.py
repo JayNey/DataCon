@@ -3551,6 +3551,7 @@ def _to_observation(payload: Mapping[str, Any], run_root: Path) -> RunObservatio
             function=signature.get("function"),
             source=signature.get("source"),
         )
+    capture_error = payload.get("capture_error")
     return RunObservation(
         version=str(payload.get("version", "")),
         phase=str(payload.get("phase", "")),
@@ -3562,6 +3563,9 @@ def _to_observation(payload: Mapping[str, Any], run_root: Path) -> RunObservatio
         input_digest=payload.get("input_digest"),
         duration_seconds=payload.get("duration_seconds"),
         log_truncated=bool(payload.get("log_truncated", False)),
+        capture_error=(
+            str(capture_error) if capture_error is not None else None
+        ),
     )
 
 
