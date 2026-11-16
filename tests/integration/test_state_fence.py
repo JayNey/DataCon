@@ -41,12 +41,14 @@ def _claim(database, job_id: UUID) -> dict:
 
 
 def _lease_remaining(database, job_id: UUID) -> float:
+    # The isolated fixture connection keeps psycopg's default tuple row
+    # factory, so positional indexing is required here.
     row = database.connection.execute(
         "SELECT EXTRACT(EPOCH FROM (lease_expires_at - clock_timestamp())) "
         "AS remaining FROM jobs WHERE job_id = %s",
         (job_id,),
     ).fetchone()
-    return float(row["remaining"])
+    return float(row[0])
 
 
 def _state_and_lease(database, job_id: UUID) -> tuple[str, float]:
@@ -56,7 +58,7 @@ def _state_and_lease(database, job_id: UUID) -> tuple[str, float]:
         "AS remaining FROM jobs WHERE job_id = %s",
         (job_id,),
     ).fetchone()
-    return row["state"], float(row["remaining"])
+    return row[0], float(row[1])
 
 
 def test_begin_execution_extends_the_lease_and_fences_the_generation(
@@ -120,8 +122,20 @@ def test_archive_fence_extends_the_lease_and_rejects_stale_writers(
         )
         is True
     )
-    before = _lease_remaining(isolated_database, job_id)
+    state_value, before = _state_and_lease(isolated_database, job_id)
+    assert state_value == "ARCHIVING"
+    # mark_archiving reserves at least 60 seconds, independent of the execute
+    # deadline that may already have passed.
     assert before > 30
+
+    # assert_archive_fence must extend a nearly expired archive lease rather
+    # than merely observing it.
+    isolated_database.connection.execute(
+        "UPDATE jobs SET lease_expires_at = clock_timestamp() + interval '5 seconds' "
+        "WHERE job_id = %s",
+        (job_id,),
+    )
+    assert _lease_remaining(isolated_database, job_id) < 10
     assert (
         state.assert_archive_fence(
             isolated_database.dsn, job_id, generation=generation
@@ -129,7 +143,7 @@ def test_archive_fence_extends_the_lease_and_rejects_stale_writers(
         is True
     )
     after = _lease_remaining(isolated_database, job_id)
-    assert after >= before - 1
+    assert after > 30
 
     with pytest.raises(state.StaleGeneration):
         state.assert_archive_fence(
@@ -145,3 +159,5 @@ def test_archive_fence_extends_the_lease_and_rejects_stale_writers(
         state.assert_archive_fence(
             isolated_database.dsn, job_id, generation=generation
         )
+    # An expired lease must never be revived by the fence.
+    assert _lease_remaining(isolated_database, job_id) < 0
