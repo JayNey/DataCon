@@ -3176,14 +3176,17 @@ def run_execution(
         return _finish_blocked(dsn, job_id, generation, error, context=context)
 
     work_root = context.run_root / context.job_id_text / context.plan_digest.split(":")[1]
-    _prepare_shared_directory(context.run_root, work_root, "work root")
-    build_root = work_root / "run"
-    _prepare_shared_directory(context.run_root, build_root, "sandbox run root")
-    generation_root = _generation_root(context)
-    _prepare_run_directory(
-        context.run_root, generation_root, "generation root",
-        scope_root=generation_root,
-    )
+    try:
+        _prepare_shared_directory(context.run_root, work_root, "work root")
+        build_root = work_root / "run"
+        _prepare_shared_directory(context.run_root, build_root, "sandbox run root")
+        generation_root = _generation_root(context)
+        _prepare_run_directory(
+            context.run_root, generation_root, "generation root",
+            scope_root=generation_root,
+        )
+    except ExecutionFailed as error:
+        return _finish_evidence_path_failure(dsn, job_id, generation, error)
     try:
         materials_dir, inputs, material_digests = _materialize(
             context, generation_root, anchor=context.run_root
