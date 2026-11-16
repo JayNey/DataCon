@@ -597,12 +597,9 @@ def test_s3_real_docker_40mib_stderr_rotation_marks_truncated_and_blocks_reprodu
         "printf '==1==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x502000000014\n"
         "WRITE of size 1 at 0x502000000014 thread T0\n"
         "    #0 0x55555565fadf in parse_token /fixture/vulnerable/parser.c:22:17\n"
-        "SUMMARY: AddressSanitizer: heap-buffer-overflow /fixture/vulnerable/parser.c:22:17 in parse_token\n' >&2
-"
-        "dd if=/dev/zero bs=1048576 count=40 2>/dev/null | tr '\\0' 'X' >&2
-"
-        "exit 86
-",
+        "SUMMARY: AddressSanitizer: heap-buffer-overflow /fixture/vulnerable/parser.c:22:17 in parse_token\n' >&2\n"
+        "dd if=/dev/zero bs=1048576 count=40 2>/dev/null | tr '\\0' 'X' >&2\n"
+        "exit 86\n",
     )
     job_id = "s3-rot-" + uuid.uuid4().hex
     sandbox = _sandbox(tmp_path, job_id)
