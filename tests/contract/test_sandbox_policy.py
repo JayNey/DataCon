@@ -1853,6 +1853,35 @@ def test_mountinfo_overmount_rejection_does_not_depend_on_line_order():
     )
 
 
+def test_mountinfo_rejects_a_same_device_nested_mount_under_the_run_root():
+    # /data/runs/scratch and /mnt/ev bind the same directory on the same
+    # device as the root mount, so a run-root writer can write the evidence.
+    text = _mountinfo(
+        "47 36 8:1 /srv/scratch /data/runs/scratch rw - ext4 /dev/sda1 rw",
+        "48 36 8:1 /srv/scratch /mnt/ev rw - ext4 /dev/sda1 rw",
+    )
+    assert (
+        execution._mountinfo_rejects(
+            Path("/mnt/ev/evidence"), Path("/data/runs"), text
+        )
+        is True
+    )
+
+
+def test_mountinfo_accepts_a_same_device_run_root_bind_with_external_evidence():
+    # The run root itself is a same-device bind; evidence lives elsewhere on
+    # the root filesystem and is not reachable from the run root.
+    text = _mountinfo(
+        "49 36 8:1 /srv/runs /data/runs rw - ext4 /dev/sda1 rw",
+    )
+    assert (
+        execution._mountinfo_rejects(
+            Path("/srv/evidence"), Path("/data/runs"), text
+        )
+        is False
+    )
+
+
 def test_mountinfo_escapes_mount_point_and_root():
     text = _mountinfo(
         "40 36 8:1 /data/runs/child\\040dir /mnt/a\\040b rw - ext4 /dev/sda1 rw"

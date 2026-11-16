@@ -429,15 +429,14 @@ def _mountinfo_rejects(path: Path, run_root: Path, text: str) -> bool:
             _lexically_within_run_root(entry.root, root_physical)
         ):
             return True
-    if target_mount.major_minor != root_mount.major_minor:
-        # A genuinely unrelated filesystem is allowed only when the run root
-        # does not itself contain a mount of that device. Otherwise a nested
-        # different-device mount can be rebound at the target path.
-        for entry in entries:
-            if entry.major_minor != target_mount.major_minor:
-                continue
-            if entry.mount_point == run_root or run_root in entry.mount_point.parents:
-                return True
+    # A mount strictly below the run root that shares the target's device can
+    # expose run-root content at the target path, whether or not that device
+    # matches the run root's own mount.
+    for entry in entries:
+        if entry.major_minor != target_mount.major_minor:
+            continue
+        if run_root in entry.mount_point.parents:
+            return True
     return False
 
 
