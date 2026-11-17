@@ -141,6 +141,14 @@ def test_release_candidate_manifest_rejects_unknown_missing_and_bad_digests():
     with pytest.raises(release.ReleaseGateError, match="migration_version"):
         release.validate_release_candidate_manifest(wrong_version)
 
+    extra_in_first_migration = dict(manifest)
+    extra_in_first_migration["migrations"] = [
+        dict(manifest["migrations"][0], unexpected=True),
+        *[dict(item) for item in manifest["migrations"][1:]],
+    ]
+    with pytest.raises(release.ReleaseGateError, match="unknown fields"):
+        release.validate_release_candidate_manifest(extra_in_first_migration)
+
 
 def test_manifest_disk_verification_rejects_replaced_migration(tmp_path):
     migrations = tmp_path / "migrations"
@@ -236,6 +244,13 @@ def test_promotion_gate_blocks_unverified_stale_or_incompatible_candidate():
             expected_manifest_digest=approval["candidate_digest"],
             approval=_approval(manifest, approved_at="2026-11-10T00:00:00Z"),
             now=release.datetime(2026, 11, 17, tzinfo=release.timezone.utc),
+        )
+
+    with pytest.raises(release.ReleaseGateError, match="contract_version"):
+        release.verify_promotion_gate(
+            manifest,
+            expected_manifest_digest=approval["candidate_digest"],
+            approval=_approval(manifest, contract_version=True),
         )
 
 
@@ -427,6 +442,116 @@ def test_rollback_release_restores_target_config_and_migration():
     assert backend.active_release()["config"] == target["config"]
 
 
+def test_rollback_release_rejects_active_execution_slots():
+    target = {
+        "image_id": "sha256:" + "7" * 64,
+        "config": {"policy_version": "0"},
+        "migration_version": "007_execution_evidence_invariant.sql",
+        "evidence_root": "/var/lib/datacon/evidence",
+    }
+    with pytest.raises(release.ReleaseGateError, match="slot"):
+        release.rollback_release(
+            target_release=target,
+            backend=_backend(slots=1),
+            smoke_checks={"cli_smoke": lambda: True},
+            approved_by="reviewer-1",
+            candidate_digest="sha256:" + "6" * 64,
+        )
+
+
+def test_dict_backend_allows_repromotion_after_smoke_rollback():
+    manifest = _sample_rc_manifest()
+    previous = _previous()
+    backend = _backend(previous=previous)
+    approval = _approval(manifest)
+
+    def rollback(prev):
+        backend.switch(
+            image_id=prev["image_id"],
+            config=prev["config"],
+            migration_version=prev["migration_version"],
+            evidence_root=prev["evidence_root"],
+            action="rollback",
+            candidate_digest=approval["candidate_digest"],
+        )
+        return {"restored_image": prev["image_id"], "ok": True}
+
+    failed_once = release.promote_and_smoke(
+        manifest=manifest,
+        expected_manifest_digest=approval["candidate_digest"],
+        approval=approval,
+        backend=backend,
+        smoke_checks={"cli_smoke": lambda: False},
+        rollback_fn=rollback,
+    )
+    assert failed_once["status"] == "rolled_back"
+
+    failed_twice = release.promote_and_smoke(
+        manifest=manifest,
+        expected_manifest_digest=approval["candidate_digest"],
+        approval=approval,
+        backend=backend,
+        smoke_checks={"cli_smoke": lambda: False},
+        rollback_fn=rollback,
+    )
+    assert failed_twice["status"] == "rolled_back"
+
+    succeeded = release.promote_and_smoke(
+        manifest=manifest,
+        expected_manifest_digest=approval["candidate_digest"],
+        approval=approval,
+        backend=backend,
+        smoke_checks={"cli_smoke": lambda: True},
+        rollback_fn=rollback,
+    )
+    assert succeeded["status"] == "promoted"
+    assert backend.active_release()["image_id"] == manifest["control_plane_image_id"]
+    assert [audit["status"] for audit in backend.audits] == [
+        "rolled_back",
+        "rolled_back",
+        "promoted",
+    ]
+
+
+def test_cli_release_slots_reads_active_slots_once(monkeypatch, capsys):
+    from datacon import cli
+
+    calls = 0
+
+    class FlappingStore:
+        def __init__(self, dsn, *, environment):
+            pass
+
+        def active_slots(self):
+            nonlocal calls
+            calls += 1
+            return 1 if calls == 1 else 0
+
+        def active_release(self):
+            return {"image_id": "sha256:" + "8" * 64}
+
+    monkeypatch.setenv("DATACON_DATABASE_URL", "postgresql://unused")
+    monkeypatch.setattr(cli.state, "ReleaseStore", FlappingStore)
+    code = cli.main(["release", "slots", "--environment", "internal-lab"])
+    assert code == 0
+    assert calls == 1
+    output = json.loads(capsys.readouterr().out)
+    assert output["active_slots"] == 1
+    assert output["drained"] is False
+
+
+def test_write_smoke_evidence_bundle_is_verifiable_and_world_readable(tmp_path):
+    bundle_dir = tmp_path / "smoke-bundle"
+    digest = release.write_smoke_evidence_bundle(
+        bundle_dir, cases_dir=REPO_ROOT / "tests" / "fixtures" / "cases"
+    )
+    verified = evidence.verify_bundle(bundle_dir)
+    assert verified.manifest_digest == digest
+    assert verified.manifest["verdict"] == "REPRODUCED"
+    assert (bundle_dir.stat().st_mode & 0o777) == 0o755
+    assert ((bundle_dir / "manifest.json").stat().st_mode & 0o777) == 0o444
+
+
 # ---------------------------------------------------------------------------
 # B03 real-material acceptance
 # ---------------------------------------------------------------------------
@@ -434,9 +559,18 @@ def test_rollback_release_restores_target_config_and_migration():
 
 def _b03_case_root(tmp_path: Path) -> Path:
     root = tmp_path / "b03-case"
-    root.mkdir(exist_ok=True)
-    for name in ("harness.c", "build.sh", "dependencies.lock", "fix.patch", "advisory.json"):
+    root.mkdir(parents=True, exist_ok=True)
+    for name in ("harness.c", "build.sh", "dependencies.lock", "fix.patch"):
         shutil.copy2(CASES / name, root / name)
+    advisory = json.loads((CASES / "advisory.json").read_text(encoding="utf-8"))
+    admission = json.loads(B03_PATH.read_text(encoding="utf-8"))
+    advisory["cve_id"] = admission["cve_id"]
+    advisory["vulnerable_commit"] = admission["versions"]["vulnerable"]["commit"]
+    advisory["fixed_commit"] = admission["versions"]["fixed"]["commit"]
+    for src in advisory.get("sources", []):
+        src["vulnerable_commit"] = advisory["vulnerable_commit"]
+        src["fixed_commit"] = advisory["fixed_commit"]
+    (root / "advisory.json").write_text(json.dumps(advisory, indent=2) + "\n", encoding="utf-8")
     shutil.copy2(CASES / "fixture-repo.bundle", root / "b03-repo.bundle")
     for version in ("vulnerable", "fixed"):
         (root / version).mkdir(exist_ok=True)
@@ -689,3 +823,170 @@ def test_b03_frozen_admission_reproduces_with_real_material_files(tmp_path):
     (bundle / "materials" / "harness.c").write_bytes(b"tampered\n")
     with pytest.raises(evidence.BundleError, match="mismatch"):
         evidence.verify_bundle(bundle)
+
+
+def test_b03_fixed_build_failure_cleans_up_vulnerable_artifact_and_staging_dirs(tmp_path):
+    import os
+
+    root = _b03_case_root(tmp_path)
+    admission = _frozen_admission()
+    review = _review_for(admission, root)
+
+    class FailOnFixedSandbox(FakeB03Sandbox):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.observed_modes: dict[str, int] = {}
+
+        def build(self, version: str, **kwargs):
+            materials_dir = Path(kwargs["materials_dir"])
+            self.observed_modes["staging_root"] = materials_dir.stat().st_mode & 0o777
+            self.observed_modes["build_sh"] = (materials_dir / "build.sh").stat().st_mode & 0o777
+            self.observed_modes["input"] = (
+                materials_dir / "inputs" / "normal.txt"
+            ).stat().st_mode & 0o777
+            if version == "fixed":
+                return BuildResult(
+                    version=version,
+                    status="failed",
+                    exit_code=1,
+                    duration_seconds=0.5,
+                    container_id="cid-fail-fixed",
+                    image_digest=self.toolchain.split("@", 1)[1],
+                    compile_args=tuple(kwargs.get("compile_args") or ()),
+                    artifact_digest=None,
+                    log=b"fixed build failed\n",
+                    log_truncated=False,
+                    artifact=b"",
+                    metadata={"image_digest": self.toolchain.split("@", 1)[1]},
+                )
+            return super().build(version, **kwargs)
+
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    sandbox = FailOnFixedSandbox(toolchain=admission["build"]["toolchain_image"])
+    old_umask = os.umask(0o077)
+    try:
+        with pytest.raises(release.ReleaseGateError, match="fixed build did not complete"):
+            release.run_b03_acceptance(
+                admission=admission,
+                sandbox=sandbox,
+                normal_input=(root / "inputs" / "normal.txt").read_bytes(),
+                candidate_input=(root / "inputs" / "candidate.txt").read_bytes(),
+                bundle_out=out_dir / "b03-bundle",
+                storage_ref="vault://datacon/private/b03/CVE-2019-13224/manifest.json",
+                review=review,
+                case_root=root,
+            )
+    finally:
+        os.umask(old_umask)
+
+    assert sandbox.observed_modes["staging_root"] == 0o755
+    assert sandbox.observed_modes["build_sh"] == 0o444
+    assert sandbox.observed_modes["input"] == 0o444
+    leftovers = [p.name for p in out_dir.iterdir() if p.name.startswith(".b03-")]
+    assert leftovers == []
+
+
+def test_b03_multifile_source_trees_verify_and_detect_any_tampered_file(tmp_path):
+    root = _b03_case_root(tmp_path)
+    (root / "vulnerable" / "helper.c").write_text("int helper_v(void) { return 1; }\n", encoding="utf-8")
+    (root / "fixed" / "helper.c").write_text("int helper_v(void) { return 2; }\n", encoding="utf-8")
+
+    admission = _frozen_admission()
+    admission["asan_signature"]["operation"] = "READ"
+    admission["asan_signature"]["access_size"] = 4
+    review = _review_for(admission, root)
+
+    prepared = release.prepare_b03_plan(
+        admission=admission,
+        materials=release.B03CaseMaterials.load(root),
+        normal_input=(root / "inputs" / "normal.txt").read_bytes(),
+        candidate_input=(root / "inputs" / "candidate.txt").read_bytes(),
+    )
+    assert prepared["asan_signature"]["operation"] == "READ"
+    assert prepared["asan_signature"]["access_size"] == 4
+    expected_lines = len((root / "vulnerable" / "parser.c").read_bytes().splitlines())
+    assert prepared["plan"]["analysis"]["symbols"][0]["end_line"] == expected_lines
+
+    import uuid as uuid_mod
+
+    explicit_job_id = str(uuid_mod.uuid4())
+    sandbox = FakeB03Sandbox(toolchain=admission["build"]["toolchain_image"])
+    bundle_out = tmp_path / "b03-multifile-bundle"
+    acceptance = release.run_b03_acceptance(
+        admission=admission,
+        sandbox=sandbox,
+        normal_input=(root / "inputs" / "normal.txt").read_bytes(),
+        candidate_input=(root / "inputs" / "candidate.txt").read_bytes(),
+        bundle_out=bundle_out,
+        storage_ref="vault://datacon/private/b03/CVE-2019-13224/manifest.json",
+        review=review,
+        case_root=root,
+        job_id=explicit_job_id,
+    )
+    assert acceptance["bundle_verified"] is True
+    verified = evidence.verify_bundle(bundle_out)
+    assert verified.manifest["job_id"] == explicit_job_id
+    assert (bundle_out / "materials" / "vulnerable" / "helper.c").is_file()
+    assert (bundle_out / "materials" / "fixed" / "helper.c").is_file()
+
+    # Tampering with ANY source file in the multi-file tree must trigger DIGEST_MISMATCH.
+    (bundle_out / "materials" / "vulnerable" / "helper.c").write_bytes(b"int helper_v(void) { return 999; }\n")
+    with pytest.raises(evidence.BundleError) as exc_info:
+        evidence.verify_bundle(bundle_out)
+    assert exc_info.value.reason_code == "DIGEST_MISMATCH"
+
+
+def test_b03_rejects_malformed_admission_and_mismatched_advisory(tmp_path):
+    root = _b03_case_root(tmp_path)
+    materials = release.B03CaseMaterials.load(root)
+    normal = (root / "inputs" / "normal.txt").read_bytes()
+    candidate = (root / "inputs" / "candidate.txt").read_bytes()
+
+    for mutator in (
+        lambda adm: adm.pop("cve_id"),
+        lambda adm: adm["asan_signature"].pop("error"),
+        lambda adm: adm["asan_signature"].pop("function"),
+        lambda adm: adm["asan_signature"].pop("source"),
+        lambda adm: adm["build"].pop("toolchain_image"),
+        lambda adm: adm["repository"].pop("url"),
+        lambda adm: adm["advisory"].pop("nvd"),
+        lambda adm: adm["harness"].__setitem__("normal_exit_code", True),
+    ):
+        broken = _frozen_admission()
+        mutator(broken)
+        with pytest.raises(release.ReleaseGateError):
+            release.prepare_b03_plan(
+                admission=broken,
+                materials=materials,
+                normal_input=normal,
+                candidate_input=candidate,
+            )
+
+    # Mismatched CVE in advisory.json must be rejected.
+    bad_cve_root = tmp_path / "bad-cve"
+    bad_cve_root_case = _b03_case_root(bad_cve_root)
+    adv = json.loads((bad_cve_root_case / "advisory.json").read_text(encoding="utf-8"))
+    adv["cve_id"] = "CVE-2099-9999"
+    (bad_cve_root_case / "advisory.json").write_text(json.dumps(adv), encoding="utf-8")
+    with pytest.raises(release.ReleaseGateError, match="advisory"):
+        release.prepare_b03_plan(
+            admission=_frozen_admission(),
+            materials=release.B03CaseMaterials.load(bad_cve_root_case),
+            normal_input=normal,
+            candidate_input=candidate,
+        )
+
+    # Mismatched commit in advisory.json must be rejected.
+    bad_commit_root = tmp_path / "bad-commit"
+    bad_commit_case = _b03_case_root(bad_commit_root)
+    adv2 = json.loads((bad_commit_case / "advisory.json").read_text(encoding="utf-8"))
+    adv2["fixed_commit"] = "0" * 40
+    (bad_commit_case / "advisory.json").write_text(json.dumps(adv2), encoding="utf-8")
+    with pytest.raises(release.ReleaseGateError, match="advisory"):
+        release.prepare_b03_plan(
+            admission=_frozen_admission(),
+            materials=release.B03CaseMaterials.load(bad_commit_case),
+            normal_input=normal,
+            candidate_input=candidate,
+        )

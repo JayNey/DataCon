@@ -29,6 +29,16 @@ _MD_LINK = re.compile(r"\[[^\]]*\]\(([^)]+)\)")
 _REQ_REF = re.compile(r"\bREQ-[0-9]{2}\b")
 _TC_REF = re.compile(r"\bTC-[0-9]{2}\b")
 _ACTION_SHA = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+@[0-9a-f]{40}")
+_REUSABLE_WORKFLOW_SHA = re.compile(
+    r"[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)+@[0-9a-f]{40}"
+)
+_UNTRUSTED_RUN_EXPR_TOKENS = (
+    "github.event",
+    "inputs.",
+    "github.head_ref",
+    "github.ref_name",
+    "github.base_ref",
+)
 _DOCKER_DIGEST = re.compile(r"docker://[^\s@]+@sha256:[0-9a-f]{64}")
 _RUN_EXPRESSION = re.compile(r"\$\{\{(.*?)\}\}", re.S)
 _ISO_DATE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$")
@@ -202,7 +212,7 @@ def _check_run_expressions(text: str) -> list[str]:
     errors: list[str] = []
     for match in _RUN_EXPRESSION.finditer(text):
         expression = match.group(1).lower()
-        if "github.event" in expression or "inputs." in expression:
+        if any(token in expression for token in _UNTRUSTED_RUN_EXPR_TOKENS):
             errors.append(
                 "run: contains an untrusted '${{ ... }}' expression; pass it "
                 "through env: instead"
@@ -249,6 +259,21 @@ def check_workflow_security(files: Iterable[Path]) -> list[str]:
                 if key == "continue-on-error" and _continue_on_error_is_true(value):
                     errors.append(
                         f"{path}: job {job_name} uses continue-on-error: {value!r}"
+                    )
+            job_uses = job.get("uses")
+            if job_uses is not None:
+                if not isinstance(job_uses, str):
+                    errors.append(f"{path}: job {job_name} uses must be a string")
+                elif job_uses.startswith("./"):
+                    if ".." in Path(job_uses).parts:
+                        errors.append(
+                            f"{path}: job {job_name} local reusable workflow '{job_uses}' "
+                            "must not traverse parent directories"
+                        )
+                elif not _REUSABLE_WORKFLOW_SHA.fullmatch(job_uses):
+                    errors.append(
+                        f"{path}: job {job_name} reusable workflow '{job_uses}' "
+                        "must be pinned to a 40-char commit SHA"
                     )
             steps = job.get("steps")
             if not isinstance(steps, list):
@@ -330,7 +355,10 @@ def evaluate_scan_findings(
     today: str | None = None,
 ) -> dict[str, int]:
     """Block unwaived CRITICAL/HIGH findings; validate structured waivers."""
-    current_day = date.fromisoformat(today) if today else date.today()
+    try:
+        current_day = date.fromisoformat(today) if today else date.today()
+    except ValueError as error:
+        raise GateError(f"invalid evaluation date {today!r}") from error
     waiver_map: dict[str, dict[str, Any]] = {}
     for entry in waivers:
         if not isinstance(entry, dict):
@@ -347,7 +375,12 @@ def evaluate_scan_findings(
         expires_raw = entry["expires_at"].strip()
         if not _ISO_DATE.fullmatch(expires_raw):
             raise GateError(f"waiver {entry['id']} expires_at must be YYYY-MM-DD")
-        expires = date.fromisoformat(expires_raw)
+        try:
+            expires = date.fromisoformat(expires_raw)
+        except ValueError as error:
+            raise GateError(
+                f"waiver {entry['id']} expires_at is not a valid date: {expires_raw}"
+            ) from error
         if expires < current_day:
             raise GateError(f"waiver {entry['id']} is expired ({expires_raw})")
         waiver_map[entry["id"]] = entry
@@ -504,12 +537,10 @@ def check_dependency_lock(root: Path) -> list[str]:
     except OSError as error:
         requirement_lines = []
         errors.append(f"requirements-ci.txt cannot be read: {error}")
-    uv_lines = [
-        line for line in requirement_lines if line.startswith("uv==")
-    ]
-    if len(uv_lines) != 1 or not _UV_REQUIREMENT.fullmatch(uv_lines[0]):
+    non_empty_lines = [line for line in requirement_lines if line]
+    if len(non_empty_lines) != 1 or not _UV_REQUIREMENT.fullmatch(non_empty_lines[0]):
         errors.append(
-            "requirements-ci.txt must contain an uncommented "
+            "requirements-ci.txt must contain only an uncommented "
             "uv==0.12.7 --hash=sha256:<64hex> requirement"
         )
 

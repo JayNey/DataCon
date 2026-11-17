@@ -17,8 +17,10 @@ CREATE TABLE IF NOT EXISTS release_state (
         CHECK (image_id ~ '^sha256:[0-9a-f]{64}$')
 );
 
--- Append-only audit log. The unique key makes a repeated promotion of the same
--- candidate idempotent: it cannot switch state or write a second audit row.
+-- Append-only audit log. Only successful promotions are unique per
+-- (environment, candidate_digest), keeping repeated promotions idempotent while
+-- allowing multiple rollbacks (including repeated smoke failures or rolling back
+-- to the same baseline image more than once).
 CREATE TABLE IF NOT EXISTS release_events (
     event_id uuid PRIMARY KEY,
     environment text NOT NULL,
@@ -37,9 +39,15 @@ CREATE TABLE IF NOT EXISTS release_events (
     CONSTRAINT release_events_candidate_digest_check
         CHECK (candidate_digest ~ '^sha256:[0-9a-f]{64}$'),
     CONSTRAINT release_events_manifest_digest_check
-        CHECK (manifest_digest ~ '^sha256:[0-9a-f]{64}$'),
-    UNIQUE (environment, action, candidate_digest)
+        CHECK (manifest_digest ~ '^sha256:[0-9a-f]{64}$')
 );
+
+ALTER TABLE release_events
+    DROP CONSTRAINT IF EXISTS release_events_environment_action_candidate_digest_key;
+
+CREATE UNIQUE INDEX IF NOT EXISTS release_events_promote_unique_idx
+    ON release_events (environment, candidate_digest)
+    WHERE action = 'promote';
 
 CREATE INDEX IF NOT EXISTS release_events_recorded_idx
     ON release_events (environment, recorded_at DESC);

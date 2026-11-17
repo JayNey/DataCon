@@ -266,8 +266,18 @@ jobs:
           retention-days: 30
 
   promote-internal:
-    needs: build-candidate
-    if: always() && (startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'promote'))
+    needs: [test-report, build-candidate]
+    if: >-
+      !cancelled()
+      && needs.test-report.result == 'success'
+      && (
+        (startsWith(github.ref, 'refs/tags/v') && needs.build-candidate.result == 'success')
+        || (
+          github.event_name == 'workflow_dispatch'
+          && github.event.inputs.action == 'promote'
+          && needs.build-candidate.result == 'skipped'
+        )
+      )
     environment: internal-lab
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -383,10 +393,11 @@ jobs:
           import json
           import os
           import pathlib
+          import shutil
           import subprocess
           import sys
 
-          from datacon import evidence, release, state
+          from datacon import release, state
 
           out = pathlib.Path(sys.argv[1])
           manifest = json.loads(
@@ -406,12 +417,11 @@ jobs:
               raise SystemExit(
                   "release_state is empty; bootstrap the baseline release before promoting"
               )
-          stored_bundle = store.latest_evidence_bundle()
-          if stored_bundle is None:
-              raise SystemExit("no archived evidence bundle exists for the smoke check")
-          verified = evidence.verify_bundle(stored_bundle["path"])
-          if verified.manifest_digest != stored_bundle["digest"]:
-              raise SystemExit("archived evidence digest does not match the task record")
+          smoke_bundle = out / "smoke-bundle"
+          shutil.rmtree(smoke_bundle, ignore_errors=True)
+          smoke_bundle_digest = release.write_smoke_evidence_bundle(
+              smoke_bundle, cases_dir=pathlib.Path("tests/fixtures/cases")
+          )
 
           def rollback_fn(prev):
               store.switch(
@@ -438,18 +448,49 @@ jobs:
               ) as conn:
                   return conn.execute("SELECT 1").fetchone() == (1,)
 
-          result = release.promote_and_smoke(
-              manifest=manifest,
-              expected_manifest_digest=expected,
-              approval=approval,
-              backend=store,
-              smoke_checks={
-                  "cli_smoke": image_help,
-                  "db_readability": db_readable,
-                  "archived_bundle": lambda: True,
-              },
-              rollback_fn=rollback_fn,
-          )
+          def archived_bundle_smoke():
+              proc = subprocess.run(
+                  [
+                      "docker",
+                      "run",
+                      "--rm",
+                      "-v",
+                      f"{smoke_bundle}:/bundle:ro",
+                      "datacon-control-plane:candidate",
+                      "verify-bundle",
+                      "/bundle",
+                      "--expected-digest",
+                      smoke_bundle_digest,
+                  ],
+                  capture_output=True,
+                  text=True,
+              )
+              if proc.returncode != 0:
+                  return False
+              try:
+                  parsed = json.loads(proc.stdout)
+              except json.JSONDecodeError:
+                  return False
+              return (
+                  parsed.get("status") == "valid"
+                  and parsed.get("manifest_digest") == smoke_bundle_digest
+              )
+
+          try:
+              result = release.promote_and_smoke(
+                  manifest=manifest,
+                  expected_manifest_digest=expected,
+                  approval=approval,
+                  backend=store,
+                  smoke_checks={
+                      "cli_smoke": image_help,
+                      "db_readability": db_readable,
+                      "archived_bundle": archived_bundle_smoke,
+                  },
+                  rollback_fn=rollback_fn,
+              )
+          finally:
+              shutil.rmtree(smoke_bundle, ignore_errors=True)
           (out / release.PROMOTION_RESULT_FILE).write_text(
               json.dumps(result, indent=2) + "\n", encoding="utf-8"
           )
@@ -537,10 +578,18 @@ jobs:
                   capture_output=True,
               ).returncode == 0
 
+          def db_readable():
+              import psycopg
+
+              with psycopg.connect(
+                  os.environ["DATACON_DATABASE_URL"], connect_timeout=5
+              ) as conn:
+                  return conn.execute("SELECT 1").fetchone() == (1,)
+
           result = release.rollback_release(
               target_release=target,
               backend=store,
-              smoke_checks={"cli_smoke": image_help},
+              smoke_checks={"cli_smoke": image_help, "db_readability": db_readable},
               approved_by="internal-lab-environment",
               candidate_digest=os.environ["TARGET_DIGEST"],
           )
@@ -581,6 +630,7 @@ jobs:
           import json
           import os
           import pathlib
+          import shutil
           import uuid
 
           from datacon import release
@@ -599,26 +649,34 @@ jobs:
               normal_input=normal_input,
               candidate_input=candidate_input,
           )
+          job_id = str(uuid.uuid4())
           sandbox = release.build_b03_sandbox(
               prepared["plan"],
               image=prepared["toolchain_image"],
-              job_id=str(uuid.uuid4()),
+              job_id=job_id,
               run_root=pathlib.Path(os.environ.get("RUNNER_TEMP", "/tmp")) / "b03-runs",
           )
+          run_id = os.environ.get("GITHUB_RUN_ID", "local")
+          run_attempt = os.environ.get("GITHUB_RUN_ATTEMPT", "1")
           bundle_out = (
               pathlib.Path(os.environ.get("RUNNER_TEMP", "/tmp"))
-              / ("b03-bundle-" + os.environ.get("GITHUB_RUN_ID", "local"))
+              / f"b03-bundle-{run_id}-{run_attempt}-{job_id}"
           )
-          acceptance = release.run_b03_acceptance(
-              admission=admission,
-              sandbox=sandbox,
-              normal_input=normal_input,
-              candidate_input=candidate_input,
-              bundle_out=bundle_out,
-              storage_ref=os.environ.get("DATACON_B03_STORAGE_REF", "vault://datacon/b03"),
-              review=review,
-              case_root=case_root,
-          )
+          shutil.rmtree(bundle_out, ignore_errors=True)
+          try:
+              acceptance = release.run_b03_acceptance(
+                  admission=admission,
+                  sandbox=sandbox,
+                  normal_input=normal_input,
+                  candidate_input=candidate_input,
+                  bundle_out=bundle_out,
+                  storage_ref=os.environ.get("DATACON_B03_STORAGE_REF", "vault://datacon/b03"),
+                  review=review,
+                  case_root=case_root,
+                  job_id=job_id,
+              )
+          finally:
+              shutil.rmtree(bundle_out, ignore_errors=True)
           summary = {
               "benchmark_id": acceptance["benchmark_id"],
               "cve_id": acceptance["cve_id"],
@@ -634,6 +692,25 @@ jobs:
               json.dumps(summary, indent=2) + "\n", encoding="utf-8"
           )
           print(json.dumps(summary, indent=2))
+          expected_verdict = admission.get("expected_verdict", "REPRODUCED")
+          if expected_verdict != "REPRODUCED":
+              raise SystemExit(
+                  f"unexpected B03 expected_verdict: {expected_verdict!r}"
+              )
+          if acceptance["verdict"] != expected_verdict:
+              raise SystemExit(
+                  f"B03 acceptance verdict mismatch: {acceptance['verdict']!r} != {expected_verdict!r}"
+              )
+          if acceptance["reason_code"] != "ASAN_SIGNATURE_MATCHED":
+              raise SystemExit(
+                  f"B03 acceptance reason_code mismatch: {acceptance['reason_code']!r}"
+              )
+          if acceptance["replay_count"] != 6:
+              raise SystemExit(
+                  f"B03 acceptance replay_count mismatch: {acceptance['replay_count']!r}"
+              )
+          if acceptance["bundle_verified"] is not True:
+              raise SystemExit("B03 acceptance bundle_verified must be True")
           PY
       - name: Upload only the sanitized B03 summary
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

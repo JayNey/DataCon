@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 import re
+import threading
 import uuid
 from typing import Any, Mapping
 from uuid import UUID
@@ -1327,14 +1329,52 @@ class ReleaseStore:
             raise ReleaseStateError("release environment must be a non-empty string")
         self.dsn = dsn
         self.environment = environment
+        self._tx_local = threading.local()
 
     def _connect(self):
         return psycopg.connect(
             self.dsn, connect_timeout=5, row_factory=dict_row
         )
 
-    def active_slots(self) -> int:
+    @contextmanager
+    def _connection(self):
+        active = getattr(self._tx_local, "conn", None)
+        if active is not None:
+            yield active
+            return
         with self._connect() as connection:
+            yield connection
+
+    @contextmanager
+    def transaction(self):
+        """Run promotion/rollback checks, state switch, and audit in one transaction.
+
+        Acquires a per-environment advisory lock and locks the ``release_state``
+        row so concurrent workflows cannot interleave or overwrite
+        ``previous_image_id``. Any exception rolls back both ``release_state``
+        and ``release_events`` together.
+        """
+        existing = getattr(self._tx_local, "conn", None)
+        if existing is not None:
+            yield existing
+            return
+        with self._connect() as connection:
+            connection.execute(
+                "SELECT pg_advisory_xact_lock(hashtext('datacon:release:' || %s))",
+                (self.environment,),
+            )
+            connection.execute(
+                "SELECT 1 FROM release_state WHERE environment = %s FOR UPDATE",
+                (self.environment,),
+            )
+            self._tx_local.conn = connection
+            try:
+                yield connection
+            finally:
+                self._tx_local.conn = None
+
+    def active_slots(self) -> int:
+        with self._connection() as connection:
             row = connection.execute(
                 "SELECT COUNT(*) AS active FROM jobs WHERE state = ANY(%s)",
                 (list(RELEASE_ACTIVE_STATES),),
@@ -1342,7 +1382,7 @@ class ReleaseStore:
         return int(row["active"])
 
     def active_release(self) -> dict[str, Any] | None:
-        with self._connect() as connection:
+        with self._connection() as connection:
             row = connection.execute(
                 "SELECT image_id, config, migration_version, evidence_root, updated_at "
                 "FROM release_state WHERE environment = %s",
@@ -1368,7 +1408,7 @@ class ReleaseStore:
     ) -> None:
         """Insert the baseline release once; an existing row is never overwritten."""
         _release_digest(image_id, "bootstrap image_id")
-        with self._connect() as connection:
+        with self._connection() as connection:
             connection.execute(
                 "INSERT INTO release_state "
                 "(environment, image_id, config, migration_version, evidence_root) "
@@ -1396,7 +1436,17 @@ class ReleaseStore:
         _release_digest(candidate_digest, "switch candidate_digest")
         if action not in ("promote", "rollback"):
             raise ReleaseStateError(f"unknown release action: {action}")
-        with self._connect() as connection:
+        with self._connection() as connection:
+            if action == "promote":
+                active_row = connection.execute(
+                    "SELECT COUNT(*) AS active FROM jobs WHERE state = ANY(%s)",
+                    (list(RELEASE_ACTIVE_STATES),),
+                ).fetchone()
+                if int(active_row["active"]) != 0:
+                    raise ReleaseStateError(
+                        "promotion blocked: execution slots not drained "
+                        f"(active_slots={int(active_row['active'])})"
+                    )
             connection.execute(
                 "INSERT INTO release_state "
                 "(environment, image_id, config, migration_version, evidence_root) "
@@ -1433,29 +1483,40 @@ class ReleaseStore:
         previous_image = result.get("previous_image_id")
         if previous_image is not None:
             previous_image = _release_digest(previous_image, "previous_image_id")
-        with self._connect() as connection:
-            connection.execute(
-                "INSERT INTO release_events "
-                "(event_id, environment, action, status, candidate_digest, "
-                "manifest_digest, previous_image_id, active_image_id, payload) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) "
-                "ON CONFLICT (environment, action, candidate_digest) DO NOTHING",
-                (
-                    uuid.uuid4(),
-                    self.environment,
-                    action,
-                    status,
-                    candidate_digest,
-                    manifest_digest,
-                    previous_image,
-                    active_image,
-                    Jsonb(dict(result)),
-                ),
+        with self._connection() as connection:
+            params = (
+                uuid.uuid4(),
+                self.environment,
+                action,
+                status,
+                candidate_digest,
+                manifest_digest,
+                previous_image,
+                active_image,
+                Jsonb(dict(result)),
             )
+            if action == "promote":
+                connection.execute(
+                    "INSERT INTO release_events "
+                    "(event_id, environment, action, status, candidate_digest, "
+                    "manifest_digest, previous_image_id, active_image_id, payload) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) "
+                    "ON CONFLICT (environment, candidate_digest) "
+                    "WHERE action = 'promote' DO NOTHING",
+                    params,
+                )
+            else:
+                connection.execute(
+                    "INSERT INTO release_events "
+                    "(event_id, environment, action, status, candidate_digest, "
+                    "manifest_digest, previous_image_id, active_image_id, payload) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                    params,
+                )
 
     def promotion_for(self, candidate_digest: str) -> dict[str, Any] | None:
         _release_digest(candidate_digest, "candidate_digest")
-        with self._connect() as connection:
+        with self._connection() as connection:
             row = connection.execute(
                 "SELECT payload FROM release_events "
                 "WHERE environment = %s AND action = 'promote' "
@@ -1472,7 +1533,7 @@ class ReleaseStore:
         workflow supplying a half-invented previous release.
         """
         _release_digest(image_id, "image_id")
-        with self._connect() as connection:
+        with self._connection() as connection:
             row = connection.execute(
                 "SELECT payload FROM release_events "
                 "WHERE environment = %s AND active_image_id = %s "
@@ -1510,7 +1571,7 @@ class ReleaseStore:
 
     def latest_evidence_bundle(self) -> dict[str, str] | None:
         """Return the newest archived evidence bundle for a release smoke check."""
-        with self._connect() as connection:
+        with self._connection() as connection:
             row = connection.execute(
                 "SELECT evidence_path, evidence_digest FROM jobs "
                 "WHERE evidence_status = 'archived' "
@@ -1525,10 +1586,10 @@ class ReleaseStore:
         }
 
     def events(self) -> list[dict[str, Any]]:
-        with self._connect() as connection:
+        with self._connection() as connection:
             rows = connection.execute(
                 "SELECT event_id, action, status, candidate_digest, "
-                "active_image_id, recorded_at FROM release_events "
+                "previous_image_id, active_image_id, recorded_at FROM release_events "
                 "WHERE environment = %s ORDER BY recorded_at, event_id",
                 (self.environment,),
             ).fetchall()
@@ -1538,6 +1599,7 @@ class ReleaseStore:
                 "action": row["action"],
                 "status": row["status"],
                 "candidate_digest": row["candidate_digest"],
+                "previous_image_id": row["previous_image_id"],
                 "active_image_id": row["active_image_id"],
                 "recorded_at": row["recorded_at"].isoformat(),
             }

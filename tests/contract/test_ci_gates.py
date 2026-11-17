@@ -194,6 +194,57 @@ def test_workflow_security_rejects_run_expressions_and_untrusted_checkout_ref(tm
     assert any("checkout ref comes from an expression" in err for err in errors)
 
 
+def test_workflow_security_rejects_unpinned_reusable_workflow_and_branch_run_expressions(tmp_path):
+    reusable_bad = tmp_path / "reusable-bad.yml"
+    reusable_bad.write_text(
+        "name: BadReusable\n"
+        "on:\n"
+        "  workflow_dispatch:\n"
+        "permissions:\n"
+        "  contents: read\n"
+        "jobs:\n"
+        "  call-other:\n"
+        "    uses: org/repo/.github/workflows/deploy.yml@main\n",
+        encoding="utf-8",
+    )
+    errors = ci_gates.check_workflow_security([reusable_bad])
+    assert any("reusable" in err.lower() or "40-char" in err for err in errors)
+
+    reusable_good = tmp_path / "reusable-good.yml"
+    reusable_good.write_text(
+        "name: GoodReusable\n"
+        "on:\n"
+        "  workflow_dispatch:\n"
+        "permissions:\n"
+        "  contents: read\n"
+        "jobs:\n"
+        "  call-sha:\n"
+        "    uses: org/repo/.github/workflows/deploy.yml@" + "a" * 40 + "\n"
+        "  call-local:\n"
+        "    uses: ./.github/workflows/ci.yml\n",
+        encoding="utf-8",
+    )
+    assert ci_gates.check_workflow_security([reusable_good]) == []
+
+    head_ref = tmp_path / "head-ref.yml"
+    head_ref.write_text(
+        "name: BadRef\n"
+        "on:\n"
+        "  pull_request:\n"
+        "permissions:\n"
+        "  contents: read\n"
+        "jobs:\n"
+        "  test:\n"
+        "    steps:\n"
+        "      - run: echo \"${{ github.head_ref }}\"\n"
+        "      - run: echo \"${{ github.ref_name }}\"\n",
+        encoding="utf-8",
+    )
+    errors = ci_gates.check_workflow_security([head_ref])
+    assert len(errors) == 2
+    assert all("untrusted '${{ ... }}'" in err for err in errors)
+
+
 def test_junit_gate_rejects_failures_skips_and_empty_suites(tmp_path):
     ok = tmp_path / "ok.xml"
     ok.write_text('<testsuite tests="3" skipped="0" failures="0" errors="0"/>', encoding="utf-8")
@@ -250,6 +301,20 @@ def test_vulnerability_scan_blocks_critical_high_and_invalid_waivers(tmp_path):
     ]
     with pytest.raises(ci_gates.GateError, match="missing"):
         ci_gates.evaluate_scan_findings(findings, waivers=incomplete_waiver, today="2026-11-17")
+
+    invalid_calendar_waiver = [
+        {
+            "id": "CVE-2025-1111",
+            "scope": "dev-only",
+            "impact": "none in container",
+            "owner": "sec-team",
+            "expires_at": "2026-02-31",
+        }
+    ]
+    with pytest.raises(ci_gates.GateError, match="expires_at"):
+        ci_gates.evaluate_scan_findings(
+            findings, waivers=invalid_calendar_waiver, today="2026-11-17"
+        )
 
     valid_waiver = [
         {
@@ -369,6 +434,18 @@ def test_dependency_lock_rejects_commented_requirement_and_bad_pyproject(tmp_pat
     )
     errors = ci_gates.check_dependency_lock(root)
     assert any("required-version" in err for err in errors)
+
+    # Extra unpinned/unhashed dependency line alongside valid uv pin must fail.
+    extra_dep_root = tmp_path / "extra-dep"
+    extra_dep_root.mkdir()
+    shutil.copy2(REPO_ROOT / "pyproject.toml", extra_dep_root / "pyproject.toml")
+    shutil.copy2(REPO_ROOT / "uv.lock", extra_dep_root / "uv.lock")
+    valid_uv_line = (REPO_ROOT / "requirements-ci.txt").read_text(encoding="utf-8")
+    (extra_dep_root / "requirements-ci.txt").write_text(
+        valid_uv_line + "\nrequests>=2.0\n", encoding="utf-8"
+    )
+    errors = ci_gates.check_dependency_lock(extra_dep_root)
+    assert any("requirements-ci.txt" in err for err in errors)
 
 
 def test_scan_findings_gate_is_wired_into_repo_static_gates(tmp_path):

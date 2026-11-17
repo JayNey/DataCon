@@ -319,12 +319,13 @@ def _release_slots(args) -> int:
         return _error(1, "DATABASE_NOT_CONFIGURED", "set DATACON_DATABASE_URL")
     try:
         store_handle = state.ReleaseStore(dsn, environment=args.environment)
+        slots = store_handle.active_slots()
         active = store_handle.active_release()
         payload = {
             "environment": args.environment,
-            "active_slots": store_handle.active_slots(),
+            "active_slots": slots,
             "active_release": active,
-            "drained": store_handle.active_slots() == 0,
+            "drained": slots == 0,
         }
     except psycopg.Error as error:
         return _error(1, "DATABASE_ERROR", _database_error_message(error))

@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager, nullcontext
+import copy
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
+import os
 from pathlib import Path, PurePosixPath
 import re
 import shutil
@@ -49,6 +52,9 @@ PROMOTION_RESULT_FILE = "promotion-result.json"
 _SHA256 = re.compile(r"sha256:[0-9a-f]{64}")
 _GIT_SHA40 = re.compile(r"[0-9a-f]{40}")
 _MIGRATION_NAME = re.compile(r"[0-9]{3}_[A-Za-z0-9_]+\.sql")
+_CVE_ID = re.compile(r"CVE-[0-9]{4}-[0-9]{4,}")
+_HTTP_URL = re.compile(r"https?://\S+")
+_B03_VERDICTS = frozenset({"REPRODUCED", "NOT_REPRODUCED", "INCONCLUSIVE"})
 
 _REQUIRED_RC_FIELDS = frozenset(
     {
@@ -199,8 +205,8 @@ def validate_release_candidate_manifest(manifest: Mapping[str, Any]) -> None:
             raise ReleaseGateError("migrations must be sorted in ascending order")
         names.append(name)
         _require_digest(entry.get("sha256"), "migration entry sha256")
-    if set(entry.keys()) != {"file", "sha256"}:
-        raise ReleaseGateError("migration entry has unknown fields")
+        if set(entry.keys()) != {"file", "sha256"}:
+            raise ReleaseGateError("migration entry has unknown fields")
     if manifest["migration_version"] != names[-1]:
         raise ReleaseGateError("migration_version must match the latest migration file")
     _parse_instant(manifest["created_at"], "created_at")
@@ -371,7 +377,9 @@ def _validate_approval(
         raise ReleaseGateError("promotion blocked: approved_by is required")
     if approval.get("candidate_digest") != candidate_digest:
         raise ReleaseGateError("promotion blocked: approval digest does not match candidate")
-    if approval.get("contract_version") != CONTRACT_VERSION:
+    if type(approval.get("contract_version")) is not int or approval.get(
+        "contract_version"
+    ) != CONTRACT_VERSION:
         raise ReleaseGateError("promotion blocked: incompatible contract_version")
     if approval.get("migration_compatible") is not True:
         raise ReleaseGateError("promotion blocked: database migration compatibility not verified")
@@ -528,10 +536,26 @@ class DictPromotionBackend:
             "evidence_root": evidence_root,
         }
 
+    @contextmanager
+    def transaction(self):
+        snapshot = (
+            copy.deepcopy(self._active),
+            copy.deepcopy(self.promotions),
+            copy.deepcopy(self.switches),
+            copy.deepcopy(self.audits),
+        )
+        try:
+            yield self
+        except BaseException:
+            self._active, self.promotions, self.switches, self.audits = snapshot
+            raise
+
     def record_audit(self, result: Mapping[str, Any]) -> None:
         self.audits.append(dict(result))
         candidate = result.get("candidate_digest")
-        if isinstance(candidate, str):
+        # Mirror ReleaseStore.promotion_for(): only a successful promotion is
+        # an idempotency key. A rolled-back smoke run must stay replayable.
+        if isinstance(candidate, str) and result.get("status") == "promoted":
             self.promotions.setdefault(candidate, dict(result))
 
     def promotion_for(self, candidate_digest: str) -> Mapping[str, Any] | None:
@@ -544,6 +568,48 @@ def _candidate_config(manifest: Mapping[str, Any]) -> dict[str, Any]:
         "contract_version": manifest["contract_version"],
         "migration_version": manifest["migration_version"],
     }
+
+
+def _backend_transaction(backend: PromotionBackend):
+    """Return the backend's atomic transaction scope when it provides one."""
+    factory = getattr(backend, "transaction", None)
+    if callable(factory):
+        return factory()
+    return nullcontext()
+
+
+def _require_drained(backend: PromotionBackend, *, action: str) -> None:
+    active_slots = backend.active_slots()
+    if type(active_slots) is not int or active_slots != 0:
+        raise ReleaseGateError(
+            f"{action} blocked: execution slots not drained "
+            f"(active_slots={active_slots})"
+        )
+
+
+def _same_release(left: Mapping[str, Any], right: Mapping[str, Any]) -> bool:
+    if not isinstance(left, Mapping) or not isinstance(right, Mapping):
+        return False
+    return all(
+        left.get(field) == right.get(field)
+        for field in ("image_id", "config", "migration_version", "evidence_root")
+    )
+
+
+def _existing_promotion(
+    backend: PromotionBackend, existing: Mapping[str, Any]
+) -> dict[str, Any]:
+    if existing.get("status") != "promoted":
+        raise ReleaseGateError(
+            "candidate already has a non-promoted audit record; refusing to replay"
+        )
+    active = backend.active_release()
+    if active is None or active.get("image_id") != existing.get("active_image_id"):
+        raise ReleaseGateError(
+            "candidate was previously promoted but the active release changed; "
+            "refusing to replay a stale approval"
+        )
+    return dict(existing)
 
 
 def promote_and_smoke(
@@ -561,7 +627,9 @@ def promote_and_smoke(
     Promotion is idempotent for a candidate digest: a repeated call returns the
     already recorded result and never switches or audits twice. A smoke failure
     is not swallowed: the rollback callable must prove it restored the previous
-    image, and the persisted active release must actually change back.
+    image, and the persisted active release must actually change back. The
+    switch and its audit share one backend transaction, so an audit failure can
+    never leave release_state and release_events out of sync.
     """
     if not isinstance(smoke_checks, Mapping) or not smoke_checks:
         raise ReleaseGateError("promotion requires at least one smoke check")
@@ -573,23 +641,9 @@ def promote_and_smoke(
     )
     existing = backend.promotion_for(candidate_digest)
     if existing is not None:
-        if existing.get("status") != "promoted":
-            raise ReleaseGateError(
-                "candidate already has a non-promoted audit record; refusing to replay"
-            )
-        active = backend.active_release()
-        if active is None or active.get("image_id") != existing.get("active_image_id"):
-            raise ReleaseGateError(
-                "candidate was previously promoted but the active release changed; "
-                "refusing to replay a stale approval"
-            )
-        return dict(existing)
+        return _existing_promotion(backend, existing)
 
-    active_slots = backend.active_slots()
-    if type(active_slots) is not int or active_slots != 0:
-        raise ReleaseGateError(
-            f"promotion blocked: execution slots not drained (active_slots={active_slots})"
-        )
+    _require_drained(backend, action="promotion")
     previous = backend.active_release()
     if previous is None:
         raise ReleaseGateError(
@@ -611,74 +665,94 @@ def promote_and_smoke(
             break
 
     if failed_check is not None:
-        try:
-            rollback_outcome = rollback_fn(previous)
-        except Exception as error:  # noqa: BLE001 - never swallow rollback failures
-            raise ReleaseGateError(f"rollback failed: {error}") from error
-        rollback_outcome = validate_rollback_outcome(
-            rollback_outcome, expected_image=previous["image_id"]
-        )
-        restored = backend.active_release()
-        if restored is None or restored.get("image_id") != previous["image_id"]:
-            raise ReleaseGateError(
-                "rollback callable returned success but the backend did not "
-                "restore the previous image"
+        with _backend_transaction(backend):
+            current = backend.active_release()
+            if current is None or not _same_release(current, previous):
+                raise ReleaseGateError(
+                    "active release changed during the smoke failure; refusing "
+                    "to roll back a release this attempt no longer owns"
+                )
+            try:
+                rollback_outcome = rollback_fn(previous)
+            except Exception as error:  # noqa: BLE001 - never swallow rollback failures
+                raise ReleaseGateError(f"rollback failed: {error}") from error
+            rollback_outcome = validate_rollback_outcome(
+                rollback_outcome, expected_image=previous["image_id"]
             )
-        result = {
-            "schema_version": SCHEMA_VERSION,
-            "status": "rolled_back",
-            "failed_check": failed_check,
-            "candidate_digest": candidate_digest,
-            "source_commit": manifest["source_commit"],
-            "previous_image_id": previous["image_id"],
-            "active_image_id": previous["image_id"],
-            "approved_by": approval["approved_by"],
-            "migration_version": previous["migration_version"],
-            "config": dict(previous["config"]),
-            "evidence_root": previous["evidence_root"],
-            "smoke_results": smoke_results,
-            "rollback": rollback_outcome,
-            "recorded_at": _utc_now(),
-        }
-        backend.record_audit(result)
+            restored = backend.active_release()
+            if restored is None or restored.get("image_id") != previous["image_id"]:
+                raise ReleaseGateError(
+                    "rollback callable returned success but the backend did not "
+                    "restore the previous image"
+                )
+            result = {
+                "schema_version": SCHEMA_VERSION,
+                "status": "rolled_back",
+                "failed_check": failed_check,
+                "candidate_digest": candidate_digest,
+                "source_commit": manifest["source_commit"],
+                "previous_image_id": previous["image_id"],
+                "active_image_id": previous["image_id"],
+                "approved_by": approval["approved_by"],
+                "migration_version": previous["migration_version"],
+                "config": dict(previous["config"]),
+                "evidence_root": previous["evidence_root"],
+                "smoke_results": smoke_results,
+                "rollback": rollback_outcome,
+                "recorded_at": _utc_now(),
+            }
+            backend.record_audit(result)
         return result
 
     candidate_image = manifest["control_plane_image_id"]
     config = _candidate_config(manifest)
-    backend.switch(
-        image_id=candidate_image,
-        config=config,
-        migration_version=manifest["migration_version"],
-        evidence_root=previous["evidence_root"],
-        action="promote",
-        candidate_digest=candidate_digest,
-    )
-    active = backend.active_release()
-    if active is None or active.get("image_id") != candidate_image:
-        raise ReleaseGateError(
-            "promotion switch did not make the candidate image active"
+    with _backend_transaction(backend):
+        # Re-read inside the transaction: another promotion may have finished
+        # while the smoke checks ran, and this attempt must not overwrite it.
+        existing = backend.promotion_for(candidate_digest)
+        if existing is not None:
+            return _existing_promotion(backend, existing)
+        _require_drained(backend, action="promotion")
+        current = backend.active_release()
+        if current is None or not _same_release(current, previous):
+            raise ReleaseGateError(
+                "active release changed while smoke checks ran; refusing to "
+                "overwrite a concurrent promotion"
+            )
+        backend.switch(
+            image_id=candidate_image,
+            config=config,
+            migration_version=manifest["migration_version"],
+            evidence_root=previous["evidence_root"],
+            action="promote",
+            candidate_digest=candidate_digest,
         )
-    if active.get("migration_version") != manifest["migration_version"]:
-        raise ReleaseGateError(
-            "promotion switch did not apply the candidate migration_version"
-        )
-    result = {
-        "schema_version": SCHEMA_VERSION,
-        "status": "promoted",
-        "failed_check": None,
-        "candidate_digest": candidate_digest,
-        "source_commit": manifest["source_commit"],
-        "previous_image_id": previous["image_id"],
-        "active_image_id": candidate_image,
-        "approved_by": approval["approved_by"],
-        "migration_version": manifest["migration_version"],
-        "config": config,
-        "evidence_root": previous["evidence_root"],
-        "smoke_results": smoke_results,
-        "rollback": None,
-        "recorded_at": _utc_now(),
-    }
-    backend.record_audit(result)
+        active = backend.active_release()
+        if active is None or active.get("image_id") != candidate_image:
+            raise ReleaseGateError(
+                "promotion switch did not make the candidate image active"
+            )
+        if active.get("migration_version") != manifest["migration_version"]:
+            raise ReleaseGateError(
+                "promotion switch did not apply the candidate migration_version"
+            )
+        result = {
+            "schema_version": SCHEMA_VERSION,
+            "status": "promoted",
+            "failed_check": None,
+            "candidate_digest": candidate_digest,
+            "source_commit": manifest["source_commit"],
+            "previous_image_id": previous["image_id"],
+            "active_image_id": candidate_image,
+            "approved_by": approval["approved_by"],
+            "migration_version": manifest["migration_version"],
+            "config": config,
+            "evidence_root": previous["evidence_root"],
+            "smoke_results": smoke_results,
+            "rollback": None,
+            "recorded_at": _utc_now(),
+        }
+        backend.record_audit(result)
     return result
 
 
@@ -691,6 +765,8 @@ def rollback_release(
     candidate_digest: str,
 ) -> dict[str, Any]:
     """Restore a persisted target release after the same smoke suite passes."""
+    if not isinstance(smoke_checks, Mapping) or not smoke_checks:
+        raise ReleaseGateError("rollback requires at least one smoke check")
     target = validate_previous_release(target_release)
     if not isinstance(approved_by, str) or not approved_by.strip():
         raise ReleaseGateError("rollback requires an approved_by identity")
@@ -698,6 +774,7 @@ def rollback_release(
     current = backend.active_release()
     if current is None:
         raise ReleaseGateError("rollback blocked: no persisted active release")
+    _require_drained(backend, action="rollback")
     smoke_results: dict[str, bool] = {}
     for name, check_fn in smoke_checks.items():
         try:
@@ -707,38 +784,391 @@ def rollback_release(
         smoke_results[name] = ok
         if not ok:
             raise ReleaseGateError(f"rollback blocked: smoke check failed: {name}")
-    backend.switch(
-        image_id=target["image_id"],
-        config=target["config"],
-        migration_version=target["migration_version"],
-        evidence_root=target["evidence_root"],
-        action="rollback",
-        candidate_digest=candidate_digest,
-    )
-    active = backend.active_release()
-    if active is None or active.get("image_id") != target["image_id"]:
-        raise ReleaseGateError("rollback switch did not restore the target image")
-    result = {
-        "schema_version": SCHEMA_VERSION,
-        "status": "rolled_back",
-        "failed_check": None,
-        "candidate_digest": candidate_digest,
-        "source_commit": None,
-        "previous_image_id": current["image_id"],
-        "active_image_id": target["image_id"],
-        "approved_by": approved_by,
-        "migration_version": target["migration_version"],
-        "config": dict(target["config"]),
-        "evidence_root": target["evidence_root"],
-        "smoke_results": smoke_results,
-        "rollback": {
-            "ok": True,
-            "restored_image": target["image_id"],
-        },
-        "recorded_at": _utc_now(),
-    }
-    backend.record_audit(result)
+    with _backend_transaction(backend):
+        _require_drained(backend, action="rollback")
+        latest = backend.active_release()
+        if latest is None or not _same_release(latest, current):
+            raise ReleaseGateError(
+                "active release changed while rollback smoke checks ran; "
+                "refusing to overwrite a concurrent promotion"
+            )
+        backend.switch(
+            image_id=target["image_id"],
+            config=target["config"],
+            migration_version=target["migration_version"],
+            evidence_root=target["evidence_root"],
+            action="rollback",
+            candidate_digest=candidate_digest,
+        )
+        active = backend.active_release()
+        if active is None or active.get("image_id") != target["image_id"]:
+            raise ReleaseGateError("rollback switch did not restore the target image")
+        result = {
+            "schema_version": SCHEMA_VERSION,
+            "status": "rolled_back",
+            "failed_check": None,
+            "candidate_digest": candidate_digest,
+            "source_commit": None,
+            "previous_image_id": current["image_id"],
+            "active_image_id": target["image_id"],
+            "approved_by": approved_by,
+            "migration_version": target["migration_version"],
+            "config": dict(target["config"]),
+            "evidence_root": target["evidence_root"],
+            "smoke_results": smoke_results,
+            "rollback": {
+                "ok": True,
+                "restored_image": target["image_id"],
+            },
+            "recorded_at": _utc_now(),
+        }
+        backend.record_audit(result)
     return result
+
+
+def write_smoke_evidence_bundle(
+    bundle_dir: Path,
+    *,
+    cases_dir: Path,
+) -> str:
+    """Write a standard verified evidence bundle for candidate container smoke checks.
+
+    Files are chmodded to 0o444 and directories to 0o755 so the unprivileged
+    container user (65534:65534) can verify the mounted bundle read-only.
+    """
+    from datacon.agents.analysis import analyze_case
+    from datacon.asan import parse_asan
+
+    request = contracts.parse_request(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "cve_id": "CVE-2099-0001",
+                "target": {
+                    "kind": "source",
+                    "case_id": "fixture-c-parser",
+                    "goal": "promotion smoke bundle verification",
+                },
+                "limits": dict(contracts.DEFAULT_LIMITS),
+            }
+        )
+    )
+    analyzed = analyze_case(request, case_root=str(cases_dir))
+    plan = analyzed.plan
+    plan_digest = analyzed.plan_digest
+    job_id = str(uuid.uuid4())
+    review = {
+        "reviewer_id": "release-smoke",
+        "decision": "approve",
+        "plan_digest": plan_digest,
+        "decided_at": "2026-11-17T00:00:00Z",
+    }
+
+    registry_doc = json.loads((cases_dir / "registry.json").read_text(encoding="utf-8"))
+    manifest_doc = json.loads((cases_dir / "manifest.json").read_text(encoding="utf-8"))
+    case_entry = registry_doc["cases"]["fixture-c-parser"]
+    manifest_case = manifest_doc["cases"]["B01"]
+    materials_digests = dict(manifest_doc["materials"])
+    used_keys = {
+        manifest_doc["harness"],
+        manifest_doc["build_recipe"],
+        manifest_doc["dependencies"],
+        case_entry["repository"]["patch"],
+        manifest_doc["versions"]["vulnerable"],
+        manifest_doc["versions"]["fixed"],
+        manifest_case["inputs"]["normal"],
+        manifest_case["inputs"]["candidate"],
+    }
+    used_materials = {key: materials_digests[key] for key in used_keys}
+    case_config = {
+        "case_id": plan["case_id"],
+        "cve_id": plan["cve_id"],
+        "benchmark_id": "B01",
+        "registry_entry": case_entry,
+        "manifest_case": manifest_case,
+        "materials": used_materials,
+        "image": f"silkeh/clang:19-bookworm@{plan['image_digest']}",
+        "platform": plan["platform"],
+        "toolchain": plan["toolchain"],
+        "asan_options": plan["asan_options"],
+        "asan_signature": manifest_doc["asan_signature"],
+    }
+
+    build_recipe = (cases_dir / manifest_doc["build_recipe"]).read_bytes()
+    compile_args = list(_extract_compile_args(build_recipe))
+    staged_materials = dict(used_materials)
+    staged_materials["inputs/normal.txt"] = plan["inputs"]["normal"]
+    staged_materials["inputs/candidate.txt"] = plan["inputs"]["candidate"]
+
+    probe_doc = {
+        "tool_id": "sandbox.probe",
+        "job_id": job_id,
+        "plan_digest": plan_digest,
+        "generation": 1,
+        "status": "completed",
+        "container_id": None,
+        "checks": {
+            "uid": "65534",
+            "seccomp": "2",
+            "no_new_privs": "1",
+            "cap_eff": "0000000000000000",
+            "cgroup_version": "2",
+        },
+        "compiler_version": "clang 19.1.7",
+        "image_digest": plan["image_digest"],
+        "limits": {
+            key: int(plan["limits"][key])
+            for key in ("cpu", "memory_mib", "pids", "scratch_mib")
+        },
+    }
+
+    build_artifacts: dict[str, bytes] = {}
+    build_logs: dict[str, bytes] = {}
+    build_docs: dict[str, dict[str, Any]] = {}
+    for version in ("vulnerable", "fixed"):
+        art = f"smoke-parser-{version}".encode("utf-8")
+        log = f"smoke build {version}\n".encode("utf-8")
+        build_artifacts[version] = art
+        build_logs[version] = log
+        build_docs[version] = {
+            "tool_id": "sandbox.build",
+            "job_id": job_id,
+            "generation": 1,
+            "plan_digest": plan_digest,
+            "input_digest": plan["analysis_digest"],
+            "status": "completed",
+            "version": version,
+            "exit_code": 0,
+            "duration_seconds": 0.1,
+            "container_id": f"smoke-build-{version}",
+            "image_digest": plan["image_digest"],
+            "build_recipe_digest": plan["build_recipe_digest"],
+            "compile_args": compile_args,
+            "artifact_digest": _sha256_bytes(art),
+            "log_digest": _sha256_bytes(log),
+            "log_truncated": False,
+            "capture_error": None,
+            "staged_materials": staged_materials,
+            "files": {
+                "log": f"build/{version}/build.log",
+                "artifact": f"build/{version}/parser",
+            },
+            "file_digests": {
+                "log": _sha256_bytes(log),
+                "artifact": _sha256_bytes(art),
+            },
+        }
+
+    asan_stderr = (
+        "==1==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x502000000014\n"
+        "WRITE of size 1 at 0x502000000014 thread T0\n"
+        "    #0 0x401234 in parse_token /fixture/vulnerable/parser.c:22:17\n"
+    ).encode("utf-8")
+    replay_docs: list[dict[str, Any]] = []
+    replay_obs: list[RunObservation] = []
+    replay_raw: dict[tuple[str, str], tuple[bytes, bytes]] = {}
+    for version in ("vulnerable", "fixed"):
+        for phase in ("normal", "candidate_1", "candidate_2"):
+            if phase == "normal":
+                out_b = manifest_case["expected_stdout"]["normal"].encode("utf-8")
+                err_b = b""
+                exit_code = int(plan["expected_exit"]["normal"])
+                in_digest = plan["inputs"]["normal"]
+            elif version == "vulnerable":
+                out_b = b""
+                err_b = asan_stderr
+                exit_code = int(plan["expected_exit"]["candidate_asan"])
+                in_digest = plan["inputs"]["candidate"]
+            else:
+                out_b = manifest_case["expected_stdout"]["candidate_clean"].encode("utf-8")
+                err_b = b""
+                exit_code = int(plan["expected_exit"]["candidate_clean"])
+                in_digest = plan["inputs"]["candidate"]
+            sig = parse_asan(err_b.decode("utf-8", "replace"))
+            replay_raw[(version, phase)] = (out_b, err_b)
+            replay_docs.append(
+                {
+                    "tool_id": "sandbox.replay",
+                    "job_id": job_id,
+                    "generation": 1,
+                    "plan_digest": plan_digest,
+                    "input_digest": in_digest,
+                    "artifact_digest": build_docs[version]["artifact_digest"],
+                    "status": "completed",
+                    "version": version,
+                    "phase": phase,
+                    "exit_code": exit_code,
+                    "duration_seconds": 0.1,
+                    "container_id": f"smoke-{version}-{phase}",
+                    "image_digest": plan["image_digest"],
+                    "asan_options": plan["asan_options"],
+                    "stdout_sha256": _sha256_bytes(out_b),
+                    "stdout_bytes": len(out_b),
+                    "stderr_sha256": _sha256_bytes(err_b),
+                    "stderr_bytes": len(err_b),
+                    "signature": sig.as_dict() if sig else None,
+                    "timed_out": False,
+                    "quota_hit": False,
+                    "log_truncated": False,
+                    "capture_error": None,
+                    "files": {
+                        "stdout": f"replay/{version}/{phase}/stdout.log",
+                        "stderr": f"replay/{version}/{phase}/stderr.log",
+                    },
+                    "file_digests": {
+                        "stdout": _sha256_bytes(out_b),
+                        "stderr": _sha256_bytes(err_b),
+                    },
+                }
+            )
+            replay_obs.append(
+                RunObservation(
+                    version=version,
+                    phase=phase,
+                    status="completed",
+                    exit_code=exit_code,
+                    stdout=out_b.decode("utf-8", "replace"),
+                    stderr=err_b.decode("utf-8", "replace"),
+                    signature=sig,
+                    input_digest=in_digest,
+                    duration_seconds=0.1,
+                    log_truncated=False,
+                    capture_error=None,
+                )
+            )
+
+    policy = VerdictPolicy(
+        signature=plan["asan_signature"],
+        expected_exit=plan["expected_exit"],
+        expected_stdout=manifest_case["expected_stdout"],
+    )
+    decision = decide_verdict(policy, replay_obs, builds=build_docs)
+    execution_metadata = {
+        "job_id": job_id,
+        "plan_digest": plan_digest,
+        "generation": 1,
+        "probe": probe_doc,
+        "builds": list(build_docs.values()),
+        "replays": replay_docs,
+    }
+    report = {
+        "schema_version": 1,
+        "job_id": job_id,
+        "plan_digest": plan_digest,
+        "cve_id": plan["cve_id"],
+        "case_id": plan["case_id"],
+        "state": decision.verdict,
+        "verdict": decision.verdict,
+        "reason_code": decision.reason_code,
+        "target": request["target"],
+        "versions": plan["revisions"],
+        "repository": plan["repository"],
+        "environment": {
+            "image": case_config["image"],
+            "image_digest": plan["image_digest"],
+            "platform": plan["platform"],
+            "toolchain": plan["toolchain"],
+            "asan_options": plan["asan_options"],
+            "compile_args": compile_args,
+            "isolation": plan["isolation"],
+            "probe": probe_doc,
+        },
+        "budget": plan["limits"],
+        "inputs": plan["inputs"],
+        "review": review,
+        "signature": plan["asan_signature"],
+        "builds": list(build_docs.values()),
+        "replays": replay_docs,
+        "rule": decision.as_dict(),
+        "evidence_refs": [
+            "report.json",
+            "report.md",
+            "plan.json",
+            "review.json",
+            "metadata/execution.json",
+        ],
+        "missing": [],
+        "error": None,
+        "evidence_complete": True,
+        "created_at": review["decided_at"],
+    }
+    report_md = "\n".join(
+        [
+            "# DataCon smoke verification report",
+            "",
+            f"- Job: `{job_id}`",
+            f"- Plan: `{plan_digest}`",
+            f"- Verdict: **{decision.verdict}**",
+            f"- Reason: `{decision.reason_code}`",
+            "",
+        ]
+    )
+    role_map = {
+        manifest_doc["harness"]: "material_harness",
+        manifest_doc["build_recipe"]: "material_build_recipe",
+        manifest_doc["dependencies"]: "material_dependencies",
+        case_entry["repository"]["patch"]: "material_patch",
+        manifest_doc["versions"]["vulnerable"]: "material_source_vulnerable",
+        manifest_doc["versions"]["fixed"]: "material_source_fixed",
+        manifest_case["inputs"]["normal"]: "material_input_normal",
+        manifest_case["inputs"]["candidate"]: "material_input_candidate",
+    }
+    artifacts: dict[str, tuple[str, bytes]] = {
+        "plan.json": ("plan", jsonutil.canonical_bytes(plan) + b"\n"),
+        "review.json": ("review", jsonutil.canonical_bytes(review) + b"\n"),
+        "metadata/execution.json": (
+            "execution_metadata",
+            jsonutil.canonical_bytes(execution_metadata) + b"\n",
+        ),
+        "metadata/probe.json": ("probe", jsonutil.canonical_bytes(probe_doc) + b"\n"),
+        "metadata/case.json": (
+            "case_config",
+            jsonutil.canonical_bytes({"case_config": case_config}) + b"\n",
+        ),
+    }
+    for rel, role in role_map.items():
+        artifacts[f"materials/{rel}"] = (role, (cases_dir / rel).read_bytes())
+    for version in ("vulnerable", "fixed"):
+        artifacts[f"build/{version}/build.log"] = ("build_log", build_logs[version])
+        artifacts[f"build/{version}/parser"] = ("build_artifact", build_artifacts[version])
+        artifacts[f"build/{version}/metadata.json"] = (
+            "build_metadata",
+            jsonutil.canonical_bytes(build_docs[version]) + b"\n",
+        )
+    for item in replay_docs:
+        v = item["version"]
+        p = item["phase"]
+        out_b, err_b = replay_raw[(v, p)]
+        artifacts[f"replay/{v}/{p}/stdout.log"] = (
+            "normal_output" if p == "normal" else "replay_stdout",
+            out_b,
+        )
+        artifacts[f"replay/{v}/{p}/stderr.log"] = (
+            "asan_log" if item["signature"] else "replay_stderr",
+            err_b,
+        )
+        artifacts[f"replay/{v}/{p}/metadata.json"] = (
+            "replay_metadata",
+            jsonutil.canonical_bytes(item) + b"\n",
+        )
+
+    info = evidence.write_bundle(
+        bundle_dir,
+        job_id=job_id,
+        plan_digest=plan_digest,
+        report=report,
+        report_markdown=report_md,
+        artifacts=artifacts,
+        verdict=decision.verdict,
+        verify=evidence.verify_bundle,
+    )
+    for item in sorted(bundle_dir.rglob("*"), key=lambda p: len(p.parts)):
+        if item.is_dir():
+            item.chmod(0o755)
+        else:
+            item.chmod(0o444)
+    bundle_dir.chmod(0o755)
+    return info.manifest_digest
 
 
 # ---------------------------------------------------------------------------
@@ -873,11 +1303,42 @@ class B03CaseMaterials:
         return cls.load(Path(case_root))
 
 
-def _validate_b03_admission(admission: Mapping[str, Any]) -> None:
+def _b03_string(container: Any, key: str, label: str) -> str:
+    if not isinstance(container, Mapping):
+        raise ReleaseGateError(f"B03 admission {label} must be an object")
+    value = container.get(key)
+    if not isinstance(value, str) or not value.strip():
+        raise ReleaseGateError(
+            f"B03 admission {label}.{key} must be a non-empty string"
+        )
+    return value
+
+
+def _b03_url(container: Any, key: str, label: str) -> str:
+    value = _b03_string(container, key, label)
+    if not _HTTP_URL.fullmatch(value):
+        raise ReleaseGateError(f"B03 admission {label}.{key} must be an HTTP(S) URL")
+    return value
+
+
+def _b03_exit_code(container: Any, key: str, label: str) -> int:
+    if not isinstance(container, Mapping):
+        raise ReleaseGateError(f"B03 admission {label} must be an object")
+    value = container.get(key)
+    if type(value) is not int:
+        raise ReleaseGateError(f"B03 admission {label}.{key} must be an integer")
+    return value
+
+
+def _validate_b03_admission(admission: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate every B03 admission field the plan copies, without KeyError."""
     if not isinstance(admission, Mapping):
         raise ReleaseGateError("B03 admission must be an object")
     if admission.get("benchmark_id") != "B03":
         raise ReleaseGateError("B03 admission benchmark_id must be B03")
+    cve_id = _b03_string(admission, "cve_id", "admission")
+    if not _CVE_ID.fullmatch(cve_id):
+        raise ReleaseGateError("B03 admission cve_id must be a CVE identifier")
     signature = admission.get("asan_signature")
     if not isinstance(signature, Mapping):
         raise ReleaseGateError("B03 admission is missing asan_signature")
@@ -887,22 +1348,151 @@ def _validate_b03_admission(admission: Mapping[str, Any]) -> None:
             "B03 admission asan_signature.status must be frozen; "
             f"got {status!r}"
         )
+    asan_signature: dict[str, Any] = {
+        "error": _b03_string(signature, "error", "asan_signature"),
+        "function": _b03_string(signature, "function", "asan_signature"),
+        "source": _b03_string(signature, "source", "asan_signature"),
+    }
+    operation = signature.get("operation")
+    if operation is not None:
+        if not isinstance(operation, str) or not operation.strip():
+            raise ReleaseGateError(
+                "B03 admission asan_signature.operation must be a non-empty string"
+            )
+        asan_signature["operation"] = operation
+    access_size = signature.get("access_size")
+    if access_size is not None:
+        if type(access_size) is not int or access_size <= 0:
+            raise ReleaseGateError(
+                "B03 admission asan_signature.access_size must be a positive integer"
+            )
+        asan_signature["access_size"] = access_size
     verdict_status = admission.get("expected_verdict_status")
     if verdict_status not in {"frozen", "verified"}:
         raise ReleaseGateError(
             "B03 admission expected_verdict_status must be frozen; "
             f"got {verdict_status!r}"
         )
-    try:
-        versions = admission["versions"]
-        for role in ("vulnerable", "fixed"):
-            commit = versions[role]["commit"]
-            if not isinstance(commit, str) or not re.fullmatch(r"[0-9a-f]{40}", commit):
+    expected_verdict = admission.get("expected_verdict", "REPRODUCED")
+    if expected_verdict not in _B03_VERDICTS:
+        raise ReleaseGateError(
+            "B03 admission expected_verdict must be a known verdict"
+        )
+    versions = admission.get("versions")
+    if not isinstance(versions, Mapping):
+        raise ReleaseGateError("B03 admission versions must be an object")
+    commits: dict[str, str] = {}
+    for role in ("vulnerable", "fixed"):
+        entry = versions.get(role)
+        if not isinstance(entry, Mapping):
+            raise ReleaseGateError(
+                f"B03 admission versions.{role} must be an object"
+            )
+        commit = _b03_string(entry, "commit", f"versions.{role}")
+        if not _GIT_SHA40.fullmatch(commit):
+            raise ReleaseGateError(
+                f"B03 admission {role} commit must be a 40-char lowercase Git SHA"
+            )
+        commits[role] = commit
+    build = admission.get("build")
+    toolchain_image = _b03_string(build, "toolchain_image", "build")
+    harness = admission.get("harness")
+    asan_options = _b03_string(harness, "asan_options", "harness")
+    expected_exit = {
+        "normal": _b03_exit_code(harness, "normal_exit_code", "harness"),
+        "candidate_clean": 0,
+        "candidate_asan": _b03_exit_code(
+            harness, "candidate_asan_exit_code", "harness"
+        ),
+    }
+    repository = admission.get("repository")
+    repository_url = _b03_url(repository, "url", "repository")
+    source_path = repository.get("source_path", "src/regext.c")
+    if (
+        not isinstance(source_path, str)
+        or not source_path.strip()
+        or ".." in PurePosixPath(source_path).parts
+    ):
+        raise ReleaseGateError("B03 repository.source_path is invalid")
+    advisory = admission.get("advisory")
+    advisory_url = _b03_url(advisory, "nvd", "advisory")
+    return {
+        "cve_id": cve_id,
+        "asan_signature": asan_signature,
+        "expected_verdict": expected_verdict,
+        "vulnerable_commit": commits["vulnerable"],
+        "fixed_commit": commits["fixed"],
+        "toolchain_image": toolchain_image,
+        "asan_options": asan_options,
+        "expected_exit": expected_exit,
+        "repository_url": repository_url,
+        "source_path": source_path,
+        "advisory_url": advisory_url,
+    }
+
+
+def _validate_b03_advisory(
+    advisory: Mapping[str, Any],
+    *,
+    cve_id: str,
+    vulnerable_commit: str,
+    fixed_commit: str,
+) -> None:
+    """Reject a case root whose advisory contradicts the admission record."""
+    if not isinstance(advisory, Mapping):
+        raise ReleaseGateError("B03 advisory.json must be a JSON object")
+    advisory_cve = advisory.get("cve_id")
+    if advisory_cve is not None and advisory_cve != cve_id:
+        raise ReleaseGateError(
+            "B03 advisory.json cve_id does not match the admission"
+        )
+    for key, expected in (
+        ("vulnerable_commit", vulnerable_commit),
+        ("fixed_commit", fixed_commit),
+    ):
+        value = advisory.get(key)
+        if value is not None and value != expected:
+            raise ReleaseGateError(
+                f"B03 advisory.json {key} does not match the admission"
+            )
+    sources = advisory.get("sources")
+    if sources is not None:
+        if not isinstance(sources, list):
+            raise ReleaseGateError("B03 advisory.json sources must be a list")
+        for index, source in enumerate(sources):
+            if not isinstance(source, Mapping):
                 raise ReleaseGateError(
-                    f"B03 admission {role} commit must be a 40-char lowercase Git SHA"
+                    "B03 advisory.json sources entries must be objects"
                 )
-    except (KeyError, TypeError) as error:
-        raise ReleaseGateError(f"B03 admission versions are invalid: {error}") from error
+            for key, expected in (
+                ("vulnerable_commit", vulnerable_commit),
+                ("fixed_commit", fixed_commit),
+            ):
+                value = source.get(key)
+                if value is not None and value != expected:
+                    raise ReleaseGateError(
+                        f"B03 advisory.json sources[{index}].{key} does not "
+                        "match the admission"
+                    )
+
+
+def _b03_source_bytes(
+    sources: Mapping[str, bytes], source_path: str
+) -> bytes:
+    direct = sources.get(source_path)
+    if direct is not None:
+        return direct
+    basename = PurePosixPath(source_path).name
+    matches = [
+        data
+        for relative, data in sources.items()
+        if PurePosixPath(relative).name == basename
+    ]
+    if len(matches) == 1:
+        return matches[0]
+    raise ReleaseGateError(
+        f"B03 repository.source_path is not present in the vulnerable tree: {source_path}"
+    )
 
 
 def prepare_b03_plan(
@@ -913,11 +1503,11 @@ def prepare_b03_plan(
     candidate_input: bytes,
 ) -> dict[str, Any]:
     """Build the exact B03 plan that a reviewer must approve before replay."""
-    _validate_b03_admission(admission)
-    cve_id = str(admission["cve_id"])
-    vuln_commit = str(admission["versions"]["vulnerable"]["commit"])
-    fixed_commit = str(admission["versions"]["fixed"]["commit"])
-    toolchain_image = str(admission["build"]["toolchain_image"])
+    validated = _validate_b03_admission(admission)
+    cve_id = validated["cve_id"]
+    vuln_commit = validated["vulnerable_commit"]
+    fixed_commit = validated["fixed_commit"]
+    toolchain_image = validated["toolchain_image"]
     if "@" not in toolchain_image:
         raise ReleaseGateError("B03 toolchain image must be pinned by digest")
     image_digest = toolchain_image.split("@", 1)[1]
@@ -926,17 +1516,16 @@ def prepare_b03_plan(
         raise ReleaseGateError(
             "B03 admission toolchain image does not match the pinned toolchain"
         )
-    asan_options = str(admission["harness"]["asan_options"])
-    asan_sig = {
-        "error": str(admission["asan_signature"]["error"]),
-        "function": str(admission["asan_signature"]["function"]),
-        "source": str(admission["asan_signature"]["source"]),
-    }
-    expected_exit = {
-        "normal": int(admission["harness"]["normal_exit_code"]),
-        "candidate_clean": 0,
-        "candidate_asan": int(admission["harness"]["candidate_asan_exit_code"]),
-    }
+    advisory = jsonutil.loads_strict(materials.advisory)
+    _validate_b03_advisory(
+        advisory,
+        cve_id=cve_id,
+        vulnerable_commit=vuln_commit,
+        fixed_commit=fixed_commit,
+    )
+    asan_options = validated["asan_options"]
+    asan_sig = dict(validated["asan_signature"])
+    expected_exit = dict(validated["expected_exit"])
     expected_stdout = {
         "normal": "OK\n",
         "candidate_clean": "MISMATCH_REJECTED\n",
@@ -955,14 +1544,13 @@ def prepare_b03_plan(
     materials_map = dict(materials.digests)
     materials_map["inputs/normal.txt"] = _sha256_bytes(normal_input)
     materials_map["inputs/candidate.txt"] = _sha256_bytes(candidate_input)
-    source_path = str(admission.get("repository", {}).get("source_path", "src/regext.c"))
-    if not source_path or ".." in PurePosixPath(source_path).parts:
-        raise ReleaseGateError("B03 repository.source_path is invalid")
+    source_path = validated["source_path"]
+    source_bytes = _b03_source_bytes(materials.vulnerable_sources, source_path)
     registry_entry = {
         "cve_id": cve_id,
         "benchmark_id": "B03",
         "repository": {
-            "origin": str(admission["repository"]["url"]),
+            "origin": validated["repository_url"],
             "bundle": "b03-repo.bundle",
             "bundle_digest": _sha256_bytes(materials.repository_bundle),
             "source_path": source_path,
@@ -983,7 +1571,7 @@ def prepare_b03_plan(
         },
         "expected_exit": expected_exit,
         "expected_stdout": expected_stdout,
-        "expected_verdict": "REPRODUCED",
+        "expected_verdict": validated["expected_verdict"],
     }
     toolchain_meta = {
         "compiler": "clang",
@@ -1014,7 +1602,7 @@ def prepare_b03_plan(
                 "role": "definition",
                 "revision": "vulnerable",
                 "start_line": 1,
-                "end_line": max(1, len(materials.vulnerable_sources.get("regext.c", b"x").splitlines())),
+                "end_line": max(1, len(source_bytes.splitlines())),
             }
         ],
         "findings": [
@@ -1032,7 +1620,7 @@ def prepare_b03_plan(
         "cve_id": cve_id,
         "case_config_digest": case_config_digest,
         "repository": {
-            "origin": str(admission["repository"]["url"]),
+            "origin": validated["repository_url"],
             "bundle_digest": registry_entry["repository"]["bundle_digest"],
             "patch_digest": materials_map["fix.patch"],
         },
@@ -1056,7 +1644,7 @@ def prepare_b03_plan(
             "snapshot": "advisory.json",
             "collected_at": "2026-11-17T00:00:00Z",
             "content_digest": registry_entry["advisory"]["digest"],
-            "sources": [str(admission["advisory"]["nvd"])],
+            "sources": [validated["advisory_url"]],
         },
         "analysis": analysis,
         "analysis_digest": analysis_digest,
@@ -1131,6 +1719,41 @@ def _require_build(result: Any, version: str) -> None:
         raise ReleaseGateError(f"B03 {version} artifact digest does not match bytes")
 
 
+def _write_readonly_staged_file(path: Path, data: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(data)
+    path.chmod(0o444)
+
+
+def _chmod_tree(root: Path, *, dir_mode: int = 0o755, file_mode: int = 0o444) -> None:
+    for item in sorted(root.rglob("*"), key=lambda p: len(p.parts)):
+        if item.is_dir():
+            item.chmod(dir_mode)
+        else:
+            item.chmod(file_mode)
+    root.chmod(dir_mode)
+
+
+def _resolve_b03_job_id(sandbox: Any, job_id: str | uuid.UUID | None) -> str:
+    sandbox_job_id = getattr(sandbox, "job_id", None)
+    if job_id is not None:
+        try:
+            normalized = str(uuid.UUID(str(job_id)))
+        except (TypeError, ValueError, AttributeError) as error:
+            raise ReleaseGateError("B03 job_id must be a UUID") from error
+        if sandbox_job_id is not None and str(sandbox_job_id) != normalized:
+            raise ReleaseGateError(
+                "B03 job_id does not match sandbox.job_id"
+            )
+        return normalized
+    if sandbox_job_id is not None:
+        try:
+            return str(uuid.UUID(str(sandbox_job_id)))
+        except (TypeError, ValueError, AttributeError) as error:
+            raise ReleaseGateError("B03 sandbox.job_id must be a UUID") from error
+    return str(uuid.uuid4())
+
+
 def run_b03_acceptance(
     *,
     admission: Mapping[str, Any],
@@ -1141,6 +1764,7 @@ def run_b03_acceptance(
     storage_ref: str,
     review: Mapping[str, Any],
     case_root: Path | str | None = None,
+    job_id: str | uuid.UUID | None = None,
 ) -> dict[str, Any]:
     """Execute B03 acceptance using real case files and a reviewer-supplied approval.
 
@@ -1175,15 +1799,15 @@ def run_b03_acceptance(
     materials_map = prepared["materials"]
     compile_args = prepared["compile_args"]
 
+    resolved_job_id = _resolve_b03_job_id(sandbox, job_id)
     probe_report = _require_probe(sandbox.probe(deadline_seconds=120.0))
     if probe_report.image_digest != image_digest:
         raise ReleaseGateError(
             "B03 probe image_digest does not match the approved toolchain"
         )
-    job_id = str(uuid.uuid4())
     probe_doc = {
         "tool_id": "sandbox.probe",
-        "job_id": job_id,
+        "job_id": resolved_job_id,
         "plan_digest": plan_digest,
         "generation": 1,
         "status": "completed",
@@ -1194,92 +1818,100 @@ def run_b03_acceptance(
         "limits": dict(probe_report.limits),
     }
 
-    # Stage the exact reviewed material tree. The real DockerSandbox mounts
-    # this directory at /fixture and runs build.sh against it; the fake sandbox
-    # used by contract tests accepts the same keyword arguments.
+    bundle_out = Path(bundle_out)
+    bundle_out.parent.mkdir(parents=True, exist_ok=True)
+    # Stage the exact reviewed material tree with explicit 0o755/0o444 modes so
+    # container uid 65534:65534 can read /fixture even under hardened umask 0077.
     staging_root = bundle_out.parent / f".b03-materials-{uuid.uuid4().hex}"
     staging_root.mkdir(parents=True, exist_ok=True)
+    build_results: dict[str, Any] = {}
+    artifact_paths: dict[str, Path] = {}
+    staging_inputs: Path | None = None
     try:
-        (staging_root / "harness.c").write_bytes(materials.harness)
-        (staging_root / "build.sh").write_bytes(materials.build_recipe)
-        (staging_root / "dependencies.lock").write_bytes(materials.dependencies)
-        (staging_root / "fix.patch").write_bytes(materials.patch)
-        (staging_root / "b03-repo.bundle").write_bytes(materials.repository_bundle)
-        (staging_root / "advisory.json").write_bytes(materials.advisory)
-        for prefix, sources in (
-            ("vulnerable", materials.vulnerable_sources),
-            ("fixed", materials.fixed_sources),
-        ):
-            for relative, data in sources.items():
-                destination = staging_root / prefix / relative
-                destination.parent.mkdir(parents=True, exist_ok=True)
-                destination.write_bytes(data)
-        (staging_root / "inputs").mkdir(exist_ok=True)
-        (staging_root / "inputs" / "normal.txt").write_bytes(normal_input)
-        (staging_root / "inputs" / "candidate.txt").write_bytes(candidate_input)
-
-        build_results: dict[str, Any] = {}
-        artifact_paths: dict[str, Path] = {}
-        for version in ("vulnerable", "fixed"):
-            result = sandbox.build(
-                version,
-                materials_dir=staging_root,
-                compile_args=compile_args,
-                expected_materials=materials_map,
+        try:
+            _write_readonly_staged_file(staging_root / "harness.c", materials.harness)
+            _write_readonly_staged_file(staging_root / "build.sh", materials.build_recipe)
+            _write_readonly_staged_file(
+                staging_root / "dependencies.lock", materials.dependencies
             )
-            _require_build(result, version)
-            build_results[version] = result
-            artifact = bundle_out.parent / f".b03-artifact-{version}-{uuid.uuid4().hex}"
-            artifact.write_bytes(bytes(result.artifact))
-            artifact_paths[version] = artifact
-    finally:
-        shutil.rmtree(staging_root, ignore_errors=True)
+            _write_readonly_staged_file(staging_root / "fix.patch", materials.patch)
+            _write_readonly_staged_file(
+                staging_root / "b03-repo.bundle", materials.repository_bundle
+            )
+            _write_readonly_staged_file(staging_root / "advisory.json", materials.advisory)
+            for prefix, sources in (
+                ("vulnerable", materials.vulnerable_sources),
+                ("fixed", materials.fixed_sources),
+            ):
+                for relative, data in sources.items():
+                    _write_readonly_staged_file(staging_root / prefix / relative, data)
+            _write_readonly_staged_file(
+                staging_root / "inputs" / "normal.txt", normal_input
+            )
+            _write_readonly_staged_file(
+                staging_root / "inputs" / "candidate.txt", candidate_input
+            )
+            _chmod_tree(staging_root, dir_mode=0o755, file_mode=0o444)
 
-    build_docs: dict[str, dict[str, Any]] = {}
+            for version in ("vulnerable", "fixed"):
+                result = sandbox.build(
+                    version,
+                    materials_dir=staging_root,
+                    compile_args=compile_args,
+                    expected_materials=materials_map,
+                )
+                _require_build(result, version)
+                build_results[version] = result
+                artifact = bundle_out.parent / f".b03-artifact-{version}-{uuid.uuid4().hex}"
+                artifact.write_bytes(bytes(result.artifact))
+                artifact.chmod(0o555)
+                artifact_paths[version] = artifact
+        finally:
+            shutil.rmtree(staging_root, ignore_errors=True)
 
-    build_docs: dict[str, dict[str, Any]] = {}
-    for version in ("vulnerable", "fixed"):
-        res = build_results[version]
-        build_docs[version] = {
-            "tool_id": "sandbox.build",
-            "job_id": job_id,
-            "generation": 1,
-            "plan_digest": plan_digest,
-            "input_digest": plan["analysis_digest"],
-            "status": res.status,
-            "version": version,
-            "exit_code": res.exit_code,
-            "duration_seconds": res.duration_seconds,
-            "container_id": res.container_id,
-            "image_digest": image_digest,
-            "build_recipe_digest": materials_map["build.sh"],
-            "compile_args": compile_args,
-            "artifact_digest": res.artifact_digest,
-            "log_digest": _sha256_bytes(res.log),
-            "log_truncated": res.log_truncated,
-            "capture_error": res.capture_error,
-            "staged_materials": dict(materials_map),
-            "files": {
-                "log": f"build/{version}/build.log",
-                "artifact": f"build/{version}/parser",
-            },
-            "file_digests": {
-                "log": _sha256_bytes(res.log),
-                "artifact": res.artifact_digest,
-            },
-        }
+        build_docs: dict[str, dict[str, Any]] = {}
+        for version in ("vulnerable", "fixed"):
+            res = build_results[version]
+            build_docs[version] = {
+                "tool_id": "sandbox.build",
+                "job_id": resolved_job_id,
+                "generation": 1,
+                "plan_digest": plan_digest,
+                "input_digest": plan["analysis_digest"],
+                "status": res.status,
+                "version": version,
+                "exit_code": res.exit_code,
+                "duration_seconds": res.duration_seconds,
+                "container_id": res.container_id,
+                "image_digest": image_digest,
+                "build_recipe_digest": materials_map["build.sh"],
+                "compile_args": compile_args,
+                "artifact_digest": res.artifact_digest,
+                "log_digest": _sha256_bytes(res.log),
+                "log_truncated": res.log_truncated,
+                "capture_error": res.capture_error,
+                "staged_materials": dict(materials_map),
+                "files": {
+                    "log": f"build/{version}/build.log",
+                    "artifact": f"build/{version}/parser",
+                },
+                "file_digests": {
+                    "log": _sha256_bytes(res.log),
+                    "artifact": res.artifact_digest,
+                },
+            }
 
-    staging_inputs = bundle_out.parent / f".b03-inputs-{uuid.uuid4().hex}"
-    staging_inputs.mkdir(parents=True, exist_ok=True)
-    normal_file = staging_inputs / "normal.txt"
-    candidate_file = staging_inputs / "candidate.txt"
-    normal_file.write_bytes(normal_input)
-    candidate_file.write_bytes(candidate_input)
+        staging_inputs = bundle_out.parent / f".b03-inputs-{uuid.uuid4().hex}"
+        staging_inputs.mkdir(parents=True, exist_ok=True)
+        normal_file = staging_inputs / "normal.txt"
+        candidate_file = staging_inputs / "candidate.txt"
+        _write_readonly_staged_file(normal_file, normal_input)
+        _write_readonly_staged_file(candidate_file, candidate_input)
+        _chmod_tree(staging_inputs, dir_mode=0o755, file_mode=0o444)
 
-    replay_docs: list[dict[str, Any]] = []
-    replay_obs: list[RunObservation] = []
-    replay_raw: dict[tuple[str, str], tuple[bytes, bytes]] = {}
-    try:
+        replay_docs: list[dict[str, Any]] = []
+        replay_obs: list[RunObservation] = []
+        replay_raw: dict[tuple[str, str], tuple[bytes, bytes]] = {}
         for version in ("vulnerable", "fixed"):
             for phase in ("normal", "candidate_1", "candidate_2"):
                 in_path = normal_file if phase == "normal" else candidate_file
@@ -1297,7 +1929,7 @@ def run_b03_acceptance(
                 replay_docs.append(
                     {
                         "tool_id": "sandbox.replay",
-                        "job_id": job_id,
+                        "job_id": resolved_job_id,
                         "generation": 1,
                         "plan_digest": plan_digest,
                         "input_digest": r.input_digest,
@@ -1345,9 +1977,8 @@ def run_b03_acceptance(
                     )
                 )
     finally:
-        normal_file.unlink(missing_ok=True)
-        candidate_file.unlink(missing_ok=True)
-        staging_inputs.rmdir()
+        if staging_inputs is not None:
+            shutil.rmtree(staging_inputs, ignore_errors=True)
         for artifact in artifact_paths.values():
             artifact.unlink(missing_ok=True)
 
@@ -1359,7 +1990,7 @@ def run_b03_acceptance(
     decision = decide_verdict(policy, replay_obs, builds=build_docs)
 
     execution_metadata = {
-        "job_id": job_id,
+        "job_id": resolved_job_id,
         "plan_digest": plan_digest,
         "generation": 1,
         "probe": probe_doc,
@@ -1368,7 +1999,7 @@ def run_b03_acceptance(
     }
     report = {
         "schema_version": 1,
-        "job_id": job_id,
+        "job_id": resolved_job_id,
         "plan_digest": plan_digest,
         "cve_id": cve_id,
         "case_id": "b03-oniguruma-cve-2019-13224",
@@ -1405,7 +2036,7 @@ def run_b03_acceptance(
         [
             "# DataCon B03 acceptance report",
             "",
-            f"- Job: `{job_id}`",
+            f"- Job: `{resolved_job_id}`",
             f"- Plan: `{plan_digest}`",
             f"- Verdict: **{decision.verdict}**",
             f"- Reason: `{decision.reason_code}`",
@@ -1458,7 +2089,7 @@ def run_b03_acceptance(
 
     info = evidence.write_bundle(
         bundle_out,
-        job_id=job_id,
+        job_id=resolved_job_id,
         plan_digest=plan_digest,
         report=report,
         report_markdown=report_md,

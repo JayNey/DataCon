@@ -230,3 +230,206 @@ def test_promotion_and_rollback_change_the_persisted_active_release(
         expected_manifest_digest=after_status["evidence"]["digest"],
     )
     assert exported.manifest_digest == after_status["evidence"]["digest"]
+
+
+def _manifest_with(image_id: str, commit: str) -> dict:
+    return release.build_release_candidate_manifest(
+        source_commit=commit,
+        control_plane_image_id=image_id,
+        wheel_digest="sha256:" + "2" * 64,
+        migrations_dir=Path(__file__).resolve().parents[2] / "migrations",
+        sbom_digest="sha256:" + "3" * 64,
+        test_report_digest="sha256:" + "4" * 64,
+        scan_report_digest="sha256:" + "5" * 64,
+    )
+
+
+def test_multiple_rollbacks_and_repeated_smoke_failures_preserve_all_audit_events(
+    isolated_database,
+):
+    store_handle = state.ReleaseStore(isolated_database.dsn)
+    baseline = {
+        "image_id": PREVIOUS_IMAGE,
+        "config": {"policy_version": "1"},
+        "migration_version": "007_execution_evidence_invariant.sql",
+        "evidence_root": "/var/lib/datacon/evidence",
+    }
+    store_handle.bootstrap_release(**baseline)
+
+    m1_image = "sha256:" + "1" * 64
+    m2_image = "sha256:" + "2" * 64
+    m3_image = "sha256:" + "3" * 64
+    m1 = _manifest_with(m1_image, "b" * 40)
+    m2 = _manifest_with(m2_image, "c" * 40)
+    m3 = _manifest_with(m3_image, "d" * 40)
+
+    def make_rollback(candidate_digest: str):
+        def _rb(prev):
+            store_handle.switch(
+                image_id=prev["image_id"],
+                config=prev["config"],
+                migration_version=prev["migration_version"],
+                evidence_root=prev["evidence_root"],
+                action="rollback",
+                candidate_digest=candidate_digest,
+            )
+            return {"restored_image": prev["image_id"], "ok": True}
+
+        return _rb
+
+    # I0 -> promote(M1) -> rollback(I0) -> promote(M2) -> rollback(I0)
+    a1 = _approval(m1)
+    assert (
+        release.promote_and_smoke(
+            manifest=m1,
+            expected_manifest_digest=a1["candidate_digest"],
+            approval=a1,
+            backend=store_handle,
+            smoke_checks={"cli_smoke": lambda: True},
+            rollback_fn=make_rollback(a1["candidate_digest"]),
+        )["status"]
+        == "promoted"
+    )
+    target_i0 = store_handle.release_for_image(PREVIOUS_IMAGE)
+    assert target_i0 is not None
+    assert (
+        release.rollback_release(
+            target_release=target_i0,
+            backend=store_handle,
+            smoke_checks={"cli_smoke": lambda: True},
+            approved_by="reviewer-1",
+            candidate_digest=PREVIOUS_IMAGE,
+        )["status"]
+        == "rolled_back"
+    )
+
+    a2 = _approval(m2)
+    assert (
+        release.promote_and_smoke(
+            manifest=m2,
+            expected_manifest_digest=a2["candidate_digest"],
+            approval=a2,
+            backend=store_handle,
+            smoke_checks={"cli_smoke": lambda: True},
+            rollback_fn=make_rollback(a2["candidate_digest"]),
+        )["status"]
+        == "promoted"
+    )
+    target_i0_again = store_handle.release_for_image(PREVIOUS_IMAGE)
+    assert target_i0_again is not None
+    assert (
+        release.rollback_release(
+            target_release=target_i0_again,
+            backend=store_handle,
+            smoke_checks={"cli_smoke": lambda: True},
+            approved_by="reviewer-1",
+            candidate_digest=PREVIOUS_IMAGE,
+        )["status"]
+        == "rolled_back"
+    )
+
+    events = store_handle.events()
+    rollbacks = [e for e in events if e["action"] == "rollback"]
+    assert len(rollbacks) == 2
+    assert rollbacks[0]["previous_image_id"] == m1_image
+    assert rollbacks[0]["active_image_id"] == PREVIOUS_IMAGE
+    assert rollbacks[1]["previous_image_id"] == m2_image
+    assert rollbacks[1]["active_image_id"] == PREVIOUS_IMAGE
+
+    # Same candidate M3 fails smoke twice in a row -> both rollback audits persisted.
+    a3 = _approval(m3)
+    for _ in range(2):
+        res = release.promote_and_smoke(
+            manifest=m3,
+            expected_manifest_digest=a3["candidate_digest"],
+            approval=a3,
+            backend=store_handle,
+            smoke_checks={"cli_smoke": lambda: False},
+            rollback_fn=make_rollback(a3["candidate_digest"]),
+        )
+        assert res["status"] == "rolled_back"
+
+    events_after_smoke = store_handle.events()
+    m3_rollbacks = [
+        e
+        for e in events_after_smoke
+        if e["action"] == "rollback" and e["candidate_digest"] == a3["candidate_digest"]
+    ]
+    assert len(m3_rollbacks) == 2
+    assert all(e["active_image_id"] == PREVIOUS_IMAGE for e in m3_rollbacks)
+
+    # Subsequent clean promotion of M3 succeeds.
+    assert (
+        release.promote_and_smoke(
+            manifest=m3,
+            expected_manifest_digest=a3["candidate_digest"],
+            approval=a3,
+            backend=store_handle,
+            smoke_checks={"cli_smoke": lambda: True},
+            rollback_fn=make_rollback(a3["candidate_digest"]),
+        )["status"]
+        == "promoted"
+    )
+
+
+def test_release_store_transaction_rolls_back_switch_when_audit_fails(
+    isolated_database, monkeypatch
+):
+    store_handle = state.ReleaseStore(isolated_database.dsn)
+    store_handle.bootstrap_release(
+        image_id=PREVIOUS_IMAGE,
+        config={"policy_version": "1"},
+        migration_version="007_execution_evidence_invariant.sql",
+        evidence_root="/var/lib/datacon/evidence",
+    )
+    manifest = _manifest()
+    approval = _approval(manifest)
+
+    def broken_audit(_result):
+        raise RuntimeError("simulated audit write failure")
+
+    monkeypatch.setattr(store_handle, "record_audit", broken_audit)
+    with pytest.raises(RuntimeError, match="simulated audit write failure"):
+        release.promote_and_smoke(
+            manifest=manifest,
+            expected_manifest_digest=approval["candidate_digest"],
+            approval=approval,
+            backend=store_handle,
+            smoke_checks={"cli_smoke": lambda: True},
+            rollback_fn=lambda prev: {"restored_image": prev["image_id"], "ok": True},
+        )
+    active = store_handle.active_release()
+    assert active is not None
+    assert active["image_id"] == PREVIOUS_IMAGE
+    assert store_handle.events() == []
+
+
+def test_migration_008_upgrades_legacy_unique_constraint_idempotently(
+    isolated_database,
+):
+    migration_sql = (
+        Path(__file__).resolve().parents[2] / "migrations" / "008_release_events.sql"
+    ).read_text(encoding="utf-8")
+    isolated_database.connection.execute(
+        "DROP INDEX IF EXISTS release_events_promote_unique_idx"
+    )
+    isolated_database.connection.execute(
+        "ALTER TABLE release_events "
+        "ADD CONSTRAINT release_events_environment_action_candidate_digest_key "
+        "UNIQUE (environment, action, candidate_digest)"
+    )
+    isolated_database.connection.execute(migration_sql)
+    isolated_database.connection.execute(migration_sql)
+    old_constraint = isolated_database.connection.execute(
+        "SELECT 1 FROM pg_constraint "
+        "WHERE conrelid = 'release_events'::regclass "
+        "AND conname = 'release_events_environment_action_candidate_digest_key'"
+    ).fetchone()
+    assert old_constraint is None
+    new_index = isolated_database.connection.execute(
+        "SELECT 1 FROM pg_indexes "
+        "WHERE schemaname = current_schema() "
+        "AND tablename = 'release_events' "
+        "AND indexname = 'release_events_promote_unique_idx'"
+    ).fetchone()
+    assert new_index is not None

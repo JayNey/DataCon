@@ -59,6 +59,22 @@ def test_build_candidate_saves_image_and_real_test_scan_evidence():
     )
 
 
+def test_promote_job_requires_test_report_and_build_candidate_without_always():
+    job = _load(RELEASE)["jobs"]["promote-internal"]
+    needs = job.get("needs")
+    if isinstance(needs, str):
+        needs_set = {needs}
+    else:
+        needs_set = set(needs or ())
+    assert needs_set == {"test-report", "build-candidate"}
+    condition = job.get("if", "")
+    assert "always()" not in condition
+    assert "!cancelled()" in condition
+    assert "needs.test-report.result == 'success'" in condition
+    assert "needs.build-candidate.result == 'success'" in condition
+    assert "needs.build-candidate.result == 'skipped'" in condition
+
+
 def test_promote_job_downloads_verifies_loads_smokes_and_audits():
     job = _load(RELEASE)["jobs"]["promote-internal"]
     assert job["environment"] == "internal-lab"
@@ -77,8 +93,10 @@ def test_promote_job_downloads_verifies_loads_smokes_and_audits():
         "ReleaseStore",
         "rollback_fn",
         "status",
+        "verify-bundle",
     ):
         assert required in text, required
+    assert "lambda: True" not in text
     assert "DATACON_RELEASE_APPROVAL" in text
     assert "artifact_run_id is required" in text
     assert '"promoted"' in text
@@ -98,6 +116,7 @@ def test_rollback_job_validates_input_via_env_and_uses_real_rollback():
     assert "docker load" in text
     assert "rollback_release" in text
     assert "release_for_image" in text
+    assert "db_readability" in text
 
 
 def test_release_workflow_passes_untrusted_inputs_through_env():
@@ -130,6 +149,12 @@ def test_b03_job_requires_authorized_runner_and_upload_only_summary():
     assert "run_b03_acceptance" in text
     assert "B03CaseMaterials" in text
     assert "b03-acceptance-summary.json" in text
+    assert "REPRODUCED" in text
+    assert "ASAN_SIGNATURE_MATCHED" in text
+    assert 'acceptance["replay_count"] != 6' in text or 'acceptance["replay_count"] == 6' in text
+    assert 'acceptance["bundle_verified"]' in text
+    assert "GITHUB_RUN_ATTEMPT" in text
+    assert "job_id=job_id" in text
     upload = [
         step
         for step in _steps(job)

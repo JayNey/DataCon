@@ -684,6 +684,22 @@ def _single_role_path(
     return matches[0]
 
 
+def _role_paths(
+    listed: Mapping[str, Mapping[str, Any]], role: str
+) -> list[tuple[str, Mapping[str, Any]]]:
+    matches = [
+        (path, entry)
+        for path, entry in listed.items()
+        if entry["role"] == role
+    ]
+    if not matches:
+        raise BundleError(
+            "INVALID_MANIFEST",
+            f"expected at least one {role} evidence file, found 0",
+        )
+    return matches
+
+
 def _case_binding(
     plan: Mapping[str, Any],
     listed: Mapping[str, Mapping[str, Any]],
@@ -822,17 +838,32 @@ def _verify_materials(
                 "DIGEST_MISMATCH",
                 f"{role} path is not pinned by the plan case config",
             )
-    for role in ("material_source_vulnerable", "material_source_fixed"):
-        path, entry = _single_role_path(listed, role)
-        if not path.startswith("materials/"):
+    for role, prefix in (
+        ("material_source_vulnerable", "vulnerable/"),
+        ("material_source_fixed", "fixed/"),
+    ):
+        matches = _role_paths(listed, role)
+        bundled_relatives: set[str] = set()
+        for path, _entry in matches:
+            if not path.startswith("materials/"):
+                raise BundleError(
+                    "INVALID_MANIFEST", f"{role} must be a materials/* evidence file"
+                )
+            relative = path[len("materials/") :]
+            if materials.get(relative) != _digest(data[path]):
+                raise BundleError(
+                    "DIGEST_MISMATCH",
+                    f"{role} is not pinned by the plan case config",
+                )
+            bundled_relatives.add(relative)
+        expected_relatives = {
+            relative for relative in materials if relative.startswith(prefix)
+        }
+        missing_sources = sorted(expected_relatives - bundled_relatives)
+        if missing_sources:
             raise BundleError(
-                "INVALID_MANIFEST", f"{role} must be a materials/* evidence file"
-            )
-        relative = path[len("materials/") :]
-        if materials.get(relative) != _digest(data[path]):
-            raise BundleError(
-                "DIGEST_MISMATCH",
-                f"{role} is not pinned by the plan case config",
+                "INVALID_MANIFEST",
+                f"{role} is missing pinned source files: {', '.join(missing_sources)}",
             )
     # A case config may pin the repository bundle and advisory snapshot as
     # materials (B03 does). When it does, the bundle must contain those exact
