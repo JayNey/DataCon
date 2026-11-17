@@ -2,58 +2,76 @@
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from uuid import UUID
 
 import psycopg
 import pytest
 
-from datacon import evidence, release, state, store
-from datacon.contracts import DEFAULT_LIMITS, parse_request
-from tests.integration.support import clear_jobs_table, make_executed_job
+from datacon import evidence, execution, release, state, store
+from tests.integration.support import review, status, submit, worker, write_request
+from tests.integration.test_execution import FakeSandbox
 
 pytestmark = pytest.mark.postgres
 
 
 def test_rollback_preserves_awaiting_review_approved_review_and_old_evidence(
-    db_dsn, tmp_path, monkeypatch
+    isolated_database, tmp_path, monkeypatch
 ):
-    clear_jobs_table(db_dsn)
     evidence_root = tmp_path / "evidence"
     run_root = tmp_path / "runs"
-    secret_file = tmp_path / "journal-secret"
     monkeypatch.setenv("DATACON_EVIDENCE_ROOT", str(evidence_root))
     monkeypatch.setenv("DATACON_RUN_ROOT", str(run_root))
-    monkeypatch.setenv("DATACON_JOURNAL_SECRET_FILE", str(secret_file))
+    monkeypatch.delenv("DATACON_JOURNAL_SECRET_FILE", raising=False)
+    monkeypatch.delenv("DATACON_FAULT_AFTER_TOOL", raising=False)
 
     # 1. Completed job with archived evidence bundle before release upgrade.
-    completed_job_id, _ = make_executed_job(db_dsn, tmp_path / "exec")
-    before_status = store.status(db_dsn, completed_job_id)
+    exec_dir = tmp_path / "exec"
+    exec_dir.mkdir()
+    completed = submit(
+        isolated_database.dsn, write_request(exec_dir, case_id="fixture-c-parser")
+    )
+    completed_job_id = UUID(completed["job_id"])
+    worker(isolated_database.dsn)
+    approved_digest = status(isolated_database.dsn, completed["job_id"])["pending_plan"][
+        "plan_digest"
+    ]
+    accepted = review(
+        isolated_database.dsn,
+        completed["job_id"],
+        approved_digest,
+        "approve",
+        env_extra={"DATACON_OPERATOR_ID": "reviewer-1"},
+    )
+    assert accepted.returncode == 0, accepted.stderr
+    worker(isolated_database.dsn)
+    claimed = state.claim_next(isolated_database.dsn, "release-rollback-test")
+    assert claimed is not None and claimed["state"] == "RUNNING"
+
+    exec_outcome = execution.run_execution(
+        isolated_database.dsn,
+        completed_job_id,
+        claimed["generation"],
+        run_root=run_root,
+        sandbox=FakeSandbox(),
+    )
+    assert exec_outcome.state == "REPRODUCED"
+
+    before_status = store.status(isolated_database.dsn, completed_job_id)
+    assert before_status is not None
     assert before_status["verdict"] == "REPRODUCED"
     assert before_status["evidence"]["available"] is True
 
     # 2. AWAITING_REVIEW job with frozen plan before upgrade.
-    pending_req = parse_request(
-        json.dumps(
-            {
-                "schema_version": 1,
-                "cve_id": "CVE-2099-0001",
-                "target": {
-                    "kind": "source",
-                    "case_id": "fixture-c-parser",
-                    "goal": "pending review before release",
-                },
-                "limits": dict(DEFAULT_LIMITS),
-            }
-        )
+    pending_dir = tmp_path / "pending"
+    pending_dir.mkdir()
+    pending = submit(
+        isolated_database.dsn, write_request(pending_dir, case_id="fixture-c-parser")
     )
-    pending_submitted = store.submit(db_dsn, pending_req, operator_id="ops-user")
-    pending_job_id = UUID(pending_submitted["job_id"])
-    from datacon import workflow
-
-    workflow.run_worker(db_dsn, once=True, execute=False, run_root=str(run_root))
-    pending_before = store.status(db_dsn, pending_job_id)
+    pending_job_id = UUID(pending["job_id"])
+    worker(isolated_database.dsn)
+    pending_before = store.status(isolated_database.dsn, pending_job_id)
+    assert pending_before is not None
     assert pending_before["state"] == "AWAITING_REVIEW"
     pending_digest = pending_before["pending_plan"]["plan_digest"]
 
@@ -84,7 +102,7 @@ def test_rollback_preserves_awaiting_review_approved_review_and_old_evidence(
         "migration_compatible": True,
     }
 
-    with psycopg.connect(db_dsn) as conn:
+    with psycopg.connect(isolated_database.dsn) as conn:
         active_slots = conn.execute(
             "SELECT COUNT(*) FROM jobs WHERE state IN ('PREPARING', 'RUNNING', 'ARCHIVING')"
         ).fetchone()[0]
@@ -97,7 +115,9 @@ def test_rollback_preserves_awaiting_review_approved_review_and_old_evidence(
         active_slots=active_slots,
         smoke_checks={
             "cli_smoke": lambda: True,
-            "db_readability": lambda: store.status(db_dsn, completed_job_id) is not None,
+            "db_readability": lambda: (
+                store.status(isolated_database.dsn, completed_job_id) is not None
+            ),
             "sandbox_probe": lambda: False,
             "synthetic_regression": lambda: True,
         },
@@ -106,15 +126,17 @@ def test_rollback_preserves_awaiting_review_approved_review_and_old_evidence(
     assert outcome["status"] == "rolled_back"
 
     # 4. TC-10 post-rollback invariants: pending plan, old review, and archived bundle still readable/verifiable.
-    pending_after = store.status(db_dsn, pending_job_id)
+    pending_after = store.status(isolated_database.dsn, pending_job_id)
+    assert pending_after is not None
     assert pending_after["state"] == "AWAITING_REVIEW"
     assert pending_after["pending_plan"]["plan_digest"] == pending_digest
 
-    old_review = state.get_review(db_dsn, completed_job_id)
+    old_review = state.get_review(isolated_database.dsn, completed_job_id)
     assert old_review is not None
     assert old_review["decision"] == "approve"
 
-    after_status = store.status(db_dsn, completed_job_id)
+    after_status = store.status(isolated_database.dsn, completed_job_id)
+    assert after_status is not None
     assert after_status["verdict"] == "REPRODUCED"
     assert after_status["evidence"]["available"] is True
     verified = evidence.verify_bundle(after_status["evidence"]["path"])
