@@ -360,6 +360,27 @@ Dockerfile              T07 控制面非 root 容器镜像构建配方
 
 `.github/workflows/ci.yml` 在 Pull Request 和 `main` 分支推送时运行：安装锁定依赖、启动固定 digest 的 PostgreSQL 17、按文件名顺序应用 `migrations/*.sql`、安装宿主 `clang` / LLVM symbolizer / patch，并在 pytest 前显式检查 `DATACON_TEST_DATABASE_URL`、这些工具、Docker 和固定 clang 镜像。独立 `image` job 在每个 PR 上真实 `docker build` 控制面镜像并 smoke 默认 / `worker` entrypoint、非 root UID 和运行时工具。测试 job 先用 `pytest --collect-only` 比较四组 marker 的 total 之和与全集，再逐个解析 JUnit 报告，要求每组 `total > 0` 且 `skipped=0`；四组用累计 `status` 收集结果，某一组失败不会掩盖其余组，JUnit 仍 `always()` 上传。缺少数据库、clang、llvm-symbolizer、Docker 或镜像时会在测试侧 `fail` 而不是 skip。`python -m datacon.ci_gates --root .` 在 PR 中运行显式的 secret / lock / workflow 静态子集；真实 Trivy 报告和 `evaluate_scan_findings` 在 `release.yml` 的 build-candidate 中执行，缺失报告时 release 直接失败。wheel 冒烟会把构建产物安装进临时 venv，执行 `datacon --help`，断言 `importlib.metadata` 的版本 / 依赖 / `datacon = datacon.cli:main` entry point，并从安装后的 wheel 解析和 `analyze_case` 默认案例。`uv` 按 `requirements-ci.txt` 中的 wheel hash 安装；构建后端固定为 uv 自带的 `uv_build==0.12.7`，`uv sync --frozen` 不解析或安装 setuptools，CI 还会以 verbose 重装确认实际使用的是内置后端。第三方 Action 固定到完整提交 SHA，工作流只有 `contents: read` 权限。真实 Docker 组在一次性 Linux runner 上运行固定镜像探针、双版本构建、六次回放、恢复和验包，不接触真实案例材料。本地未设置 `DATACON_TEST_DATABASE_URL`、缺少 clang 或 Docker 守护进程时仍允许显式 skip；`CI=true` 时不允许。
 
+### 发布 workflow（`release.yml`）
+
+`release.yml` 的 build-candidate 会产出 wheel、CycloneDX SBOM、`control-plane-image.tar`、四份真实 JUnit 与 Trivy JSON，并重算 manifest 证据；promote / rollback 只消费这些 artifact，不再用 `echo` 冒充切换。触发前必须由维护者在仓库 Settings → Environments 创建 `internal-lab` 并配置 required reviewers，以及 `DATACON_DATABASE_URL`、`DATACON_RELEASE_APPROVAL`（reviewer 产出的审批 JSON）；B03 另需 `DATACON_B03_CASE_ROOT`、`DATACON_B03_ADMISSION`、`DATACON_B03_REVIEW` 和 `datacon-internal` 授权 runner。代码无法创建这些仓库设置，未配置时相关 job 会失败或等待 runner。
+
+```bash
+# 1. 构建候选，记录 run id 与 manifest digest
+gh workflow run release.yml -f action=build
+gh run list --workflow=release.yml --limit 1
+
+# 2. 用同一 artifact run 推广（expected_manifest_digest 来自 build 输出）
+gh workflow run release.yml   -f action=promote   -f artifact_run_id=<build-run-id>   -f expected_manifest_digest=sha256:<64-hex>
+
+# 3. 回滚到持久化审计中存在的目标 image id
+gh workflow run release.yml   -f action=rollback   -f artifact_run_id=<run-with-target-tar>   -f target_digest=sha256:<64-hex>
+
+# 4. B03 只在授权 runner 上执行；仓库内 pending admission 会被拒绝
+gh workflow run release.yml -f action=build -f run_b03=true
+```
+
+这些命令在本次修复环境中**未执行**（无 GitHub workflow dispatch 权限，且 `release.yml` 在本 PR 前从未运行）；真实 dispatch 仍是最终验收步骤。
+
 ## 开发方式
 
 需求和接口契约先定义可观察的验收条件。编码 Agent 按任务范围实施，通过 TDD 记录失败测试、最小实现和回归结果。CI/CD 计划覆盖契约测试、隔离环境验证和实验版本发布。
