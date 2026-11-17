@@ -319,6 +319,9 @@ src/datacon/
   verdict.py            SRS 判定优先级
   asan.py               原始 ASan 日志解析与签名匹配
   evidence.py           证据包写入、离线校验与导出
+  ci_gates.py           T07 静态规范、链接、REQ/TC、Action SHA、JUnit、密钥与漏洞豁免门禁
+  b04_eval.py           T07 B04 离线标注集三轮 Agent 评估门禁
+  release.py            T07/T08 候选发布清单、CycloneDX SBOM、推广冒烟、回滚与 B03 验收
   agent_contracts.py    AgentInput / AgentOutput / Finding
   agents/analysis.py    离线情报、版本、diff、事实 / 假设与计划冻结
   tools/source.py       受限 Git 与 Tree-sitter
@@ -327,16 +330,18 @@ src/datacon/
   data/seccomp/         固定 seccomp profile（计划记录其 canonical 摘要）
 migrations/             001 任务表、002 工作流增量、003 attempts 代次键升级、004 旧 binary 回填、005 判定 / 证据、006 journal provenance token、007 归档证据不变量修复与 CHECK
 examples/               示例请求
-tests/contract/         请求、计划、Agent、分析、判定、证据、沙箱策略、wheel 与案例材料 / B03
-tests/integration/      真实 PostgreSQL CLI / 审核 / 恢复 / 重试 / 迁移 / 执行 / ASan 回放
+tests/contract/         请求、计划、Agent、分析、判定、证据、沙箱策略、wheel、CI 门禁、B04、发布与 B03
+tests/integration/      真实 PostgreSQL CLI / 审核 / 恢复 / 重试 / 迁移 / 执行 / 回滚 / ASan 回放
 tests/e2e/              真实 Docker 的 MVP-01 至 MVP-04
-tests/fixtures/cases/   测试基线镜像（合成材料、Git bundle、公告、注册表与 B03）
-.github/workflows/      PR CI
+tests/fixtures/cases/   测试基线镜像（合成材料、Git bundle、公告、注册表、B03 与 B04）
+.github/workflows/      CI 合并门禁（ci.yml）与候选发布/推广/回滚（release.yml）
+Dockerfile              T07 控制面非 root 容器镜像构建配方
 ```
 
-## 范围外
+## M3 交付（T07–T08）
 
-T07–T08 仍不包含在本批：真实公开 CVE 的发布验收、控制面镜像 / 工具链镜像发布、SBOM 与镜像扫描、按摘要晋级与回滚演练留在后续任务。本批也不实现二进制逆向、CodeQL、AFL++ / libFuzzer 搜索和 Web 界面。真实案例只在授权实验环境执行。
+- **T07 CI 与制品生成**：`src/datacon/ci_gates.py` 与 `.github/workflows/ci.yml` 实现 Markdown 相对链接、`REQ-01..REQ-10` / `TC-01..TC-10` 引用一致性、契约示例、`uv.lock` / `requirements-ci.txt` 锁定、第三方 Action 40 位 SHA 与最小权限检查、B04 离线标注集（`tests/fixtures/cases/B04-offline.json`）三轮评估门禁（三轮零越权工具调用、100% 契约校验）、JUnit zero-skip 门禁、密钥与结构化豁免校验以及脱敏 JUnit 制品上传。`Dockerfile` 基于固定 digest 基础镜像与 `uv.lock` 构建非 root 控制面镜像。
+- **T08 发布、B03 验收与回滚**：`src/datacon/release.py` 与 `.github/workflows/release.yml` 实现 CycloneDX SBOM 生成、Release Candidate Manifest 绑定、Promotion Gate、执行槽位排空检查、冒烟失败自动阻断与回滚、B03（`CVE-2019-13224`）授权隔离环境 6 次回放与 `verify-bundle` 验收编排，以及 TC-10 回滚后待审计划/历史审核/已归档证据包可读可验不变性。本批仍不实现二进制逆向、CodeQL、AFL++ / libFuzzer 搜索和 Web 界面；真实公开案例输入与证据实体不入库，仅在授权实验环境保存。
 
 ## 安全与数据
 

@@ -58,6 +58,21 @@ jobs:
             echo "setuptools must not be resolved as the build backend" >&2
             exit 1
           fi
+      - name: Run T07 static, link, REQ/TC, workflow SHA, and secret gates
+        run: |
+          uv run --frozen python -m datacon.ci_gates --root .
+      - name: Run T07 B04 three-round offline Agent evaluation gate
+        run: |
+          uv run --frozen python - <<'PY'
+          import json
+          from pathlib import Path
+          from datacon.b04_eval import run_b04_evaluation
+
+          report = run_b04_evaluation(
+              Path("tests/fixtures/cases/B04-offline.json"), rounds=3
+          )
+          print(json.dumps({k: v for k, v in report.items() if k != "round_reports"}, indent=2))
+          PY
       - name: Apply database migrations
         run: |
           uv run --frozen python - <<'PY'
@@ -142,9 +157,6 @@ jobs:
           python -m venv "$venv"
           "$venv/bin/python" -m pip install \
             --no-index --no-deps --disable-pip-version-check "$wheel"
-          # Dependencies come from the locked project environment. The datacon
-          # package itself must come from the installed wheel, not from a
-          # PYTHONPATH pointing at an unpacked zip.
           deps_site="$(uv run --frozen python -c \
             'import sysconfig; print(sysconfig.get_paths()["purelib"])')"
           export PYTHONPATH="$deps_site"
@@ -198,41 +210,34 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/ci-reports"
 
           run_suite() {
             local marker="$1"
             local label="$2"
-            local report="$RUNNER_TEMP/${label}.xml"
+            local report="$RUNNER_TEMP/ci-reports/${label}.xml"
             uv run --frozen pytest -q -m "$marker" -rs --junitxml="$report"
             uv run --frozen python - "$report" "$label" <<'PY'
+          import pathlib
           import sys
-          import xml.etree.ElementTree as ET
+          from datacon.ci_gates import check_junit_report
 
-          path, label = sys.argv[1], sys.argv[2]
-          root = ET.parse(path).getroot()
-          suites = [root] if root.tag == "testsuite" else root.findall("testsuite")
-          total = sum(int(suite.get("tests", 0)) for suite in suites)
-          skipped = sum(int(suite.get("skipped", 0)) for suite in suites)
-          failures = sum(int(suite.get("failures", 0)) for suite in suites)
-          errors = sum(int(suite.get("errors", 0)) for suite in suites)
+          summary = check_junit_report(pathlib.Path(sys.argv[1]), label=sys.argv[2])
           print(
-              f"{label}: total={total} skipped={skipped} "
-              f"failures={failures} errors={errors}"
+              f"{summary['label']}: total={summary['total']} skipped={summary['skipped']} "
+              f"failures={summary['failures']} errors={summary['errors']}"
           )
-          if total == 0:
-              raise SystemExit(f"the {label} suite did not run any tests")
-          if skipped or failures or errors:
-              raise SystemExit(
-                  f"CI requires the {label} suite to pass with zero skips"
-              )
           PY
           }
 
-          # T03/T04 PostgreSQL, workflow and migration paths must actually run.
           run_suite "postgres and not docker" postgres
-          # T05/T06 real Linux isolation, build, six-replay and evidence gates.
           run_suite "postgres and docker" docker
-          # ASan frame/source assertions must actually run.
           run_suite asan asan
-          # Contract, analysis, verdict, evidence, wheel and entry-point checks.
           run_suite "not postgres and not asan" contract
+      - name: Upload sanitized synthetic JUnit reports
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ci-junit-reports
+          path: ${{ runner.temp }}/ci-reports/*.xml
+          retention-days: 14
