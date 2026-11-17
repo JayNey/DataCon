@@ -280,10 +280,15 @@ def check_workflow_security(files: Iterable[Path]) -> list[str]:
                             ref = with_block.get("ref")
                             if isinstance(ref, str):
                                 lowered = ref.lower()
-                                if "github.event" in lowered or "inputs." in lowered:
+                                if (
+                                    "${{" in lowered
+                                    or "github.event" in lowered
+                                    or "inputs." in lowered
+                                ):
                                     errors.append(
                                         f"{path}: job {job_name} step {index} "
-                                        "checkout ref comes from untrusted input"
+                                        "checkout ref comes from an expression; "
+                                        "pin a literal ref instead"
                                     )
                 run_text = step.get("run")
                 if isinstance(run_text, str):

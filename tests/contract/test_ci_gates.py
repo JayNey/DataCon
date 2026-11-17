@@ -172,8 +172,26 @@ def test_workflow_security_rejects_run_expressions_and_untrusted_checkout_ref(tm
         "      - run: echo \"${{ inputs.target_digest }}\"\n",
     )
     errors = ci_gates.check_workflow_security([expression])
-    assert any("untrusted" in err for err in errors)
+    assert any("checkout ref comes from an expression" in err for err in errors)
     assert any("untrusted '${{ ... }}'" in err for err in errors)
+
+    env_ref = tmp_path / "env-ref.yml"
+    env_ref.write_text(
+        "name: Bad\n"
+        "on:\n"
+        "  pull_request:\n"
+        "permissions:\n"
+        "  contents: read\n"
+        "jobs:\n"
+        "  test:\n"
+        "    steps:\n"
+        "      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262\n"
+        "        with:\n"
+        "          ref: ${{ env.REF }}\n",
+        encoding="utf-8",
+    )
+    errors = ci_gates.check_workflow_security([env_ref])
+    assert any("checkout ref comes from an expression" in err for err in errors)
 
 
 def test_junit_gate_rejects_failures_skips_and_empty_suites(tmp_path):
