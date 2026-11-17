@@ -1,0 +1,4115 @@
+"""Execution state machine for approved READY jobs (T05/T06).
+
+The executor is deterministic. It re-verifies the approved review, plan and
+material digests before every target container, materializes only pinned
+inputs, records generation-scoped attempts, and archives a verifiable evidence
+bundle before committing the terminal verdict.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+import hashlib
+import hmac
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import stat
+import sys
+import unicodedata
+import uuid
+from typing import Any, Callable, Mapping, Sequence
+from uuid import UUID
+
+from datacon import contracts, fileio, jsonutil, state
+from datacon.cases import (
+    MAX_MATERIAL_BYTES,
+    CaseConfigurationError,
+    CaseDefinition,
+    load_registry,
+)
+from datacon.evidence import BundleError, verify_bundle, write_bundle
+from datacon.tools.sandbox import (
+    MAX_ARTIFACT_BYTES,
+    MAX_LOG_BYTES,
+    BuildResult,
+    DockerSandbox,
+    IsolationPolicy,
+    ProbeReport,
+    ReplayResult,
+    ResourceLimits,
+    SandboxError,
+    SandboxPolicyError,
+    SandboxUnavailable,
+    _extract_compile_args,
+)
+from datacon.verdict import (
+    PRIORITY,
+    RunObservation,
+    VerdictDecision,
+    VerdictPolicy,
+    decide_verdict,
+)
+
+ARCHIVE_RESERVE_MAX = 60
+ARCHIVE_RESERVE_RATIO = 0.1
+BUILD_TIMEOUT = 300.0
+PROBE_TIMEOUT = 120.0
+MAX_ATTEMPTS_PER_STEP = 2
+FAULT_ENV = "DATACON_FAULT_AFTER_TOOL"
+TEST_MODE_ENV = "DATACON_TEST_MODE"
+STAGING_ROOT_ENV = "DATACON_STAGING_ROOT"
+# Journals and the HMAC key live inside/next to the run root, so their readers
+# must reject oversized attacker-written files before loading them.
+_JOURNAL_MAX_BYTES = 1024 * 1024
+_JOURNAL_SECRET_MAX_BYTES = 1024
+
+
+def test_hooks_enabled() -> bool:
+    return os.getenv(TEST_MODE_ENV) == "1"
+
+
+def validate_test_hooks() -> None:
+    """Refuse fault-injection switches outside an explicit test run."""
+    configured = [
+        name
+        for name in (FAULT_ENV, "DATACON_FAULT_DURING_ARCHIVE")
+        if os.getenv(name)
+    ]
+    if configured and not test_hooks_enabled():
+        raise RuntimeError(
+            "test fault injection is disabled in production; set "
+            f"{TEST_MODE_ENV}=1 and run only in tests (configured: "
+            + ", ".join(configured)
+            + ")"
+        )
+
+
+class ExecutionBlocked(RuntimeError):
+    """The approved execution cannot start or continue; no target runs."""
+
+    def __init__(self, reason_code: str, message: str, details: Mapping[str, Any] | None = None):
+        super().__init__(message)
+        self.reason_code = reason_code
+        self.message = message
+        self.details = dict(details or {})
+
+
+class ExecutionFailed(RuntimeError):
+    """An execution step failed for an infrastructure or build reason."""
+
+    def __init__(self, reason_code: str, message: str):
+        super().__init__(message)
+        self.reason_code = reason_code
+        self.message = message
+
+
+@dataclass
+class ExecutionContext:
+    job_id: UUID
+    generation: int
+    job: dict[str, Any]
+    plan: dict[str, Any]
+    plan_digest: str
+    review: dict[str, Any]
+    case: CaseDefinition
+    case_root: Path
+    manifest_case: dict[str, Any]
+    materials: dict[str, str]
+    case_config: dict[str, Any]
+    material_root: Path
+    run_root: Path
+    playbook: dict[str, Any]
+    image: str
+    isolation: IsolationPolicy
+    limits: ResourceLimits
+    compile_args: tuple[str, ...]
+    deadline_at: datetime
+    reserve_seconds: float
+    material_payloads: dict[str, bytes] = field(default_factory=dict)
+    cleanup_errors: list[str] = field(default_factory=list)
+
+    @property
+    def job_id_text(self) -> str:
+        return str(self.job_id)
+
+
+@dataclass
+class ExecutionResult:
+    state: str
+    verdict: str | None = None
+    verdict_reason: str | None = None
+    evidence_digest: str | None = None
+    evidence_path: str | None = None
+    reason_code: str | None = None
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace(
+        "+00:00", "Z"
+    )
+
+
+def _digest(data: bytes) -> str:
+    return "sha256:" + hashlib.sha256(data).hexdigest()
+
+
+def _read_run_file_bounded(path: Path, *, max_bytes: int) -> bytes | None:
+    """Read a run-root file only after proving it is a small regular file.
+
+    Everything below ``DATACON_RUN_ROOT`` is attacker-writable. The shared
+    ``fileio`` helper opens the leaf with ``O_NOFOLLOW`` and ``O_NONBLOCK`` and
+    then checks it with ``fstat`` so a symlink swap or FIFO can neither redirect
+    the read nor block the worker. Rejecting an oversized or non-regular file
+    *before* reading prevents a huge journal, log or artifact from exhausting
+    memory ahead of digest/HMAC checks.
+    """
+    try:
+        return fileio.read_regular_file_bounded(path, max_bytes=max_bytes)
+    except fileio.UnsafeFileError:
+        return None
+
+
+def _stat_identity(path: Path, label: str) -> tuple[int, int] | None:
+    """Return ``(st_dev, st_ino)`` or ``None`` when the path does not exist."""
+    try:
+        info = os.stat(path)
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+    except OSError as error:
+        # An unreadable ancestor means containment cannot be proven.
+        raise ExecutionFailed(
+            "EVIDENCE_WRITE_FAILED", f"{label} cannot be inspected: {error}"
+        ) from error
+    return (info.st_dev, info.st_ino)
+
+
+def _normalized_parts(path: Path) -> tuple[str, ...]:
+    return tuple(
+        unicodedata.normalize("NFC", part).casefold() for part in path.parts
+    )
+
+
+def _lexically_within_run_root(path: Path, run_root: Path) -> bool:
+    """Conservative normalized comparison for paths whose identity is unknown.
+
+    This is deliberately broader than a byte comparison: it also catches
+    case-only and NFC/NFD-only variants that a case-insensitive or
+    normalization-insensitive filesystem would resolve to the run root.
+    """
+    path_parts = _normalized_parts(path)
+    root_parts = _normalized_parts(run_root)
+    return (
+        len(path_parts) >= len(root_parts)
+        and path_parts[: len(root_parts)] == root_parts
+    )
+
+
+def _inside_run_root(path: Path, run_root: Path, label: str) -> bool:
+    """Decide containment using filesystem identity, not resolved strings.
+
+    ``path`` and ``run_root`` are already resolved lexically. For every
+    existing ancestor of ``path`` we compare device/inode numbers with the run
+    root, which is what makes a case-only or Unicode-normalization-only variant
+    of the same directory indistinguishable from the original. A conservative
+    normalized component comparison is applied as well, so a not-yet-created
+    path nested under a case variant is still rejected on case-sensitive
+    filesystems.
+    """
+    if _lexically_within_run_root(path, run_root):
+        return True
+    root_identity = _stat_identity(run_root, label)
+    current = path
+    while True:
+        identity = _stat_identity(current, label)
+        if identity is not None:
+            break
+        parent = current.parent
+        if parent == current:
+            return False
+        current = parent
+    if root_identity is None:
+        return False
+    probe = current
+    while True:
+        if _stat_identity(probe, label) == root_identity:
+            return True
+        parent = probe.parent
+        if parent == probe:
+            return False
+        probe = parent
+
+
+@dataclass(frozen=True)
+class _MountPoint:
+    """The subset of a ``/proc/self/mountinfo`` line used for containment.
+
+    ``root`` is ``None`` for pseudo filesystems whose mount root is not a path
+    (for example ``nsfs`` reports ``net:[4026532313]``). Such a mount cannot
+    prove containment and is rejected when it is relevant to the target.
+    """
+
+    mount_id: int
+    parent_id: int
+    major_minor: str
+    root: Path | None
+    mount_point: Path
+
+
+_MOUNTINFO_ESCAPE = re.compile(r"\\([0-7]{3})")
+
+
+def _unescape_mountinfo(value: str) -> str:
+    def replace(match: re.Match[str]) -> str:
+        return chr(int(match.group(1), 8))
+
+    return _MOUNTINFO_ESCAPE.sub(replace, value)
+
+
+def _parse_mountinfo(text: str) -> tuple[_MountPoint, ...]:
+    """Parse mount IDs, roots and mount points from ``/proc/self/mountinfo``.
+
+    The parser is deliberately strict: a line that cannot be understood makes
+    the caller fail closed instead of silently dropping a mount that might
+    redirect the target under the run root.
+    """
+    entries: list[_MountPoint] = []
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        fields = line.split()
+        try:
+            separator = fields.index("-")
+        except ValueError as error:
+            raise ValueError("mountinfo line has no separator") from error
+        if separator < 6 or len(fields) < 7:
+            raise ValueError("mountinfo line is too short")
+        try:
+            mount_id = int(fields[0])
+            parent_id = int(fields[1])
+        except ValueError as error:
+            raise ValueError("mountinfo mount IDs are not integers") from error
+        major_minor = fields[2]
+        if ":" not in major_minor:
+            raise ValueError("mountinfo device is malformed")
+        root_value = _unescape_mountinfo(fields[3])
+        root = Path(root_value) if root_value.startswith("/") else None
+        mount_point = Path(_unescape_mountinfo(fields[4]))
+        if not mount_point.is_absolute():
+            raise ValueError("mountinfo mount point is not absolute")
+        entries.append(
+            _MountPoint(
+                mount_id=mount_id,
+                parent_id=parent_id,
+                major_minor=major_minor,
+                root=root,
+                mount_point=mount_point,
+            )
+        )
+    return tuple(entries)
+
+
+def _mount_point_for(
+    entries: Sequence[_MountPoint], path: Path
+) -> _MountPoint | None:
+    """Return the topmost mount that contains ``path``, or ``None``.
+
+    Overmounts share a mount point. The visible mount is the leaf of the
+    ``parent_id`` chain rooted at the mount that was covered first, not the
+    entry with the largest ``mount_id``: mount IDs are reused and are not
+    ordered. Any ambiguity (duplicate IDs, multiple roots or leaves, a cycle,
+    or a gap in the chain) makes containment unprovable, so the caller must
+    fail closed instead of guessing.
+    """
+    if not entries:
+        return None
+    mount_ids = [entry.mount_id for entry in entries]
+    if len(set(mount_ids)) != len(mount_ids):
+        return None
+    candidates = [
+        entry
+        for entry in entries
+        if path == entry.mount_point or entry.mount_point in path.parents
+    ]
+    if not candidates:
+        return None
+    depth = max(len(entry.mount_point.parts) for entry in candidates)
+    deepest = {
+        entry.mount_point
+        for entry in candidates
+        if len(entry.mount_point.parts) == depth
+    }
+    if len(deepest) != 1:
+        return None
+    mount_point = next(iter(deepest))
+    group = [entry for entry in candidates if entry.mount_point == mount_point]
+    if len(group) == 1:
+        return group[0]
+    by_id = {entry.mount_id: entry for entry in group}
+    children: dict[int, list[int]] = {}
+    roots: list[int] = []
+    for entry in group:
+        if entry.parent_id in by_id:
+            children.setdefault(entry.parent_id, []).append(entry.mount_id)
+        else:
+            roots.append(entry.mount_id)
+    if len(roots) != 1:
+        return None
+    visited: list[int] = []
+    seen: set[int] = set()
+    current: int | None = roots[0]
+    while current is not None:
+        if current in seen:
+            return None
+        seen.add(current)
+        visited.append(current)
+        next_ids = children.get(current, [])
+        if len(next_ids) > 1:
+            return None
+        current = next_ids[0] if next_ids else None
+    if set(visited) != set(by_id):
+        return None
+    return by_id[visited[-1]]
+
+
+def _mountinfo_rejects(path: Path, run_root: Path, text: str) -> bool:
+    """Return whether mount relationships cannot prove ``path`` is outside.
+
+    A bind mount whose source subtree lives below the run root can expose
+    run-root content at a completely different path. For the mount that
+    contains ``path`` and the mount that contains ``run_root`` we reconstruct
+    each physical path from the mount root and compare them. A different
+    device number is **not** proof of isolation: a nested mount below the run
+    root can share that device and be rebound elsewhere, so that case is
+    rejected whenever the run root contains any mount of the target's device.
+    Anything unparseable or unprovable is rejected.
+    """
+    try:
+        entries = _parse_mountinfo(text)
+    except ValueError:
+        return True
+    if not entries:
+        return True
+    target_mount = _mount_point_for(entries, path)
+    root_mount = _mount_point_for(entries, run_root)
+    if target_mount is None or root_mount is None:
+        return True
+    if target_mount.root is None or root_mount.root is None:
+        return True
+    try:
+        target_physical = target_mount.root / path.relative_to(
+            target_mount.mount_point
+        )
+        root_physical = root_mount.root / run_root.relative_to(
+            root_mount.mount_point
+        )
+    except ValueError:
+        return True
+    if _lexically_within_run_root(target_physical, root_physical):
+        return True
+    # The bind source itself may live below the run root even when the
+    # reconstructed physical path is on another device.
+    if _lexically_within_run_root(target_mount.root, run_root):
+        return True
+    # Check every mount that is an ancestor of the target, not only the
+    # deepest one. An overmount at the same path can hide a lower bind whose
+    # source is the run root, so every entry on every ancestor mount point is
+    # inspected. A non-path root (for example nsfs) cannot prove anything.
+    for entry in entries:
+        if not (path == entry.mount_point or entry.mount_point in path.parents):
+            continue
+        if entry.root is None:
+            return True
+        if _lexically_within_run_root(entry.root, run_root):
+            return True
+        if entry.major_minor == root_mount.major_minor and (
+            _lexically_within_run_root(entry.root, root_physical)
+        ):
+            return True
+    # A mount strictly below the run root that shares the target's device can
+    # expose run-root content at the target path, whether or not that device
+    # matches the run root's own mount.
+    for entry in entries:
+        if entry.major_minor != target_mount.major_minor:
+            continue
+        if run_root in entry.mount_point.parents:
+            return True
+    return False
+
+
+def _mountinfo_document() -> str | None:
+    """Read Linux mountinfo, or return ``None`` where the kernel lacks it.
+
+    Linux must always expose the document: a missing ``/proc/self/mountinfo``
+    means containment cannot be proven, so the caller must fail closed. Only
+    non-Linux platforms legitimately skip the check.
+    """
+    try:
+        return Path("/proc/self/mountinfo").read_text(
+            encoding="utf-8", errors="replace"
+        )
+    except FileNotFoundError as error:
+        if sys.platform.startswith("linux"):
+            raise ExecutionFailed(
+                "EVIDENCE_WRITE_FAILED",
+                "mount relationships cannot be inspected: "
+                "/proc/self/mountinfo is missing",
+            ) from error
+        return None
+    except OSError as error:
+        raise ExecutionFailed(
+            "EVIDENCE_WRITE_FAILED",
+            f"mount relationships cannot be inspected: {error}",
+        ) from error
+
+
+def _safe_name(value: str) -> str:
+    return "".join(
+        character if character.isalnum() or character in "._-" else "_"
+        for character in value
+    )[:120]
+
+
+def _reserve_seconds(execute_seconds: int) -> float:
+    return float(min(ARCHIVE_RESERVE_MAX, max(1, int(execute_seconds * ARCHIVE_RESERVE_RATIO))))
+
+
+def _remaining(context: ExecutionContext) -> float:
+    now = datetime.now(timezone.utc)
+    deadline = context.deadline_at
+    if deadline.tzinfo is None:
+        deadline = deadline.replace(tzinfo=timezone.utc)
+    return (deadline - now).total_seconds()
+
+
+def _assert_budget(context: ExecutionContext, *, purpose: str) -> float:
+    remaining = _remaining(context)
+    if remaining <= context.reserve_seconds + 0.5:
+        raise ExecutionBlocked(
+            "DEADLINE_EXCEEDED",
+            f"execution budget exhausted before {purpose}; "
+            f"only {remaining:.1f}s remains and the archive reserve is "
+            f"{context.reserve_seconds:.0f}s",
+        )
+    return remaining
+
+
+def _load_context(
+    dsn: str,
+    job_id: UUID,
+    generation: int,
+    *,
+    case_root: str | None,
+    run_root: Path | str | None,
+) -> ExecutionContext:
+    job = state.load_job(dsn, job_id)
+    if job is None:
+        raise ExecutionBlocked("JOB_NOT_FOUND", "job does not exist")
+    if job["generation"] != generation:
+        raise state.StaleGeneration("execution generation is no longer current")
+    if job["state"] not in ("RUNNING", "ARCHIVING"):
+        raise ExecutionBlocked(
+            "INVALID_STATE", f"job is {job['state']}, not RUNNING"
+        )
+    plan_row = state.get_plan(dsn, job_id)
+    review = state.get_review(dsn, job_id)
+    if plan_row is None:
+        raise ExecutionBlocked("PLAN_MISMATCH", "no frozen plan is available")
+    plan = plan_row["plan"]
+    try:
+        computed_digest = contracts.plan_digest(plan)
+    except ValueError as error:
+        raise ExecutionBlocked("PLAN_MISMATCH", f"frozen plan is invalid: {error}") from error
+    if computed_digest != plan_row["plan_digest"]:
+        raise ExecutionBlocked(
+            "PLAN_MISMATCH", "frozen plan digest does not match its content"
+        )
+    if review is None or review["decision"] != "approve":
+        raise ExecutionBlocked(
+            "PLAN_MISMATCH", "an approved review bound to the plan is required"
+        )
+    if review["plan_digest"] != plan_row["plan_digest"]:
+        raise ExecutionBlocked(
+            "PLAN_MISMATCH", "the approval is bound to a different plan"
+        )
+
+    request = job["request"]
+    if request.get("limits") != plan["limits"]:
+        raise ExecutionBlocked(
+            "PLAN_MISMATCH", "request budget differs from the approved plan"
+        )
+    if job["request"].get("target", {}).get("case_id") != plan["case_id"]:
+        raise ExecutionBlocked("PLAN_MISMATCH", "request case does not match the plan")
+    if job["request"].get("cve_id") != plan["cve_id"]:
+        raise ExecutionBlocked("PLAN_MISMATCH", "request CVE does not match the plan")
+
+    try:
+        registry = load_registry(case_root)
+        case = registry.case(plan["case_id"])
+    except CaseConfigurationError as error:
+        raise ExecutionBlocked(error.reason_code, error.message) from error
+    manifest = case.manifest
+    manifest_case = case.manifest_case
+    if registry.document.get("policy_version", "1") != plan["policy_version"]:
+        raise ExecutionBlocked(
+            "POLICY_DENIED",
+            "the current case policy version differs from the approved plan",
+        )
+    try:
+        current_isolation = IsolationPolicy.from_plan(
+            registry.document.get("isolation") or {}
+        )
+        plan_isolation = IsolationPolicy.from_plan(plan["isolation"])
+        if current_isolation != plan_isolation:
+            raise ExecutionBlocked(
+                "POLICY_DENIED",
+                "the current isolation policy differs from the approved plan",
+            )
+        current_isolation.validate()
+    except SandboxPolicyError as error:
+        raise ExecutionBlocked("POLICY_DENIED", error.message) from error
+
+    materials = manifest.get("materials")
+    if not isinstance(materials, dict):
+        raise ExecutionBlocked("MATERIAL_MISSING", "case manifest has no materials")
+    source_vulnerable = manifest["versions"]["vulnerable"]
+    source_fixed = manifest["versions"]["fixed"]
+    expected_materials = {
+        "harness": (manifest["harness"], plan["harness_digest"]),
+        "build_recipe": (manifest["build_recipe"], plan["build_recipe_digest"]),
+        "dependencies": (manifest["dependencies"], plan["dependencies_digest"]),
+        "patch": (case.repository["patch"], plan["repository"]["patch_digest"]),
+        "source_vulnerable": (
+            source_vulnerable,
+            materials.get(source_vulnerable),
+        ),
+        "source_fixed": (source_fixed, materials.get(source_fixed)),
+        "input_normal": (
+            manifest_case["inputs"]["normal"],
+            plan["inputs"]["normal"],
+        ),
+        "input_candidate": (
+            manifest_case["inputs"]["candidate"],
+            plan["inputs"]["candidate"],
+        ),
+    }
+    for label, (relative, expected_digest) in expected_materials.items():
+        if not isinstance(expected_digest, str):
+            raise ExecutionBlocked(
+                "MATERIAL_MISSING", f"plan has no digest for {label}"
+            )
+        try:
+            _, actual = case.read_material(relative, expected_digest)
+        except CaseConfigurationError as error:
+            raise ExecutionBlocked(error.reason_code, error.message) from error
+        if actual != expected_digest:
+            raise ExecutionBlocked(
+                "MATERIAL_MISSING", f"actual material digest for {label} drifted"
+            )
+    for relative, digest in materials.items():
+        if not isinstance(digest, str):
+            raise ExecutionBlocked(
+                "MATERIAL_MISSING", f"case material {relative} has no digest"
+            )
+    for label, relative, expected_digest in (
+        (
+            "advisory snapshot",
+            case.advisory["path"],
+            plan["intel"]["content_digest"],
+        ),
+        (
+            "repository bundle",
+            case.repository["bundle"],
+            plan["repository"]["bundle_digest"],
+        ),
+    ):
+        try:
+            _, actual = case.read_material(relative, expected_digest)
+        except CaseConfigurationError as error:
+            raise ExecutionBlocked(error.reason_code, error.message) from error
+        if actual != expected_digest:
+            raise ExecutionBlocked(
+                "MATERIAL_MISSING", f"{label} digest drifted"
+            )
+
+    if plan["revisions"]["vulnerable"] != case.repository["commits"]["vulnerable"]:
+        raise ExecutionBlocked(
+            "PLAN_MISMATCH", "the vulnerable revision differs from the registered commit"
+        )
+    if plan["revisions"]["fixed"] != case.repository["commits"]["fixed"]:
+        raise ExecutionBlocked(
+            "PLAN_MISMATCH", "the fixed revision differs from the registered commit"
+        )
+    if plan["repository"]["bundle_digest"] != case.repository["bundle_digest"]:
+        raise ExecutionBlocked(
+            "PLAN_MISMATCH", "the repository bundle digest differs from the plan"
+        )
+    if plan["dependencies_digest"] != materials.get(manifest["dependencies"]):
+        raise ExecutionBlocked("MATERIAL_MISSING", "dependency lock digest drifted")
+    image = manifest.get("image")
+    if not isinstance(image, str) or not image.endswith("@" + plan["image_digest"]):
+        raise ExecutionBlocked("PLAN_MISMATCH", "the pinned image differs from the plan")
+    if plan["platform"] != manifest.get("platform"):
+        raise ExecutionBlocked("PLAN_MISMATCH", "the platform differs from the plan")
+
+    # Recompute the analysis binding without rerunning Git: the case config
+    # covers the registry entry, manifest case, pinned materials, image,
+    # platform, toolchain, ASan options and signature.
+    used_materials = {
+        key: materials[key]
+        for key in {
+            manifest["harness"],
+            manifest["build_recipe"],
+            manifest["dependencies"],
+            case.repository["patch"],
+            source_vulnerable,
+            source_fixed,
+            manifest_case["inputs"]["candidate"],
+            manifest_case["inputs"]["normal"],
+        }
+    }
+    case_config = {
+        "case_id": case.case_id,
+        "cve_id": case.cve_id,
+        "benchmark_id": case.benchmark_id,
+        "registry_entry": case.entry,
+        "manifest_case": manifest_case,
+        "materials": used_materials,
+        "image": image,
+        "platform": manifest["platform"],
+        "toolchain": manifest["toolchain"],
+        "asan_options": manifest["asan_options"],
+        "asan_signature": manifest["asan_signature"],
+    }
+    try:
+        case_config_digest = jsonutil.digest_json(case_config)
+    except (ValueError, UnicodeError, RecursionError) as error:
+        raise ExecutionBlocked(
+            "MATERIAL_MISSING", f"case configuration is not canonical: {error}"
+        ) from error
+    if case_config_digest != plan["case_config_digest"]:
+        raise ExecutionBlocked(
+            "PLAN_MISMATCH",
+            "the registry or one of the actual case materials drifted from the plan",
+        )
+
+    try:
+        compile_args = _extract_compile_args(
+            case.read_material(manifest["build_recipe"], plan["build_recipe_digest"])[0]
+        )
+    except CaseConfigurationError as error:
+        raise ExecutionBlocked(error.reason_code, error.message) from error
+
+    deadline = job["execute_deadline_at"]
+    if deadline is None:
+        raise ExecutionBlocked("DEADLINE_EXCEEDED", "execution deadline is not fixed")
+    if deadline.tzinfo is None:
+        deadline = deadline.replace(tzinfo=timezone.utc)
+    limits = plan["limits"]
+    context = ExecutionContext(
+        job_id=job_id,
+        generation=generation,
+        job=job,
+        plan=plan,
+        plan_digest=plan_row["plan_digest"],
+        review=review,
+        case=case,
+        case_root=registry.root,
+        manifest_case=manifest_case,
+        materials=materials,
+        case_config=case_config,
+        material_root=Path(case.material_root),
+        run_root=Path(run_root)
+        if run_root is not None
+        else Path(os.getenv("DATACON_RUN_ROOT", ".datacon/runs")),
+        playbook={
+            "expected_exit": plan["expected_exit"],
+            "expected_stdout": manifest_case.get("expected_stdout"),
+            "asan_signature": plan["asan_signature"],
+            "asan_options": plan["asan_options"],
+            "inputs": {
+                "normal": manifest_case["inputs"]["normal"],
+                "candidate": manifest_case["inputs"]["candidate"],
+            },
+        },
+        image=image,
+        isolation=current_isolation,
+        limits=ResourceLimits(
+            cpu=limits["cpu"],
+            memory_mib=limits["memory_mib"],
+            pids=limits["pids"],
+            scratch_mib=limits["scratch_mib"],
+        ),
+        compile_args=compile_args,
+        deadline_at=deadline,
+        reserve_seconds=_reserve_seconds(limits["execute_seconds"]),
+    )
+    return context
+
+
+def _assert_context_unchanged(
+    dsn: str,
+    context: ExecutionContext,
+    *,
+    materials_dir: Path | None = None,
+    material_digests: Mapping[str, str] | None = None,
+) -> None:
+    """Re-check approval, plan, materials, policy and budget before a container."""
+    _assert_budget(context, purpose="starting a target container")
+    job = state.load_job(dsn, context.job_id)
+    if job is None:
+        raise ExecutionBlocked("JOB_NOT_FOUND", "job disappeared")
+    if job["generation"] != context.generation:
+        raise state.StaleGeneration("execution generation is no longer current")
+    if job["state"] not in ("RUNNING", "ARCHIVING"):
+        raise ExecutionBlocked(
+            "INVALID_STATE", f"job is {job['state']}, not executable"
+        )
+    plan_row = state.get_plan(dsn, context.job_id)
+    review = state.get_review(dsn, context.job_id)
+    if plan_row is None or plan_row["plan_digest"] != context.plan_digest:
+        raise ExecutionBlocked("PLAN_MISMATCH", "the frozen plan changed")
+    try:
+        if contracts.plan_digest(plan_row["plan"]) != context.plan_digest:
+            raise ExecutionBlocked(
+                "PLAN_MISMATCH", "the frozen plan content no longer matches its digest"
+            )
+    except ValueError as error:
+        raise ExecutionBlocked("PLAN_MISMATCH", f"the frozen plan is invalid: {error}") from error
+    if review is None or review["decision"] != "approve" or review["plan_digest"] != context.plan_digest:
+        raise ExecutionBlocked("PLAN_MISMATCH", "the approved review changed")
+    # ``material_root`` is the directory containing case materials, not the
+    # registry root. Reload from the registry root captured when the context
+    # was built so a registry with material_root != "." is supported.
+    try:
+        registry = load_registry(str(context.case_root))
+        case = registry.case(context.plan["case_id"])
+    except CaseConfigurationError as error:
+        raise ExecutionBlocked(error.reason_code, error.message) from error
+    if case.case_id != context.case.case_id:
+        raise ExecutionBlocked("PLAN_MISMATCH", "the registered case changed")
+    if case.material_root != context.case.material_root:
+        raise ExecutionBlocked(
+            "MATERIAL_MISSING", "the case material root moved"
+        )
+    if registry.document.get("policy_version", "1") != context.plan["policy_version"]:
+        raise ExecutionBlocked("POLICY_DENIED", "policy version drifted")
+    try:
+        current_isolation = IsolationPolicy.from_plan(
+            registry.document.get("isolation") or {}
+        )
+        current_isolation.validate()
+    except SandboxPolicyError as error:
+        raise ExecutionBlocked("POLICY_DENIED", error.message) from error
+    if current_isolation != context.isolation:
+        raise ExecutionBlocked("POLICY_DENIED", "isolation policy drifted")
+    expected_digests = {
+        "harness": context.plan["harness_digest"],
+        "build_recipe": context.plan["build_recipe_digest"],
+        "dependencies": context.plan["dependencies_digest"],
+        "source_vulnerable": context.materials.get(
+            context.case.manifest["versions"]["vulnerable"]
+        ),
+        "source_fixed": context.materials.get(
+            context.case.manifest["versions"]["fixed"]
+        ),
+        "input_normal": context.plan["inputs"]["normal"],
+        "input_candidate": context.plan["inputs"]["candidate"],
+        "advisory": context.plan["intel"]["content_digest"],
+        "bundle": context.plan["repository"]["bundle_digest"],
+    }
+    for label, relative in (
+        ("harness", case.manifest["harness"]),
+        ("build_recipe", case.manifest["build_recipe"]),
+        ("dependencies", case.manifest["dependencies"]),
+        ("source_vulnerable", case.manifest["versions"]["vulnerable"]),
+        ("source_fixed", case.manifest["versions"]["fixed"]),
+        ("input_normal", context.manifest_case["inputs"]["normal"]),
+        ("input_candidate", context.manifest_case["inputs"]["candidate"]),
+        ("advisory", case.advisory["path"]),
+        ("bundle", case.repository["bundle"]),
+    ):
+        try:
+            case.read_material(relative, expected_digests.get(label))
+        except CaseConfigurationError as error:
+            raise ExecutionBlocked(
+                "MATERIAL_MISSING", f"{label} is no longer readable: {error.message}"
+            ) from error
+
+
+    if materials_dir is not None and material_digests is not None:
+        _verify_materialized_tree(materials_dir, material_digests)
+
+
+_GENERATION_COMPONENT = re.compile(r"generation-[0-9]+")
+
+
+def _ensure_run_anchor(anchor: Path, label: str) -> None:
+    """Create the trusted anchor if needed, but never accept a symlink."""
+    try:
+        anchor.mkdir(parents=True, exist_ok=True)
+        info = anchor.lstat()
+    except OSError as error:
+        raise ExecutionFailed(
+            "EVIDENCE_WRITE_FAILED", f"{label} is unavailable: {error}"
+        ) from error
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        raise ExecutionFailed(
+            "EVIDENCE_WRITE_FAILED", f"{label} is not a real directory"
+        )
+
+
+def _generation_components(
+    anchor: Path, path: Path, label: str
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Split ``path`` into generation-scope components and the remainder.
+
+    Every run-root write must be bound to a ``generation-<n>`` directory (for
+    journals, ``steps/<key>/generation-<n>``). A path without one cannot be
+    attributed to a single generation, so it is rejected rather than being
+    written into the shared job directory.
+    """
+    try:
+        relative = path.relative_to(anchor)
+    except ValueError as error:
+        raise ExecutionFailed(
+            "EVIDENCE_WRITE_FAILED", f"{label} escaped the run root"
+        ) from error
+    parts = relative.parts
+    if not parts or any(
+        part in ("", ".", "..") or "/" in part or "\x00" in part
+        for part in parts
+    ):
+        raise ExecutionFailed(
+            "EVIDENCE_WRITE_FAILED", f"{label} has an unsafe run-root path"
+        )
+    for index, part in enumerate(parts):
+        if _GENERATION_COMPONENT.fullmatch(part):
+            return parts[: index + 1], parts[index + 1 :]
+    raise ExecutionFailed(
+        "EVIDENCE_WRITE_FAILED",
+        f"{label} is not scoped to a generation directory",
+    )
+
+
+def _open_chain(
+    anchor: Path,
+    parts: Sequence[str],
+    *,
+    create: bool,
+    label: str,
+) -> tuple[int, Path]:
+    """Open ``anchor/parts...`` one component at a time with no symlink following."""
+    _ensure_run_anchor(anchor, label)
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        descriptor = os.open(anchor, flags)
+    except OSError as error:
+        raise ExecutionFailed(
+            "EVIDENCE_WRITE_FAILED", f"{label} cannot be opened: {error}"
+        ) from error
+    current = anchor
+    try:
+        for part in parts:
+            if part in ("", ".", "..") or "/" in part or "\x00" in part:
+                raise ExecutionFailed(
+                    "EVIDENCE_WRITE_FAILED", f"{label} has an unsafe component"
+                )
+            try:
+                child = os.open(part, flags, dir_fd=descriptor)
+            except FileNotFoundError:
+                if not create:
+                    raise
+                try:
+                    os.mkdir(part, 0o700, dir_fd=descriptor)
+                except FileExistsError:
+                    pass
+                child = os.open(part, flags, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = child
+            current = current / part
+        info = os.fstat(descriptor)
+        by_path = os.lstat(current)
+        if (info.st_dev, info.st_ino) != (by_path.st_dev, by_path.st_ino):
+            raise ExecutionFailed(
+                "EVIDENCE_WRITE_FAILED", f"{label} parent changed while opening"
+            )
+        return descriptor, current
+    except ExecutionFailed:
+        os.close(descriptor)
+        raise
+    except OSError as error:
+        os.close(descriptor)
+        raise ExecutionFailed(
+            "EVIDENCE_WRITE_FAILED",
+            f"{label} cannot be opened without following a symlink: {error}",
+        ) from error
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _prepare_shared_directory(anchor: Path, directory: Path, label: str) -> Path:
+    """Create a shared (pre-generation) run-root directory safely."""
+    try:
+        relative = directory.relative_to(anchor)
+    except ValueError as error:
+        raise ExecutionFailed(
+            "EVIDENCE_WRITE_FAILED", f"{label} escaped the run root"
+        ) from error
+    descriptor, _ = _open_chain(
+        anchor, relative.parts, create=True, label=label
+    )
+    os.close(descriptor)
+    return directory
+
+
+def _prepare_run_directory(
+    anchor: Path,
+    directory: Path,
+    label: str,
+    *,
+    scope_root: Path | None = None,
+) -> Path:
+    """Create a generation-scoped directory and prove it is a real directory."""
+    if scope_root is None:
+        scope_parts, _ = _generation_components(anchor, directory, label)
+    else:
+        scope_parts, _ = _generation_components(anchor, scope_root, label)
+    try:
+        relative = directory.relative_to(anchor)
+    except ValueError as error:
+        raise ExecutionFailed(
+            "EVIDENCE_WRITE_FAILED", f"{label} escaped the run root"
+        ) from error
+    parts = relative.parts
+    if parts[: len(scope_parts)] != scope_parts:
+        raise ExecutionFailed(
+            "EVIDENCE_WRITE_FAILED", f"{label} escaped its generation scope"
+        )
+    descriptor, _ = _open_chain(anchor, parts, create=True, label=label)
+    os.close(descriptor)
+    return directory
+
+
+def _open_run_parent_fd(
+    anchor: Path,
+    path: Path,
+    label: str,
+    *,
+    scope_root: Path | None = None,
+) -> tuple[int, Path]:
+    """Open ``path.parent`` relative to a generation-scoped trusted chain."""
+    if scope_root is None:
+        scope_parts, _ = _generation_components(anchor, path, label)
+    else:
+        scope_parts, _ = _generation_components(anchor, scope_root, label)
+    try:
+        relative = path.relative_to(anchor)
+    except ValueError as error:
+        raise ExecutionFailed(
+            "EVIDENCE_WRITE_FAILED", f"{label} escaped the run root"
+        ) from error
+    parts = relative.parts
+    if parts[: len(scope_parts)] != scope_parts:
+        raise ExecutionFailed(
+            "EVIDENCE_WRITE_FAILED", f"{label} escaped its generation scope"
+        )
+    parent_parts = parts[:-1]
+    descriptor, parent = _open_chain(
+        anchor, parent_parts, create=True, label=label
+    )
+    try:
+        fileio._assert_dir_fd_matches_parent(descriptor, parent)
+    except fileio.UnsafeFileError as error:
+        os.close(descriptor)
+        raise ExecutionFailed(
+            "EVIDENCE_WRITE_FAILED", f"{label}: {error.message}"
+        ) from error
+    return descriptor, parent
+
+
+def _write_tree_file(
+    descriptor: int,
+    root: Path,
+    relative: str,
+    data: bytes,
+    mode: int,
+    label: str,
+) -> None:
+    """Write ``relative`` below an already-open, trusted directory descriptor."""
+    parts = Path(relative).parts
+    if not parts or any(
+        part in ("", ".", "..") or "/" in part for part in parts
+    ):
+        raise ExecutionFailed(
+            "EVIDENCE_WRITE_FAILED", f"{label} has an unsafe path"
+        )
+    current = root
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    fd = os.dup(descriptor)
+    try:
+        for part in parts[:-1]:
+            try:
+                child = os.open(part, flags, dir_fd=fd)
+            except FileNotFoundError:
+                os.mkdir(part, 0o755, dir_fd=fd)
+                child = os.open(part, flags, dir_fd=fd)
+            os.close(fd)
+            fd = child
+            current = current / part
+        fileio.write_regular_file(
+            parts[-1],
+            data,
+            mode=mode,
+            dir_fd=fd,
+            parent_path=current,
+        )
+    except fileio.UnsafeFileError as error:
+        raise ExecutionFailed(
+            "EVIDENCE_WRITE_FAILED", f"{label}: {error.message}"
+        ) from error
+    except OSError as error:
+        raise ExecutionFailed(
+            "EVIDENCE_WRITE_FAILED", f"{label}: {error}"
+        ) from error
+    finally:
+        os.close(fd)
+
+
+def _materialize(
+    context: ExecutionContext,
+    run_root: Path,
+    *,
+    anchor: Path | None = None,
+) -> tuple[Path, dict[str, Path], dict[str, str]]:
+    """Write approved materials into a generation-scoped, symlink-safe tree.
+
+    ``run_root`` is the generation-scoped directory. The generation root and
+    every parent below it are opened one component at a time with
+    ``O_DIRECTORY|O_NOFOLLOW``; temporary files and the final rename are
+    performed relative to those descriptors. A symlinked generation root or a
+    parent directory swapped after the check therefore fails closed instead of
+    redirecting reviewed bytes outside the run root.
+    """
+    generation_root = run_root
+    trusted_anchor = anchor if anchor is not None else generation_root.parent
+    _prepare_run_directory(
+        trusted_anchor, generation_root, "materialized generation root"
+    )
+    scope_parts, _ = _generation_components(
+        trusted_anchor, generation_root, "materialized generation root"
+    )
+    generation_fd, _ = _open_chain(
+        trusted_anchor, scope_parts, create=False, label="materialized generation root"
+    )
+    try:
+        return _materialize_into_generation(
+            context, generation_root, generation_fd
+        )
+    finally:
+        os.close(generation_fd)
+
+
+def _materialize_into_generation(
+    context: ExecutionContext, generation_root: Path, generation_fd: int
+) -> tuple[Path, dict[str, Path], dict[str, str]]:
+    target = generation_root / "materials"
+    expected = {
+        "harness": (context.case.manifest["harness"], context.plan["harness_digest"]),
+        "build_recipe": (
+            context.case.manifest["build_recipe"],
+            context.plan["build_recipe_digest"],
+        ),
+        "dependencies": (
+            context.case.manifest["dependencies"],
+            context.plan["dependencies_digest"],
+        ),
+        "patch": (
+            context.case.repository["patch"],
+            context.plan["repository"]["patch_digest"],
+        ),
+        "source_vulnerable": (
+            context.case.manifest["versions"]["vulnerable"],
+            None,
+        ),
+        "source_fixed": (context.case.manifest["versions"]["fixed"], None),
+        "input_normal": (context.manifest_case["inputs"]["normal"], context.plan["inputs"]["normal"]),
+        "input_candidate": (
+            context.manifest_case["inputs"]["candidate"],
+            context.plan["inputs"]["candidate"],
+        ),
+    }
+    payloads: dict[str, bytes] = {}
+    for label, (relative, digest) in expected.items():
+        try:
+            data, actual = context.case.read_material(relative, digest)
+        except CaseConfigurationError as error:
+            raise ExecutionBlocked(error.reason_code, error.message) from error
+        if digest is None:
+            digest = context.materials.get(relative)
+        if digest is not None and actual != digest:
+            raise ExecutionBlocked(
+                "MATERIAL_MISSING", f"material {label} digest drifted while materializing"
+            )
+        payloads[relative] = data
+
+    # Keep the exact bytes that were verified for this execution. Archiving
+    # uses this snapshot instead of re-reading the case directory after the
+    # target has run, so a later case-root replacement cannot become evidence.
+    context.material_payloads = dict(payloads)
+
+    candidate_path = target / "inputs" / "candidate.txt"
+    normal_path = target / "inputs" / "normal.txt"
+    for label, destination, relative in (
+        ("candidate", candidate_path, context.manifest_case["inputs"]["candidate"]),
+        ("normal", normal_path, context.manifest_case["inputs"]["normal"]),
+    ):
+        data = payloads[relative]
+        if _digest(data) != context.plan["inputs"][label]:
+            raise ExecutionBlocked(
+                "MATERIAL_MISSING", f"{label} input digest drifted"
+            )
+
+    if target.is_symlink():
+        raise ExecutionBlocked(
+            "MATERIAL_MISSING", "materialized directory must not be a symlink"
+        )
+    if target.exists():
+        try:
+            os.chmod(
+                "materials", 0o755, dir_fd=generation_fd, follow_symlinks=False
+            )
+        except OSError as error:
+            raise ExecutionBlocked(
+                "MATERIAL_MISSING", f"materialized directory is not accessible: {error}"
+            ) from error
+        _verify_materialized(target, payloads)
+        for label, path, expected_digest in (
+            ("candidate", candidate_path, context.plan["inputs"]["candidate"]),
+            ("normal", normal_path, context.plan["inputs"]["normal"]),
+        ):
+            data = _read_run_file_bounded(path, max_bytes=MAX_MATERIAL_BYTES)
+            if data is None:
+                raise ExecutionBlocked(
+                    "MATERIAL_MISSING",
+                    f"materialized {label} input is missing or too large",
+                )
+            if _digest(data) != expected_digest:
+                raise ExecutionBlocked("MATERIAL_MISSING", f"materialized {label} input drifted")
+        return target, {
+            "candidate": candidate_path,
+            "normal": normal_path,
+            "build_recipe": target / context.case.manifest["build_recipe"],
+        }, _material_digests(context, payloads)
+
+    temporary = generation_root / f".materials-tmp-{uuid.uuid4().hex}"
+    temporary_name = temporary.name
+    try:
+        os.mkdir(temporary_name, 0o755, dir_fd=generation_fd)
+    except FileExistsError as error:
+        raise ExecutionBlocked(
+            "MATERIAL_MISSING", "temporary material path exists"
+        ) from error
+    temporary_fd: int | None = None
+    try:
+        temporary_fd = os.open(
+            temporary_name,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=generation_fd,
+        )
+        for relative, data in payloads.items():
+            mode = (
+                0o555
+                if relative == context.case.manifest["build_recipe"]
+                else 0o444
+            )
+            _write_tree_file(
+                temporary_fd, temporary, relative, data, mode, "materialized file"
+            )
+        for path, data in (
+            (candidate_path, payloads[context.manifest_case["inputs"]["candidate"]]),
+            (normal_path, payloads[context.manifest_case["inputs"]["normal"]]),
+        ):
+            _write_tree_file(
+                temporary_fd,
+                temporary,
+                str(path.relative_to(target)),
+                data,
+                0o444,
+                "materialized input",
+            )
+        os.chmod("inputs", 0o755, dir_fd=temporary_fd, follow_symlinks=False)
+        os.chmod(temporary_name, 0o755, dir_fd=generation_fd, follow_symlinks=False)
+        os.close(temporary_fd)
+        temporary_fd = None
+        os.replace(
+            temporary_name,
+            "materials",
+            src_dir_fd=generation_fd,
+            dst_dir_fd=generation_fd,
+        )
+    except (ExecutionBlocked, ExecutionFailed):
+        if temporary_fd is not None:
+            os.close(temporary_fd)
+        shutil.rmtree(temporary, ignore_errors=True)
+        raise
+    except OSError as error:
+        if temporary_fd is not None:
+            os.close(temporary_fd)
+        shutil.rmtree(temporary, ignore_errors=True)
+        raise ExecutionFailed(
+            "EVIDENCE_WRITE_FAILED", f"cannot materialize reviewed bytes: {error}"
+        ) from error
+    except BaseException:
+        if temporary_fd is not None:
+            os.close(temporary_fd)
+        shutil.rmtree(temporary, ignore_errors=True)
+        raise
+    return target, {
+        "candidate": candidate_path,
+        "normal": normal_path,
+        "build_recipe": target / context.case.manifest["build_recipe"],
+    }, _material_digests(context, payloads)
+
+
+def _material_digests(
+    context: ExecutionContext, payloads: Mapping[str, bytes]
+) -> dict[str, str]:
+    digests = {
+        relative: _digest(data) for relative, data in payloads.items()
+    }
+    # Replay commands use stable names even when the manifest names the input
+    # differently; both copies are part of the verified tree.
+    digests["inputs/candidate.txt"] = context.plan["inputs"]["candidate"]
+    digests["inputs/normal.txt"] = context.plan["inputs"]["normal"]
+    return digests
+
+
+def _verify_materialized(target: Path, payloads: Mapping[str, bytes]) -> None:
+    for relative, expected in payloads.items():
+        path = target / Path(relative)
+        data = _read_run_file_bounded(path, max_bytes=MAX_MATERIAL_BYTES)
+        if data is None:
+            raise ExecutionBlocked(
+                "MATERIAL_MISSING",
+                f"materialized file is missing, not regular or too large: {relative}",
+            )
+        if data != expected:
+            raise ExecutionBlocked(
+                "MATERIAL_MISSING", f"materialized file drifted: {relative}"
+            )
+
+
+def _verify_materialized_tree(
+    target: Path, expected: Mapping[str, str]
+) -> None:
+    """Fail closed on extra files, symlinks or changed bytes in the copy."""
+    if target.is_symlink() or not target.is_dir():
+        raise ExecutionBlocked("MATERIAL_MISSING", "materialized directory is missing")
+    seen: set[str] = set()
+    for current_root, directories, filenames in os.walk(target, followlinks=False):
+        current = Path(current_root)
+        for name in directories:
+            child = current / name
+            if child.is_symlink():
+                raise ExecutionBlocked(
+                    "MATERIAL_MISSING", "materialized tree contains a symlink"
+                )
+        for name in filenames:
+            child = current / name
+            relative = child.relative_to(target).as_posix()
+            if child.is_symlink() or not child.is_file():
+                raise ExecutionBlocked(
+                    "MATERIAL_MISSING",
+                    f"materialized file is not regular: {relative}",
+                )
+            seen.add(relative)
+    if seen != set(expected):
+        missing = sorted(set(expected) - seen)
+        extra = sorted(seen - set(expected))
+        raise ExecutionBlocked(
+            "MATERIAL_MISSING",
+            f"materialized tree changed; missing={missing} extra={extra}",
+        )
+    for relative, digest in expected.items():
+        path = target / Path(relative)
+        data = _read_run_file_bounded(path, max_bytes=MAX_MATERIAL_BYTES)
+        if data is None:
+            raise ExecutionBlocked(
+                "MATERIAL_MISSING",
+                f"materialized file is missing, not regular or too large: {relative}",
+            )
+        if _digest(data) != digest:
+            raise ExecutionBlocked(
+                "MATERIAL_MISSING", f"materialized file drifted: {relative}"
+            )
+
+
+def _attempts(context: ExecutionContext, dsn: str, step_key: str) -> list[dict[str, Any]]:
+    return state.attempts_for_step(
+        dsn,
+        context.job_id,
+        stage="execute",
+        step_key=step_key,
+        generation=context.generation,
+    )
+
+
+def _work_root(context: ExecutionContext) -> Path:
+    return (
+        context.run_root
+        / context.job_id_text
+        / context.plan_digest.split(":")[1]
+        / "run"
+    )
+
+
+def _generation_root(context: ExecutionContext) -> Path:
+    return _work_root(context) / f"generation-{context.generation}"
+
+
+def _outside_run_root(path: Path, run_root: Path, label: str) -> Path:
+    """Resolve ``path`` and reject anything inside the writable run root.
+
+    Containment is decided from device/inode identities of the deepest
+    existing ancestors (see ``_inside_run_root``), never from resolved strings
+    alone. That catches ``target == run_root``, nested targets and case-only or
+    Unicode-normalization variants of the run-root path on filesystems that
+    treat them as the same directory.
+    """
+    try:
+        resolved = path.expanduser().resolve()
+        resolved_root = run_root.expanduser().resolve()
+    except (OSError, RuntimeError) as error:
+        raise ExecutionFailed(
+            "EVIDENCE_WRITE_FAILED", f"{label} cannot be resolved: {error}"
+        ) from error
+    if _inside_run_root(resolved, resolved_root, label):
+        raise ExecutionFailed(
+            "EVIDENCE_WRITE_FAILED",
+            f"{label} must live outside DATACON_RUN_ROOT",
+        )
+    mountinfo = _mountinfo_document()
+    if mountinfo is not None and _mountinfo_rejects(
+        resolved, resolved_root, mountinfo
+    ):
+        raise ExecutionFailed(
+            "EVIDENCE_WRITE_FAILED",
+            f"{label} mount relationships cannot prove it lives outside "
+            "DATACON_RUN_ROOT",
+        )
+    return resolved
+
+
+def _assert_evidence_root_outside_run_root(run_root: Path) -> Path:
+    """Fail before any archive work when the evidence root is attacker-writable."""
+    evidence_root = Path(
+        os.getenv("DATACON_EVIDENCE_ROOT", ".datacon/evidence")
+    ).expanduser()
+    return _outside_run_root(evidence_root, run_root, "DATACON_EVIDENCE_ROOT")
+
+
+def _staging_root(context: ExecutionContext) -> Path:
+    """Return the private staging root used for every mounted byte.
+
+    The run root is treated as attacker-writable. Materials, built parsers and
+    replay inputs are copied here, re-hashed and only then mounted. The root
+    itself is private (0700) and must live outside ``DATACON_RUN_ROOT``; the
+    per-attempt directory is traversable by the non-root container user while
+    the private parent stays hidden from other host users.
+    """
+    evidence_root = Path(
+        os.getenv("DATACON_EVIDENCE_ROOT", ".datacon/evidence")
+    ).expanduser()
+    raw = _configured_staging_path(evidence_root)
+    if raw.is_symlink():
+        raise ExecutionFailed(
+            "EVIDENCE_WRITE_FAILED", "staging root must not be a symlink"
+        )
+    resolved = _outside_run_root(raw, context.run_root, "staging root")
+    try:
+        resolved.mkdir(mode=0o700, parents=True, exist_ok=True)
+        info = resolved.lstat()
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            raise ExecutionFailed(
+                "EVIDENCE_WRITE_FAILED", "staging root is not a directory"
+            )
+        if info.st_uid != os.getuid():
+            raise ExecutionFailed(
+                "EVIDENCE_WRITE_FAILED", "staging root is not owned by this user"
+            )
+        # Re-check the final directory. The pre-create check used the deepest
+        # existing ancestor; only the created inode proves where it landed.
+        resolved = _outside_run_root(resolved, context.run_root, "staging root")
+        resolved.chmod(0o700)
+    except ExecutionFailed:
+        raise
+    except OSError as error:
+        raise ExecutionFailed(
+            "EVIDENCE_WRITE_FAILED", f"staging root is unavailable: {error}"
+        ) from error
+    return resolved
+
+
+def _new_staging_directory(
+    context: ExecutionContext, label: str
+) -> Path:
+    root = _staging_root(context)
+    directory = root / (
+        f"{_safe_name(label)}-g{context.generation}-{uuid.uuid4().hex}"
+    )
+    try:
+        directory.mkdir(mode=0o700)
+    except OSError as error:
+        raise ExecutionFailed(
+            "EVIDENCE_WRITE_FAILED", f"staging directory is unavailable: {error}"
+        ) from error
+    return directory
+
+
+def _discard_staging(directory: Path) -> OSError | None:
+    """Best-effort removal that never raises into a caller's error path."""
+    try:
+        shutil.rmtree(directory)
+    except OSError as error:
+        return error
+    return None
+
+
+def _cleanup_staging(directory: Path, failure: BaseException | None) -> None:
+    """Remove one attempt's staging copy without masking its real failure."""
+    error = _discard_staging(directory)
+    if error is None:
+        return
+    if failure is None:
+        raise ExecutionFailed(
+            "EVIDENCE_WRITE_FAILED", f"cannot remove staging directory: {error}"
+        ) from error
+    add_note = getattr(failure, "add_note", None)
+    if callable(add_note):
+        add_note(f"staging cleanup also failed: {error}")
+
+
+def _write_staged_file(
+    directory: Path, relative: str, data: bytes, mode: int
+) -> Path:
+    destination = directory / Path(relative)
+    try:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.parent.chmod(0o755)
+        destination.write_bytes(data)
+        destination.chmod(mode)
+    except OSError as error:
+        raise ExecutionFailed(
+            "EVIDENCE_WRITE_FAILED",
+            f"cannot write staging copy {relative}: {error}",
+        ) from error
+    return destination
+
+
+def _make_staging_tree_readable(directory: Path) -> None:
+    """Let the non-root container traverse the attempt directory.
+
+    The 0700 staging root is the private boundary; bind mounts reference the
+    attempt directory itself, so the container never walks the host parent.
+    """
+    try:
+        for current, directories, filenames in os.walk(directory, topdown=False):
+            for name in filenames:
+                path = Path(current) / name
+                path.chmod(0o555 if os.access(path, os.X_OK) else 0o444)
+            for name in directories:
+                (Path(current) / name).chmod(0o755)
+        directory.chmod(0o755)
+    except OSError as error:
+        raise ExecutionFailed(
+            "EVIDENCE_WRITE_FAILED", f"cannot finalize staging modes: {error}"
+        ) from error
+
+
+def _stage_materials(
+    context: ExecutionContext,
+    materials_dir: Path,
+    material_digests: Mapping[str, str],
+    label: str,
+) -> tuple[Path, dict[str, str]]:
+    """Copy the verified material tree outside the run root and re-hash it."""
+    _verify_materialized_tree(materials_dir, material_digests)
+    directory = _new_staging_directory(context, label)
+    try:
+        staged: dict[str, str] = {}
+        for relative in sorted(material_digests):
+            source = materials_dir / Path(relative)
+            data = _read_run_file_bounded(
+                source, max_bytes=MAX_MATERIAL_BYTES
+            )
+            if data is None:
+                raise ExecutionBlocked(
+                    "MATERIAL_MISSING",
+                    f"material disappeared, is not regular or is too large "
+                    f"before staging: {relative}",
+                )
+            actual = _digest(data)
+            if actual != material_digests[relative]:
+                raise ExecutionBlocked(
+                    "MATERIAL_MISSING",
+                    f"material changed while staging: {relative}",
+                )
+            _write_staged_file(directory, relative, data, 0o444)
+            staged[relative] = actual
+        recipe = directory / Path(context.case.manifest["build_recipe"])
+        if recipe.is_symlink() or not recipe.is_file():
+            raise ExecutionBlocked(
+                "MATERIAL_MISSING", "build recipe is missing from the staging copy"
+            )
+        recipe.chmod(0o555)
+        _make_staging_tree_readable(directory)
+        # Hash the staged copy, not the source, immediately before mounting.
+        _verify_materialized_tree(directory, material_digests)
+        return directory, staged
+    except (ExecutionBlocked, ExecutionFailed):
+        _discard_staging(directory)
+        raise
+    except OSError as error:
+        _discard_staging(directory)
+        raise ExecutionFailed(
+            "EVIDENCE_WRITE_FAILED", f"cannot stage reviewed materials: {error}"
+        ) from error
+    except BaseException:
+        _discard_staging(directory)
+        raise
+
+
+def _stage_replay_files(
+    context: ExecutionContext,
+    artifact_path: Path,
+    artifact_digest: str,
+    input_path: Path,
+    input_digest: str,
+    label: str,
+) -> tuple[Path, Path, Path]:
+    """Copy the parser and input outside the run root and verify both copies."""
+    directory = _new_staging_directory(context, label)
+    try:
+        for source, relative, expected, mode, kind, limit in (
+            (artifact_path, "parser", artifact_digest, 0o555, "parser", MAX_ARTIFACT_BYTES),
+            (input_path, "input", input_digest, 0o444, "input", MAX_MATERIAL_BYTES),
+        ):
+            data = _read_run_file_bounded(source, max_bytes=limit)
+            if data is None:
+                raise ExecutionBlocked(
+                    "MATERIAL_MISSING",
+                    f"replay {kind} is missing, not regular or too large "
+                    f"before staging",
+                )
+            actual = _digest(data)
+            if actual != expected:
+                raise ExecutionBlocked(
+                    "PLAN_MISMATCH",
+                    f"replay {kind} changed before staging",
+                )
+            destination = _write_staged_file(directory, relative, data, mode)
+            staged_data = _read_run_file_bounded(destination, max_bytes=limit)
+            if staged_data is None:
+                raise ExecutionFailed(
+                    "EVIDENCE_WRITE_FAILED",
+                    f"cannot read back staged replay {kind}",
+                )
+            staged_digest = _digest(staged_data)
+            if staged_digest != expected:
+                raise ExecutionBlocked(
+                    "PLAN_MISMATCH",
+                    f"staged replay {kind} does not match the approved digest",
+                )
+        _make_staging_tree_readable(directory)
+        return directory, directory / "parser", directory / "input"
+    except (ExecutionBlocked, ExecutionFailed):
+        _discard_staging(directory)
+        raise
+    except OSError as error:
+        _discard_staging(directory)
+        raise ExecutionFailed(
+            "EVIDENCE_WRITE_FAILED", f"cannot stage replay inputs: {error}"
+        ) from error
+    except BaseException:
+        _discard_staging(directory)
+        raise
+
+
+def _configured_staging_path(evidence_root: Path) -> Path:
+    """Return the configured staging root without creating it."""
+    explicit = os.getenv(STAGING_ROOT_ENV)
+    return (
+        Path(explicit).expanduser()
+        if explicit
+        else evidence_root.parent / ".datacon-staging"
+    )
+
+
+def _journal_secret_path(run_root: Path) -> Path:
+    """Return the HMAC key path, enforcing that it is outside sensitive roots.
+
+    A journal secret must not be readable by the same-UID writer that can
+    modify the run root, the evidence root, the staging root or the current
+    working directory. The historical default
+    (``evidence_root.parent/.datacon-journal-secret``) is only safe when the
+    evidence root is absolute and outside CWD; with the default relative
+    evidence root it would place the key inside CWD, so that configuration
+    fails closed and requires an explicit secret path instead.
+    """
+    explicit = os.getenv("DATACON_JOURNAL_SECRET_FILE")
+    raw_evidence = os.getenv("DATACON_EVIDENCE_ROOT", ".datacon/evidence")
+    configured_evidence = Path(raw_evidence).expanduser()
+    if explicit is None and not configured_evidence.is_absolute():
+        raise ExecutionFailed(
+            "EVIDENCE_WRITE_FAILED",
+            "a relative DATACON_EVIDENCE_ROOT cannot derive a safe journal "
+            "secret; set DATACON_JOURNAL_SECRET_FILE or an absolute evidence "
+            "root outside the current working directory",
+        )
+    evidence_root = _assert_evidence_root_outside_run_root(run_root)
+    path = (
+        Path(explicit).expanduser()
+        if explicit
+        else evidence_root.parent / ".datacon-journal-secret"
+    )
+    if path.is_symlink():
+        raise ExecutionFailed(
+            "EVIDENCE_WRITE_FAILED", "journal secret path must not be a symlink"
+        )
+    resolved = _outside_run_root(path, run_root, "journal secret")
+    try:
+        resolved_cwd = Path.cwd().expanduser().resolve()
+    except (OSError, RuntimeError) as error:
+        raise ExecutionFailed(
+            "EVIDENCE_WRITE_FAILED",
+            f"journal secret current working directory cannot be resolved: {error}",
+        ) from error
+    if resolved_cwd.parent == resolved_cwd:
+        raise ExecutionFailed(
+            "EVIDENCE_WRITE_FAILED",
+            "current working directory is the filesystem root ('/'), so no "
+            "journal secret path can live outside current working directory; "
+            "run datacon from a non-root working directory and set "
+            "DATACON_JOURNAL_SECRET_FILE outside that directory",
+        )
+    protected_roots = [
+        (evidence_root, "DATACON_EVIDENCE_ROOT"),
+        (_configured_staging_path(evidence_root), "staging root"),
+        (resolved_cwd, "current working directory"),
+    ]
+    for root, label in protected_roots:
+        try:
+            resolved_root = root.expanduser().resolve()
+        except (OSError, RuntimeError) as error:
+            raise ExecutionFailed(
+                "EVIDENCE_WRITE_FAILED",
+                f"journal secret {label} cannot be resolved: {error}",
+            ) from error
+        # Check both lexical normalization (case/NFC variants) and the final
+        # inode identity. A symlinked ancestor must not turn the path into one
+        # of the protected trees after the string comparison.
+        if _lexically_within_run_root(resolved, resolved_root):
+            raise ExecutionFailed(
+                "EVIDENCE_WRITE_FAILED",
+                f"journal secret must live outside {label}",
+            )
+        if _inside_run_root(resolved, resolved_root, "journal secret"):
+            raise ExecutionFailed(
+                "EVIDENCE_WRITE_FAILED",
+                f"journal secret must live outside {label}",
+            )
+    return resolved
+
+
+def _assert_journal_paths(run_root: Path) -> None:
+    """Fail before any target container when the HMAC key is exposed."""
+    path = _journal_secret_path(run_root)
+    if path.exists():
+        _journal_secret(create=False, run_root=run_root)
+
+
+def _journal_secret(*, create: bool, run_root: Path) -> bytes | None:
+    path = _journal_secret_path(run_root)
+    if path.is_symlink():
+        raise ExecutionFailed(
+            "EVIDENCE_WRITE_FAILED", "journal secret path must not be a symlink"
+        )
+    if not path.exists():
+        if not create:
+            return None
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            # UUID4 is generated from the OS CSPRNG; 256 bits is enough for an
+            # HMAC key that only has to stop a run-root writer from forging a
+            # journal for an unrelated database row. O_EXCL + O_NOFOLLOW avoids
+            # a concurrent-create or symlink race.
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+            descriptor = os.open(path, flags, 0o600)
+            try:
+                os.write(
+                    descriptor, (uuid.uuid4().hex + uuid.uuid4().hex).encode("ascii")
+                )
+            finally:
+                os.close(descriptor)
+        except FileExistsError:
+            pass
+        except OSError as error:
+            raise ExecutionFailed(
+                "EVIDENCE_WRITE_FAILED",
+                f"journal secret is unavailable: {error}",
+            ) from error
+    # The file may have been created (or its parent swapped) after the
+    # path-level check. Re-run every protected-root check, then inspect the
+    # final inode so a path that landed inside the run root, evidence root,
+    # staging root or CWD is never read.
+    path = _journal_secret_path(run_root)
+    try:
+        info = path.lstat()
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+            raise ExecutionFailed(
+                "EVIDENCE_WRITE_FAILED", "journal secret is not a regular file"
+            )
+        if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) & 0o077:
+            raise ExecutionFailed(
+                "EVIDENCE_WRITE_FAILED", "journal secret is not private"
+            )
+        data = _read_run_file_bounded(
+            path, max_bytes=_JOURNAL_SECRET_MAX_BYTES
+        )
+        if data is None:
+            raise ExecutionFailed(
+                "EVIDENCE_WRITE_FAILED",
+                "journal secret is unreadable or too large",
+            )
+    except OSError as error:
+        raise ExecutionFailed(
+            "EVIDENCE_WRITE_FAILED", f"journal secret is unreadable: {error}"
+        ) from error
+    if len(data) < 32:
+        raise ExecutionFailed(
+            "EVIDENCE_WRITE_FAILED", "journal secret is too short"
+        )
+    return data
+
+
+def _journal_hmac(payload: Mapping[str, Any], secret: bytes) -> str:
+    body = {key: value for key, value in payload.items() if key != "hmac"}
+    encoded = json.dumps(
+        body, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+    return hmac.new(secret, encoded, hashlib.sha256).hexdigest()
+
+
+def _run_step(
+    dsn: str,
+    context: ExecutionContext,
+    *,
+    step_key: str,
+    input_digest: str | None,
+    action: Callable[[int, str], Any],
+    reusable: Callable[[Mapping[str, Any]], bool] | None = None,
+) -> tuple[Any, bool]:
+    """Execute one logical step with generation fencing and crash recovery.
+
+    A completed attempt for this generation is reused only when its input
+    digest matches. Otherwise a journal is adopted only when a database attempt
+    row proves it belongs to this job, step, attempt and generation and the
+    journal's one-time token and HMAC agree. Across generations a step may
+    start at most two attempts; adopting an already finished tool result is
+    explicitly exempt so a crash after the tool is not charged twice.
+    """
+    history = _attempts(context, dsn, step_key)
+    for row in reversed(history):
+        if row["status"] == "completed" and isinstance(row["result"], dict):
+            if input_digest is not None and row.get("input_digest") != input_digest:
+                # A completed result for different bytes is not a result for
+                # this request. Do not reuse it; a bounded new attempt below
+                # recomputes the step for the current input.
+                continue
+            if reusable is None or reusable(row["result"]):
+                return row["result"], True
+            raise ExecutionFailed(
+                "RUN_INCOMPLETE",
+                f"completed attempt for {step_key} no longer has verified evidence",
+            )
+    if any(
+        row["status"] == "completed"
+        and (input_digest is None or row.get("input_digest") == input_digest)
+        for row in history
+    ):
+        raise ExecutionFailed(
+            "RUN_INCOMPLETE", f"completed attempt for {step_key} has no reusable result"
+        )
+
+    all_history = state.attempts_for_step_across_generations(
+        dsn, context.job_id, stage="execute", step_key=step_key
+    )
+    next_attempt_no = max(
+        (row["attempt_no"] for row in all_history), default=0
+    ) + 1
+    if reusable is not None:
+        journal = _find_reusable_journal(
+            dsn,
+            context,
+            step_key=step_key,
+            plan_digest=context.plan_digest,
+            input_digest=input_digest,
+            verify=reusable,
+        )
+        if journal is not None:
+            adopted = {
+                key: value
+                for key, value in journal.items()
+                if key not in ("attempt_token", "hmac")
+            }
+            adopted["reused"] = True
+            adopted["reused_from_attempt"] = journal.get("attempt_no")
+            adopted["reused_from_generation"] = journal.get("generation")
+            recorded = state.record_attempt(
+                dsn,
+                context.job_id,
+                stage="execute",
+                step_key=step_key,
+                attempt_no=next_attempt_no,
+                generation=context.generation,
+                input_digest=input_digest,
+                status="completed",
+                result=adopted,
+                container_id=journal.get("container_id"),
+                attempt_token=journal.get("attempt_token"),
+            )
+            if not recorded:
+                raise state.StaleGeneration(
+                    "the worker lease was lost while adopting a prior result"
+                )
+            return adopted, True
+
+    if len(all_history) >= MAX_ATTEMPTS_PER_STEP:
+        raise ExecutionFailed(
+            "RUN_INCOMPLETE",
+            f"step {step_key} consumed both attempts without a usable result",
+        )
+    # Attempt numbers are unique per generation; max(all)+1 keeps the journal
+    # tree ordered without colliding with an adopted result.
+    attempt_no = next_attempt_no
+    token = uuid.uuid4().hex
+    stored = state.record_attempt(
+        dsn,
+        context.job_id,
+        stage="execute",
+        step_key=step_key,
+        attempt_no=attempt_no,
+        generation=context.generation,
+        input_digest=input_digest,
+        status="started",
+        attempt_token=token,
+    )
+    if not stored:
+        raise state.StaleGeneration("the worker lease was lost before the step")
+    result = action(attempt_no, token)
+    if os.getenv(FAULT_ENV):
+        prefixes = [item.strip() for item in os.getenv(FAULT_ENV, "").split(",") if item.strip()]
+        if any(step_key.startswith(prefix) for prefix in prefixes):
+            os._exit(70)
+    recorded = state.record_attempt(
+        dsn,
+        context.job_id,
+        stage="execute",
+        step_key=step_key,
+        attempt_no=attempt_no,
+        generation=context.generation,
+        input_digest=input_digest,
+        status="completed",
+        result=result,
+        container_id=result.get("container_id") if isinstance(result, dict) else None,
+        attempt_token=token,
+    )
+    if not recorded:
+        raise state.StaleGeneration("the worker lease was lost before the result")
+    return result, False
+
+
+def _journal_path(
+    run_root: Path, step_key: str, attempt_no: int, generation: int
+) -> Path:
+    return (
+        run_root
+        / "steps"
+        / _safe_name(step_key)
+        / f"generation-{generation}"
+        / f"attempt-{attempt_no}"
+        / "run.json"
+    )
+
+
+def _prepare_run_parent(
+    path: Path, run_root: Path, label: str
+) -> Path:
+    """Create ``path.parent`` only after proving it stays inside the run root.
+
+    The check runs before ``mkdir`` so a symlinked parent is rejected without
+    creating anything outside. ``resolve(strict=False)`` follows every existing
+    ancestor, which is exactly the "deepest existing ancestor" rule used by
+    ``_inside_run_root``. The parent is resolved again after creation to close
+    the window between the check and the ``mkdir``.
+    """
+    root = run_root.resolve()
+    try:
+        before = path.parent.resolve()
+    except (OSError, RuntimeError) as error:
+        raise ExecutionFailed(
+            "EVIDENCE_WRITE_FAILED", f"{label} cannot be resolved: {error}"
+        ) from error
+    if not _inside_run_root(before, root, label):
+        raise ExecutionFailed(
+            "EVIDENCE_WRITE_FAILED", f"{label} escaped the run root"
+        )
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as error:
+        raise ExecutionFailed(
+            "EVIDENCE_WRITE_FAILED", f"{label} parent cannot be created: {error}"
+        ) from error
+    try:
+        after = path.parent.resolve()
+    except (OSError, RuntimeError) as error:
+        raise ExecutionFailed(
+            "EVIDENCE_WRITE_FAILED", f"{label} cannot be resolved: {error}"
+        ) from error
+    if not _inside_run_root(after, root, label):
+        raise ExecutionFailed(
+            "EVIDENCE_WRITE_FAILED", f"{label} escaped the run root"
+        )
+    return after
+
+
+def _write_journal(
+    run_root: Path,
+    step_key: str,
+    attempt_no: int,
+    generation: int,
+    payload: Mapping[str, Any],
+    *,
+    anchor: Path | None = None,
+) -> Path:
+    path = _journal_path(run_root, step_key, attempt_no, generation)
+    trusted_anchor = anchor if anchor is not None else run_root
+    scope_root = (
+        run_root
+        / "steps"
+        / _safe_name(step_key)
+        / f"generation-{generation}"
+    )
+    descriptor, parent = _open_run_parent_fd(
+        trusted_anchor,
+        path,
+        "journal path",
+        scope_root=scope_root,
+    )
+    try:
+        secret = _journal_secret(create=True, run_root=run_root)
+        if secret is None:
+            raise ExecutionFailed(
+                "EVIDENCE_WRITE_FAILED", "journal secret is unavailable"
+            )
+        document = dict(payload)
+        document["hmac"] = _journal_hmac(document, secret)
+        fileio.write_regular_file_atomic(
+            path.name,
+            json.dumps(document, ensure_ascii=False, sort_keys=True).encode(
+                "utf-8"
+            ),
+            mode=0o600,
+            dir_fd=descriptor,
+            parent_path=parent,
+        )
+    except fileio.UnsafeFileError as error:
+        raise ExecutionFailed(
+            "EVIDENCE_WRITE_FAILED", f"cannot write journal: {error.message}"
+        ) from error
+    finally:
+        os.close(descriptor)
+    return path
+
+
+def _find_reusable_journal(
+    dsn: str,
+    context: ExecutionContext,
+    *,
+    step_key: str,
+    plan_digest: str,
+    input_digest: str | None,
+    verify: Callable[[Mapping[str, Any]], bool],
+) -> dict[str, Any] | None:
+    """Return a journal only when database provenance proves it is ours.
+
+    The run root is treated as untrusted. Its files alone must never decide
+    that a result is reused: the matching attempts row supplies the generation,
+    attempt number, container id and one-time token, and the HMAC key lives
+    outside ``DATACON_RUN_ROOT``.
+    """
+    rows = state.attempts_for_step_across_generations(
+        dsn, context.job_id, stage="execute", step_key=step_key
+    )
+    if not rows:
+        return None
+    secret = _journal_secret(create=False, run_root=_work_root(context))
+    if secret is None:
+        return None
+    run_root = _work_root(context)
+    for row in rows:
+        if row["status"] not in ("started", "completed"):
+            continue
+        if input_digest is not None and row.get("input_digest") != input_digest:
+            continue
+        token = row.get("attempt_token")
+        if not isinstance(token, str) or not token:
+            continue
+        path = _journal_path(
+            run_root, step_key, row["attempt_no"], row["generation"]
+        )
+        if path.is_symlink() or not path.is_file():
+            continue
+        data = _read_run_file_bounded(path, max_bytes=_JOURNAL_MAX_BYTES)
+        if data is None:
+            continue
+        try:
+            payload = json.loads(data.decode("utf-8"))
+        except (ValueError, UnicodeError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        try:
+            if payload.get("job_id") != context.job_id_text:
+                continue
+            if payload.get("generation") != row["generation"]:
+                continue
+            if payload.get("attempt_no") != row["attempt_no"]:
+                continue
+            if payload.get("plan_digest") != plan_digest:
+                continue
+            if payload.get("input_digest") != row.get("input_digest"):
+                continue
+            if payload.get("attempt_token") != token:
+                continue
+            if payload.get("container_id") != row.get("container_id"):
+                continue
+            body_hmac = payload.get("hmac")
+            if not isinstance(body_hmac, str) or not hmac.compare_digest(
+                body_hmac, _journal_hmac(payload, secret)
+            ):
+                continue
+            if payload.get("status") not in (
+                "completed",
+                "build_failed",
+                "timeout",
+                "resource_limited",
+            ):
+                continue
+            if verify(payload):
+                return payload
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+    return None
+
+
+def _write_run_file(
+    run_root: Path,
+    path: Path,
+    data: bytes,
+    mode: int,
+    *,
+    scope_root: Path | None = None,
+    anchor: Path | None = None,
+) -> None:
+    """Write a file under a generation scope without following a symlink.
+
+    The parent is opened from the trusted run-root anchor one component at a
+    time. The leaf open, write, chmod and replace all use the verified
+    directory descriptor, so neither a pre-existing symlink nor a parent
+    renamed after the check can redirect the write outside the generation.
+    """
+    trusted_anchor = anchor if anchor is not None else run_root
+    descriptor, parent = _open_run_parent_fd(
+        trusted_anchor,
+        path,
+        "run evidence path",
+        scope_root=scope_root,
+    )
+    try:
+        fileio.write_regular_file(
+            path.name,
+            data,
+            mode=mode,
+            dir_fd=descriptor,
+            parent_path=parent,
+        )
+        # A parent swapped after the pre-write check cannot redirect the
+        # descriptor write, but the operation is still reported as failed so
+        # the worker does not treat a moved directory as the approved scope.
+        fileio._assert_dir_fd_matches_parent(descriptor, parent)
+    except fileio.UnsafeFileError as error:
+        raise ExecutionFailed(
+            "EVIDENCE_WRITE_FAILED", f"cannot write run evidence: {error.message}"
+        ) from error
+    finally:
+        os.close(descriptor)
+
+
+def _persist_build(
+    dsn: str,
+    context: ExecutionContext,
+    result: BuildResult,
+    attempt_no: int,
+    token: str,
+    *,
+    staged_materials: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
+    run_root = _work_root(context)
+    generation_root = _generation_root(context)
+    directory = generation_root / "build" / result.version
+    _prepare_run_directory(
+        context.run_root, directory, "build evidence directory",
+        scope_root=generation_root,
+    )
+    log_path = directory / "build.log"
+    _write_run_file(
+        run_root,
+        log_path,
+        result.log,
+        0o600,
+        scope_root=generation_root,
+        anchor=context.run_root,
+    )
+    artifact_path = directory / "parser"
+    if result.artifact is not None and result.artifact_digest is not None:
+        _write_run_file(
+            run_root,
+            artifact_path,
+            result.artifact,
+            0o555,
+            scope_root=generation_root,
+            anchor=context.run_root,
+        )
+        if _digest(result.artifact) != result.artifact_digest:
+            raise ExecutionFailed("BUILD_FAILED", "build artifact digest changed")
+    updated = state.record_attempt(
+        dsn,
+        context.job_id,
+        stage="execute",
+        step_key=f"build:{result.version}",
+        attempt_no=attempt_no,
+        generation=context.generation,
+        input_digest=context.plan["analysis_digest"],
+        status="started",
+        container_id=result.container_id,
+        attempt_token=token,
+    )
+    if not updated:
+        raise state.StaleGeneration("the worker lease was lost after the build")
+    payload = {
+        "tool_id": "sandbox.build",
+        "job_id": context.job_id_text,
+        "generation": context.generation,
+        "attempt_token": token,
+        "plan_digest": context.plan_digest,
+        "input_digest": context.plan["analysis_digest"],
+        "status": result.status,
+        "version": result.version,
+        "container_id": result.container_id,
+        "artifact_digest": result.artifact_digest,
+        "attempt_no": attempt_no,
+        "files": {
+            "log": str(log_path.relative_to(run_root)),
+            "artifact": str(artifact_path.relative_to(run_root))
+            if artifact_path.is_file()
+            else None,
+        },
+        "file_digests": {
+            "log": _digest(result.log),
+            "artifact": result.artifact_digest,
+        },
+        **result.as_dict(),
+    }
+    if staged_materials is not None:
+        # Bind the build result to the exact bytes copied out of the run root
+        # and mounted for this attempt, not just to the case's current files.
+        payload["staged_materials"] = dict(staged_materials)
+    _write_journal(
+        run_root,
+        f"build:{result.version}",
+        attempt_no,
+        context.generation,
+        payload,
+        anchor=context.run_root,
+    )
+    return {
+        key: value for key, value in payload.items() if key != "attempt_token"
+    }
+
+
+def _persist_replay(
+    dsn: str,
+    context: ExecutionContext,
+    result: ReplayResult,
+    attempt_no: int,
+    token: str,
+    *,
+    artifact_digest: str | None = None,
+) -> dict[str, Any]:
+    run_root = _work_root(context)
+    generation_root = _generation_root(context)
+    directory = generation_root / "replay" / result.version / result.phase
+    _prepare_run_directory(
+        context.run_root, directory, "replay evidence directory",
+        scope_root=generation_root,
+    )
+    stdout_path = directory / "stdout.log"
+    stderr_path = directory / "stderr.log"
+    _write_run_file(
+        run_root,
+        stdout_path,
+        result.stdout,
+        0o600,
+        scope_root=generation_root,
+        anchor=context.run_root,
+    )
+    _write_run_file(
+        run_root,
+        stderr_path,
+        result.stderr,
+        0o600,
+        scope_root=generation_root,
+        anchor=context.run_root,
+    )
+    updated = state.record_attempt(
+        dsn,
+        context.job_id,
+        stage="execute",
+        step_key=_replay_step(result.version, result.phase),
+        attempt_no=attempt_no,
+        generation=context.generation,
+        input_digest=result.input_digest,
+        status="started",
+        container_id=result.container_id,
+        attempt_token=token,
+    )
+    if not updated:
+        raise state.StaleGeneration("the worker lease was lost after the replay")
+    payload = {
+        "tool_id": "sandbox.replay",
+        "job_id": context.job_id_text,
+        "generation": context.generation,
+        "attempt_token": token,
+        "plan_digest": context.plan_digest,
+        "input_digest": result.input_digest,
+        "artifact_digest": artifact_digest,
+        "status": result.status,
+        "version": result.version,
+        "phase": result.phase,
+        "container_id": result.container_id,
+        "signature": result.signature.as_dict() if result.signature else None,
+        "attempt_no": attempt_no,
+        "files": {
+            "stdout": str(stdout_path.relative_to(run_root)),
+            "stderr": str(stderr_path.relative_to(run_root)),
+        },
+        "file_digests": {
+            "stdout": _digest(result.stdout),
+            "stderr": _digest(result.stderr),
+        },
+        **result.as_dict(),
+    }
+    # Keep the build binding authoritative even if a sandbox result happens to
+    # carry a same-named metadata field.
+    payload["artifact_digest"] = artifact_digest
+    _write_journal(
+        run_root,
+        _replay_step(result.version, result.phase),
+        attempt_no,
+        context.generation,
+        payload,
+        anchor=context.run_root,
+    )
+    return {
+        key: value for key, value in payload.items() if key != "attempt_token"
+    }
+
+
+def _replay_step(version: str, phase: str) -> str:
+    return f"replay:{version}:{phase}"
+
+
+
+
+def _policy_from_context(context: ExecutionContext) -> VerdictPolicy:
+    expected_stdout = context.playbook.get("expected_stdout")
+    if not isinstance(expected_stdout, dict):
+        raise ExecutionBlocked(
+            "MATERIAL_MISSING", "the case manifest has no expected stdout assertions"
+        )
+    for key in ("normal", "candidate_clean"):
+        if not isinstance(expected_stdout.get(key), str):
+            raise ExecutionBlocked(
+                "MATERIAL_MISSING", f"expected stdout assertion {key} is missing"
+            )
+    return VerdictPolicy(
+        signature=context.plan["asan_signature"],
+        expected_exit=context.plan["expected_exit"],
+        expected_stdout=expected_stdout,
+    )
+
+
+def _build_report(
+    context: ExecutionContext,
+    *,
+    verdict: str | None,
+    verdict_reason: str | None,
+    decision: VerdictDecision | None,
+    builds: Mapping[str, Mapping[str, Any]],
+    runs: Sequence[Mapping[str, Any]],
+    probe: Mapping[str, Any] | None,
+    evidence_refs: Sequence[str],
+    missing: Sequence[str],
+    error: str | None = None,
+) -> tuple[dict[str, Any], str]:
+    report = {
+        "schema_version": 1,
+        "job_id": context.job_id_text,
+        "plan_digest": context.plan_digest,
+        "cve_id": context.plan["cve_id"],
+        "case_id": context.plan["case_id"],
+        "state": verdict,
+        "verdict": verdict,
+        "reason_code": verdict_reason,
+        "target": context.job["request"]["target"],
+        "versions": context.plan["revisions"],
+        "repository": context.plan["repository"],
+        "environment": {
+            "image": context.image,
+            "image_digest": context.plan["image_digest"],
+            "platform": context.plan["platform"],
+            "toolchain": context.plan["toolchain"],
+            "asan_options": context.plan["asan_options"],
+            "compile_args": list(context.compile_args),
+            "isolation": context.plan["isolation"],
+            "probe": probe,
+        },
+        "budget": context.plan["limits"],
+        "inputs": {
+            "candidate": context.plan["inputs"]["candidate"],
+            "normal": context.plan["inputs"]["normal"],
+        },
+        "review": {
+            "reviewer_id": context.review["reviewer_id"],
+            "decision": context.review["decision"],
+            "decided_at": jsonutil.timestamp(context.review["decided_at"]),
+            "plan_digest": context.review["plan_digest"],
+        },
+        "signature": context.plan["asan_signature"],
+        "builds": [dict(item) for item in builds.values()],
+        "replays": [dict(item) for item in runs],
+        "rule": decision.as_dict() if decision else None,
+        "evidence_refs": list(evidence_refs),
+        "missing": list(missing),
+        "error": error,
+        "evidence_complete": (
+            decision is not None and not missing and error is None
+        ),
+        "cleanup_errors": list(getattr(context, "cleanup_errors", [])),
+        "created_at": _utc_now(),
+    }
+    lines = [
+        "# DataCon evidence report",
+        "",
+        f"- Job: `{context.job_id_text}`",
+        f"- Plan: `{context.plan_digest}`",
+        f"- Case: `{context.plan['case_id']}` / `{context.plan['cve_id']}`",
+        f"- Verdict: **{verdict or 'PENDING'}**",
+        f"- Reason: `{verdict_reason or ''}`",
+        f"- Image: `{context.image}`",
+        f"- Platform: `{context.plan['platform']}`",
+        f"- ASan options: `{context.plan['asan_options']}`",
+        f"- Compile args: `{' '.join(context.compile_args)}`",
+        "",
+        "## Revisions",
+        "",
+        f"- vulnerable: `{context.plan['revisions']['vulnerable']}`",
+        f"- fixed: `{context.plan['revisions']['fixed']}`",
+        "",
+        "## Builds",
+        "",
+        "| Version | Status | Exit | Artifact |",
+        "| --- | --- | ---: | --- |",
+    ]
+    for version in ("vulnerable", "fixed"):
+        build = builds.get(version, {})
+        lines.append(
+            "| {version} | {status} | {exit} | `{artifact}` |".format(
+                version=version,
+                status=build.get("status", "missing"),
+                exit=build.get("exit_code", ""),
+                artifact=build.get("artifact_digest") or "",
+            )
+        )
+    lines.extend(
+        [
+            "",
+            "## Replays",
+            "",
+            "| Version | Phase | Status | Exit | ASan |",
+            "| --- | --- | --- | ---: | --- |",
+        ]
+    )
+    for run in runs:
+        signature = run.get("signature") or {}
+        lines.append(
+            "| {version} | {phase} | {status} | {exit} | {asan} |".format(
+                version=run.get("version", ""),
+                phase=run.get("phase", ""),
+                status=run.get("status", ""),
+                exit=run.get("exit_code", ""),
+                asan=signature.get("error", ""),
+            )
+        )
+    lines.extend(
+        [
+            "",
+            "## Rule trace",
+            "",
+            "```json",
+            json.dumps(decision.as_dict() if decision else {}, indent=2, sort_keys=True),
+            "```",
+            "",
+            "## Evidence",
+            "",
+        ]
+    )
+    for reference in evidence_refs:
+        lines.append(f"- `{reference}`")
+    if missing:
+        lines.extend(["", "## Missing", ""])
+        for item in missing:
+            lines.append(f"- `{item}`")
+    if error:
+        lines.extend(["", "## Error", "", error])
+    cleanup_errors = list(getattr(context, "cleanup_errors", []))
+    if cleanup_errors:
+        lines.extend(["", "## Cleanup", ""])
+        for item in cleanup_errors:
+            lines.append(f"- `{item}`")
+    lines.extend(
+        [
+            "",
+            "The report is generated deterministically from persisted runs. "
+            "Raw sanitizer logs and metadata are archived next to this report.",
+            "",
+        ]
+    )
+    return report, "\n".join(lines)
+
+
+def _run_root_path(
+    run_root: Path, relative: Any, suffix: str
+) -> Path | None:
+    """Map a journal-recorded path to a file strictly inside the run root.
+
+    Journal payloads are attacker-writable. Absolute paths, parent traversal
+    and paths that resolve outside the run root are rejected instead of being
+    joined to ``run_root`` (where an absolute operand would silently replace
+    the trusted prefix).
+    """
+    if not isinstance(relative, str) or not relative:
+        return None
+    candidate = Path(relative)
+    if candidate.is_absolute() or candidate.drive:
+        return None
+    if relative.startswith(("\\", "//")):
+        return None
+    if ".." in candidate.parts:
+        return None
+    if not relative.endswith(suffix):
+        return None
+    try:
+        root = run_root.resolve()
+        path = (root / candidate).resolve()
+    except (OSError, RuntimeError):
+        return None
+    if path == root or root not in path.parents:
+        return None
+    return path
+
+
+def _verified_run_file(
+    run_root: Path,
+    payload: Mapping[str, Any],
+    key: str,
+    suffix: str,
+) -> bytes | None:
+    files = payload.get("files")
+    relative = files.get(key) if isinstance(files, Mapping) else None
+    path = _run_root_path(run_root, relative, suffix)
+    if path is None:
+        return None
+    limit = MAX_ARTIFACT_BYTES if suffix == "/parser" else MAX_LOG_BYTES
+    data = _read_run_file_bounded(path, max_bytes=limit)
+    if data is None:
+        return None
+    digests = payload.get("file_digests")
+    expected = digests.get(key) if isinstance(digests, Mapping) else None
+    if expected is not None and _digest(data) != expected:
+        return None
+    return data
+
+
+def _case_materials(
+    context: ExecutionContext,
+) -> dict[str, tuple[str, bytes]]:
+    manifest = context.case.manifest
+    entries = (
+        (manifest["harness"], "material_harness", context.plan["harness_digest"]),
+        (
+            manifest["build_recipe"],
+            "material_build_recipe",
+            context.plan["build_recipe_digest"],
+        ),
+        (
+            manifest["dependencies"],
+            "material_dependencies",
+            context.plan["dependencies_digest"],
+        ),
+        (
+            context.case.repository["patch"],
+            "material_patch",
+            context.plan["repository"]["patch_digest"],
+        ),
+        (
+            context.manifest_case["inputs"]["normal"],
+            "material_input_normal",
+            context.plan["inputs"]["normal"],
+        ),
+        (
+            context.manifest_case["inputs"]["candidate"],
+            "material_input_candidate",
+            context.plan["inputs"]["candidate"],
+        ),
+        (
+            manifest["versions"]["vulnerable"],
+            "material_source_vulnerable",
+            context.materials.get(manifest["versions"]["vulnerable"]),
+        ),
+        (
+            manifest["versions"]["fixed"],
+            "material_source_fixed",
+            context.materials.get(manifest["versions"]["fixed"]),
+        ),
+    )
+    materials: dict[str, tuple[str, bytes]] = {}
+    snapshot = getattr(context, "material_payloads", None)
+    for relative, role, expected in entries:
+        if isinstance(snapshot, Mapping) and relative in snapshot:
+            data = snapshot[relative]
+            if expected is not None and _digest(data) != expected:
+                continue
+            materials[relative] = (role, data)
+            continue
+        try:
+            data, actual = context.case.read_material(relative, expected)
+        except CaseConfigurationError:
+            continue
+        if expected is not None and actual != expected:
+            continue
+        materials[relative] = (role, data)
+    return materials
+
+
+def _evidence_artifacts(
+    context: ExecutionContext,
+    run_root: Path,
+    *,
+    builds: Mapping[str, Mapping[str, Any]],
+    runs: Sequence[Mapping[str, Any]],
+    probe: Mapping[str, Any] | None,
+    execution_metadata: Mapping[str, Any],
+) -> dict[str, tuple[str, bytes | Path]]:
+    artifacts: dict[str, tuple[str, bytes | Path]] = {
+        "plan.json": ("plan", jsonutil.canonical_bytes(context.plan) + b"\n"),
+        "review.json": (
+            "review",
+            jsonutil.canonical_bytes(
+                {
+                    "reviewer_id": context.review["reviewer_id"],
+                    "decision": context.review["decision"],
+                    "plan_digest": context.review["plan_digest"],
+                    "decided_at": jsonutil.timestamp(context.review["decided_at"]),
+                }
+            )
+            + b"\n",
+        ),
+        "metadata/execution.json": (
+            "execution_metadata",
+            jsonutil.canonical_bytes(execution_metadata) + b"\n",
+        ),
+        "metadata/case.json": (
+            "case_config",
+            jsonutil.canonical_bytes(
+                {"case_config": context.case_config}
+            )
+            + b"\n",
+        ),
+    }
+    if probe is not None:
+        artifacts["metadata/probe.json"] = (
+            "probe",
+            jsonutil.canonical_bytes(probe) + b"\n",
+        )
+    for version in ("vulnerable", "fixed"):
+        build = builds.get(version)
+        if not build:
+            continue
+        log = _verified_run_file(run_root, build, "log", "/build.log")
+        artifact = _verified_run_file(run_root, build, "artifact", "/parser")
+        if log is not None:
+            artifacts[f"build/{version}/build.log"] = ("build_log", log)
+        if artifact is not None:
+            artifacts[f"build/{version}/parser"] = ("build_artifact", artifact)
+        artifacts[f"build/{version}/metadata.json"] = (
+            "build_metadata",
+            jsonutil.canonical_bytes(dict(build)) + b"\n",
+        )
+    for run in runs:
+        version = run.get("version", "")
+        phase = run.get("phase", "")
+        if version not in ("vulnerable", "fixed") or phase not in (
+            "normal",
+            "candidate_1",
+            "candidate_2",
+        ):
+            continue
+        stdout = _verified_run_file(run_root, run, "stdout", "/stdout.log")
+        stderr = _verified_run_file(run_root, run, "stderr", "/stderr.log")
+        if stdout is not None:
+            artifacts[f"replay/{version}/{phase}/stdout.log"] = (
+                "replay_stdout" if phase != "normal" else "normal_output",
+                stdout,
+            )
+        if stderr is not None:
+            role = "asan_log" if run.get("signature") else "replay_stderr"
+            artifacts[f"replay/{version}/{phase}/stderr.log"] = (role, stderr)
+        artifacts[f"replay/{version}/{phase}/metadata.json"] = (
+            "replay_metadata",
+            jsonutil.canonical_bytes(dict(run)) + b"\n",
+        )
+    for relative, (role, data) in _case_materials(context).items():
+        artifacts[f"materials/{relative}"] = (role, data)
+    return artifacts
+
+
+def _discard_published_bundle(path: str | None) -> None:
+    """Best-effort removal of a bundle this generation just published.
+
+    Only a generation-scoped directory is removed. The shared job directory and
+    other generations (including the legacy flat ``evidence/<job_id>`` layout)
+    are never touched, so a stale worker can clean up after itself without
+    racing a newer generation that is about to publish.
+    """
+    if not path:
+        return
+    try:
+        target = Path(path)
+        if not target.name.startswith("generation-"):
+            return
+        shutil.rmtree(target, ignore_errors=True)
+    except OSError:
+        pass
+
+
+def _archive(
+    dsn: str,
+    context: ExecutionContext,
+    *,
+    report: Mapping[str, Any],
+    report_markdown: str,
+    artifacts: Mapping[str, tuple[str, Any]],
+    verdict: str | None,
+) -> tuple[str | None, str | None, str | None]:
+    # A lease/generation failure here must reach the caller so it can return
+    # STALE; every filesystem/verification failure is contained below and
+    # turned into an evidence error instead of escaping into the workflow.
+    try:
+        evidence_root = _assert_evidence_root_outside_run_root(context.run_root)
+    except ExecutionFailed as error:
+        # _finish_blocked/_finish_failed/_archive_only reach this helper after
+        # loading a context; never publish a bundle into the run root even on
+        # those recovery paths.
+        return None, None, f"{error.reason_code}: {error.message}"
+    state.mark_archiving(dsn, context.job_id, generation=context.generation)
+    # Every generation publishes into its own directory below the job
+    # directory. A worker that passed the fence and was then paused can only
+    # ever replace its own generation; it can never overwrite a newer
+    # generation's evidence path.
+    job_root = evidence_root / context.job_id_text
+    bundle = job_root / f"generation-{context.generation}"
+    temporary = (
+        evidence_root
+        / f".{context.job_id_text}.generation-{context.generation}.tmp-{uuid.uuid4().hex}"
+    )
+    backup = (
+        job_root
+        / f".generation-{context.generation}.old-{uuid.uuid4().hex}"
+    )
+    try:
+        evidence_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        evidence_root.chmod(0o700)
+        try:
+            final_root = _outside_run_root(
+                evidence_root, context.run_root, "DATACON_EVIDENCE_ROOT"
+            )
+        except ExecutionFailed as error:
+            return None, None, f"{error.reason_code}: {error.message}"
+        if final_root != evidence_root:
+            return (
+                None,
+                None,
+                "EVIDENCE_WRITE_FAILED: evidence root changed after creation",
+            )
+        if job_root.is_symlink():
+            raise BundleError("SYMLINK", "evidence destination is a symlink")
+        job_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        job_info = job_root.lstat()
+        if stat.S_ISLNK(job_info.st_mode) or not stat.S_ISDIR(job_info.st_mode):
+            raise BundleError(
+                "SYMLINK", "evidence destination is not a directory"
+            )
+        if bundle.is_symlink():
+            raise BundleError("SYMLINK", "evidence generation is a symlink")
+        info = write_bundle(
+            temporary,
+            job_id=context.job_id,
+            plan_digest=context.plan_digest,
+            report=report,
+            report_markdown=report_markdown,
+            artifacts=artifacts,
+            verdict=verdict,
+            # Verify the complete staging directory before it replaces any
+            # previously archived bundle. An unverified bundle is never
+            # published as evidence.
+            verify=verify_bundle,
+        )
+        # Verification can take time. Refuse to publish unless this exact
+        # generation still owns an active lease; a stale worker must never
+        # replace a newer generation's bundle.
+        state.assert_archive_fence(
+            dsn, context.job_id, generation=context.generation
+        )
+        if bundle.exists():
+            if bundle.is_dir():
+                bundle.rename(backup)
+            else:
+                bundle.unlink()
+        temporary.rename(bundle)
+        if backup.exists():
+            shutil.rmtree(backup, ignore_errors=True)
+        return info.manifest_digest, str(bundle.resolve()), None
+    except BundleError as error:
+        shutil.rmtree(temporary, ignore_errors=True)
+        if backup.exists() and not bundle.exists():
+            backup.rename(bundle)
+        return None, None, f"{error.reason_code}: {error.message}"
+    except OSError as error:
+        shutil.rmtree(temporary, ignore_errors=True)
+        if backup.exists() and not bundle.exists():
+            backup.rename(bundle)
+        return None, None, f"EVIDENCE_WRITE_FAILED: {error}"
+    except (state.StateError, state.StaleGeneration):
+        # The lease disappeared while the bundle was being verified. Remove
+        # the staging directory and let the caller return STALE; a stale
+        # worker must not touch the published evidence path.
+        shutil.rmtree(temporary, ignore_errors=True)
+        raise
+
+def _archive_only(dsn: str, context: ExecutionContext) -> ExecutionResult:
+    """Recover an ARCHIVING generation without starting any target container.
+
+    The claim after an archive crash advances the generation, so the durable
+    attempts and journals belong to previous generations. Only completed,
+    digest-verified results are considered; a past execute deadline is
+    irrelevant because nothing is executed.
+    """
+    build_root = _work_root(context)
+    rows = state.execution_attempts_across_generations(dsn, context.job_id)
+    completed: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        if row["status"] == "completed" and isinstance(row["result"], dict):
+            completed.setdefault(row["step_key"], row["result"])
+    rejected: list[str] = []
+
+    def plan_bound(result: Mapping[str, Any], step: str) -> bool:
+        if result.get("plan_digest") != context.plan_digest:
+            rejected.append(f"{step} belongs to a different frozen plan")
+            return False
+        return True
+
+    probe = completed.get("sandbox.probe")
+    if probe is not None:
+        if not isinstance(probe, dict) or not plan_bound(probe, "probe"):
+            probe = None
+        elif probe.get("status") != "completed":
+            probe = None
+    builds: dict[str, dict[str, Any]] = {}
+    for version in ("vulnerable", "fixed"):
+        result = completed.get(f"build:{version}")
+        if result is None:
+            continue
+        if not isinstance(result, dict) or not plan_bound(
+            result, f"build:{version}"
+        ):
+            continue
+        if result.get("input_digest") != context.plan["analysis_digest"]:
+            rejected.append(f"build:{version} input does not match the plan")
+            continue
+        if _reusable_build(build_root, result):
+            builds[version] = result
+    runs: list[dict[str, Any]] = []
+    for version in ("vulnerable", "fixed"):
+        for phase in ("normal", "candidate_1", "candidate_2"):
+            result = completed.get(_replay_step(version, phase))
+            if result is None:
+                continue
+            if not isinstance(result, dict) or not plan_bound(
+                result, _replay_step(version, phase)
+            ):
+                continue
+            expected_input = (
+                context.plan["inputs"]["normal"]
+                if phase == "normal"
+                else context.plan["inputs"]["candidate"]
+            )
+            if result.get("input_digest") != expected_input:
+                rejected.append(
+                    f"{version}/{phase} input does not match the approved plan"
+                )
+                continue
+            if _reusable_replay(build_root, result):
+                runs.append(result)
+    complete = (
+        isinstance(probe, dict)
+        and len(builds) == 2
+        and len(runs) == 6
+        and not rejected
+    )
+    missing: list[str] = list(rejected)
+    if not complete:
+        if not isinstance(probe, dict):
+            missing.append("probe evidence is missing")
+        for version in ("vulnerable", "fixed"):
+            if version not in builds:
+                missing.append(f"{version} build evidence is missing")
+        for version in ("vulnerable", "fixed"):
+            for phase in ("normal", "candidate_1", "candidate_2"):
+                if all(
+                    run.get("version") != version or run.get("phase") != phase
+                    for run in runs
+                ):
+                    missing.append(f"{version}/{phase} replay evidence is missing")
+        decision = VerdictDecision(
+            "INCONCLUSIVE",
+            "EVIDENCE_INCOMPLETE",
+            "archive-only recovery found incomplete evidence",
+            {"priority": list(PRIORITY), "missing": missing},
+        )
+    else:
+        try:
+            decision = decide_verdict(
+                _policy_from_context(context),
+                [_to_observation(run, build_root) for run in runs],
+                builds=builds,
+                expected_inputs={
+                    "vulnerable": context.plan["inputs"]["candidate"],
+                    "fixed": context.plan["inputs"]["candidate"],
+                },
+            )
+        except ExecutionFailed as error:
+            missing.append(error.message)
+            decision = VerdictDecision(
+                "INCONCLUSIVE",
+                "EVIDENCE_INCOMPLETE",
+                error.message,
+                {"priority": list(PRIORITY), "missing": missing},
+            )
+        except ExecutionBlocked as error:
+            missing.append(error.message)
+            decision = VerdictDecision(
+                "INCONCLUSIVE",
+                "EVIDENCE_INCOMPLETE",
+                error.message,
+                {"priority": list(PRIORITY), "missing": missing},
+            )
+
+    if not complete:
+        # There is no complete execution evidence tree, so no verifiable
+        # outcome bundle can be published. Record the honest outcome and keep
+        # any verdict already committed by a previous archive.
+        reason = "EVIDENCE_INCOMPLETE: " + "; ".join(missing)
+        try:
+            finished = state.finish_execution(
+                dsn,
+                context.job_id,
+                generation=context.generation,
+                state="INCONCLUSIVE",
+                reason_code="EVIDENCE_INCOMPLETE",
+                verdict=None,
+                verdict_reason=None,
+                evidence_status="failed",
+                evidence_error=reason,
+                last_error="archive-only recovery found incomplete evidence",
+                stage="failed",
+            )
+        except (state.StateError, state.StaleGeneration):
+            return ExecutionResult("STALE")
+        if not finished:
+            return ExecutionResult("STALE")
+        return ExecutionResult("INCONCLUSIVE", reason_code="EVIDENCE_INCOMPLETE")
+
+    report, report_markdown = _build_report(
+        context,
+        verdict=decision.verdict,
+        verdict_reason=decision.reason_code,
+        decision=decision,
+        builds=builds,
+        runs=runs,
+        probe=probe,
+        evidence_refs=["report.json", "report.md", "plan.json", "review.json"],
+        missing=missing,
+    )
+    attempt_rows = []
+    for row in rows:
+        item = {
+            key: value for key, value in row.items() if key != "attempt_token"
+        }
+        for field in ("started_at", "finished_at"):
+            if item.get(field) is not None:
+                item[field] = jsonutil.timestamp(item[field])
+        attempt_rows.append(item)
+    artifacts = _evidence_artifacts(
+        context,
+        build_root,
+        builds=builds,
+        runs=runs,
+        probe=probe,
+        execution_metadata={
+            "job_id": context.job_id_text,
+            "plan_digest": context.plan_digest,
+            "generation": context.generation,
+            "recovered_archive_only": True,
+            "probe": probe,
+            # Duplicated in report.json for diagnostics. Keep the exact same
+            # list shape so the verifier can require byte-level agreement
+            # instead of maintaining two unbound copies.
+            "builds": [dict(item) for item in builds.values()],
+            "replays": [dict(item) for item in runs],
+            "attempts": attempt_rows,
+        },
+    )
+    try:
+        digest, path, archive_error = _archive(
+            dsn,
+            context,
+            report=report,
+            report_markdown=report_markdown,
+            artifacts=artifacts,
+            verdict=decision.verdict,
+        )
+    except (BundleError, OSError) as error:
+        archive_error = f"EVIDENCE_WRITE_FAILED: {error}"
+        digest = path = None
+    except (state.StateError, state.StaleGeneration):
+        return ExecutionResult("STALE")
+    if archive_error is not None:
+        try:
+            finished = state.finish_execution(
+                dsn,
+                context.job_id,
+                generation=context.generation,
+                state="FAILED",
+                reason_code="EVIDENCE_WRITE_FAILED",
+                verdict=None,
+                verdict_reason=None,
+                evidence_status="failed",
+                evidence_error=archive_error,
+                last_error="evidence bundle could not be written during archive recovery",
+                stage="failed",
+            )
+        except (state.StateError, state.StaleGeneration):
+            return ExecutionResult("STALE")
+        if not finished:
+            return ExecutionResult("STALE")
+        return ExecutionResult("FAILED", reason_code="EVIDENCE_WRITE_FAILED")
+    final_state = decision.verdict
+    reason_code = (
+        None
+        if final_state in ("REPRODUCED", "NOT_REPRODUCED")
+        else decision.reason_code
+    )
+    try:
+        finished = state.finish_execution(
+            dsn,
+            context.job_id,
+            generation=context.generation,
+            state=final_state,
+            reason_code=reason_code,
+            verdict=decision.verdict,
+            verdict_reason=decision.reason_code,
+            evidence_digest=digest,
+            evidence_path=path,
+            evidence_status="archived",
+            stage="done",
+        )
+    except (state.StateError, state.StaleGeneration):
+        # The bundle was published but the terminal row was not committed.
+        # Remove only this generation's directory so it cannot be cited as
+        # evidence for a state the database never accepted.
+        _discard_published_bundle(path)
+        return ExecutionResult("STALE")
+    if not finished:
+        _discard_published_bundle(path)
+        return ExecutionResult("STALE")
+    return ExecutionResult(
+        final_state,
+        verdict=decision.verdict,
+        verdict_reason=decision.reason_code,
+        evidence_digest=digest,
+        evidence_path=path,
+        reason_code=reason_code,
+    )
+
+
+def _finish_evidence_path_failure(
+    dsn: str,
+    job_id: UUID,
+    generation: int,
+    error: ExecutionFailed,
+) -> ExecutionResult:
+    """Commit FAILED/EVIDENCE_WRITE_FAILED without archiving any bundle.
+
+    The evidence destination itself is untrusted in this branch, so the
+    failure must stay visible through ``status.evidence.error`` rather than
+    being written into the run root or silently dropped.
+    """
+    try:
+        finished = state.finish_execution(
+            dsn,
+            job_id,
+            generation=generation,
+            state="FAILED",
+            reason_code=error.reason_code,
+            verdict=None,
+            verdict_reason=None,
+            evidence_status="failed",
+            evidence_error=f"{error.reason_code}: {error.message}",
+            last_error=error.message,
+            stage="failed",
+        )
+    except (state.StateError, state.StaleGeneration):
+        return ExecutionResult("STALE")
+    if not finished:
+        return ExecutionResult("STALE")
+    return ExecutionResult("FAILED", reason_code=error.reason_code)
+
+
+def run_execution(
+    dsn: str,
+    job_id: UUID,
+    generation: int,
+    *,
+    case_root: str | None = None,
+    run_root: Path | str | None = None,
+    sandbox: Any | None = None,
+) -> ExecutionResult:
+    """Run one claimed READY/RUNNING generation to a terminal state."""
+    validate_test_hooks()
+    try:
+        context = _load_context(
+            dsn, job_id, generation, case_root=case_root, run_root=run_root
+        )
+    except state.StaleGeneration:
+        return ExecutionResult("STALE")
+    except ExecutionBlocked as error:
+        # The execution cannot start. The claim still has a lease, so archive
+        # the blocking reason and commit BLOCKED. Reuse the caller's roots so
+        # a reload cannot drift to environment defaults.
+        return _finish_blocked(
+            dsn,
+            job_id,
+            generation,
+            error,
+            case_root=case_root,
+            run_root=run_root,
+        )
+    except ExecutionFailed as error:
+        return _finish_blocked_failed(dsn, job_id, generation, error)
+
+    # The evidence root must be outside the attacker-writable run root before
+    # either archive recovery or the normal path can touch any bundle.
+    try:
+        _assert_evidence_root_outside_run_root(context.run_root)
+    except ExecutionFailed as error:
+        return _finish_evidence_path_failure(dsn, job_id, generation, error)
+
+    if context.job["state"] == "ARCHIVING":
+        return _archive_only(dsn, context)
+
+    try:
+        _assert_journal_paths(context.run_root)
+        # The staging root holds the bytes that containers actually mount, so
+        # a bad location must fail before any probe/build/replay container.
+        _staging_root(context)
+    except ExecutionFailed as error:
+        # The HMAC key and staging copies must live outside the writable run
+        # root; fail before any probe/build/replay container exists. Do not
+        # archive: the evidence destination itself may be inside the untrusted
+        # run root, and the failure must remain visible via
+        # status.evidence.error.
+        return _finish_evidence_path_failure(dsn, job_id, generation, error)
+
+    try:
+        _assert_budget(context, purpose="starting isolated execution")
+    except ExecutionBlocked as error:
+        return _finish_blocked(dsn, job_id, generation, error, context=context)
+
+    work_root = context.run_root / context.job_id_text / context.plan_digest.split(":")[1]
+    try:
+        _prepare_shared_directory(context.run_root, work_root, "work root")
+        build_root = work_root / "run"
+        _prepare_shared_directory(context.run_root, build_root, "sandbox run root")
+        generation_root = _generation_root(context)
+        _prepare_run_directory(
+            context.run_root, generation_root, "generation root",
+            scope_root=generation_root,
+        )
+    except ExecutionFailed as error:
+        return _finish_evidence_path_failure(dsn, job_id, generation, error)
+    try:
+        materials_dir, inputs, material_digests = _materialize(
+            context, generation_root, anchor=context.run_root
+        )
+    except ExecutionBlocked as error:
+        return _finish_blocked(dsn, job_id, generation, error, context=context)
+
+    if sandbox is None:
+        sandbox = DockerSandbox(
+            image=context.image,
+            platform=context.plan["platform"],
+            policy=context.isolation,
+            limits=context.limits,
+            job_id=context.job_id_text,
+            run_root=build_root,
+            generation=generation,
+        )
+    reclaim = getattr(sandbox, "reclaim_job", None)
+    if callable(reclaim):
+        try:
+            reclaim()
+        except SandboxError as error:
+            # Cleanup failure is not a reason to silently continue: record it
+            # on the context so the archived report exposes the condition, and
+            # keep the current generation's containers untouched.
+            context.cleanup_errors.append(f"reclaim: {error.message}")
+
+    probe_payload: dict[str, Any] | None = None
+    builds: dict[str, dict[str, Any]] = {}
+    runs: list[dict[str, Any]] = []
+    decision: VerdictDecision | None = None
+    missing: list[str] = []
+    try:
+        probe_result, _ = _run_step(
+            dsn,
+            context,
+            step_key="sandbox.probe",
+            input_digest=context.plan_digest,
+            action=lambda attempt_no, token: _do_probe(context, sandbox),
+            reusable=lambda payload: payload.get("status") == "completed",
+        )
+        probe_payload = probe_result
+        for version in ("vulnerable", "fixed"):
+            _assert_context_unchanged(
+                dsn,
+                context,
+                materials_dir=materials_dir,
+                material_digests=material_digests,
+            )
+            _assert_budget(context, purpose=f"building {version}")
+            result, reused = _run_step(
+                dsn,
+                context,
+                step_key=f"build:{version}",
+                input_digest=context.plan["analysis_digest"],
+                action=lambda attempt_no, token, version=version: _do_build(
+                    dsn,
+                    context,
+                    sandbox,
+                    materials_dir,
+                    material_digests,
+                    version,
+                    attempt_no,
+                    token,
+                ),
+                reusable=lambda payload: _reusable_build(build_root, payload),
+            )
+            builds[version] = result
+            if result.get("status") != "completed":
+                raise ExecutionFailed(
+                    "BUILD_FAILED",
+                    f"{version} build ended with status {result.get('status')}",
+                )
+        for version in ("vulnerable", "fixed"):
+            for phase in ("normal", "candidate_1", "candidate_2"):
+                _assert_context_unchanged(
+                    dsn,
+                    context,
+                    materials_dir=materials_dir,
+                    material_digests=material_digests,
+                )
+                _assert_budget(context, purpose=f"replaying {version}/{phase}")
+                input_path = inputs["normal"] if phase == "normal" else inputs["candidate"]
+                step_key = _replay_step(version, phase)
+                remaining = _remaining(context) - context.reserve_seconds
+                replay_timeout = min(
+                    float(context.plan["limits"]["replay_seconds"]),
+                    max(1.0, remaining),
+                )
+                result, reused = _run_step(
+                    dsn,
+                    context,
+                    step_key=step_key,
+                    input_digest=context.plan["inputs"][
+                        "normal" if phase == "normal" else "candidate"
+                    ],
+                    action=lambda attempt_no, token, version=version, phase=phase, input_path=input_path, replay_timeout=replay_timeout: _do_replay(
+                        dsn,
+                        context,
+                        sandbox,
+                        builds[version],
+                        version,
+                        phase,
+                        input_path,
+                        replay_timeout,
+                        attempt_no,
+                        token,
+                    ),
+                    reusable=lambda payload: _reusable_replay(build_root, payload),
+                )
+                runs.append(result)
+        input_mismatch = False
+        for run in runs:
+            expected = (
+                context.plan["inputs"]["normal"]
+                if run.get("phase") == "normal"
+                else context.plan["inputs"]["candidate"]
+            )
+            if run.get("input_digest") != expected:
+                input_mismatch = True
+                missing.append(
+                    f"input digest mismatch for {run.get('version')}/{run.get('phase')}"
+                )
+        if input_mismatch:
+            # The completed result does not describe the approved bytes.
+            # Never archive it as a full six-replay bundle: the verifier
+            # rejects plan-mismatched inputs, and there is no verifiable
+            # outcome. B3/B6 require an inconclusive state with no
+            # authoritative verdict.
+            try:
+                finished = state.finish_execution(
+                    dsn,
+                    context.job_id,
+                    generation=context.generation,
+                    state="INCONCLUSIVE",
+                    reason_code="EVIDENCE_INCOMPLETE",
+                    verdict=None,
+                    verdict_reason=None,
+                    evidence_status="failed",
+                    evidence_error=(
+                        "replay input digest does not match the approved plan"
+                    ),
+                    last_error="required input digests do not match the approved plan",
+                    stage="done",
+                )
+            except (state.StateError, state.StaleGeneration):
+                return ExecutionResult("STALE")
+            if not finished:
+                return ExecutionResult("STALE")
+            return ExecutionResult(
+                "INCONCLUSIVE",
+                verdict=None,
+                verdict_reason=None,
+                reason_code="EVIDENCE_INCOMPLETE",
+            )
+        policy = _policy_from_context(context)
+        decision = decide_verdict(
+            policy, [_to_observation(run, build_root) for run in runs], builds=builds
+        )
+        verdict = decision.verdict
+        verdict_reason = decision.reason_code
+    except ExecutionBlocked as error:
+        return _finish_blocked(
+            dsn, job_id, generation, error, context=context, probe=probe_payload, builds=builds, runs=runs
+        )
+    except ExecutionFailed as error:
+        return _finish_failed(
+            dsn, job_id, generation, error, context=context, probe=probe_payload, builds=builds, runs=runs
+        )
+    except SandboxPolicyError as error:
+        return _finish_blocked(
+            dsn,
+            job_id,
+            generation,
+            ExecutionBlocked(error.reason_code, error.message),
+            context=context,
+            probe=probe_payload,
+            builds=builds,
+            runs=runs,
+        )
+    except SandboxUnavailable as error:
+        return _finish_blocked(
+            dsn,
+            job_id,
+            generation,
+            ExecutionBlocked("POLICY_DENIED", error.message),
+            context=context,
+            probe=probe_payload,
+            builds=builds,
+            runs=runs,
+        )
+    except SandboxError as error:
+        return _finish_failed(
+            dsn,
+            job_id,
+            generation,
+            ExecutionFailed(
+                "TIMEOUT" if error.reason_code == "TIMEOUT" else "RUN_INCOMPLETE",
+                error.message,
+            ),
+            context=context,
+            probe=probe_payload,
+            builds=builds,
+            runs=runs,
+        )
+    except state.StaleGeneration:
+        return ExecutionResult("STALE")
+
+    attempt_rows = []
+    for row in state.execution_attempts(dsn, job_id, generation):
+        item = {
+            key: value for key, value in row.items() if key != "attempt_token"
+        }
+        for field in ("started_at", "finished_at"):
+            if item.get(field) is not None:
+                item[field] = jsonutil.timestamp(item[field])
+        attempt_rows.append(item)
+    execution_metadata = {
+        "job_id": context.job_id_text,
+        "plan_digest": context.plan_digest,
+        "generation": generation,
+        "probe": probe_payload,
+        # Mirror the report's list shapes exactly; _verify_semantics rejects a
+        # bundle whose execution metadata and report disagree.
+        "builds": [dict(item) for item in builds.values()],
+        "replays": [dict(item) for item in runs],
+        "attempts": attempt_rows,
+    }
+    evidence_refs = [
+        "report.json",
+        "report.md",
+        "plan.json",
+        "review.json",
+        "metadata/execution.json",
+    ]
+    report, report_markdown = _build_report(
+        context,
+        verdict=decision.verdict,
+        verdict_reason=decision.reason_code,
+        decision=decision,
+        builds=builds,
+        runs=runs,
+        probe=probe_payload,
+        evidence_refs=evidence_refs,
+        missing=missing,
+    )
+    artifacts = _evidence_artifacts(
+        context,
+        build_root,
+        builds=builds,
+        runs=runs,
+        probe=probe_payload,
+        execution_metadata=execution_metadata,
+    )
+    try:
+        digest, path, archive_error = _archive(
+            dsn,
+            context,
+            report=report,
+            report_markdown=report_markdown,
+            artifacts=artifacts,
+            verdict=decision.verdict,
+        )
+    except (BundleError, OSError) as error:
+        archive_error = f"EVIDENCE_WRITE_FAILED: {error}"
+    except (state.StateError, state.StaleGeneration) as error:
+        return ExecutionResult("STALE")
+    if archive_error is not None:
+        try:
+            # The computed decision is not published as authoritative until a
+            # verifiable bundle exists. COALESCE in finish_execution therefore
+            # only preserves a verdict from an earlier successful archive.
+            finished = state.finish_execution(
+                dsn,
+                job_id,
+                generation=context.generation,
+                state="FAILED",
+                reason_code="EVIDENCE_WRITE_FAILED",
+                verdict=None,
+                verdict_reason=None,
+                evidence_status="failed",
+                evidence_error=archive_error,
+                last_error="evidence bundle could not be written",
+                stage="failed",
+            )
+        except (state.StateError, state.StaleGeneration):
+            # Another generation owns the job now (or the lease expired while
+            # archiving). Never let this escape to the workflow's generic
+            # handler, which would leave the job looking recoverable RUNNING.
+            return ExecutionResult("STALE")
+        if not finished:
+            return ExecutionResult("STALE")
+        return ExecutionResult("FAILED", reason_code="EVIDENCE_WRITE_FAILED")
+    final_state = decision.verdict
+    reason_code = None if final_state in ("REPRODUCED", "NOT_REPRODUCED") else decision.reason_code
+    try:
+        finished = state.finish_execution(
+            dsn,
+            job_id,
+            generation=context.generation,
+            state=final_state,
+            reason_code=reason_code,
+            verdict=decision.verdict,
+            verdict_reason=decision.reason_code,
+            evidence_digest=digest,
+            evidence_path=path,
+            evidence_status="archived",
+            stage="done",
+        )
+    except (state.StateError, state.StaleGeneration):
+        _discard_published_bundle(path)
+        return ExecutionResult("STALE")
+    if not finished:
+        _discard_published_bundle(path)
+        return ExecutionResult("STALE")
+    return ExecutionResult(
+        final_state,
+        verdict=decision.verdict,
+        verdict_reason=decision.reason_code,
+        evidence_digest=digest,
+        evidence_path=path,
+        reason_code=reason_code,
+    )
+
+
+def _replay_log_text(
+    payload: Mapping[str, Any], run_root: Path, key: str, digest_key: str
+) -> str:
+    """Load a replay stream from its evidence file, never from report text."""
+    files = payload.get("files")
+    relative = files.get(key) if isinstance(files, Mapping) else None
+    if isinstance(relative, str):
+        path = _run_root_path(run_root, relative, f"/{key}.log")
+        if path is None:
+            raise ExecutionFailed("RUN_INCOMPLETE", f"unsafe {key} evidence path")
+        data = _read_run_file_bounded(path, max_bytes=MAX_LOG_BYTES)
+        if data is None:
+            raise ExecutionFailed(
+                "RUN_INCOMPLETE", f"{key} evidence file is missing or too large"
+            )
+        expected = payload.get("file_digests", {}).get(key) if isinstance(
+            payload.get("file_digests"), Mapping
+        ) else None
+        if expected is not None and _digest(data) != expected:
+            raise ExecutionFailed("RUN_INCOMPLETE", f"{key} evidence file changed")
+        return data.decode("utf-8", "replace")
+    # Legacy journals stored the text inline. Only a bounded preview is trusted
+    # here; full logs always come from the evidence file.
+    return str(payload.get(f"{key}_preview") or payload.get(key) or "")
+
+
+def _to_observation(payload: Mapping[str, Any], run_root: Path) -> RunObservation:
+    from datacon.asan import ASanSignature
+
+    signature = payload.get("signature")
+    parsed = None
+    if isinstance(signature, Mapping):
+        parsed = ASanSignature(
+            error=str(signature.get("error", "")),
+            operation=signature.get("operation"),
+            access_size=signature.get("access_size"),
+            function=signature.get("function"),
+            source=signature.get("source"),
+        )
+    capture_error = payload.get("capture_error")
+    return RunObservation(
+        version=str(payload.get("version", "")),
+        phase=str(payload.get("phase", "")),
+        status=str(payload.get("status", "infra_error")),
+        exit_code=payload.get("exit_code"),
+        stdout=_replay_log_text(payload, run_root, "stdout", "stdout"),
+        stderr=_replay_log_text(payload, run_root, "stderr", "stderr"),
+        signature=parsed,
+        input_digest=payload.get("input_digest"),
+        duration_seconds=payload.get("duration_seconds"),
+        log_truncated=bool(payload.get("log_truncated", False)),
+        capture_error=(
+            str(capture_error) if capture_error is not None else None
+        ),
+    )
+
+
+def _reusable_build(run_root: Path, payload: Mapping[str, Any]) -> bool:
+    if payload.get("status") != "completed":
+        return False
+    files = payload.get("files")
+    digests = payload.get("file_digests")
+    if not isinstance(files, Mapping) or not isinstance(digests, Mapping):
+        return False
+    for key, suffix in (("artifact", "/parser"), ("log", "/build.log")):
+        relative = files.get(key)
+        path = _run_root_path(run_root, relative, suffix)
+        if path is None:
+            return False
+        limit = MAX_ARTIFACT_BYTES if key == "artifact" else MAX_LOG_BYTES
+        data = _read_run_file_bounded(path, max_bytes=limit)
+        if data is None or _digest(data) != digests.get(key):
+            return False
+    return True
+
+
+def _reusable_replay(run_root: Path, payload: Mapping[str, Any]) -> bool:
+    files = payload.get("files")
+    digests = payload.get("file_digests")
+    if not isinstance(files, Mapping) or not isinstance(digests, Mapping):
+        return False
+    for key, suffix in (("stdout", "/stdout.log"), ("stderr", "/stderr.log")):
+        relative = files.get(key)
+        path = _run_root_path(run_root, relative, suffix)
+        if path is None:
+            return False
+        data = _read_run_file_bounded(path, max_bytes=MAX_LOG_BYTES)
+        if data is None or _digest(data) != digests.get(key):
+            return False
+    return True
+
+
+def _do_probe(context: ExecutionContext, sandbox: Any) -> dict[str, Any]:
+    try:
+        report: ProbeReport = sandbox.probe(deadline_seconds=min(PROBE_TIMEOUT, _remaining(context)))
+    except SandboxPolicyError:
+        raise
+    except SandboxUnavailable:
+        raise
+    if not report.ok:
+        raise ExecutionBlocked(
+            "POLICY_DENIED", "the isolation probe did not confirm the policy"
+        )
+    return {
+        "tool_id": "sandbox.probe",
+        "job_id": context.job_id_text,
+        "plan_digest": context.plan_digest,
+        "generation": context.generation,
+        "status": "completed" if report.ok else "policy_denied",
+        "container_id": None,
+        "checks": report.checks,
+        "compiler_version": report.compiler_version,
+        "image_digest": report.image_digest,
+        "limits": report.limits,
+        "raw": report.raw[-64 * 1024 :],
+        "cleanup_errors": list(report.cleanup_errors),
+    }
+
+
+def _expected_build_materials(context: ExecutionContext) -> dict[str, str]:
+    manifest = context.case.manifest
+    source_vulnerable = manifest["versions"]["vulnerable"]
+    source_fixed = manifest["versions"]["fixed"]
+    expected = {
+        manifest["harness"]: context.plan["harness_digest"],
+        manifest["build_recipe"]: context.plan["build_recipe_digest"],
+        manifest["dependencies"]: context.plan["dependencies_digest"],
+    }
+    for relative in (source_vulnerable, source_fixed):
+        digest = context.materials.get(relative)
+        if isinstance(digest, str):
+            expected[relative] = digest
+    return expected
+
+
+def _do_build(
+    dsn: str,
+    context: ExecutionContext,
+    sandbox: Any,
+    materials_dir: Path,
+    material_digests: Mapping[str, str],
+    version: str,
+    attempt_no: int,
+    token: str,
+) -> dict[str, Any]:
+    deadline = max(1.0, min(BUILD_TIMEOUT, _remaining(context) - context.reserve_seconds))
+    # Hash the exact tree that will be mounted immediately before the
+    # container is created. A replaced recipe/source aborts the step.
+    _verify_materialized_tree(materials_dir, material_digests)
+    staging: Path | None = None
+    failure: BaseException | None = None
+    try:
+        # The container only ever mounts this copy. A writer limited to the
+        # run root cannot replace the bytes after this point.
+        staging, staged_materials = _stage_materials(
+            context,
+            materials_dir,
+            material_digests,
+            f"build-{version}-attempt-{attempt_no}",
+        )
+        result: BuildResult = sandbox.build(
+            version,
+            materials_dir=staging,
+            compile_args=context.compile_args,
+            deadline_seconds=deadline,
+            expected_materials=_expected_build_materials(context),
+        )
+        return _persist_build(
+            dsn,
+            context,
+            result,
+            attempt_no,
+            token,
+            staged_materials=staged_materials,
+        )
+    except BaseException as error:
+        failure = error
+        raise
+    finally:
+        if staging is not None:
+            _cleanup_staging(staging, failure)
+
+
+def _do_replay(
+    dsn: str,
+    context: ExecutionContext,
+    sandbox: Any,
+    build: Mapping[str, Any],
+    version: str,
+    phase: str,
+    input_path: Path,
+    timeout_seconds: float,
+    attempt_no: int,
+    token: str,
+) -> dict[str, Any]:
+    files = build.get("files") if isinstance(build.get("files"), Mapping) else {}
+    relative = files.get("artifact") if isinstance(files, Mapping) else None
+    artifact_path = _run_root_path(_work_root(context), relative, "/parser")
+    if artifact_path is None:
+        raise ExecutionBlocked(
+            "PLAN_MISMATCH", "the build result has no trusted parser path"
+        )
+    expected_artifact = build.get("artifact_digest")
+    if not isinstance(expected_artifact, str):
+        raise ExecutionBlocked(
+            "PLAN_MISMATCH", "the build result has no trusted parser digest"
+        )
+    artifact = _read_run_file_bounded(
+        artifact_path, max_bytes=MAX_ARTIFACT_BYTES
+    )
+    if artifact is None:
+        raise ExecutionBlocked(
+            "MATERIAL_MISSING",
+            "the built parser is missing, not regular or too large",
+        )
+    if _digest(artifact) != expected_artifact:
+        raise ExecutionBlocked(
+            "PLAN_MISMATCH", "the built parser changed before replay"
+        )
+    expected_input = context.plan["inputs"][
+        "normal" if phase == "normal" else "candidate"
+    ]
+    staging: Path | None = None
+    failure: BaseException | None = None
+    try:
+        # Parser and input are copied out of the run root, re-hashed, and only
+        # then mounted. The sandbox also re-checks both digests before create.
+        staging, staged_artifact, staged_input = _stage_replay_files(
+            context,
+            artifact_path,
+            expected_artifact,
+            input_path,
+            expected_input,
+            f"replay-{version}-{phase}-attempt-{attempt_no}",
+        )
+        try:
+            result: ReplayResult = sandbox.replay(
+                version,
+                phase,
+                artifact_path=staged_artifact,
+                input_path=staged_input,
+                asan_options=context.plan["asan_options"],
+                timeout_seconds=timeout_seconds,
+                deadline_seconds=timeout_seconds,
+                expected_artifact_digest=expected_artifact,
+                expected_input_digest=expected_input,
+            )
+        except SandboxError as error:
+            if error.reason_code != "TIMEOUT":
+                raise
+            # A docker exec/wait timeout is replay evidence, not an infrastructure
+            # failure: persist a timeout observation so the verdict layer can
+            # return INCONCLUSIVE/TIMEOUT instead of FAILED.
+            result = ReplayResult(
+                version=version,
+                phase=phase,
+                status="timeout",
+                exit_code=None,
+                duration_seconds=0.0,
+                container_id=None,
+                input_digest=expected_input,
+                stdout=b"",
+                stderr=b"",
+                signature=None,
+                timed_out=True,
+                quota_hit=False,
+                log_truncated=False,
+                metadata={
+                    "image_digest": context.plan["image_digest"],
+                    "asan_options": context.plan["asan_options"],
+                    "timeout_seconds": timeout_seconds,
+                    "error": error.message,
+                },
+            )
+        return _persist_replay(
+            dsn,
+            context,
+            result,
+            attempt_no,
+            token,
+            artifact_digest=expected_artifact,
+        )
+    except BaseException as error:
+        failure = error
+        raise
+    finally:
+        if staging is not None:
+            _cleanup_staging(staging, failure)
+
+
+def _finish_blocked(
+    dsn: str,
+    job_id: UUID,
+    generation: int,
+    error: ExecutionBlocked,
+    *,
+    case_root: str | None = None,
+    run_root: Path | str | None = None,
+    context: ExecutionContext | None = None,
+    probe: Mapping[str, Any] | None = None,
+    builds: Mapping[str, Mapping[str, Any]] | None = None,
+    runs: Sequence[Mapping[str, Any]] | None = None,
+) -> ExecutionResult:
+    """Archive the blocking reason, then commit BLOCKED.
+
+    A block before the plan can be loaded still has a claimed RUNNING job; the
+    context is loaded again if possible so the report carries the target. The
+    caller's ``case_root``/``run_root`` are reused here: falling back to the
+    environment defaults would make ``_archive`` compare the evidence root
+    against a different run root and could publish a BLOCKED bundle into the
+    real run root.
+    """
+    if context is None:
+        try:
+            context = _load_context(
+                dsn,
+                job_id,
+                generation,
+                case_root=case_root,
+                run_root=run_root,
+            )
+        except state.StaleGeneration:
+            return ExecutionResult("STALE")
+        except ExecutionFailed as reload_error:
+            # The blocking context could not be reconstructed with the caller's
+            # roots. Never archive against guessed roots; keep the failure
+            # visible instead of publishing a bundle to the wrong tree.
+            return _finish_evidence_path_failure(
+                dsn,
+                job_id,
+                generation,
+                ExecutionFailed(
+                    "EVIDENCE_WRITE_FAILED",
+                    "execution context could not be reconstructed: "
+                    f"{reload_error.message}",
+                ),
+            )
+        except ExecutionBlocked:
+            # The same (or another) business block prevents reconstruction.
+            # There is no archive to misplace, so the original reason stands.
+            context = None
+    if context is None:
+        try:
+            finished = state.finish_execution(
+                dsn,
+                job_id,
+                generation=generation,
+                state="BLOCKED",
+                reason_code=error.reason_code,
+                verdict=None,
+                verdict_reason=None,
+                evidence_status="failed",
+                evidence_error=error.message,
+                last_error=error.message,
+                stage="blocked",
+            )
+        except (state.StateError, state.StaleGeneration):
+            return ExecutionResult("STALE")
+        if not finished:
+            return ExecutionResult("STALE")
+        return ExecutionResult("BLOCKED", reason_code=error.reason_code)
+    work_root = context.run_root / context.job_id_text / context.plan_digest.split(":")[1]
+    build_root = work_root / "run"
+    build_root.mkdir(parents=True, exist_ok=True)
+    report, markdown = _build_report(
+        context,
+        verdict="BLOCKED",
+        verdict_reason=error.reason_code,
+        decision=None,
+        builds=builds or {},
+        runs=runs or [],
+        probe=probe,
+        evidence_refs=["report.json", "report.md", "plan.json", "review.json"],
+        missing=[
+            "target execution blocked"
+        ],
+        error=f"{error.reason_code}: {error.message}",
+    )
+    try:
+        digest, path, archive_error = _archive(
+            dsn,
+            context,
+            report=report,
+            report_markdown=markdown,
+            artifacts=_evidence_artifacts(
+                context,
+                build_root,
+                builds=builds or {},
+                runs=runs or [],
+                probe=probe,
+                execution_metadata={},
+            ),
+            verdict="BLOCKED",
+        )
+    except state.StaleGeneration:
+        return ExecutionResult("STALE")
+    except (BundleError, state.StateError) as archive_failure:
+        archive_error = str(archive_failure)
+        digest = path = None
+    if archive_error is not None:
+        kwargs: dict[str, Any] = {
+            "evidence_status": "failed",
+            "evidence_error": archive_error,
+            "last_error": error.message,
+        }
+        try:
+            finished = state.finish_execution(
+                dsn,
+                job_id,
+                generation=generation,
+                state="FAILED",
+                reason_code="EVIDENCE_WRITE_FAILED",
+                verdict=None,
+                verdict_reason=None,
+                stage="failed",
+                **kwargs,
+            )
+        except (state.StateError, state.StaleGeneration):
+            return ExecutionResult("STALE")
+        if not finished:
+            return ExecutionResult("STALE")
+        return ExecutionResult("FAILED", reason_code="EVIDENCE_WRITE_FAILED")
+    try:
+        finished = state.finish_execution(
+            dsn,
+            job_id,
+            generation=generation,
+            state="BLOCKED",
+            reason_code=error.reason_code,
+            verdict=None,
+            verdict_reason=None,
+            evidence_digest=digest,
+            evidence_path=path,
+            evidence_status="archived",
+            last_error=error.message,
+            stage="blocked",
+        )
+    except (state.StateError, state.StaleGeneration):
+        _discard_published_bundle(path)
+        return ExecutionResult("STALE")
+    if not finished:
+        _discard_published_bundle(path)
+        return ExecutionResult("STALE")
+    return ExecutionResult(
+        "BLOCKED",
+        reason_code=error.reason_code,
+        evidence_digest=digest,
+        evidence_path=path,
+    )
+
+
+def _finish_blocked_failed(
+    dsn: str, job_id: UUID, generation: int, error: ExecutionFailed
+) -> ExecutionResult:
+    try:
+        finished = state.finish_execution(
+            dsn,
+            job_id,
+            generation=generation,
+            state="FAILED",
+            reason_code=error.reason_code,
+            verdict=None,
+            verdict_reason=None,
+            evidence_status="failed",
+            evidence_error=error.message,
+            last_error=error.message,
+            stage="failed",
+        )
+    except (state.StateError, state.StaleGeneration):
+        return ExecutionResult("STALE")
+    if not finished:
+        return ExecutionResult("STALE")
+    return ExecutionResult("FAILED", reason_code=error.reason_code)
+
+
+def _finish_failed(
+    dsn: str,
+    job_id: UUID,
+    generation: int,
+    error: ExecutionFailed,
+    *,
+    context: ExecutionContext,
+    probe: Mapping[str, Any] | None,
+    builds: Mapping[str, Mapping[str, Any]],
+    runs: Sequence[Mapping[str, Any]],
+) -> ExecutionResult:
+    work_root = context.run_root / context.job_id_text / context.plan_digest.split(":")[1]
+    build_root = work_root / "run"
+    build_root.mkdir(parents=True, exist_ok=True)
+    incomplete = error.reason_code in (
+        "RUN_INCOMPLETE",
+        "NOT_COMPARABLE",
+        "TIMEOUT",
+    )
+    terminal = "INCONCLUSIVE" if incomplete else "FAILED"
+    report, markdown = _build_report(
+        context,
+        verdict=terminal,
+        verdict_reason=error.reason_code,
+        decision=None,
+        builds=builds,
+        runs=runs,
+        probe=probe,
+        evidence_refs=["report.json", "report.md", "plan.json", "review.json"],
+        missing=["required replay evidence is incomplete"] if incomplete else ["execution failed"],
+        error=f"{error.reason_code}: {error.message}",
+    )
+    try:
+        digest, path, archive_error = _archive(
+            dsn,
+            context,
+            report=report,
+            report_markdown=markdown,
+            artifacts=_evidence_artifacts(
+                context,
+                build_root,
+                builds=builds,
+                runs=runs,
+                probe=probe,
+                execution_metadata={
+                    "job_id": context.job_id_text,
+                    "plan_digest": context.plan_digest,
+                    "generation": generation,
+                    "probe": probe,
+                    "builds": [dict(item) for item in builds.values()],
+                    "replays": [dict(item) for item in runs],
+                },
+            ),
+            verdict=terminal,
+        )
+    except state.StaleGeneration:
+        return ExecutionResult("STALE")
+    except (BundleError, state.StateError) as archive_failure:
+        digest = path = None
+        archive_error = str(archive_failure)
+    if archive_error is not None:
+        try:
+            finished = state.finish_execution(
+                dsn,
+                job_id,
+                generation=generation,
+                state="FAILED",
+                reason_code="EVIDENCE_WRITE_FAILED",
+                verdict=None,
+                verdict_reason=None,
+                evidence_status="failed",
+                evidence_error=archive_error,
+                last_error=error.message,
+                stage="failed",
+            )
+        except (state.StateError, state.StaleGeneration):
+            return ExecutionResult("STALE")
+        if not finished:
+            return ExecutionResult("STALE")
+        return ExecutionResult("FAILED", reason_code="EVIDENCE_WRITE_FAILED")
+    try:
+        finished = state.finish_execution(
+            dsn,
+            job_id,
+            generation=generation,
+            state=terminal,
+            reason_code=error.reason_code,
+            verdict=terminal if incomplete else None,
+            verdict_reason=error.reason_code if incomplete else None,
+            evidence_digest=digest,
+            evidence_path=path,
+            evidence_status="archived",
+            last_error=error.message,
+            stage="failed",
+        )
+    except (state.StateError, state.StaleGeneration):
+        _discard_published_bundle(path)
+        return ExecutionResult("STALE")
+    if not finished:
+        _discard_published_bundle(path)
+        return ExecutionResult("STALE")
+    return ExecutionResult(
+        terminal,
+        verdict=terminal if incomplete else None,
+        verdict_reason=error.reason_code if incomplete else None,
+        reason_code=error.reason_code,
+        evidence_digest=digest,
+        evidence_path=path,
+    )

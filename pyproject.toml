@@ -39,4 +39,5 @@ testpaths = ["tests"]
 markers = [
     "postgres: requires a migrated PostgreSQL test database",
     "asan: requires a C compiler with AddressSanitizer support",
+    "docker: requires a Docker daemon and the pinned toolchain image",
 ]

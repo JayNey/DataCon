@@ -7,9 +7,12 @@
     "network": "none",
     "user": "65534:65534",
     "read_only_root": true,
-    "cap_drop": ["ALL"],
+    "cap_drop": [
+      "ALL"
+    ],
     "no_new_privileges": true,
-    "seccomp": "runtime/default"
+    "seccomp": "runtime/default",
+    "seccomp_profile_digest": "sha256:885442dc08f21f8d60f99ea43d59af88b1c529103815fe24bbf9ce998d3a609d"
   },
   "cases": {
     "fixture-c-parser": {

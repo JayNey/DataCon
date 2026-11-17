@@ -40,7 +40,7 @@ def crash_after_interrupt_before_finalize(database, tmp_path, monkeypatch):
 
     monkeypatch.setattr(state, "finalize_workflow", crash_once)
 
-    first = workflow.run_worker(database.dsn, once=True)
+    first = workflow.run_worker(database.dsn, once=True, execute=False)
     assert first["processed"] == 1
     assert first["state"] == "AWAITING_REVIEW"
     assert first["workflow"] == "interrupted"
@@ -55,7 +55,7 @@ def crash_after_interrupt_before_finalize(database, tmp_path, monkeypatch):
         "WHERE job_id = %s",
         (job_uuid,),
     )
-    restart = workflow.run_worker(database.dsn, once=True)
+    restart = workflow.run_worker(database.dsn, once=True, execute=False)
     assert restart["processed"] == 1
     assert restart["state"] == "AWAITING_REVIEW"
 
@@ -110,7 +110,7 @@ def test_crash_before_finalize_then_approve_converges(
     assert outcome.status == "applied"
     assert outcome.state == "READY"
 
-    resumed = workflow.run_worker(isolated_database.dsn, once=True)
+    resumed = workflow.run_worker(isolated_database.dsn, once=True, execute=False)
     assert resumed["processed"] == 1
     assert resumed["state"] == "READY"
     assert resumed["workflow"] == "completed"
@@ -152,7 +152,7 @@ def test_crash_before_finalize_then_reject_converges(
     assert outcome.status == "applied"
     assert outcome.state == "BLOCKED"
 
-    resumed = workflow.run_worker(isolated_database.dsn, once=True)
+    resumed = workflow.run_worker(isolated_database.dsn, once=True, execute=False)
     assert resumed["processed"] == 1
     assert resumed["state"] == "BLOCKED"
     assert resumed["workflow"] == "completed"
@@ -190,7 +190,7 @@ def test_crash_before_finalize_then_review_expiry_converges(
         (job_uuid,),
     )
 
-    expired = workflow.run_worker(isolated_database.dsn, once=True)
+    expired = workflow.run_worker(isolated_database.dsn, once=True, execute=False)
     assert expired["processed"] == 1
     assert expired["state"] == "BLOCKED"
     assert expired["workflow"] == "completed"
@@ -213,7 +213,7 @@ def test_crash_before_finalize_then_review_expiry_converges(
 
     # Expiring a review increments the generation, so the expiring worker
     # cannot finalize. The next worker claims the BLOCKED job and syncs it.
-    synced = workflow.run_worker(isolated_database.dsn, once=True)
+    synced = workflow.run_worker(isolated_database.dsn, once=True, execute=False)
     assert synced["processed"] == 1
     assert synced["state"] == "BLOCKED"
     assert synced["workflow"] == "completed"
@@ -238,7 +238,7 @@ def test_old_generation_cannot_finalize_after_pre_finalize_crash(
         return real_finalize(dsn, job_id, generation)
 
     monkeypatch.setattr(state, "finalize_workflow", crash_once)
-    first = workflow.run_worker(isolated_database.dsn, once=True)
+    first = workflow.run_worker(isolated_database.dsn, once=True, execute=False)
     assert first["state"] == "AWAITING_REVIEW"
 
     old_generation = state.load_job(isolated_database.dsn, job_uuid)["generation"]

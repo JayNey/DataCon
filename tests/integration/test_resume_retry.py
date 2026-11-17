@@ -94,7 +94,7 @@ def crash_after_interrupt_before_finalize(database, tmp_path, monkeypatch):
         return real_finalize(dsn, job_id, generation)
 
     monkeypatch.setattr(state, "finalize_workflow", crash_once)
-    first = workflow.run_worker(database.dsn, once=True)
+    first = workflow.run_worker(database.dsn, once=True, execute=False)
     assert first["processed"] == 1
     assert first["state"] == "AWAITING_REVIEW"
 
@@ -118,7 +118,7 @@ def test_prepare_retry_continues_the_pending_node(
     job_uuid = uuid.UUID(job["job_id"])
     fail_first(monkeypatch, "load_job")
 
-    result = workflow.run_worker(isolated_database.dsn, once=True)
+    result = workflow.run_worker(isolated_database.dsn, once=True, execute=False)
 
     assert result["processed"] == 1
     assert result["state"] == "AWAITING_REVIEW"
@@ -144,12 +144,12 @@ def test_pending_review_resume_survives_transient_read(
 ):
     job = submit(isolated_database.dsn, write_request(tmp_path))
     job_uuid = uuid.UUID(job["job_id"])
-    first = workflow.run_worker(isolated_database.dsn, once=True)
+    first = workflow.run_worker(isolated_database.dsn, once=True, execute=False)
     assert first["state"] == "AWAITING_REVIEW"
     park_then_expire_lease(isolated_database, job_uuid)
 
     fail_first(monkeypatch, "get_review")
-    resumed = workflow.run_worker(isolated_database.dsn, once=True)
+    resumed = workflow.run_worker(isolated_database.dsn, once=True, execute=False)
 
     assert resumed["processed"] == 1
     assert resumed["state"] == "AWAITING_REVIEW"
@@ -192,7 +192,7 @@ def test_approved_resume_survives_transient_read(
 ):
     job = submit(isolated_database.dsn, write_request(tmp_path))
     job_uuid = uuid.UUID(job["job_id"])
-    workflow.run_worker(isolated_database.dsn, once=True)
+    workflow.run_worker(isolated_database.dsn, once=True, execute=False)
     digest = pending_digest(isolated_database, job_uuid)
     approved = state.record_review(
         isolated_database.dsn,
@@ -204,7 +204,7 @@ def test_approved_resume_survives_transient_read(
     assert approved.state == "READY"
 
     fail_first(monkeypatch, "get_plan")
-    resumed = workflow.run_worker(isolated_database.dsn, once=True)
+    resumed = workflow.run_worker(isolated_database.dsn, once=True, execute=False)
 
     assert resumed["processed"] == 1
     assert resumed["state"] == "READY"
@@ -240,7 +240,7 @@ def test_rejected_resume_survives_transient_read(
 ):
     job = submit(isolated_database.dsn, write_request(tmp_path))
     job_uuid = uuid.UUID(job["job_id"])
-    workflow.run_worker(isolated_database.dsn, once=True)
+    workflow.run_worker(isolated_database.dsn, once=True, execute=False)
     digest = pending_digest(isolated_database, job_uuid)
     rejected = state.record_review(
         isolated_database.dsn,
@@ -252,7 +252,7 @@ def test_rejected_resume_survives_transient_read(
     assert rejected.state == "BLOCKED"
 
     fail_first(monkeypatch, "get_plan")
-    resumed = workflow.run_worker(isolated_database.dsn, once=True)
+    resumed = workflow.run_worker(isolated_database.dsn, once=True, execute=False)
 
     assert resumed["processed"] == 1
     assert resumed["state"] == "BLOCKED"
@@ -289,7 +289,7 @@ def test_pre_finalize_crash_resume_survives_transient_read(
         isolated_database, tmp_path, monkeypatch
     )
     fail_first(monkeypatch, "get_review")
-    restarted = workflow.run_worker(isolated_database.dsn, once=True)
+    restarted = workflow.run_worker(isolated_database.dsn, once=True, execute=False)
 
     assert restarted["processed"] == 1
     assert restarted["state"] == "AWAITING_REVIEW"
@@ -330,7 +330,7 @@ def test_persistent_resume_error_keeps_the_business_record(
 ):
     job = submit(isolated_database.dsn, write_request(tmp_path))
     job_uuid = uuid.UUID(job["job_id"])
-    workflow.run_worker(isolated_database.dsn, once=True)
+    workflow.run_worker(isolated_database.dsn, once=True, execute=False)
     digest = pending_digest(isolated_database, job_uuid)
     recorded = state.record_review(
         isolated_database.dsn,
@@ -342,7 +342,7 @@ def test_persistent_resume_error_keeps_the_business_record(
     assert recorded.state == expected_state
 
     fail_first(monkeypatch, "get_plan", times=2)
-    failed = workflow.run_worker(isolated_database.dsn, once=True)
+    failed = workflow.run_worker(isolated_database.dsn, once=True, execute=False)
 
     assert failed["processed"] == 1
     current = state.load_job(isolated_database.dsn, job_uuid)
@@ -377,7 +377,7 @@ def test_persistent_resume_error_keeps_the_business_record(
         "WHERE job_id = %s",
         (job_uuid,),
     )
-    recovered = workflow.run_worker(isolated_database.dsn, once=True)
+    recovered = workflow.run_worker(isolated_database.dsn, once=True, execute=False)
     assert recovered["processed"] == 1
     assert recovered["state"] == expected_state
     current = state.load_job(isolated_database.dsn, job_uuid)
