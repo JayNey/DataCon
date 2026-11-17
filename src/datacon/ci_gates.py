@@ -151,11 +151,18 @@ def _workflow_trigger(document: Mapping[str, Any]) -> Any:
 
 
 def _check_permissions(
-    value: Any, *, path: Path, label: str, errors: list[str]
+    value: Any,
+    *,
+    path: Path,
+    label: str,
+    errors: list[str],
+    require_contents: bool = False,
 ) -> None:
     if not isinstance(value, Mapping):
         errors.append(f"{path}: {label} permissions must be a mapping")
         return
+    if require_contents and "contents" not in value:
+        errors.append(f"{path}: {label} permissions must declare contents: read")
     for key, level in value.items():
         if not isinstance(key, str):
             errors.append(f"{path}: {label} permission key must be a string")
@@ -216,7 +223,11 @@ def check_workflow_security(files: Iterable[Path]) -> list[str]:
             errors.append(f"{path}: workflow must declare 'contents: read' permissions")
         else:
             _check_permissions(
-                document["permissions"], path=path, label="workflow", errors=errors
+                document["permissions"],
+                path=path,
+                label="workflow",
+                errors=errors,
+                require_contents=True,
             )
 
         jobs = document.get("jobs")

@@ -139,6 +139,21 @@ def test_workflow_security_rejects_write_all(tmp_path):
     errors = ci_gates.check_workflow_security([bad])
     assert any("permissions must be a mapping" in err for err in errors)
 
+    empty = tmp_path / "empty.yml"
+    empty.write_text(
+        "name: Empty\n"
+        "on:\n"
+        "  pull_request:\n"
+        "permissions: {}\n"
+        "jobs:\n"
+        "  test:\n"
+        "    steps:\n"
+        "      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262\n",
+        encoding="utf-8",
+    )
+    errors = ci_gates.check_workflow_security([empty])
+    assert any("contents: read" in err for err in errors)
+
 
 def test_workflow_security_rejects_run_expressions_and_untrusted_checkout_ref(tmp_path):
     expression = _workflow(
