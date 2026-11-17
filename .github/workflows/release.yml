@@ -605,7 +605,10 @@ jobs:
               job_id=str(uuid.uuid4()),
               run_root=pathlib.Path(os.environ.get("RUNNER_TEMP", "/tmp")) / "b03-runs",
           )
-          bundle_out = pathlib.Path(os.environ.get("RUNNER_TEMP", "/tmp")) / "b03-bundle"
+          bundle_out = (
+              pathlib.Path(os.environ.get("RUNNER_TEMP", "/tmp"))
+              / ("b03-bundle-" + os.environ.get("GITHUB_RUN_ID", "local"))
+          )
           acceptance = release.run_b03_acceptance(
               admission=admission,
               sandbox=sandbox,
