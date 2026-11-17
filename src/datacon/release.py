@@ -577,6 +577,12 @@ def promote_and_smoke(
             raise ReleaseGateError(
                 "candidate already has a non-promoted audit record; refusing to replay"
             )
+        active = backend.active_release()
+        if active is None or active.get("image_id") != existing.get("active_image_id"):
+            raise ReleaseGateError(
+                "candidate was previously promoted but the active release changed; "
+                "refusing to replay a stale approval"
+            )
         return dict(existing)
 
     active_slots = backend.active_slots()

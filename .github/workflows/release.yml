@@ -267,12 +267,13 @@ jobs:
 
   promote-internal:
     needs: build-candidate
-    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'promote')
+    if: always() && (startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'promote'))
     environment: internal-lab
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
       EXPECTED_MANIFEST_DIGEST: ${{ github.event.inputs.expected_manifest_digest || needs.build-candidate.outputs.manifest_digest }}
+      ARTIFACT_RUN_ID: ${{ github.event.inputs.artifact_run_id }}
       DATACON_DATABASE_URL: ${{ secrets.DATACON_DATABASE_URL }}
       DATACON_RELEASE_APPROVAL: ${{ secrets.DATACON_RELEASE_APPROVAL }}
     steps:
@@ -285,11 +286,29 @@ jobs:
           python -m pip install --disable-pip-version-check --require-hashes \
             --only-binary :all: -r requirements-ci.txt
           uv sync --frozen
-      - name: Download the candidate artifact
+      - name: Require an explicit artifact run for a dispatched promotion
+        if: github.event_name == 'workflow_dispatch'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "${ARTIFACT_RUN_ID}" ]; then
+            echo "artifact_run_id is required to promote a previously built candidate" >&2
+            exit 1
+          fi
+      - name: Download the candidate artifact from this run
+        if: github.event_name != 'workflow_dispatch'
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: release-candidate-artifacts
           path: ${{ runner.temp }}/release-artifacts
+      - name: Download the candidate artifact from the selected run
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-candidate-artifacts
+          path: ${{ runner.temp }}/release-artifacts
+          run-id: ${{ github.event.inputs.artifact_run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
       - name: Validate the approved manifest digest and loaded image id
         shell: bash
         run: |

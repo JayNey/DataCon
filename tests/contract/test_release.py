@@ -271,6 +271,38 @@ def test_promotion_switches_state_audits_once_and_is_idempotent():
     assert len(backend.audits) == 1
 
 
+def test_replayed_approval_after_a_state_change_is_rejected():
+    manifest = _sample_rc_manifest()
+    backend = _backend()
+    approval = _approval(manifest)
+    release.promote_and_smoke(
+        manifest=manifest,
+        expected_manifest_digest=approval["candidate_digest"],
+        approval=approval,
+        backend=backend,
+        smoke_checks={"cli_smoke": lambda: True},
+        rollback_fn=lambda prev: {"restored_image": prev["image_id"], "ok": True},
+    )
+    previous = _previous()
+    backend.switch(
+        image_id=previous["image_id"],
+        config=previous["config"],
+        migration_version=previous["migration_version"],
+        evidence_root=previous["evidence_root"],
+        action="rollback",
+        candidate_digest=approval["candidate_digest"],
+    )
+    with pytest.raises(release.ReleaseGateError, match="stale approval"):
+        release.promote_and_smoke(
+            manifest=manifest,
+            expected_manifest_digest=approval["candidate_digest"],
+            approval=approval,
+            backend=backend,
+            smoke_checks={"cli_smoke": lambda: True},
+            rollback_fn=lambda prev: {"restored_image": prev["image_id"], "ok": True},
+        )
+
+
 def test_smoke_failure_restores_previous_release_and_changes_active_state():
     manifest = _sample_rc_manifest()
     previous = _previous()

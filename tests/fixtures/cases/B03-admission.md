@@ -20,3 +20,4 @@
 - 验收编排入口：`datacon.release.run_b03_acceptance`（执行隔离探针、双版本构建、每版 1 次正常对照 + 2 次候选输入共 6 次回放，得出 `REPRODUCED` 并通过 `datacon.evidence.verify_bundle` 校验）。
 - 仓库内仅提交公开元数据、准入核对记录与脱敏摘要契约，不提交真实案例输入、构建日志、完整 ASan 诊断、凭证或证据包实体。
 - 预期结论为 `REPRODUCED`，仓库基线在未连接授权 Linux 实验环境实机回放前保持 `expected_verdict_status = pending_t05_replay` 与 `asan_signature.status = expected_pending_t05_replay`。
+- `run_b03_acceptance` 会硬拒绝 `pending_t05_replay` / 非 `frozen` 的签名状态；必须由 T05 在授权环境完成回放并冻结签名后，才能用真实 `case_root`、审核人 `review` 和授权 runner 执行验收。

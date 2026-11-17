@@ -80,6 +80,7 @@ def test_promote_job_downloads_verifies_loads_smokes_and_audits():
     ):
         assert required in text, required
     assert "DATACON_RELEASE_APPROVAL" in text
+    assert "artifact_run_id is required" in text
     assert '"promoted"' in text
 
 
