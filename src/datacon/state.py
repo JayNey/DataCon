@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import re
 import uuid
-from typing import Any
+from typing import Any, Mapping
 from uuid import UUID
 
 import psycopg
@@ -1292,3 +1293,243 @@ def status(dsn: str, job_id: UUID) -> dict[str, Any] | None:
         "verdict_current": verdict_current,
         "evidence": evidence,
     }
+
+
+# ---------------------------------------------------------------------------
+# Release promotion / rollback persistence (T08, TC-10, SF2)
+# ---------------------------------------------------------------------------
+
+RELEASE_ENVIRONMENT = "internal-lab"
+RELEASE_ACTIVE_STATES = ("PREPARING", "RUNNING", "ARCHIVING")
+_RELEASE_DIGEST_FIELDS = ("candidate_digest", "manifest_digest")
+
+
+class ReleaseStateError(StateError):
+    """A persisted release transition is invalid or missing."""
+
+
+def _release_digest(value: Any, label: str) -> str:
+    if not isinstance(value, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", value):
+        raise ReleaseStateError(f"{label} must be a sha256 digest")
+    return value
+
+
+class ReleaseStore:
+    """PostgreSQL-backed promotion state and append-only audit.
+
+    The store is the only source of the active slots and previous release. A
+    workflow cannot pass those values in, which is what makes the promotion
+    gate causal rather than self-attested.
+    """
+
+    def __init__(self, dsn: str, *, environment: str = RELEASE_ENVIRONMENT):
+        if not isinstance(environment, str) or not environment.strip():
+            raise ReleaseStateError("release environment must be a non-empty string")
+        self.dsn = dsn
+        self.environment = environment
+
+    def _connect(self):
+        return psycopg.connect(
+            self.dsn, connect_timeout=5, row_factory=dict_row
+        )
+
+    def active_slots(self) -> int:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT COUNT(*) AS active FROM jobs WHERE state = ANY(%s)",
+                (list(RELEASE_ACTIVE_STATES),),
+            ).fetchone()
+        return int(row["active"])
+
+    def active_release(self) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT image_id, config, migration_version, evidence_root, updated_at "
+                "FROM release_state WHERE environment = %s",
+                (self.environment,),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "image_id": row["image_id"],
+            "config": row["config"],
+            "migration_version": row["migration_version"],
+            "evidence_root": row["evidence_root"],
+            "updated_at": row["updated_at"].isoformat(),
+        }
+
+    def bootstrap_release(
+        self,
+        *,
+        image_id: str,
+        config: Mapping[str, Any],
+        migration_version: str,
+        evidence_root: str,
+    ) -> None:
+        """Insert the baseline release once; an existing row is never overwritten."""
+        _release_digest(image_id, "bootstrap image_id")
+        with self._connect() as connection:
+            connection.execute(
+                "INSERT INTO release_state "
+                "(environment, image_id, config, migration_version, evidence_root) "
+                "VALUES (%s, %s, %s, %s, %s) ON CONFLICT (environment) DO NOTHING",
+                (
+                    self.environment,
+                    image_id,
+                    Jsonb(dict(config)),
+                    migration_version,
+                    evidence_root,
+                ),
+            )
+
+    def switch(
+        self,
+        *,
+        image_id: str,
+        config: Mapping[str, Any],
+        migration_version: str,
+        evidence_root: str,
+        action: str,
+        candidate_digest: str,
+    ) -> None:
+        _release_digest(image_id, "switch image_id")
+        _release_digest(candidate_digest, "switch candidate_digest")
+        if action not in ("promote", "rollback"):
+            raise ReleaseStateError(f"unknown release action: {action}")
+        with self._connect() as connection:
+            connection.execute(
+                "INSERT INTO release_state "
+                "(environment, image_id, config, migration_version, evidence_root) "
+                "VALUES (%s, %s, %s, %s, %s) "
+                "ON CONFLICT (environment) DO UPDATE SET "
+                "image_id = EXCLUDED.image_id, config = EXCLUDED.config, "
+                "migration_version = EXCLUDED.migration_version, "
+                "evidence_root = EXCLUDED.evidence_root, "
+                "updated_at = clock_timestamp()",
+                (
+                    self.environment,
+                    image_id,
+                    Jsonb(dict(config)),
+                    migration_version,
+                    evidence_root,
+                ),
+            )
+
+    def record_audit(self, result: Mapping[str, Any]) -> None:
+        status = result.get("status")
+        action = {"promoted": "promote", "rolled_back": "rollback"}.get(status)
+        if action is None:
+            raise ReleaseStateError(f"unknown release result status: {status!r}")
+        candidate_digest = _release_digest(
+            result.get("candidate_digest"), "candidate_digest"
+        )
+        manifest_digest = result.get("manifest_digest")
+        if manifest_digest is None:
+            # A promotion result is bound to the approved manifest; a manual
+            # rollback result records the target image id instead.
+            manifest_digest = candidate_digest
+        manifest_digest = _release_digest(manifest_digest, "manifest_digest")
+        active_image = _release_digest(result.get("active_image_id"), "active_image_id")
+        previous_image = result.get("previous_image_id")
+        if previous_image is not None:
+            previous_image = _release_digest(previous_image, "previous_image_id")
+        with self._connect() as connection:
+            connection.execute(
+                "INSERT INTO release_events "
+                "(event_id, environment, action, status, candidate_digest, "
+                "manifest_digest, previous_image_id, active_image_id, payload) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) "
+                "ON CONFLICT (environment, action, candidate_digest) DO NOTHING",
+                (
+                    uuid.uuid4(),
+                    self.environment,
+                    action,
+                    status,
+                    candidate_digest,
+                    manifest_digest,
+                    previous_image,
+                    active_image,
+                    Jsonb(dict(result)),
+                ),
+            )
+
+    def promotion_for(self, candidate_digest: str) -> dict[str, Any] | None:
+        _release_digest(candidate_digest, "candidate_digest")
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT payload FROM release_events "
+                "WHERE environment = %s AND action = 'promote' "
+                "AND candidate_digest = %s",
+                (self.environment, candidate_digest),
+            ).fetchone()
+        return dict(row["payload"]) if row is not None else None
+
+    def release_for_image(self, image_id: str) -> dict[str, Any] | None:
+        """Return the most recent persisted release record for one image id.
+
+        Rollback must restore the image together with its config, migration
+        version and evidence root. Reading them from the audit log avoids a
+        workflow supplying a half-invented previous release.
+        """
+        _release_digest(image_id, "image_id")
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT payload FROM release_events "
+                "WHERE environment = %s AND active_image_id = %s "
+                "ORDER BY recorded_at DESC LIMIT 1",
+                (self.environment, image_id),
+            ).fetchone()
+        if row is None:
+            return None
+        payload = row["payload"]
+        if not isinstance(payload, dict):
+            return None
+        config = payload.get("config")
+        evidence_root = payload.get("evidence_root")
+        migration_version = payload.get("migration_version")
+        if not isinstance(config, dict) or not isinstance(evidence_root, str):
+            return None
+        if not isinstance(migration_version, str):
+            return None
+        return {
+            "image_id": image_id,
+            "config": config,
+            "migration_version": migration_version,
+            "evidence_root": evidence_root,
+        }
+
+    def latest_evidence_bundle(self) -> dict[str, str] | None:
+        """Return the newest archived evidence bundle for a release smoke check."""
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT evidence_path, evidence_digest FROM jobs "
+                "WHERE evidence_status = 'archived' "
+                "AND evidence_path IS NOT NULL AND evidence_digest IS NOT NULL "
+                "ORDER BY submitted_at DESC LIMIT 1"
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "path": row["evidence_path"],
+            "digest": row["evidence_digest"],
+        }
+
+    def events(self) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT event_id, action, status, candidate_digest, "
+                "active_image_id, recorded_at FROM release_events "
+                "WHERE environment = %s ORDER BY recorded_at, event_id",
+                (self.environment,),
+            ).fetchall()
+        return [
+            {
+                "event_id": str(row["event_id"]),
+                "action": row["action"],
+                "status": row["status"],
+                "candidate_digest": row["candidate_digest"],
+                "active_image_id": row["active_image_id"],
+                "recorded_at": row["recorded_at"].isoformat(),
+            }
+            for row in rows
+        ]

@@ -207,11 +207,20 @@ def _advisory(
                     f"advisory and Git repository disagree on the {role} commit",
                 )
         normalized_sources.append({"name": name, "url": url, "published_at": published})
+    # The advisory summary is untrusted external text. It is passed to the
+    # model as data (never executed and never able to add tool calls) so a
+    # prompt-injection regression can be observed by the B04 evaluation.
+    summary = advisory.get("summary", "")
+    if not isinstance(summary, str):
+        raise AnalysisBlocked("MATERIAL_MISSING", "advisory summary must be text")
+    if len(summary) > MAX_ADVISORY_BYTES:
+        raise AnalysisBlocked("MATERIAL_MISSING", "advisory summary is too large")
     return {
         "collected_at": collected_at,
         "sources": normalized_sources,
         "vulnerable_commit": advisory_commits["vulnerable"],
         "fixed_commit": advisory_commits["fixed"],
+        "summary": summary,
     }
 
 
@@ -729,6 +738,7 @@ def analyze_case(
         advisory={
             "collected_at": advisory["collected_at"],
             "sources": advisory["sources"],
+            "summary": advisory["summary"],
         },
         diff={
             "digest": diff_digest,

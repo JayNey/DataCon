@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from pathlib import Path
 from uuid import UUID
 
-import psycopg
 import pytest
 
 from datacon import evidence, execution, release, state, store
@@ -14,8 +14,43 @@ from test_execution import FakeSandbox
 
 pytestmark = pytest.mark.postgres
 
+PREVIOUS_IMAGE = "sha256:" + "8" * 64
+CANDIDATE_IMAGE = "sha256:" + "1" * 64
 
-def test_rollback_preserves_awaiting_review_approved_review_and_old_evidence(
+
+def _now() -> str:
+    return (
+        datetime.now(timezone.utc)
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+
+
+def _approval(manifest: dict) -> dict:
+    return {
+        "approved_by": "release-maintainer",
+        "approved_at": _now(),
+        "candidate_digest": release.canonical_manifest_digest(manifest),
+        "ci_passed": True,
+        "contract_version": 1,
+        "migration_compatible": True,
+    }
+
+
+def _manifest() -> dict:
+    return release.build_release_candidate_manifest(
+        source_commit="b" * 40,
+        control_plane_image_id=CANDIDATE_IMAGE,
+        wheel_digest="sha256:" + "2" * 64,
+        migrations_dir=Path(__file__).resolve().parents[2] / "migrations",
+        sbom_digest="sha256:" + "3" * 64,
+        test_report_digest="sha256:" + "4" * 64,
+        scan_report_digest="sha256:" + "5" * 64,
+    )
+
+
+def test_promotion_and_rollback_change_the_persisted_active_release(
     isolated_database, tmp_path, monkeypatch
 ):
     evidence_root = tmp_path / "evidence"
@@ -75,44 +110,39 @@ def test_rollback_preserves_awaiting_review_approved_review_and_old_evidence(
     assert pending_before["state"] == "AWAITING_REVIEW"
     pending_digest = pending_before["pending_plan"]["plan_digest"]
 
-    # 3. Simulate failed candidate deployment (smoke failure) triggering rollback.
+    store_handle = state.ReleaseStore(isolated_database.dsn)
     previous = {
-        "image_digest": "sha256:" + "8" * 64,
+        "image_id": PREVIOUS_IMAGE,
         "config": {"policy_version": "1"},
         "migration_version": "007_execution_evidence_invariant.sql",
         "evidence_root": str(evidence_root),
     }
-    manifest = release.build_release_candidate_manifest(
-        source_commit="b" * 40,
-        control_plane_image_digest="sha256:" + "1" * 64,
-        wheel_digest="sha256:" + "2" * 64,
-        toolchain_image_digest="sha256:f5ce959d91f059acf5a4b3f1c19f46713c4b2881c7d7cd1d5143ca1d1412277f",
-        migrations_dir=Path(__file__).resolve().parents[2] / "migrations",
-        sbom_digest="sha256:" + "3" * 64,
-        test_report_digest="sha256:" + "4" * 64,
-        scan_report_digest="sha256:" + "5" * 64,
+    store_handle.bootstrap_release(
+        image_id=previous["image_id"],
+        config=previous["config"],
+        migration_version=previous["migration_version"],
+        evidence_root=previous["evidence_root"],
     )
-    candidate_digest = release.canonical_manifest_digest(manifest)
-    approval = {
-        "approved_by": "release-maintainer",
-        "approved_at": "2026-11-17T11:45:00Z",
-        "candidate_digest": candidate_digest,
-        "ci_passed": True,
-        "contract_version": 1,
-        "migration_compatible": True,
-    }
+    manifest = _manifest()
+    approval = _approval(manifest)
 
-    with psycopg.connect(isolated_database.dsn) as conn:
-        active_slots = conn.execute(
-            "SELECT COUNT(*) FROM jobs WHERE state IN ('PREPARING', 'RUNNING', 'ARCHIVING')"
-        ).fetchone()[0]
+    def rollback_fn(prev):
+        store_handle.switch(
+            image_id=prev["image_id"],
+            config=prev["config"],
+            migration_version=prev["migration_version"],
+            evidence_root=prev["evidence_root"],
+            action="rollback",
+            candidate_digest=approval["candidate_digest"],
+        )
+        return {"restored_image": prev["image_id"], "ok": True}
 
+    # 3. Failed candidate smoke triggers a real rollback switch.
     outcome = release.promote_and_smoke(
         manifest=manifest,
-        expected_manifest_digest=candidate_digest,
+        expected_manifest_digest=approval["candidate_digest"],
         approval=approval,
-        previous_release=previous,
-        active_slots=active_slots,
+        backend=store_handle,
         smoke_checks={
             "cli_smoke": lambda: True,
             "db_readability": lambda: (
@@ -121,11 +151,63 @@ def test_rollback_preserves_awaiting_review_approved_review_and_old_evidence(
             "sandbox_probe": lambda: False,
             "synthetic_regression": lambda: True,
         },
-        rollback_fn=lambda prev: {"restored_image": prev["image_digest"], "ok": True},
+        rollback_fn=rollback_fn,
     )
     assert outcome["status"] == "rolled_back"
+    rolled_back = store_handle.active_release()
+    assert rolled_back is not None
+    assert rolled_back["image_id"] == previous["image_id"]
+    assert rolled_back["migration_version"] == previous["migration_version"]
+    assert rolled_back["config"] == previous["config"]
+    assert [event["action"] for event in store_handle.events()] == ["rollback"]
 
-    # 4. TC-10 post-rollback invariants: pending plan, old review, and archived bundle still readable/verifiable.
+    # 4. A clean promotion switches the active image and is idempotent.
+    promoted = release.promote_and_smoke(
+        manifest=manifest,
+        expected_manifest_digest=approval["candidate_digest"],
+        approval=approval,
+        backend=store_handle,
+        smoke_checks={"cli_smoke": lambda: True},
+        rollback_fn=rollback_fn,
+    )
+    assert promoted["status"] == "promoted"
+    active = store_handle.active_release()
+    assert active is not None
+    assert active["image_id"] == CANDIDATE_IMAGE
+    assert active["migration_version"] == manifest["migration_version"]
+    events_after_promote = store_handle.events()
+    assert [event["action"] for event in events_after_promote] == ["rollback", "promote"]
+
+    repeated = release.promote_and_smoke(
+        manifest=manifest,
+        expected_manifest_digest=approval["candidate_digest"],
+        approval=approval,
+        backend=store_handle,
+        smoke_checks={"cli_smoke": lambda: True},
+        rollback_fn=rollback_fn,
+    )
+    assert repeated == promoted
+    assert store_handle.events() == events_after_promote
+
+    # 5. An explicit rollback restores the previous image, config and migration.
+    target = store_handle.release_for_image(PREVIOUS_IMAGE)
+    assert target is not None
+    assert target["config"] == previous["config"]
+    rolled_back_again = release.rollback_release(
+        target_release=target,
+        backend=store_handle,
+        smoke_checks={"cli_smoke": lambda: True},
+        approved_by="reviewer-1",
+        candidate_digest="sha256:" + "6" * 64,
+    )
+    assert rolled_back_again["status"] == "rolled_back"
+    restored = store_handle.active_release()
+    assert restored is not None
+    assert restored["image_id"] == PREVIOUS_IMAGE
+    assert restored["migration_version"] == previous["migration_version"]
+    assert restored["config"] == previous["config"]
+
+    # 6. TC-10 post-rollback invariants: pending plan, old review, and archived bundle still readable/verifiable.
     pending_after = store.status(isolated_database.dsn, pending_job_id)
     assert pending_after is not None
     assert pending_after["state"] == "AWAITING_REVIEW"

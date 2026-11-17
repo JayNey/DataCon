@@ -85,6 +85,8 @@ _ROLE_NAMES = frozenset(
         "material_source_vulnerable",
         "material_source_fixed",
         "material_patch",
+        "material_repository_bundle",
+        "material_advisory",
         "case_config",
         "symbolizer_log",
     }
@@ -832,6 +834,80 @@ def _verify_materials(
                 "DIGEST_MISMATCH",
                 f"{role} is not pinned by the plan case config",
             )
+    # A case config may pin the repository bundle and advisory snapshot as
+    # materials (B03 does). When it does, the bundle must contain those exact
+    # files at the named paths. B01/B02 case configs do not pin them, so their
+    # older bundles keep verifying unchanged.
+    registry_entry = case_config.get("registry_entry")
+    if isinstance(registry_entry, Mapping):
+        repository_entry = registry_entry.get("repository")
+        if isinstance(repository_entry, Mapping):
+            bundle_relative = repository_entry.get("bundle")
+            if (
+                isinstance(bundle_relative, str)
+                and bundle_relative in materials
+            ):
+                _verify_named_material(
+                    "materials/" + bundle_relative,
+                    "material_repository_bundle",
+                    plan.get("repository", {}).get("bundle_digest"),
+                    listed,
+                    data,
+                    materials,
+                    "repository bundle",
+                )
+        advisory_entry = registry_entry.get("advisory")
+        if isinstance(advisory_entry, Mapping):
+            snapshot = advisory_entry.get("path")
+            if isinstance(snapshot, str) and snapshot in materials:
+                intel = plan.get("intel")
+                expected = intel.get("content_digest") if isinstance(intel, Mapping) else None
+                _verify_named_material(
+                    "materials/" + snapshot,
+                    "material_advisory",
+                    expected,
+                    listed,
+                    data,
+                    materials,
+                    "advisory snapshot",
+                )
+
+
+def _verify_named_material(
+    path: str,
+    role: str,
+    expected_digest: Any,
+    listed: Mapping[str, Mapping[str, Any]],
+    data: Mapping[str, bytes],
+    materials: Mapping[str, str],
+    label: str,
+) -> None:
+    """Require one named material at its exact path with a matching digest."""
+    entry = listed.get(path)
+    if entry is None:
+        raise BundleError(
+            "INVALID_MANIFEST", f"required {label} is missing from the bundle: {path}"
+        )
+    if entry.get("role") != role:
+        raise BundleError(
+            "INVALID_MANIFEST",
+            f"{label} {path} must carry the {role} role, not {entry.get('role')!r}",
+        )
+    content = data.get(path)
+    if content is None:
+        raise BundleError("MISSING_FILE", f"required {label} is not readable: {path}")
+    actual = _digest(content)
+    if actual != expected_digest:
+        raise BundleError(
+            "DIGEST_MISMATCH",
+            f"{label} digest does not match the plan: {path}",
+        )
+    relative = path[len("materials/") :]
+    if materials.get(relative) != actual:
+        raise BundleError(
+            "DIGEST_MISMATCH",
+            f"{label} is not pinned by the plan case config: {relative}",
+        )
 
 
 def _compile_args_from_recipe(recipe: bytes) -> list[str]:

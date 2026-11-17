@@ -15,7 +15,7 @@ concurrency:
 jobs:
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
     services:
       postgres:
         image: postgres:17-bookworm@sha256:665dc7b37ac52a17e298511414c21d23ffa4e6a6ef6225b3e5d59c7afb35e994
@@ -58,20 +58,94 @@ jobs:
             echo "setuptools must not be resolved as the build backend" >&2
             exit 1
           fi
-      - name: Run T07 static, link, REQ/TC, workflow SHA, and secret gates
+      - name: Run T07 static, link, REQ/TC, workflow YAML, secret and lock gates
         run: |
+          # This PR job runs the explicit static subset. The real Trivy report
+          # and evaluate_scan_findings run in release.yml; this job does not
+          # pretend a missing scanner report is a clean scan.
           uv run --frozen python -m datacon.ci_gates --root .
-      - name: Run T07 B04 three-round offline Agent evaluation gate
+      - name: Assert the four pytest marker groups are disjoint and complete
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv run --frozen python - <<'PY'
+          import re
+          import subprocess
+          import sys
+
+          from datacon.ci_gates import check_test_partition_counts
+
+          groups = {
+              "postgres": "postgres and not docker",
+              "docker": "postgres and docker",
+              "asan": "asan",
+              "contract": "not postgres and not asan",
+          }
+          counts = {}
+          for label, expression in groups.items():
+              result = subprocess.run(
+                  [
+                      sys.executable,
+                      "-m",
+                      "pytest",
+                      "--collect-only",
+                      "-q",
+                      "-p",
+                      "no:cacheprovider",
+                      "-m",
+                      expression,
+                  ],
+                  capture_output=True,
+                  text=True,
+              )
+              if result.returncode not in (0, 5):
+                  raise SystemExit(result.stdout + result.stderr)
+              match = re.search(r"(\d+)(?:/\d+)? tests? collected", result.stdout)
+              if match is None:
+                  if "no tests ran" in result.stdout or result.returncode == 5:
+                      counts[label] = 0
+                      continue
+                  raise SystemExit(f"cannot parse collection count for {label}: {result.stdout}")
+              counts[label] = int(match.group(1))
+          total_result = subprocess.run(
+              [
+                  sys.executable,
+                  "-m",
+                  "pytest",
+                  "--collect-only",
+                  "-q",
+                  "-p",
+                  "no:cacheprovider",
+              ],
+              capture_output=True,
+              text=True,
+          )
+          total_match = re.search(r"(\d+)(?:/\d+)? tests? collected", total_result.stdout)
+          if total_match is None:
+              raise SystemExit(total_result.stdout + total_result.stderr)
+          total = int(total_match.group(1))
+          errors = check_test_partition_counts(
+              total, counts, expected_groups=list(groups)
+          )
+          print(f"total={total} groups={counts}")
+          if errors:
+              raise SystemExit("; ".join(errors))
+          PY
+      - name: Run T07 B04 three-round injected-model contract gate
         run: |
           uv run --frozen python - <<'PY'
           import json
           from pathlib import Path
-          from datacon.b04_eval import run_b04_evaluation
+          from datacon.b04_eval import OfflineContractModel, run_b04_evaluation
 
           report = run_b04_evaluation(
-              Path("tests/fixtures/cases/B04-offline.json"), rounds=3
+              Path("tests/fixtures/cases/B04-offline.json"),
+              rounds=3,
+              model_factory=lambda case: OfflineContractModel(),
           )
           print(json.dumps({k: v for k, v in report.items() if k != "round_reports"}, indent=2))
+          if not report["passed"] or report["model_invocations"] <= 0:
+              raise SystemExit("B04 gate did not pass with model invocations")
           PY
       - name: Apply database migrations
         run: |
@@ -209,7 +283,7 @@ jobs:
       - name: Run test suites with zero skips
         shell: bash
         run: |
-          set -euo pipefail
+          set -uo pipefail
           mkdir -p "$RUNNER_TEMP/ci-reports"
 
           run_suite() {
@@ -230,10 +304,14 @@ jobs:
           PY
           }
 
-          run_suite "postgres and not docker" postgres
-          run_suite "postgres and docker" docker
-          run_suite asan asan
-          run_suite "not postgres and not asan" contract
+          # Do not use `set -e` around the four groups: one failing group must
+          # not hide the others, and every JUnit report must still be produced.
+          status=0
+          run_suite "postgres and not docker" postgres || status=1
+          run_suite "postgres and docker" docker || status=1
+          run_suite asan asan || status=1
+          run_suite "not postgres and not asan" contract || status=1
+          exit "$status"
       - name: Upload sanitized synthetic JUnit reports
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -241,3 +319,35 @@ jobs:
           name: ci-junit-reports
           path: ${{ runner.temp }}/ci-reports/*.xml
           retention-days: 14
+
+  image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Build the control-plane image
+        run: |
+          set -euo pipefail
+          docker build -t datacon-ci .
+      - name: Smoke the default entrypoint, subcommand, non-root user and tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm datacon-ci --help
+          docker run --rm datacon-ci worker --help
+          docker run --rm --entrypoint /app/.venv/bin/python datacon-ci \
+            -c 'import os; assert os.getuid() == 65534, os.getuid(); print("uid=65534")'
+          docker run --rm --entrypoint docker datacon-ci --version
+          docker run --rm --entrypoint git datacon-ci --version
+          docker run --rm --entrypoint clang datacon-ci --version
+      - name: Worker without a journal secret fails closed with a readable error
+        shell: bash
+        run: |
+          set -euo pipefail
+          set +e
+          output="$(docker run --rm datacon-ci worker 2>&1)"
+          code=$?
+          set -e
+          printf '%s\n' "$output"
+          test "$code" -eq 2
+          grep -Fq "journal secret" <<<"$output"

@@ -1,0 +1,13 @@
+# Keep the build context small and deterministic. The control-plane image is
+# built from source, not from a local virtualenv or generated artifacts.
+.git
+.gitignore
+.venv
+__pycache__
+*.pyc
+.pytest_cache
+dist
+build
+.review
+.github
+tests

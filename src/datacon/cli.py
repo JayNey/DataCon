@@ -80,6 +80,17 @@ def _parser() -> argparse.ArgumentParser:
     )
     verify.add_argument("directory", type=Path)
     verify.add_argument("--expected-digest", default=None)
+
+    release = commands.add_parser(
+        "release", help="inspect the persisted release state"
+    )
+    release_commands = release.add_subparsers(
+        dest="release_command", required=True
+    )
+    slots = release_commands.add_parser(
+        "slots", help="show active execution slots and the active release"
+    )
+    slots.add_argument("--environment", default="internal-lab")
     return parser
 
 
@@ -302,6 +313,27 @@ def _verify_bundle(args) -> int:
     return 0
 
 
+def _release_slots(args) -> int:
+    dsn = _database_url()
+    if not dsn:
+        return _error(1, "DATABASE_NOT_CONFIGURED", "set DATACON_DATABASE_URL")
+    try:
+        store_handle = state.ReleaseStore(dsn, environment=args.environment)
+        active = store_handle.active_release()
+        payload = {
+            "environment": args.environment,
+            "active_slots": store_handle.active_slots(),
+            "active_release": active,
+            "drained": store_handle.active_slots() == 0,
+        }
+    except psycopg.Error as error:
+        return _error(1, "DATABASE_ERROR", _database_error_message(error))
+    except (state.StateError, ValueError) as error:
+        return _error(2, "INVALID_RELEASE_STATE", str(error))
+    print(json.dumps(payload, ensure_ascii=False, default=str))
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     if args.command == "submit":
@@ -316,4 +348,8 @@ def main(argv: list[str] | None = None) -> int:
         return _export(args)
     if args.command == "verify-bundle":
         return _verify_bundle(args)
+    if args.command == "release":
+        if args.release_command == "slots":
+            return _release_slots(args)
+        return _error(2, "INVALID_REQUEST", "unknown release command")
     return _error(2, "INVALID_REQUEST", "unknown command")
