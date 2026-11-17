@@ -1480,6 +1480,16 @@ class ReleaseStore:
                 (self.environment, image_id),
             ).fetchone()
         if row is None:
+            # A bootstrapped baseline release has no event yet. It is still a
+            # persisted release_state row, so rollback may target it.
+            active = self.active_release()
+            if active is not None and active.get("image_id") == image_id:
+                return {
+                    "image_id": active["image_id"],
+                    "config": active["config"],
+                    "migration_version": active["migration_version"],
+                    "evidence_root": active["evidence_root"],
+                }
             return None
         payload = row["payload"]
         if not isinstance(payload, dict):
