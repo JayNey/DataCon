@@ -9,8 +9,8 @@ import psycopg
 import pytest
 
 from datacon import evidence, execution, release, state, store
-from tests.integration.support import review, status, submit, worker, write_request
-from tests.integration.test_execution import FakeSandbox
+from support import review, status, submit, worker, write_request
+from test_execution import FakeSandbox
 
 pytestmark = pytest.mark.postgres
 
