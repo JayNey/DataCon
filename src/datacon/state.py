@@ -1620,6 +1620,17 @@ class ReleaseStore:
                 for row in ledger_rows
                 if isinstance(row.get("file"), str)
             ]
+            if not applied_files:
+                raise ReleaseStateError(
+                    "schema_migrations ledger is empty; run `datacon migrate` "
+                    "against the target database before bootstrapping a release"
+                )
+            numbers = sorted(_migration_number(name) for name in applied_files)
+            if numbers != list(range(1, len(numbers) + 1)):
+                raise ReleaseStateError(
+                    "schema_migrations ledger has non-consecutive or duplicate "
+                    "migration ordinals (expected consecutive 001..N without gaps)"
+                )
             if migration_version not in applied_files:
                 raise ReleaseStateError(
                     "bootstrap migration_version is not recorded in schema_migrations: "

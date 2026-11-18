@@ -476,16 +476,22 @@ def _assert_secrets_scoped(document: dict) -> None:
         if "rollback_release" in step.get("run", "")
     )
     for idx, step in enumerate(rollback_steps[:restore_idx]):
-        assert "DATACON_DATABASE_URL" not in step.get("env", {}), (
+        step_env = step.get("env", {})
+        step_run = step.get("run", "")
+        step_with = json.dumps(step.get("with", {}))
+        assert "DATACON_DATABASE_URL" not in step_env, (
             f"rollback step {idx} leaks DATACON_DATABASE_URL"
         )
-        assert "DATACON_DATABASE_URL" not in step.get("run", ""), (
+        assert "DATACON_DATABASE_URL" not in step_run, (
             f"rollback step {idx} references DATACON_DATABASE_URL"
+        )
+        assert "DATACON_DATABASE_URL" not in step_with, (
+            f"rollback step {idx} with references DATACON_DATABASE_URL"
         )
 
     b03 = jobs["b03-internal"]
-    b03_secrets = {"DATACON_B03_CASE_ROOT", "DATACON_B03_ADMISSION", "DATACON_B03_REVIEW"}
-    assert not (b03_secrets & set(b03.get("env", {})))
+    b03_secrets = ("DATACON_B03_CASE_ROOT", "DATACON_B03_ADMISSION", "DATACON_B03_REVIEW")
+    assert not (set(b03_secrets) & set(b03.get("env", {})))
     b03_steps = _steps(b03)
     b03_run_idx = next(
         idx
@@ -493,14 +499,44 @@ def _assert_secrets_scoped(document: dict) -> None:
         if "run_b03_acceptance" in step.get("run", "")
     )
     for idx, step in enumerate(b03_steps[:b03_run_idx]):
-        assert not (b03_secrets & set(step.get("env", {}))), (
-            f"b03 step {idx} leaks B03 secrets"
-        )
+        step_env = step.get("env", {})
+        step_run = step.get("run", "")
+        step_with = json.dumps(step.get("with", {}))
+        for secret in b03_secrets:
+            assert secret not in step_env, f"b03 step {idx} env leaks {secret}"
+            assert secret not in step_run, f"b03 step {idx} run references {secret}"
+            assert secret not in step_with, f"b03 step {idx} with references {secret}"
 
 
 def _assert_smoke_timeouts(document: dict) -> None:
     import ast
+    import re
     import shlex
+
+    subprocess_methods = {"run", "Popen", "check_call", "check_output", "call"}
+
+    def _resolve_target(expr: ast.AST, sp_mods: set[str], os_mods: set[str], fn_aliases: dict[str, str]) -> str | None:
+        if isinstance(expr, ast.Name):
+            return fn_aliases.get(expr.id)
+        if isinstance(expr, ast.Attribute) and isinstance(expr.value, ast.Name):
+            if expr.value.id in sp_mods and expr.attr in subprocess_methods:
+                return f"subprocess.{expr.attr}"
+            if expr.value.id in os_mods and expr.attr == "system":
+                return "os.system"
+        if (
+            isinstance(expr, ast.Call)
+            and isinstance(expr.func, ast.Name)
+            and expr.func.id == "getattr"
+            and len(expr.args) >= 2
+            and isinstance(expr.args[0], ast.Name)
+            and isinstance(expr.args[1], ast.Constant)
+            and isinstance(expr.args[1].value, str)
+        ):
+            if expr.args[0].id in sp_mods and expr.args[1].value in subprocess_methods:
+                return f"subprocess.{expr.args[1].value}"
+            if expr.args[0].id in os_mods and expr.args[1].value == "system":
+                return "os.system"
+        return None
 
     jobs = document["jobs"]
     for job_name in ("promote-internal", "rollback-internal"):
@@ -509,22 +545,70 @@ def _assert_smoke_timeouts(document: dict) -> None:
             run_script = step.get("run", "")
             for block in _extract_python_heredocs(run_script):
                 tree = ast.parse(block)
+                sp_mods: set[str] = set()
+                os_mods: set[str] = set()
+                fn_aliases: dict[str, str] = {}
+                list_vars: dict[str, list[Any]] = {}
+
+                for node in ast.walk(tree):
+                    if isinstance(node, ast.Import):
+                        for alias in node.names:
+                            bound = alias.asname or alias.name
+                            if alias.name == "subprocess":
+                                sp_mods.add(bound)
+                            elif alias.name == "os":
+                                os_mods.add(bound)
+                    elif isinstance(node, ast.ImportFrom):
+                        if node.module == "subprocess":
+                            for alias in node.names:
+                                if alias.name in subprocess_methods:
+                                    fn_aliases[alias.asname or alias.name] = f"subprocess.{alias.name}"
+                        elif node.module == "os":
+                            for alias in node.names:
+                                if alias.name == "system":
+                                    fn_aliases[alias.asname or alias.name] = "os.system"
+
+                # Walk statements in source order to resolve local aliases accurately.
+                for node in ast.walk(tree):
+                    if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+                        target_name = node.targets[0].id
+                        if isinstance(node.value, ast.Name):
+                            if node.value.id in sp_mods:
+                                sp_mods.add(target_name)
+                            elif node.value.id in os_mods:
+                                os_mods.add(target_name)
+                        resolved = _resolve_target(node.value, sp_mods, os_mods, fn_aliases)
+                        if resolved is not None:
+                            fn_aliases[target_name] = resolved
+                        if isinstance(node.value, ast.List) and node.value.elts:
+                            first = node.value.elts[0]
+                            if isinstance(first, ast.Constant):
+                                list_vars[target_name] = [first.value]
+                    elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and node.value is not None:
+                        target_name = node.target.id
+                        resolved = _resolve_target(node.value, sp_mods, os_mods, fn_aliases)
+                        if resolved is not None:
+                            fn_aliases[target_name] = resolved
+
                 for node in ast.walk(tree):
                     if not isinstance(node, ast.Call):
                         continue
-                    func = node.func
-                    is_subprocess_run = (
-                        isinstance(func, ast.Attribute)
-                        and func.attr == "run"
-                        and isinstance(func.value, ast.Name)
-                        and func.value.id == "subprocess"
-                    )
-                    if not is_subprocess_run:
+                    target = _resolve_target(node.func, sp_mods, os_mods, fn_aliases)
+                    if target is None:
                         continue
+                    if target == "os.system":
+                        raise AssertionError(f"{job_name}: os.system is forbidden in smoke checks (no timeout)")
+                    if target == "subprocess.Popen":
+                        raise AssertionError(f"{job_name}: subprocess.Popen is forbidden in smoke checks without bounded run(..., timeout=...)")
+
                     cmd_is_docker = False
-                    if node.args and isinstance(node.args[0], ast.List):
-                        elts = node.args[0].elts
-                        if elts and isinstance(elts[0], ast.Constant) and elts[0].value == "docker":
+                    if node.args:
+                        arg0 = node.args[0]
+                        if isinstance(arg0, ast.List) and arg0.elts:
+                            if isinstance(arg0.elts[0], ast.Constant) and arg0.elts[0].value == "docker":
+                                cmd_is_docker = True
+                                found_python_docker = True
+                        elif isinstance(arg0, ast.Name) and list_vars.get(arg0.id, [None])[0] == "docker":
                             cmd_is_docker = True
                             found_python_docker = True
                     timeout_kw = next(
@@ -532,18 +616,16 @@ def _assert_smoke_timeouts(document: dict) -> None:
                         None,
                     )
                     assert timeout_kw is not None, (
-                        f"{job_name}: subprocess.run missing timeout= keyword"
+                        f"{job_name}: {target} missing timeout= keyword"
                     )
                     assert isinstance(timeout_kw.value, ast.Constant) and isinstance(
                         timeout_kw.value.value, (int, float)
                     ) and 0 < timeout_kw.value.value <= 300, (
-                        f"{job_name}: subprocess.run timeout must be positive <= 300"
+                        f"{job_name}: {target} timeout must be positive <= 300"
                     )
                     if cmd_is_docker:
                         assert timeout_kw.value.value == 60
             # Check shell-level `docker run` commands outside Python heredocs.
-            import re
-
             outside_heredoc = re.sub(
                 r"<<'?PY'?\n.*?\n[ \t]*PY(?:\n|$)",
                 "\n",
@@ -693,12 +775,19 @@ def test_promote_archived_bundle_is_fail_closed_by_default_and_audited_when_skip
                 }
 
         def _fake_preflight(
-            *, evidence_root, store, verify_fn, require_archived_bundle=True, skip_reason=None
+            *,
+            evidence_root,
+            store,
+            verify_fn,
+            require_archived_bundle=True,
+            skip_reason=None,
+            approval=None,
         ):
             captured["preflight_args"] = {
                 "evidence_root": evidence_root,
                 "require_archived_bundle": require_archived_bundle,
                 "skip_reason": skip_reason,
+                "approval": approval,
             }
             if preflight_mode == "verified":
                 return {
@@ -740,7 +829,11 @@ def test_promote_archived_bundle_is_fail_closed_by_default_and_audited_when_skip
         monkeypatch.setitem(sys.modules, "datacon.state", fake_state)
         monkeypatch.setitem(sys.modules, "psycopg", fake_psycopg)
         monkeypatch.setenv("EXPECTED_MANIFEST_DIGEST", "sha256:" + "f" * 64)
-        monkeypatch.setenv("DATACON_RELEASE_APPROVAL", '{"approved_by": "ops"}')
+        approval_doc = {"approved_by": "ops"}
+        if req_env == "false":
+            approval_doc["allow_skip_archived_bundle"] = True
+            approval_doc["archived_bundle_skip_reason"] = skip_reason
+        monkeypatch.setenv("DATACON_RELEASE_APPROVAL", json.dumps(approval_doc))
         monkeypatch.setenv("DATACON_DATABASE_URL", "postgresql://unused")
         monkeypatch.setenv("REQUIRE_ARCHIVED_BUNDLE", req_env)
         monkeypatch.setenv("ARCHIVED_BUNDLE_SKIP_REASON", skip_reason)
@@ -750,6 +843,7 @@ def test_promote_archived_bundle_is_fail_closed_by_default_and_audited_when_skip
         exec(code, ns, ns)  # noqa: S102
         return captured
 
+    import json
     import pytest
 
     with pytest.raises(SystemExit, match="REQUIRE_ARCHIVED_BUNDLE"):
@@ -768,6 +862,9 @@ def test_promote_archived_bundle_is_fail_closed_by_default_and_audited_when_skip
     cap_skip = _run_promote_heredoc("false", "initial bootstrap lab", "skipped")
     assert cap_skip["preflight_args"]["require_archived_bundle"] is False
     assert cap_skip["preflight_args"]["skip_reason"] == "initial bootstrap lab"
+    assert cap_skip["preflight_args"]["approval"]["allow_skip_archived_bundle"] is True
+    assert cap_skip["promote_kwargs"]["require_archived_bundle"] is False
+    assert cap_skip["promote_kwargs"]["skip_reason"] == "initial bootstrap lab"
     assert "archived_real_bundle" not in cap_skip["promote_kwargs"]["preflight_checks"]
     assert cap_skip["promote_kwargs"]["audit_metadata"] == {
         "archived_real_bundle": "skipped",
@@ -966,6 +1063,7 @@ def test_rollback_runs_release_slots_compatibility_in_pre_switch_smoke_not_post_
         "subprocess": _FakeSubprocess,
         "json": json,
         "current": {"image_id": current_image},
+        "target_image": "sha256:" + "0" * 64,
     }
     exec(compile(fn_module, "<release-slots-compatible>", "exec"), ns, ns)  # noqa: S102
     compat = ns["release_slots_compatible"]
@@ -1081,3 +1179,151 @@ def test_workflows_use_shared_run_suite_script():
     rel_text = _run_text(_load(RELEASE)["jobs"]["test-report"])
     assert "scripts/run_suite.sh" in ci_text
     assert "scripts/run_suite.sh" in rel_text
+
+
+def test_rollback_supports_baseline_and_expired_artifact_local_digest_path_with_audit_provenance():
+    import pytest
+
+    doc = _load(RELEASE)
+    rollback = doc["jobs"]["rollback-internal"]
+    steps = _steps(rollback)
+    text = _run_text(rollback)
+
+    # 1. Cross-run download step is gated on non-empty ARTIFACT_RUN_ID while preserving strict provenance.
+    dl_step = next(
+        step
+        for step in steps
+        if step.get("uses", "").startswith("actions/download-artifact@")
+    )
+    assert dl_step.get("if") == "env.ARTIFACT_RUN_ID != ''"
+    assert dl_step["with"]["run-id"] == "${{ env.ARTIFACT_RUN_ID }}"
+
+    # 2. Verify protected ref allows empty ARTIFACT_RUN_ID, while rejecting non-numeric ARTIFACT_RUN_ID.
+    verify_step = next(step for step in steps if step.get("name") == "Verify protected ref")
+    verify_blocks = _extract_python_heredocs(verify_step["run"])
+    assert verify_blocks
+    for bad_id in ("abc", "123abc", " 123"):
+        ns = {}
+        import os
+
+        old = os.environ.get("ARTIFACT_RUN_ID")
+        os.environ["ARTIFACT_RUN_ID"] = bad_id
+        try:
+            with pytest.raises(SystemExit):
+                exec(compile(verify_blocks[0], "<verify-ref>", "exec"), ns, ns)  # noqa: S102
+        finally:
+            if old is None:
+                os.environ.pop("ARTIFACT_RUN_ID", None)
+            else:
+                os.environ["ARTIFACT_RUN_ID"] = old
+
+    # 3. Validate/load steps do NOT unconditionally fail when ARTIFACT_RUN_ID is empty,
+    #    and verify immutable TARGET_DIGEST via `docker image inspect`.
+    assert "artifact_run_id is required to load" not in text
+    assert 'docker image inspect "${TARGET_DIGEST}"' in text or 'docker image inspect "$TARGET_DIGEST"' in text
+    assert "DATACON_IMAGE_ARCHIVE_DIR" in rollback.get("env", {}) or "DATACON_IMAGE_ARCHIVE_DIR" in text
+
+    # 4. Smoke & restore step strictly requires persisted release_events provenance (action in bootstrap/promote/rollback)
+    #    and candidate_digest / manifest_digest; never falls back to unrecorded images.
+    restore_step = next(step for step in steps if "rollback_release" in step.get("run", ""))
+    restore_run = restore_step["run"]
+    assert "release_for_image" in restore_run
+    assert 'target.get("action") not in ("bootstrap", "promote", "rollback")' in restore_run or 'in ("bootstrap", "promote", "rollback")' in restore_run
+    assert 'os.environ["TARGET_DIGEST"]' in restore_run
+
+
+def test_secret_scoping_helper_rejects_b03_run_and_with_leaks():
+    import copy
+    import pytest
+
+    base_doc = _load(RELEASE)
+
+    mutated_b03_run = copy.deepcopy(base_doc)
+    mutated_b03_run["jobs"]["b03-internal"]["steps"].insert(
+        1,
+        {
+            "name": "Leak B03 secret in run",
+            "run": "echo DATACON_B03_CASE_ROOT",
+        },
+    )
+    with pytest.raises(AssertionError):
+        _assert_secrets_scoped(mutated_b03_run)
+
+    mutated_b03_with = copy.deepcopy(base_doc)
+    mutated_b03_with["jobs"]["b03-internal"]["steps"].insert(
+        1,
+        {
+            "name": "Leak B03 secret in with",
+            "uses": "actions/checkout@11d5960a326750d5838078e36cf38b85af677262",
+            "with": {"path": "${{ secrets.DATACON_B03_ADMISSION }}"},
+        },
+    )
+    with pytest.raises(AssertionError):
+        _assert_secrets_scoped(mutated_b03_with)
+
+    mutated_rb_with = copy.deepcopy(base_doc)
+    mutated_rb_with["jobs"]["rollback-internal"]["steps"].insert(
+        1,
+        {
+            "name": "Leak rollback secret in with",
+            "uses": "actions/checkout@11d5960a326750d5838078e36cf38b85af677262",
+            "with": {"token": "${{ secrets.DATACON_DATABASE_URL }}"},
+        },
+    )
+    with pytest.raises(AssertionError):
+        _assert_secrets_scoped(mutated_rb_with)
+
+
+def test_timeout_helper_rejects_aliased_subprocess_and_os_system():
+    import copy
+    import pytest
+
+    base_doc = _load(RELEASE)
+
+    # 1. Local variable alias: `runner = subprocess.run; runner(["docker", ...])` without timeout=
+    mutated_alias = copy.deepcopy(base_doc)
+    for step in mutated_alias["jobs"]["promote-internal"]["steps"]:
+        if "timeout=60" in step.get("run", ""):
+            step["run"] = step["run"].replace(
+                "import sys\n",
+                "import sys\nrunner = subprocess.run\nrunner(['docker', 'ps'])\n",
+            )
+            break
+    with pytest.raises(AssertionError):
+        _assert_smoke_timeouts(mutated_alias)
+
+    # 2. subprocess.check_call without timeout=
+    mutated_check_call = copy.deepcopy(base_doc)
+    for step in mutated_check_call["jobs"]["rollback-internal"]["steps"]:
+        if "timeout=60" in step.get("run", ""):
+            step["run"] = step["run"].replace(
+                "import sys\n",
+                "import sys\nsubprocess.check_call(['docker', 'ps'])\n",
+            )
+            break
+    with pytest.raises(AssertionError):
+        _assert_smoke_timeouts(mutated_check_call)
+
+    # 3. subprocess.Popen
+    mutated_popen = copy.deepcopy(base_doc)
+    for step in mutated_popen["jobs"]["promote-internal"]["steps"]:
+        if "timeout=60" in step.get("run", ""):
+            step["run"] = step["run"].replace(
+                "import sys\n",
+                "import sys\nsubprocess.Popen(['docker', 'ps'])\n",
+            )
+            break
+    with pytest.raises(AssertionError):
+        _assert_smoke_timeouts(mutated_popen)
+
+    # 4. os.system
+    mutated_os = copy.deepcopy(base_doc)
+    for step in mutated_os["jobs"]["rollback-internal"]["steps"]:
+        if "timeout=60" in step.get("run", ""):
+            step["run"] = step["run"].replace(
+                "import sys\n",
+                "import sys\nos.system('docker ps')\n",
+            )
+            break
+    with pytest.raises(AssertionError):
+        _assert_smoke_timeouts(mutated_os)

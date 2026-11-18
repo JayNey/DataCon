@@ -2727,3 +2727,100 @@ def test_s1_finish_failed_archives_partial_inconclusive(
     assert committed[0]["state"] == "INCONCLUSIVE"
     assert committed[0]["reason_code"] == reason_code
     assert committed[0]["evidence_status"] == "archived"
+
+
+def test_write_export_and_archive_bundles_are_readable_by_unprivileged_container_user(
+    tmp_path, monkeypatch
+):
+    import os
+    from datetime import datetime, timezone
+    from types import SimpleNamespace
+    from uuid import UUID
+    from datacon import execution
+
+    old_umask = os.umask(0o077)
+    try:
+        info = make_bundle(tmp_path, name="written")
+        exported = export_bundle(info.root, tmp_path / "exported")
+    finally:
+        os.umask(old_umask)
+
+    for bundle_root in (info.root, exported.root):
+        assert stat.S_IMODE(bundle_root.stat().st_mode) == 0o755
+        for item in bundle_root.rglob("*"):
+            mode = stat.S_IMODE(item.stat().st_mode)
+            if item.is_dir():
+                assert (mode & 0o005) == 0o005, (item, oct(mode))
+                assert (mode & 0o022) == 0, (item, oct(mode))
+            else:
+                assert (mode & 0o004) == 0o004, (item, oct(mode))
+                assert (mode & 0o022) == 0, (item, oct(mode))
+
+    # _archive must also ensure evidence_root and job_root are traversable by 65534:65534.
+    run_root = tmp_path / "runs"
+    evidence_root = tmp_path / "archive-evidence"
+    monkeypatch.setenv("DATACON_RUN_ROOT", str(run_root))
+    monkeypatch.setenv("DATACON_EVIDENCE_ROOT", str(evidence_root))
+    monkeypatch.setattr(execution.state, "mark_archiving", lambda *a, **kw: True)
+    monkeypatch.setattr(
+        execution.state, "assert_archive_fence", lambda *a, **kw: True
+    )
+    monkeypatch.setattr(execution.state, "finish_execution", lambda *a, **kw: True)
+
+    context = SimpleNamespace(
+        job_id=UUID(JOB_ID),
+        job_id_text=JOB_ID,
+        generation=1,
+        job={"request": {"target": {"kind": "source", "case_id": PLAN["case_id"]}}},
+        plan=deepcopy(PLAN),
+        plan_digest=PLAN_DIGEST,
+        review={
+            "reviewer_id": REVIEW["reviewer_id"],
+            "decision": REVIEW["decision"],
+            "decided_at": datetime(2026, 1, 2, tzinfo=timezone.utc),
+            "plan_digest": PLAN_DIGEST,
+        },
+        case=SimpleNamespace(
+            manifest={
+                "harness": "harness.c",
+                "build_recipe": "build.sh",
+                "dependencies": "dependencies.lock",
+                "versions": {
+                    "vulnerable": "vulnerable/parser.c",
+                    "fixed": "fixed/parser.c",
+                },
+            },
+            repository={"patch": "fix.patch"},
+            read_material=lambda rel, exp: (MATERIALS[rel], MATERIAL_DIGESTS[rel]),
+        ),
+        manifest_case=deepcopy(CASE_CONFIG["manifest_case"]),
+        materials=dict(MATERIAL_DIGESTS),
+        case_config=deepcopy(CASE_CONFIG),
+        run_root=run_root,
+        image="silkeh/clang:19-bookworm@" + PLAN["image_digest"],
+        compile_args=tuple(COMPILE_ARGS),
+        material_payloads=dict(MATERIALS),
+        cleanup_errors=[],
+    )
+    old_umask = os.umask(0o077)
+    try:
+        outcome = execution._finish_failed(
+            "unused-dsn",
+            UUID(JOB_ID),
+            1,
+            execution.ExecutionFailed("TIMEOUT", "injected timeout"),
+            context=context,
+            probe=deepcopy(PROBE),
+            builds={},
+            runs=[],
+        )
+    finally:
+        os.umask(old_umask)
+    assert outcome.evidence_path is not None
+    archived_bundle = Path(outcome.evidence_path)
+    assert (stat.S_IMODE(evidence_root.stat().st_mode) & 0o005) == 0o005
+    assert (stat.S_IMODE(archived_bundle.parent.stat().st_mode) & 0o005) == 0o005
+    assert (stat.S_IMODE(archived_bundle.stat().st_mode) & 0o005) == 0o005
+    assert (
+        stat.S_IMODE((archived_bundle / "manifest.json").stat().st_mode) & 0o004
+    ) == 0o004

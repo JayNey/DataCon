@@ -1048,3 +1048,166 @@ def test_workflow_security_rejects_yaml_alias_bomb_within_budget(tmp_path):
         REPO_ROOT / ".github" / "workflows" / "release.yml",
     ]
     assert ci_gates.check_workflow_security(real_workflows) == []
+
+
+def test_codeowners_protects_ci_trusted_root():
+    codeowners = REPO_ROOT / ".github" / "CODEOWNERS"
+    assert codeowners.is_file(), ".github/CODEOWNERS must exist to protect CI trusted root"
+    text = codeowners.read_text(encoding="utf-8")
+    for required in (
+        "/.github/",
+        "/src/datacon/ci_gates.py",
+        "/scripts/run_suite.sh",
+        "/tests/contract/test_ci_gates.py",
+        "/tests/contract/test_release_workflow.py",
+    ):
+        assert required in text, f"{required} missing from .github/CODEOWNERS"
+
+
+def test_workflow_security_rejects_deeply_nested_yaml_without_recursion_error(tmp_path):
+    nested = "[" * 2000 + "1" + "]" * 2000
+    deep = _workflow(
+        tmp_path,
+        "name: Deep\n"
+        "on: pull_request\n"
+        "permissions:\n"
+        "  contents: read\n"
+        f"x-deep: {nested}\n"
+        "jobs:\n"
+        "  test:\n"
+        "    steps:\n"
+        "      - run: echo ok\n",
+    )
+    with pytest.raises(ci_gates.GateError):
+        ci_gates._load_workflow(deep)
+    errors = ci_gates.check_workflow_security([deep])
+    assert errors and any("YAML" in err or "recursion" in err.lower() for err in errors)
+
+
+def test_workflow_security_bounds_on_trigger_memory_amplification(tmp_path):
+    import time
+
+    big_str = "a" * 100_000
+    lines = [
+        "name: TriggerBomb",
+        "on:",
+        f'  x0: &t0 ["{big_str}", "{big_str}"]',
+    ]
+    # 13 levels => 2^14 - 1 = 16,383 nodes (< 150k node budget), but >1.6GB if json.dumps runs.
+    for idx in range(1, 14):
+        lines.append(f"  x{idx}: &t{idx} [*t{idx - 1}, *t{idx - 1}]")
+    lines.extend(
+        [
+            "permissions:",
+            "  contents: read",
+            "jobs:",
+            "  test:",
+            "    steps:",
+            "      - run: echo ok",
+        ]
+    )
+    bomb = tmp_path / "trigger-bomb.yml"
+    bomb.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    started = time.monotonic()
+    errors = ci_gates.check_workflow_security([bomb])
+    elapsed = time.monotonic() - started
+    assert elapsed < 1.0, f"trigger amplification check took {elapsed:.2f}s"
+    assert errors and any("budget" in err or "trigger" in err.lower() for err in errors), errors
+
+
+def test_workflow_security_checks_step_local_actions_and_direct_secrets_in_run(tmp_path):
+    # 1. Step-level local ./ path traversal is rejected.
+    repo = tmp_path / "repo"
+    (repo / ".github" / "workflows").mkdir(parents=True)
+    traversal = repo / ".github" / "workflows" / "traversal.yml"
+    traversal.write_text(
+        "name: Traversal\n"
+        "on: pull_request\n"
+        "permissions:\n"
+        "  contents: read\n"
+        "jobs:\n"
+        "  test:\n"
+        "    steps:\n"
+        "      - uses: ./../../outside\n",
+        encoding="utf-8",
+    )
+    errors = ci_gates.check_workflow_security([traversal], root=repo)
+    assert errors and any("traverse" in err or ".." in err for err in errors), errors
+
+    # 2. Local composite action.yml is recursively validated for SHA pins and injections.
+    bad_action_dir = repo / ".github" / "actions" / "bad-composite"
+    bad_action_dir.mkdir(parents=True)
+    (bad_action_dir / "action.yml").write_text(
+        "name: BadComposite\n"
+        "runs:\n"
+        "  using: composite\n"
+        "  steps:\n"
+        "    - uses: actions/checkout@v4\n"
+        "    - shell: bash\n"
+        "      run: echo \"${{ github.event.issue.title }}\"\n"
+        "    - shell: bash\n"
+        "      run: echo \"${{ secrets.INNER_SECRET }}\"\n",
+        encoding="utf-8",
+    )
+    use_bad = repo / ".github" / "workflows" / "use-bad.yml"
+    use_bad.write_text(
+        "name: UseBad\n"
+        "on: pull_request\n"
+        "permissions:\n"
+        "  contents: read\n"
+        "jobs:\n"
+        "  test:\n"
+        "    steps:\n"
+        "      - uses: ./.github/actions/bad-composite\n",
+        encoding="utf-8",
+    )
+    errors = ci_gates.check_workflow_security([use_bad], root=repo)
+    assert any("40-char" in err or "SHA" in err for err in errors), errors
+    assert any("github.event.issue.title" in err for err in errors), errors
+    assert any("secrets.inner_secret" in err.lower() for err in errors), errors
+
+    # Valid local composite action passes.
+    good_action_dir = repo / ".github" / "actions" / "good-composite"
+    good_action_dir.mkdir(parents=True)
+    (good_action_dir / "action.yaml").write_text(
+        "name: GoodComposite\n"
+        "runs:\n"
+        "  using: composite\n"
+        "  steps:\n"
+        "    - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262\n"
+        "    - shell: bash\n"
+        "      env:\n"
+        "        TITLE: ${{ github.event.issue.title }}\n"
+        "      run: echo \"$TITLE\"\n",
+        encoding="utf-8",
+    )
+    use_good = repo / ".github" / "workflows" / "use-good.yml"
+    use_good.write_text(
+        "name: UseGood\n"
+        "on: pull_request\n"
+        "permissions:\n"
+        "  contents: read\n"
+        "jobs:\n"
+        "  test:\n"
+        "    steps:\n"
+        "      - uses: ./.github/actions/good-composite\n",
+        encoding="utf-8",
+    )
+    assert ci_gates.check_workflow_security([use_good], root=repo) == []
+
+    # 3. Direct ${{ secrets.* }} in run: is rejected; env: indirection & with.github-token allowed.
+    direct_secret = _workflow(
+        tmp_path,
+        "name: DirectSecret\n"
+        "on: workflow_dispatch\n"
+        "permissions:\n"
+        "  contents: read\n"
+        "jobs:\n"
+        "  test:\n"
+        "    steps:\n"
+        "      - run: echo \"${{ secrets.DEPLOY_KEY }}\"\n"
+        "      - run: echo \"${{ secrets['OTHER_KEY'] }}\"\n",
+    )
+    errors = ci_gates.check_workflow_security([direct_secret])
+    assert sum("secrets" in err.lower() for err in errors) == 2, errors

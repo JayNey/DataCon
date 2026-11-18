@@ -260,6 +260,22 @@ def _read_bounded(path: Path, *, expected_size: int) -> bytes:
         ) from error
 
 
+def _apply_bundle_modes(
+    root: Path, *, dir_mode: int, file_mode: int
+) -> None:
+    """Apply explicit directory/file permissions bottom-up, overriding process umask."""
+    for directory in sorted(
+        (item for item in root.rglob("*") if item.is_dir() and not item.is_symlink()),
+        key=lambda item: len(item.parts),
+        reverse=True,
+    ):
+        directory.chmod(dir_mode)
+    for item in root.rglob("*"):
+        if item.is_file() and not item.is_symlink():
+            item.chmod(file_mode)
+    root.chmod(dir_mode)
+
+
 def write_bundle(
     root: Path | str,
     *,
@@ -271,6 +287,8 @@ def write_bundle(
     verdict: str | None = None,
     created_at: str | None = None,
     verify: Callable[[Path], object] | None = None,
+    dir_mode: int = 0o755,
+    file_mode: int = 0o644,
 ) -> BundleInfo:
     """Create a new bundle directory and its manifest.
 
@@ -345,7 +363,8 @@ def write_bundle(
     # A possibly pre-existing symlink at the temp name is never followed.
     if temporary.exists() or temporary.is_symlink():
         raise BundleError("BUNDLE_EXISTS", "temporary bundle path already exists")
-    temporary.mkdir(mode=0o700)
+    temporary.mkdir(mode=dir_mode)
+    temporary.chmod(dir_mode)
     try:
         entries: list[dict[str, Any]] = []
         markdown_bytes = report_markdown.encode("utf-8")
@@ -390,7 +409,7 @@ def write_bundle(
             destination = temporary / PurePosixPath(path)
             destination.parent.mkdir(parents=True, exist_ok=True)
             destination.write_bytes(data)
-            destination.chmod(0o600)
+            destination.chmod(file_mode)
             role = (
                 "report_json"
                 if path == "report.json"
@@ -423,14 +442,8 @@ def write_bundle(
             raise BundleError("INVALID_MANIFEST", "manifest verdict is invalid")
         manifest_bytes = canonical_manifest_bytes(manifest) + b"\n"
         (temporary / "manifest.json").write_bytes(manifest_bytes)
-        (temporary / "manifest.json").chmod(0o600)
-        for directory in sorted(
-            (item for item in temporary.rglob("*") if item.is_dir()),
-            key=lambda item: len(item.parts),
-            reverse=True,
-        ):
-            directory.chmod(0o700)
-        temporary.chmod(0o700)
+        (temporary / "manifest.json").chmod(file_mode)
+        _apply_bundle_modes(temporary, dir_mode=dir_mode, file_mode=file_mode)
         if verify is not None:
             # Sample the completed staging directory before it becomes the
             # archived bundle. A bundle that cannot verify offline must never
@@ -2512,6 +2525,8 @@ def export_bundle(
     destination: Path | str,
     *,
     expected_manifest_digest: str | None = None,
+    dir_mode: int = 0o755,
+    file_mode: int = 0o644,
 ) -> BundleInfo:
     """Copy a verified bundle to a new directory, verifying the copy."""
     if expected_manifest_digest is not None and not _DIGEST.fullmatch(
@@ -2552,7 +2567,8 @@ def export_bundle(
     parent = target.parent
     parent.mkdir(parents=True, exist_ok=True)
     temporary = parent / f".{target.name}.export-{uuid.uuid4().hex}"
-    temporary.mkdir(mode=0o700)
+    temporary.mkdir(mode=dir_mode)
+    temporary.chmod(dir_mode)
     temporary_resolved = temporary.resolve()
     try:
         for relative in sorted(verified.file_data):
@@ -2576,11 +2592,12 @@ def export_bundle(
                     "UNSAFE_PATH", f"export path escapes the bundle: {relative}"
                 )
             output.write_bytes(verified.file_data[relative])
-            output.chmod(0o600)
+            output.chmod(file_mode)
         # Copy the exact bytes that were verified and hashed, never a reread
         # from the mutable source directory.
         (temporary / "manifest.json").write_bytes(verified.manifest_bytes)
-        (temporary / "manifest.json").chmod(0o600)
+        (temporary / "manifest.json").chmod(file_mode)
+        _apply_bundle_modes(temporary, dir_mode=dir_mode, file_mode=file_mode)
         copied = verify_bundle(temporary)
         if copied.manifest_digest != verified.manifest_digest:
             raise BundleError("DIGEST_MISMATCH", "exported manifest digest changed")

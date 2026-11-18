@@ -12,7 +12,9 @@ import os
 from pathlib import Path, PurePosixPath
 import re
 import shutil
+import stat
 import tomllib
+from types import MappingProxyType
 from typing import Any, Callable, Mapping, Protocol, Sequence
 import uuid
 
@@ -55,18 +57,29 @@ _MIGRATION_NAME = re.compile(r"[0-9]{3}_[A-Za-z0-9_]+\.sql")
 _MIGRATION_NUMBER = re.compile(r"^([0-9]{3})_")
 # Migrations that may be crossed when rolling an image back. A rollback never
 # reverts PostgreSQL DDL; it is only safe when every migration newer than the
-# target is additive/backward-compatible for the older image. Anything not
-# listed here fails closed so release_state.migration_version cannot lie about
-# a schema the target image was not built for. 003 (unique-key replacement) and
-# 007 (cleanup + constraints) are intentionally absent: rolling across them
-# requires an explicit operator decision and a new compatibility entry.
-ROLLBACK_COMPATIBLE_MIGRATIONS = frozenset(
+# target is additive/backward-compatible for the older image AND its recorded
+# sha256 matches the exact reviewed SQL file. Anything not listed here (or with
+# a mismatched sha256) fails closed so release_state.migration_version cannot
+# lie about a schema the target image was not built for. 003 (unique-key
+# replacement) and 007 (cleanup + constraints) are intentionally absent: rolling
+# across them requires an explicit operator decision and a new entry.
+ROLLBACK_COMPATIBLE_MIGRATIONS: Mapping[str, str] = MappingProxyType(
     {
-        "002_workflow.sql",
-        "004_legacy_binary_sync.sql",
-        "005_execution_evidence.sql",
-        "006_attempt_journal_provenance.sql",
-        "008_release_events.sql",
+        "002_workflow.sql": (
+            "sha256:1ab1f9959851b6c6ac143226fd8a6f979d649c1b8a439eda6dcc65bb2065eb32"
+        ),
+        "004_legacy_binary_sync.sql": (
+            "sha256:f6f98754bf994ea1158c54bbb54359e8e59b9f867e39cc7417f55506f19dde84"
+        ),
+        "005_execution_evidence.sql": (
+            "sha256:06838a65b615709ad4b45a0739b19de0bc90d5a189853fcd6b344f00ff0d7534"
+        ),
+        "006_attempt_journal_provenance.sql": (
+            "sha256:6b3a1848fa7dec8b4cfeac0167a66de20b01e3f00c96c6aad3618b1f0f9ba47e"
+        ),
+        "008_release_events.sql": (
+            "sha256:c117f26d16f8f956032018bedb22304ea53704b6ed2032d43c01a4ff3d98ba09"
+        ),
     }
 )
 _CVE_ID = re.compile(r"CVE-[0-9]{4}-[0-9]{4,}")
@@ -412,11 +425,51 @@ def generate_sbom(
     return sbom, _sha256_bytes(encoded)
 
 
+def _validate_skip_archived_bundle_approval(
+    approval: Mapping[str, Any] | None,
+    *,
+    skip_reason: str | None = None,
+    require_skip_reason: bool = False,
+) -> str | None:
+    if not isinstance(approval, Mapping):
+        raise ReleaseGateError(
+            "promotion blocked: skipping archived_real_bundle requires a signed "
+            "approval object with allow_skip_archived_bundle=true"
+        )
+    if approval.get("allow_skip_archived_bundle") is not True:
+        raise ReleaseGateError(
+            "promotion blocked: skipping archived_real_bundle requires "
+            "approval.allow_skip_archived_bundle=true"
+        )
+    approval_reason = approval.get("archived_bundle_skip_reason")
+    if not isinstance(approval_reason, str) or not approval_reason.strip():
+        raise ReleaseGateError(
+            "promotion blocked: skipping archived_real_bundle requires a "
+            "non-empty approval.archived_bundle_skip_reason"
+        )
+    normalized_approval_reason = approval_reason.strip()
+    if skip_reason is not None or require_skip_reason:
+        if not isinstance(skip_reason, str) or not skip_reason.strip():
+            raise ReleaseGateError(
+                "promotion blocked: skipping archived_real_bundle requires a "
+                "non-empty reason"
+            )
+        if skip_reason.strip() != normalized_approval_reason:
+            raise ReleaseGateError(
+                "promotion blocked: archived_bundle_skip_reason does not match "
+                "approval.archived_bundle_skip_reason"
+            )
+        return skip_reason.strip()
+    return normalized_approval_reason
+
+
 def _validate_approval(
     approval: Mapping[str, Any],
     *,
     candidate_digest: str,
     now: datetime | None = None,
+    require_archived_bundle: bool = True,
+    skip_reason: str | None = None,
 ) -> None:
     if not isinstance(approval, Mapping):
         raise ReleaseGateError("approval record must be an object")
@@ -438,6 +491,10 @@ def _validate_approval(
         raise ReleaseGateError("promotion blocked: approval is from the future")
     if reference - approved_at > APPROVAL_MAX_AGE:
         raise ReleaseGateError("promotion blocked: approval has expired")
+    if not require_archived_bundle:
+        _validate_skip_archived_bundle_approval(
+            approval, skip_reason=skip_reason, require_skip_reason=False
+        )
 
 
 def verify_promotion_gate(
@@ -446,6 +503,8 @@ def verify_promotion_gate(
     expected_manifest_digest: str,
     approval: Mapping[str, Any],
     now: datetime | None = None,
+    require_archived_bundle: bool = True,
+    skip_reason: str | None = None,
 ) -> str:
     """Enforce Promotion Gate: immutable digest, CI status, approval, contract & migration compatibility."""
     validate_release_candidate_manifest(manifest)
@@ -454,7 +513,13 @@ def verify_promotion_gate(
         raise ReleaseGateError(
             f"candidate manifest digest mismatch: expected {expected_manifest_digest}, got {actual_digest}"
         )
-    _validate_approval(approval, candidate_digest=actual_digest, now=now)
+    _validate_approval(
+        approval,
+        candidate_digest=actual_digest,
+        now=now,
+        require_archived_bundle=require_archived_bundle,
+        skip_reason=skip_reason,
+    )
     return actual_digest
 
 
@@ -741,6 +806,17 @@ def _verify_rollback_migrations(
             "rollback blocked: target migration_version is newer than the "
             "active schema"
         )
+    same_ordinal = sorted(
+        name
+        for name in applied
+        if _migration_ordinal(name, "migration ledger entry") == target_number
+        and name != target_version
+    )
+    if same_ordinal:
+        raise ReleaseGateError(
+            "rollback blocked: unexpected same-ordinal migration in ledger alongside "
+            f"{target_version}: {', '.join(same_ordinal)}"
+        )
     crossed = sorted(
         name
         for name in applied
@@ -753,6 +829,16 @@ def _verify_rollback_migrations(
         raise ReleaseGateError(
             "rollback blocked: target crosses migrations without a declared "
             f"backward-compatibility boundary: {', '.join(incompatible)}"
+        )
+    mismatched = [
+        name
+        for name in crossed
+        if applied[name] != ROLLBACK_COMPATIBLE_MIGRATIONS[name]
+    ]
+    if mismatched:
+        raise ReleaseGateError(
+            "rollback blocked: crossed migration digest mismatch against "
+            f"rollback-compatible ledger: {', '.join(mismatched)}"
         )
     return target_number
 
@@ -824,6 +910,8 @@ def promote_and_smoke(
     preflight_checks: Mapping[str, Callable[[], bool]] | None = None,
     audit_metadata: Mapping[str, Any] | None = None,
     now: datetime | None = None,
+    require_archived_bundle: bool = True,
+    skip_reason: str | None = None,
 ) -> dict[str, Any]:
     """Drain-check, switch to the candidate, smoke it, and audit the outcome.
 
@@ -846,6 +934,8 @@ def promote_and_smoke(
         expected_manifest_digest=expected_manifest_digest,
         approval=approval,
         now=now,
+        require_archived_bundle=require_archived_bundle,
+        skip_reason=skip_reason,
     )
     existing = backend.promotion_for(candidate_digest)
     if existing is not None:
@@ -1072,15 +1162,15 @@ def rollback_release(
     with _backend_transaction(backend):
         _require_drained(backend, action="rollback")
         latest = backend.active_release()
+        if latest is not None and _same_release(target, latest):
+            raise ReleaseGateError(
+                "rollback blocked: target release is already the active release; "
+                "no state change"
+            )
         if latest is None or not _same_release(latest, current):
             raise ReleaseGateError(
                 "active release changed while rollback smoke checks ran; "
                 "refusing to overwrite a concurrent promotion"
-            )
-        if _same_release(target, latest):
-            raise ReleaseGateError(
-                "rollback blocked: target release is already the active release; "
-                "no state change"
             )
         _verify_rollback_migrations(
             target_version=target["migration_version"],
@@ -1147,6 +1237,86 @@ def _reject_symlink_ancestors(path: Path, *, label: str) -> None:
     jsonutil.reject_symlink_ancestors(path, label=label, error_cls=ReleaseGateError)
 
 
+def _verify_bundle_container_readability(bundle_path: Path) -> None:
+    """Verify an archived bundle tree is traversable/readable by UID 65534:65534."""
+    try:
+        root_stat = bundle_path.lstat()
+    except OSError as error:
+        raise ReleaseGateError(
+            f"promotion blocked: cannot inspect archived bundle {bundle_path}: {error}"
+        ) from error
+    if stat.S_ISLNK(root_stat.st_mode):
+        raise ReleaseGateError(
+            f"refusing promotion: archived bundle root is a symlink: {bundle_path}"
+        )
+    if not stat.S_ISDIR(root_stat.st_mode):
+        raise ReleaseGateError(
+            f"refusing promotion: archived bundle path is not a directory: {bundle_path}"
+        )
+    root_mode = stat.S_IMODE(root_stat.st_mode)
+    if not ((root_mode & 0o005) == 0o005 or (root_stat.st_uid == 65534 and (root_mode & 0o500) == 0o500)):
+        raise ReleaseGateError(
+            f"promotion blocked: archived bundle directory {bundle_path} has mode "
+            f"{oct(root_mode)}, which is not traversable/readable by unprivileged "
+            "container user 65534:65534 (expected >= 0o755)"
+        )
+
+    entries_seen = 0
+    stack: list[Path] = [bundle_path]
+    while stack:
+        current = stack.pop()
+        try:
+            iterator = os.scandir(current)
+        except OSError as error:
+            raise ReleaseGateError(
+                f"promotion blocked: archived bundle directory {current} cannot be scanned: {error}"
+            ) from error
+        with iterator:
+            for dirent in iterator:
+                entries_seen += 1
+                if entries_seen > evidence.MAX_BUNDLE_ENTRIES:
+                    raise ReleaseGateError(
+                        "refusing promotion: archived bundle exceeds entry cap"
+                    )
+                child = Path(dirent.path)
+                if dirent.is_symlink():
+                    raise ReleaseGateError(
+                        f"refusing promotion: archived bundle contains a symlink: {child}"
+                    )
+                try:
+                    entry_stat = dirent.stat(follow_symlinks=False)
+                except OSError as error:
+                    raise ReleaseGateError(
+                        f"promotion blocked: cannot inspect archived bundle entry {child}: {error}"
+                    ) from error
+                mode = stat.S_IMODE(entry_stat.st_mode)
+                if stat.S_ISDIR(entry_stat.st_mode):
+                    if not (
+                        (mode & 0o005) == 0o005
+                        or (entry_stat.st_uid == 65534 and (mode & 0o500) == 0o500)
+                    ):
+                        raise ReleaseGateError(
+                            f"promotion blocked: archived bundle directory {child} has mode "
+                            f"{oct(mode)}, which is not traversable/readable by unprivileged "
+                            "container user 65534:65534 (expected >= 0o755)"
+                        )
+                    stack.append(child)
+                elif stat.S_ISREG(entry_stat.st_mode):
+                    if not (
+                        (mode & 0o004) == 0o004
+                        or (entry_stat.st_uid == 65534 and (mode & 0o400) == 0o400)
+                    ):
+                        raise ReleaseGateError(
+                            f"promotion blocked: archived bundle file {child} has mode "
+                            f"{oct(mode)}, which is not readable by unprivileged container "
+                            "user 65534:65534 (expected >= 0o444 / 0o644)"
+                        )
+                else:
+                    raise ReleaseGateError(
+                        f"refusing promotion: archived bundle contains non-regular entry: {child}"
+                    )
+
+
 def archived_bundle_preflight(
     *,
     evidence_root: str | Path,
@@ -1154,6 +1324,7 @@ def archived_bundle_preflight(
     verify_fn: Callable[[str, str], bool],
     require_archived_bundle: bool = True,
     skip_reason: str | None = None,
+    approval: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Enforce real archived bundle verification on promote unless explicitly skipped."""
     if isinstance(evidence_root, str):
@@ -1191,14 +1362,12 @@ def archived_bundle_preflight(
                 f"promotion blocked: evidence_root {root_path} is not mounted; "
                 "run promotion on a runner with the evidence volume mounted"
             )
-        if not isinstance(skip_reason, str) or not skip_reason.strip():
-            raise ReleaseGateError(
-                "promotion blocked: skipping archived_real_bundle requires a "
-                "non-empty reason"
-            )
+        reason = _validate_skip_archived_bundle_approval(
+            approval, skip_reason=skip_reason, require_skip_reason=True
+        )
         return {
             "status": "skipped",
-            "reason": skip_reason.strip(),
+            "reason": reason,
             "check_fn": None,
         }
     if not root_path.is_dir():
@@ -1213,14 +1382,12 @@ def archived_bundle_preflight(
                 f"evidence_root {root_path}; run promotion on a runner with the "
                 "evidence volume mounted"
             )
-        if not isinstance(skip_reason, str) or not skip_reason.strip():
-            raise ReleaseGateError(
-                "promotion blocked: skipping archived_real_bundle requires a "
-                "non-empty reason"
-            )
+        reason = _validate_skip_archived_bundle_approval(
+            approval, skip_reason=skip_reason, require_skip_reason=True
+        )
         return {
             "status": "skipped",
-            "reason": skip_reason.strip(),
+            "reason": reason,
             "check_fn": None,
         }
     latest_path = Path(latest["path"])
@@ -1229,6 +1396,7 @@ def archived_bundle_preflight(
         raise ReleaseGateError(
             f"refusing promotion: latest evidence bundle path is not a real directory: {latest_path}"
         )
+    _verify_bundle_container_readability(latest_path)
     bundle_path = str(latest["path"])
     bundle_digest = str(latest["digest"])
     return {
@@ -2772,7 +2940,8 @@ def persist_b03_evidence_bundle(
         raise ReleaseGateError(
             f"invalid B03 job_id for persistent bundle path: {job_id!r}"
         )
-    root_path.mkdir(parents=True, exist_ok=True)
+    root_path.mkdir(mode=0o755, parents=True, exist_ok=True)
+    root_path.chmod(0o755)
     destination = root_path / job_id
     try:
         exported = evidence.export_bundle(

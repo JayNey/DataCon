@@ -1164,3 +1164,85 @@ def test_all_release_store_entrypoints_and_slots_cli_fail_closed_on_unmigrated_d
                     sql.Identifier(empty_schema)
                 )
             )
+
+
+def test_bootstrap_rejects_non_consecutive_schema_migrations_in_postgres(
+    isolated_database,
+):
+    isolated_database.connection.execute(
+        "DELETE FROM schema_migrations WHERE file = '007_execution_evidence_invariant.sql'"
+    )
+    store_handle = state.ReleaseStore(isolated_database.dsn)
+    with pytest.raises(state.ReleaseStateError, match="consecutive|gap"):
+        store_handle.bootstrap_release(
+            image_id=PREVIOUS_IMAGE,
+            config={"policy_version": "1"},
+            migration_version="008_release_events.sql",
+            evidence_root="/var/lib/datacon/evidence",
+        )
+    assert store_handle.active_release() is None
+
+
+def test_rollback_rejects_tampered_compatible_migration_digest_and_same_ordinal_extra_in_postgres(
+    isolated_database,
+):
+    store_handle = state.ReleaseStore(isolated_database.dsn)
+    store_handle.bootstrap_release(
+        image_id=PREVIOUS_IMAGE,
+        config={"policy_version": "1"},
+        migration_version="008_release_events.sql",
+        evidence_root="/var/lib/datacon/evidence",
+    )
+    m1 = _manifest()
+    a1 = _approval(m1)
+    assert (
+        release.promote_and_smoke(
+            manifest=m1,
+            expected_manifest_digest=a1["candidate_digest"],
+            approval=a1,
+            backend=store_handle,
+            smoke_checks={"cli_smoke": lambda: True},
+            rollback_fn=lambda prev: {"restored_image": prev["image_id"], "ok": True},
+        )["status"]
+        == "promoted"
+    )
+    target_007 = {
+        "image_id": PREVIOUS_IMAGE,
+        "config": {"policy_version": "1"},
+        "migration_version": "007_execution_evidence_invariant.sql",
+        "evidence_root": "/var/lib/datacon/evidence",
+        "manifest_digest": "sha256:" + "9" * 64,
+    }
+
+    # 1. Tamper 008's sha256 in schema_migrations -> must fail closed.
+    isolated_database.connection.execute(
+        "UPDATE schema_migrations SET sha256 = %s WHERE file = '008_release_events.sql'",
+        ("sha256:" + "0" * 64,),
+    )
+    with pytest.raises(release.ReleaseGateError, match="digest|008_release_events"):
+        release.rollback_release(
+            target_release=target_007,
+            backend=store_handle,
+            smoke_checks={"cli_smoke": lambda: True},
+            approved_by="reviewer-1",
+            candidate_digest=a1["candidate_digest"],
+        )
+
+    # Restore 008's real digest and insert an extra same-ordinal 007 migration.
+    real_008 = release.ROLLBACK_COMPATIBLE_MIGRATIONS["008_release_events.sql"]
+    isolated_database.connection.execute(
+        "UPDATE schema_migrations SET sha256 = %s WHERE file = '008_release_events.sql'",
+        (real_008,),
+    )
+    isolated_database.connection.execute(
+        "INSERT INTO schema_migrations (file, sha256) VALUES (%s, %s)",
+        ("007_extra_shadow.sql", "sha256:" + "f" * 64),
+    )
+    with pytest.raises(release.ReleaseGateError, match="same-ordinal|007_extra_shadow"):
+        release.rollback_release(
+            target_release=target_007,
+            backend=store_handle,
+            smoke_checks={"cli_smoke": lambda: True},
+            approved_by="reviewer-1",
+            candidate_digest=a1["candidate_digest"],
+        )

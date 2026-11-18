@@ -344,6 +344,7 @@ jobs:
       ARTIFACT_RUN_ID: ${{ github.event.inputs.artifact_run_id }}
       REQUIRE_ARCHIVED_BUNDLE: ${{ github.event.inputs.require_archived_bundle }}
       ARCHIVED_BUNDLE_SKIP_REASON: ${{ github.event.inputs.archived_bundle_skip_reason }}
+      DATACON_IMAGE_ARCHIVE_DIR: ${{ vars.DATACON_IMAGE_ARCHIVE_DIR }}
       CURRENT_SHA: ${{ github.sha }}
     steps:
       - name: Verify protected ref
@@ -535,10 +536,17 @@ jobs:
           manifest = json.loads(
               (out / release.RELEASE_MANIFEST_FILE).read_text(encoding="utf-8")
           )
+          req_env = os.environ.get("REQUIRE_ARCHIVED_BUNDLE", "true").strip().lower()
+          if req_env not in ("true", "false", ""):
+              raise SystemExit(f"invalid REQUIRE_ARCHIVED_BUNDLE value: {req_env!r}")
+          require_archived_bundle = req_env != "false"
+          skip_reason = os.environ.get("ARCHIVED_BUNDLE_SKIP_REASON", "").strip()
           release.verify_promotion_gate(
               manifest,
               expected_manifest_digest=expected,
               approval=approval,
+              require_archived_bundle=require_archived_bundle,
+              skip_reason=None if require_archived_bundle else skip_reason,
           )
           expected_head = os.environ.get("VERIFIED_RUN_HEAD_SHA") or os.environ["CURRENT_SHA"]
           if manifest["source_commit"] != expected_head:
@@ -587,6 +595,35 @@ jobs:
               )
           print("loaded image id verified")
           PY
+          if [ -n "${DATACON_IMAGE_ARCHIVE_DIR:-}" ]; then
+            uv run --frozen python - "$out/control-plane-image.tar" "$image_id" "${DATACON_IMAGE_ARCHIVE_DIR}" <<'PY'
+          import os
+          import pathlib
+          import shutil
+          import sys
+          import uuid
+
+          from datacon import jsonutil
+
+          src_tar = pathlib.Path(sys.argv[1])
+          image_id = sys.argv[2]
+          archive_dir = pathlib.Path(sys.argv[3])
+          if not archive_dir.is_absolute() or ".." in archive_dir.parts:
+              raise SystemExit(f"DATACON_IMAGE_ARCHIVE_DIR must be an absolute path without '..': {archive_dir}")
+          jsonutil.reject_symlink_ancestors(archive_dir, label="DATACON_IMAGE_ARCHIVE_DIR")
+          archive_dir.mkdir(mode=0o755, parents=True, exist_ok=True)
+          archive_dir.chmod(0o755)
+          dest = archive_dir / f"{image_id.removeprefix('sha256:')}.tar"
+          if dest.is_symlink():
+              raise SystemExit(f"archived image tar destination must not be a symlink: {dest}")
+          if not dest.exists():
+              tmp_dest = archive_dir / f".{dest.name}.tmp-{uuid.uuid4().hex}"
+              shutil.copy2(src_tar, tmp_dest)
+              tmp_dest.chmod(0o644)
+              tmp_dest.rename(dest)
+          print(f"archived candidate image tar to {dest}")
+          PY
+          fi
       - name: Check environment preconditions and read-only candidate container DB smoke
         shell: bash
         env:
@@ -709,6 +746,8 @@ jobs:
                   timeout=60,
               )
               if proc.returncode != 0:
+                  if proc.stderr:
+                      sys.stderr.write(proc.stderr)
                   return False
               try:
                   parsed = json.loads(proc.stdout)
@@ -743,6 +782,7 @@ jobs:
               verify_fn=verify_bundle_in_container,
               require_archived_bundle=require_archived_bundle,
               skip_reason=skip_reason or None,
+              approval=approval,
           )
           audit_metadata = {}
           if archived_preflight["status"] == "required":
@@ -762,6 +802,8 @@ jobs:
                   smoke_checks=smoke_checks,
                   rollback_fn=rollback_fn,
                   audit_metadata=audit_metadata,
+                  require_archived_bundle=require_archived_bundle,
+                  skip_reason=None if require_archived_bundle else skip_reason,
               )
           finally:
               shutil.rmtree(smoke_bundle, ignore_errors=True)
@@ -790,6 +832,7 @@ jobs:
     env:
       TARGET_DIGEST: ${{ github.event.inputs.target_digest }}
       ARTIFACT_RUN_ID: ${{ github.event.inputs.artifact_run_id }}
+      DATACON_IMAGE_ARCHIVE_DIR: ${{ vars.DATACON_IMAGE_ARCHIVE_DIR }}
       APPROVED_BY: ${{ github.actor }}
       CURRENT_SHA: ${{ github.sha }}
     steps:
@@ -815,8 +858,8 @@ jobs:
           import re
           import urllib.request
 
-          run_id = os.environ.get("ARTIFACT_RUN_ID", "").strip()
-          if not re.fullmatch(r"[0-9]+", run_id):
+          run_id = os.environ.get("ARTIFACT_RUN_ID", "")
+          if run_id and not re.fullmatch(r"[0-9]+", run_id):
               raise SystemExit("artifact_run_id must be numeric")
           url = (
               "https://api.github.com/repos/"
@@ -870,56 +913,62 @@ jobs:
           current = os.environ.get("CURRENT_SHA", "").strip()
           if not re.fullmatch(r"[0-9a-f]{40}", current):
               fail("GITHUB_SHA is not a 40-char commit")
-          run_id = os.environ.get("ARTIFACT_RUN_ID", "").strip()
-          if not run_id or not re.fullmatch(r"[0-9]+", run_id):
-              fail("artifact_run_id must be a numeric run id to verify rollback provenance")
-          token = os.environ.get("GITHUB_TOKEN", "").strip()
-          if not token:
-              fail("GITHUB_TOKEN is required to verify the artifact run")
-          url = (
-              "https://api.github.com/repos/"
-              + os.environ["REPOSITORY"]
-              + "/actions/runs/"
-              + run_id
-          )
-          request = urllib.request.Request(
-              url,
-              headers={
-                  "Authorization": "Bearer " + token,
-                  "Accept": "application/vnd.github+json",
-                  "X-GitHub-Api-Version": "2022-11-28",
-              },
-          )
-          try:
-              with urllib.request.urlopen(request, timeout=20) as response:
-                  run = json.load(response)
-          except Exception as error:
-              fail("cannot read artifact run metadata: " + repr(error))
-          path = str(run.get("path", ""))
-          if not path.endswith(".github/workflows/release.yml"):
-              fail("artifact run was not produced by release.yml")
-          if run.get("status") != "completed" or run.get("conclusion") != "success":
-              fail("artifact run did not complete successfully")
-          head_sha = run.get("head_sha")
-          if not isinstance(head_sha, str) or not re.fullmatch(r"[0-9a-f]{40}", head_sha):
-              fail("artifact run has no valid head_sha")
-          head_branch = run.get("head_branch")
-          if not isinstance(head_branch, str) or (
-              head_branch != "main"
-              and not re.fullmatch(r"v[0-9A-Za-z._-]+", head_branch)
-          ):
-              fail("artifact run did not come from main or a release tag")
-          if subprocess.run(
-              ["git", "merge-base", "--is-ancestor", head_sha, "refs/remotes/origin/main"],
-              timeout=30,
-          ).returncode != 0:
-              fail("artifact run head_sha is not in origin/main history")
-          if subprocess.run(
-              ["git", "merge-base", "--is-ancestor", head_sha, current],
-              timeout=30,
-          ).returncode != 0:
-              fail("artifact run head_sha is not in the protected ref history")
-          print("protected ref and rollback artifact provenance verified")
+          run_id = os.environ.get("ARTIFACT_RUN_ID", "")
+          if run_id:
+              if not re.fullmatch(r"[0-9]+", run_id):
+                  fail("artifact_run_id must be a numeric run id to verify rollback provenance")
+              token = os.environ.get("GITHUB_TOKEN", "").strip()
+              if not token:
+                  fail("GITHUB_TOKEN is required to verify the artifact run")
+              url = (
+                  "https://api.github.com/repos/"
+                  + os.environ["REPOSITORY"]
+                  + "/actions/runs/"
+                  + run_id
+              )
+              request = urllib.request.Request(
+                  url,
+                  headers={
+                      "Authorization": "Bearer " + token,
+                      "Accept": "application/vnd.github+json",
+                      "X-GitHub-Api-Version": "2022-11-28",
+                  },
+              )
+              try:
+                  with urllib.request.urlopen(request, timeout=20) as response:
+                      run = json.load(response)
+              except Exception as error:
+                  fail("cannot read artifact run metadata: " + repr(error))
+              path = str(run.get("path", ""))
+              if not path.endswith(".github/workflows/release.yml"):
+                  fail("artifact run was not produced by release.yml")
+              if run.get("status") != "completed" or run.get("conclusion") != "success":
+                  fail("artifact run did not complete successfully")
+              head_sha = run.get("head_sha")
+              if not isinstance(head_sha, str) or not re.fullmatch(r"[0-9a-f]{40}", head_sha):
+                  fail("artifact run has no valid head_sha")
+              head_branch = run.get("head_branch")
+              if not isinstance(head_branch, str) or (
+                  head_branch != "main"
+                  and not re.fullmatch(r"v[0-9A-Za-z._-]+", head_branch)
+              ):
+                  fail("artifact run did not come from main or a release tag")
+              if subprocess.run(
+                  ["git", "merge-base", "--is-ancestor", head_sha, "refs/remotes/origin/main"],
+                  timeout=30,
+              ).returncode != 0:
+                  fail("artifact run head_sha is not in origin/main history")
+              if subprocess.run(
+                  ["git", "merge-base", "--is-ancestor", head_sha, current],
+                  timeout=30,
+              ).returncode != 0:
+                  fail("artifact run head_sha is not in the protected ref history")
+              print("protected ref and rollback artifact provenance verified")
+          else:
+              print(
+                  "artifact_run_id omitted; rollback will resolve target_digest from "
+                  "runner-local/archived image storage and require release_events provenance"
+              )
           PY
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
@@ -937,12 +986,9 @@ jobs:
             echo "target_digest must be sha256:<64 hex>" >&2
             exit 1
           fi
-          if [ -z "${ARTIFACT_RUN_ID}" ]; then
-            echo "artifact_run_id is required to load the rollback image tar" >&2
-            exit 1
-          fi
 
       - name: Download the candidate artifact that contains the target image
+        if: env.ARTIFACT_RUN_ID != ''
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: release-candidate-artifacts
@@ -954,10 +1000,45 @@ jobs:
         run: |
           set -euo pipefail
           out="$RUNNER_TEMP/release-artifacts"
-          docker load -i "$out/control-plane-image.tar"
-          loaded="$(docker image inspect datacon-control-plane:candidate --format '{{.Id}}')"
-          if [ "$loaded" != "$TARGET_DIGEST" ]; then
-            echo "loaded image id $loaded does not match target $TARGET_DIGEST" >&2
+          if [ -n "${ARTIFACT_RUN_ID}" ]; then
+            docker load -i "$out/control-plane-image.tar"
+            loaded="$(docker image inspect datacon-control-plane:candidate --format '{{.Id}}')"
+            if [ "$loaded" != "$TARGET_DIGEST" ]; then
+              echo "loaded image id $loaded does not match target $TARGET_DIGEST" >&2
+              exit 1
+            fi
+          else
+            if ! docker image inspect "${TARGET_DIGEST}" --format '{{.Id}}' >/dev/null 2>&1; then
+              if [ -n "${DATACON_IMAGE_ARCHIVE_DIR:-}" ]; then
+                archive_tar_file="$RUNNER_TEMP/rollback-archive-tar.txt"
+                rm -f "$archive_tar_file"
+                uv run --frozen python - "${DATACON_IMAGE_ARCHIVE_DIR}" "${TARGET_DIGEST}" "$archive_tar_file" <<'PY'
+          import pathlib
+          import sys
+
+          from datacon import jsonutil
+
+          archive_dir = pathlib.Path(sys.argv[1])
+          digest = sys.argv[2]
+          out_file = pathlib.Path(sys.argv[3])
+          if not archive_dir.is_absolute() or ".." in archive_dir.parts:
+              raise SystemExit(f"DATACON_IMAGE_ARCHIVE_DIR must be an absolute path without '..': {archive_dir}")
+          jsonutil.reject_symlink_ancestors(archive_dir, label="DATACON_IMAGE_ARCHIVE_DIR")
+          tar_path = archive_dir / f"{digest.removeprefix('sha256:')}.tar"
+          if tar_path.is_symlink():
+              raise SystemExit(f"archived image tar must not be a symlink: {tar_path}")
+          if not tar_path.is_file():
+              raise SystemExit(f"archived image tar not found for {digest}: {tar_path}")
+          out_file.write_text(str(tar_path), encoding="utf-8")
+          PY
+                archive_tar="$(cat "$archive_tar_file")"
+                docker load -i "$archive_tar"
+              fi
+            fi
+          fi
+          inspected="$(docker image inspect "${TARGET_DIGEST}" --format '{{.Id}}')"
+          if [ "$inspected" != "$TARGET_DIGEST" ]; then
+            echo "target image id $inspected does not match $TARGET_DIGEST" >&2
             exit 1
           fi
       - name: Smoke and restore the persisted target release
@@ -967,6 +1048,7 @@ jobs:
         run: |
           set -euo pipefail
           out="$RUNNER_TEMP/release-artifacts"
+          mkdir -p "$out"
           uv run --frozen python - "$out" <<'PY'
           import json
           import os
@@ -978,6 +1060,7 @@ jobs:
           from datacon import release, state
 
           out = pathlib.Path(sys.argv[1])
+          target_image = os.environ["TARGET_DIGEST"]
           store = state.ReleaseStore(os.environ["DATACON_DATABASE_URL"])
           current = store.active_release()
           if current is None:
@@ -988,6 +1071,10 @@ jobs:
           if target is None:
               raise SystemExit(
                   "no persisted release record matches target_digest; refusing rollback"
+              )
+          if target.get("action") not in ("bootstrap", "promote", "rollback"):
+              raise SystemExit(
+                  "target_digest lacks a persisted release_events audit record; refusing rollback"
               )
           target_candidate_digest = (
               target.get("candidate_digest") or target.get("manifest_digest")
@@ -1004,7 +1091,7 @@ jobs:
 
           def image_help():
               return subprocess.run(
-                  ["docker", "run", "--rm", "datacon-control-plane:candidate", "--help"],
+                  ["docker", "run", "--rm", target_image, "--help"],
                   capture_output=True,
                   timeout=60,
               ).returncode == 0
@@ -1025,7 +1112,7 @@ jobs:
                       "--rm",
                       "-v",
                       f"{smoke_bundle}:/bundle:ro",
-                      "datacon-control-plane:candidate",
+                      target_image,
                       "verify-bundle",
                       "/bundle",
                       "--expected-digest",
@@ -1036,6 +1123,8 @@ jobs:
                   timeout=60,
               )
               if proc.returncode != 0:
+                  if proc.stderr:
+                      sys.stderr.write(proc.stderr)
                   return False
               try:
                   parsed = json.loads(proc.stdout)
@@ -1046,7 +1135,7 @@ jobs:
                   and parsed.get("manifest_digest") == smoke_bundle_digest
               )
 
-          def release_slots_compatible():
+          def release_slots_compatible(image=target_image):
               proc = subprocess.run(
                   [
                       "docker",
@@ -1056,7 +1145,7 @@ jobs:
                       "host",
                       "-e",
                       "DATACON_DATABASE_URL",
-                      "datacon-control-plane:candidate",
+                      image,
                       "release",
                       "slots",
                       "--environment",

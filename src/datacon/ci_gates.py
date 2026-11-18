@@ -12,7 +12,7 @@ from __future__ import annotations
 from datetime import date
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 from typing import Any, Iterable, Mapping, Sequence
 import tomllib
@@ -112,7 +112,15 @@ _SECRET_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
 _REQUIRED_WAIVER_FIELDS = frozenset({"id", "scope", "impact", "owner", "expires_at"})
 _BLOCKING_SEVERITIES = frozenset({"CRITICAL", "HIGH"})
 _YAML_NODE_BUDGET = 150_000
+_TRIGGER_CHAR_BUDGET = 1_000_000
 _STATIC_WITH_KEY = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]*$")
+_RUN_SECRETS_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"\bsecrets\s*(?:\.|\[)", re.IGNORECASE),
+    re.compile(
+        r"(?:^|[,(\s!|&=])\s*secrets\s*(?=$|[,)\s!|&=])",
+        re.IGNORECASE,
+    ),
+)
 
 
 class GateError(RuntimeError):
@@ -166,7 +174,7 @@ def check_req_tc_consistency(files: Iterable[Path]) -> list[str]:
 def _load_workflow(path: Path) -> Any:
     try:
         document = yaml.safe_load(path.read_text(encoding="utf-8"))
-    except yaml.YAMLError as error:
+    except (yaml.YAMLError, RecursionError) as error:
         raise GateError(f"{path}: workflow is not valid YAML: {error}") from error
     if not isinstance(document, Mapping):
         raise GateError(f"{path}: workflow must be a YAML mapping")
@@ -240,6 +248,10 @@ def _walk_yaml(
                 _bump_yaml_budget(state)
                 yield str(key), item
                 yield from _walk_yaml(item, seen, state)
+        except RecursionError as error:
+            raise GateError(
+                f"workflow YAML exceeds recursion safety limit: {error}"
+            ) from error
         finally:
             seen.discard(marker)
     elif isinstance(value, list):
@@ -250,6 +262,10 @@ def _walk_yaml(
         try:
             for item in value:
                 yield from _walk_yaml(item, seen, state)
+        except RecursionError as error:
+            raise GateError(
+                f"workflow YAML exceeds recursion safety limit: {error}"
+            ) from error
         finally:
             seen.discard(marker)
 
@@ -287,6 +303,10 @@ def _iter_yaml_strings(
                 yield from _iter_yaml_strings(
                     item, prefix=f"{prefix}.{key}", _seen=seen, _state=state
                 )
+        except RecursionError as error:
+            raise GateError(
+                f"workflow YAML exceeds recursion safety limit: {error}"
+            ) from error
         finally:
             seen.discard(marker)
     elif isinstance(value, list):
@@ -299,6 +319,10 @@ def _iter_yaml_strings(
                 yield from _iter_yaml_strings(
                     item, prefix=f"{prefix}[{idx}]", _seen=seen, _state=state
                 )
+        except RecursionError as error:
+            raise GateError(
+                f"workflow YAML exceeds recursion safety limit: {error}"
+            ) from error
         finally:
             seen.discard(marker)
 
@@ -319,6 +343,13 @@ def _check_run_expressions(text: str) -> list[str]:
             "run: contains an untrusted '${{ ... }}' expression "
             f"({expression}); pass it through env: instead"
         )
+    for match in _RUN_EXPRESSION.finditer(text):
+        expression = match.group(1).lower()
+        if any(pattern.search(expression) for pattern in _RUN_SECRETS_PATTERNS):
+            errors.append(
+                "run: directly interpolates '${{ ... }}' secrets expression "
+                f"({expression.strip()}); pass it through env: instead"
+            )
     return errors
 
 
@@ -362,21 +393,248 @@ def _check_with_expressions(
     return errors
 
 
-def check_workflow_security(files: Iterable[Path]) -> list[str]:
+def _trigger_has_pull_request_target(
+    trigger: Any,
+    *,
+    _seen: set[int] | None = None,
+    _state: list[int] | None = None,
+) -> bool:
+    """Recursively check ``on:`` keys/strings within node and total char budgets."""
+    seen = _seen if _seen is not None else set()
+    state = _state if _state is not None else [0, 0]  # [nodes, chars]
+
+    def _account_text(text: str) -> bool:
+        state[1] += len(text)
+        if state[1] > _TRIGGER_CHAR_BUDGET:
+            raise GateError(
+                f"workflow 'on:' trigger exceeds the {_TRIGGER_CHAR_BUDGET}-char safety budget"
+            )
+        return "pull_request_target" in text
+
+    _bump_yaml_budget(state)
+    if trigger is None:
+        return False
+    if isinstance(trigger, str):
+        return _account_text(trigger)
+    if isinstance(trigger, Mapping):
+        marker = id(trigger)
+        if marker in seen:
+            raise GateError("workflow contains a circular YAML reference")
+        seen.add(marker)
+        try:
+            for key, item in trigger.items():
+                _bump_yaml_budget(state)
+                if _account_text(str(key)):
+                    return True
+                if _trigger_has_pull_request_target(item, _seen=seen, _state=state):
+                    return True
+        except RecursionError as error:
+            raise GateError(
+                f"workflow YAML exceeds recursion safety limit: {error}"
+            ) from error
+        finally:
+            seen.discard(marker)
+        return False
+    if isinstance(trigger, list):
+        marker = id(trigger)
+        if marker in seen:
+            raise GateError("workflow contains a circular YAML reference")
+        seen.add(marker)
+        try:
+            for item in trigger:
+                if _trigger_has_pull_request_target(item, _seen=seen, _state=state):
+                    return True
+        except RecursionError as error:
+            raise GateError(
+                f"workflow YAML exceeds recursion safety limit: {error}"
+            ) from error
+        finally:
+            seen.discard(marker)
+        return False
+    return _account_text(str(trigger))
+
+
+def _infer_repo_root(workflow_path: Path, explicit_root: Path | None) -> Path:
+    if explicit_root is not None:
+        return explicit_root.resolve()
+    resolved = workflow_path.resolve()
+    if resolved.parent.name == "workflows" and resolved.parent.parent.name == ".github":
+        return resolved.parent.parent.parent
+    return resolved.parent
+
+
+def _resolve_local_action_file(
+    uses: str, *, repo_root: Path, label: str, errors: list[str]
+) -> Path | None:
+    if "\x00" in uses or "\\" in uses or ".." in PurePosixPath(uses).parts:
+        errors.append(
+            f"{label} local action '{uses}' must not traverse parent directories"
+        )
+        return None
+    rel = uses[2:].lstrip("/")
+    if not rel:
+        candidate_dir = repo_root
+    else:
+        cursor = repo_root
+        for part in PurePosixPath(rel).parts:
+            if part in ("", "."):
+                continue
+            cursor = cursor / part
+            if cursor.is_symlink():
+                errors.append(
+                    f"{label} local action '{uses}' must not traverse symlinks"
+                )
+                return None
+        candidate_dir = cursor
+    try:
+        resolved_dir = candidate_dir.resolve()
+    except OSError as error:
+        errors.append(f"{label} local action '{uses}' cannot be resolved: {error}")
+        return None
+    if resolved_dir != repo_root and repo_root not in resolved_dir.parents:
+        errors.append(
+            f"{label} local action '{uses}' escapes repository root"
+        )
+        return None
+    for name in ("action.yml", "action.yaml"):
+        action_file = resolved_dir / name
+        if action_file.is_symlink():
+            errors.append(
+                f"{label} local action '{uses}' action manifest must not be a symlink"
+            )
+            return None
+        if action_file.is_file():
+            return action_file
+    errors.append(
+        f"{label} local action '{uses}' is missing action.yml/action.yaml"
+    )
+    return None
+
+
+def _check_composite_action(
+    action_file: Path,
+    *,
+    repo_root: Path,
+    errors: list[str],
+    visited_actions: set[Path],
+) -> None:
+    resolved_action = action_file.resolve()
+    if resolved_action in visited_actions:
+        return
+    visited_actions.add(resolved_action)
+    try:
+        document = _load_workflow(action_file)
+        for key, value in _walk_yaml(document):
+            if key == "continue-on-error" and _continue_on_error_is_true(value):
+                errors.append(
+                    f"{action_file}: composite action uses continue-on-error: {value!r}"
+                )
+    except GateError as error:
+        errors.append(str(error))
+        return
+    runs = document.get("runs")
+    if not isinstance(runs, Mapping):
+        return
+    image = runs.get("image")
+    if isinstance(image, str) and image.startswith("docker://") and not _DOCKER_DIGEST.fullmatch(image):
+        errors.append(
+            f"{action_file}: docker action '{image}' must be pinned to a sha256 digest"
+        )
+    steps = runs.get("steps")
+    if not isinstance(steps, list):
+        return
+    for index, step in enumerate(steps):
+        if not isinstance(step, Mapping):
+            errors.append(f"{action_file}: step {index} must be a mapping")
+            continue
+        _check_step_security(
+            step,
+            label=f"{action_file}: step {index}",
+            repo_root=repo_root,
+            errors=errors,
+            visited_actions=visited_actions,
+        )
+
+
+def _check_step_security(
+    step: Mapping[str, Any],
+    *,
+    label: str,
+    repo_root: Path,
+    errors: list[str],
+    visited_actions: set[Path],
+) -> None:
+    with_block = step.get("with")
+    uses = step.get("uses")
+    if uses is not None:
+        if not isinstance(uses, str):
+            errors.append(f"{label} uses must be a string")
+        elif uses.startswith("./"):
+            action_file = _resolve_local_action_file(
+                uses, repo_root=repo_root, label=label, errors=errors
+            )
+            if action_file is not None:
+                _check_composite_action(
+                    action_file,
+                    repo_root=repo_root,
+                    errors=errors,
+                    visited_actions=visited_actions,
+                )
+        elif uses.startswith("docker://"):
+            if not _DOCKER_DIGEST.fullmatch(uses):
+                errors.append(
+                    f"{label} docker action '{uses}' must be pinned to a sha256 digest"
+                )
+        elif not _ACTION_SHA.fullmatch(uses):
+            errors.append(
+                f"{label} action '{uses}' must be pinned to a 40-char commit SHA"
+            )
+        if isinstance(uses, str) and uses.startswith("actions/checkout"):
+            if isinstance(with_block, Mapping):
+                ref = with_block.get("ref")
+                if isinstance(ref, str):
+                    lowered = ref.lower()
+                    if (
+                        "${{" in lowered
+                        or "github.event" in lowered
+                        or "inputs." in lowered
+                    ):
+                        errors.append(
+                            f"{label} checkout ref comes from an expression; "
+                            "pin a literal ref instead"
+                        )
+    if with_block is not None:
+        try:
+            for problem in _check_with_expressions(
+                with_block, step_uses=uses if isinstance(uses, str) else None
+            ):
+                errors.append(f"{label}: {problem}")
+        except GateError as error:
+            errors.append(f"{label}: {error}")
+    run_text = step.get("run")
+    if isinstance(run_text, str):
+        for problem in _check_run_expressions(run_text):
+            errors.append(f"{label}: {problem}")
+
+
+def check_workflow_security(
+    files: Iterable[Path], *, root: Path | None = None
+) -> list[str]:
     """Parse each workflow and enforce secure permissions, pins and triggers."""
     errors: list[str] = []
+    visited_actions: set[Path] = set()
     for path in files:
-        document = _load_workflow(path)
         try:
+            document = _load_workflow(path)
             for _ in _walk_yaml(document):
                 pass
+            trigger = _workflow_trigger(document)
+            if _trigger_has_pull_request_target(trigger):
+                errors.append(f"{path}: pull_request_target is forbidden")
         except GateError as error:
             errors.append(f"{path}: {error}")
             continue
-        trigger = _workflow_trigger(document)
-        trigger_text = json.dumps(trigger, default=str) if not isinstance(trigger, str) else trigger
-        if "pull_request_target" in trigger_text:
-            errors.append(f"{path}: pull_request_target is forbidden")
+        repo_root = _infer_repo_root(path, root)
         if "permissions" not in document:
             errors.append(f"{path}: workflow must declare 'contents: read' permissions")
         else:
@@ -449,7 +707,7 @@ def check_workflow_security(files: Iterable[Path]) -> list[str]:
                 if not isinstance(job_uses, str):
                     errors.append(f"{path}: job {job_name} uses must be a string")
                 elif job_uses.startswith("./"):
-                    if ".." in Path(job_uses).parts:
+                    if ".." in PurePosixPath(job_uses).parts or "\\" in job_uses:
                         errors.append(
                             f"{path}: job {job_name} local reusable workflow '{job_uses}' "
                             "must not traverse parent directories"
@@ -480,53 +738,13 @@ def check_workflow_security(files: Iterable[Path]) -> list[str]:
                 if not isinstance(step, Mapping):
                     errors.append(f"{path}: job {job_name} step {index} must be a mapping")
                     continue
-                with_block = step.get("with")
-                uses = step.get("uses")
-                if uses is not None:
-                    if not isinstance(uses, str):
-                        errors.append(f"{path}: job {job_name} step {index} uses must be a string")
-                    elif uses.startswith("./"):
-                        pass
-                    elif uses.startswith("docker://"):
-                        if not _DOCKER_DIGEST.fullmatch(uses):
-                            errors.append(
-                                f"{path}: job {job_name} step {index} docker action "
-                                f"'{uses}' must be pinned to a sha256 digest"
-                            )
-                    elif not _ACTION_SHA.fullmatch(uses):
-                        errors.append(
-                            f"{path}: job {job_name} step {index} action '{uses}' "
-                            "must be pinned to a 40-char commit SHA"
-                        )
-                    if isinstance(uses, str) and uses.startswith("actions/checkout"):
-                        if isinstance(with_block, Mapping):
-                            ref = with_block.get("ref")
-                            if isinstance(ref, str):
-                                lowered = ref.lower()
-                                if (
-                                    "${{" in lowered
-                                    or "github.event" in lowered
-                                    or "inputs." in lowered
-                                ):
-                                    errors.append(
-                                        f"{path}: job {job_name} step {index} "
-                                        "checkout ref comes from an expression; "
-                                        "pin a literal ref instead"
-                                    )
-                if with_block is not None:
-                    try:
-                        for problem in _check_with_expressions(
-                            with_block, step_uses=uses if isinstance(uses, str) else None
-                        ):
-                            errors.append(
-                                f"{path}: job {job_name} step {index}: {problem}"
-                            )
-                    except GateError as error:
-                        errors.append(f"{path}: job {job_name} step {index}: {error}")
-                run_text = step.get("run")
-                if isinstance(run_text, str):
-                    for problem in _check_run_expressions(run_text):
-                        errors.append(f"{path}: job {job_name} step {index}: {problem}")
+                _check_step_security(
+                    step,
+                    label=f"{path}: job {job_name} step {index}",
+                    repo_root=repo_root,
+                    errors=errors,
+                    visited_actions=visited_actions,
+                )
     return errors
 
 
@@ -1005,7 +1223,7 @@ def run_repo_static_gates(
                 )
     errors.extend(check_markdown_links(md_files, root=root))
     errors.extend(check_req_tc_consistency(md_files))
-    errors.extend(check_workflow_security(workflow_files))
+    errors.extend(check_workflow_security(workflow_files, root=root))
     errors.extend(check_dependency_lock(root))
     errors.extend(check_contract_examples(root))
     errors.extend(scan_secrets(iter_repo_files(root)))

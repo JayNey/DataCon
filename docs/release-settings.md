@@ -23,9 +23,12 @@ GitHub Actions 在触发 `push`（含 `refs/tags/v*`）或 `workflow_dispatch` �
 
 ### 2. 分支与 Tag 保护（Settings → Rules → Rulesets）
 
-1. 启用 `main` 分支保护（禁止非审核合入、禁止强推）。
+1. 启用 `main` 分支保护（禁止非审核合入、禁止强推），并开启 **`Require review from Code Owners`**（配合仓库根目录 [`.github/CODEOWNERS`](../.github/CODEOWNERS) 保护 `.github/`、`src/datacon/ci_gates.py`、`scripts/run_suite.sh`、`tests/contract/test_ci_gates.py` 与 `tests/contract/test_release_workflow.py` 等可信根）。
 2. 启用 **`v*` Tag Protection**：限制仅维护者可创建、更新或删除 `v*` tag，并严禁将 `v*` tag 指向未合入 `main` 的历史提交（如 `04f45b8`）。
-3. **PR 合入规范**：合入 PR #7 时**必须使用 squash merge，或在合入前已完成 `v*` Tag Protection 与 `internal-lab` 环境锁定**，避免包含旧版 workflow 的历史提交 `04f45b8` 进入 `main` 祖先历史且无控制面阻断。
+3. **合入前置硬要求（非替代关系）**：由于历史提交 `04f45b8` 已存在于远端 Git 对象库中，即使采用 squash merge，任何能推送 `v*` tag 的用户仍可将 `v*` tag 指向 `04f45b8` 触发旧版 workflow 并接触 `internal-lab` secrets。因此，**必须在合入 PR #7 前同时完成两项控制面锁定**：
+   - `internal-lab` Environment 仅允许 **`main`** 分支部署并开启 Required reviewers；
+   - 启用 **`v*` Tag Protection**（仅维护者可创建/更新/删除 `v*` tag）。
+   （`squash merge` 仅作为保持 `main` 历史整洁的建议，**不构成** `v*` Tag Protection 或 `internal-lab` 环境锁定的安全替代。）
 
 ### 3. 自托管 Runner 与证据卷宿主机前置条件（`datacon-internal`）
 
@@ -34,7 +37,12 @@ GitHub Actions 在触发 `push`（含 `refs/tags/v*`）或 `workflow_dispatch` �
 1. **Docker daemon 可用**：runner 服务进程所属用户可直接执行 `docker load`、`docker image inspect` 与 `docker run`（包括 `--network host` 访问内网 PostgreSQL）。
 2. **宿主机 `evidence_root` 路径与 DB 一致**：宿主机挂载的证据根目录必须为绝对路径，且与数据库 `release_state.evidence_root` 完全一致（若运行 `b03-internal`，`DATACON_B03_EVIDENCE_DIR` 也须为同一套宿主机持久绝对路径）；`archived_bundle_preflight` 与 `ReleaseStore.latest_evidence_bundle` 会按此路径直接校验并挂载到候选容器。
 3. **所有路径段禁止 symlink**：`evidence_root` 本身、其所有祖先父目录（例如挂载点父目录），以及归档的 `<job_id>/<generation>` bundle 目录均不得包含任何 symlink；否则 `archived_bundle_preflight`、`persist_b03_evidence_bundle` 与 `latest_evidence_bundle` 会 fail closed 拒绝执行。
-4. **容器非 root 用户 `65534:65534` 只读遍历/读取权限**：[控制面 Dockerfile](../Dockerfile) 以 `USER 65534:65534` 运行容器；`promote-internal` 会将归档 bundle 以 `-v <bundle_path>:/bundle:ro` 挂载进容器内执行 `verify-bundle`。因此宿主机上 `evidence_root` 及其下的历史归档目录必须对 `65534:65534` 具备目录遍历与只读读取权限（目录至少 `0o755`，bundle 内文件至少 `0o444`；若目录为 `0o700` 且属主非 `65534`，容器内将报 `PermissionError` 导致发布阻塞）。
+4. **容器非 root 用户 `65534:65534` 只读遍历/读取权限**：[控制面 Dockerfile](../Dockerfile) 以 `USER 65534:65534` 运行容器；`promote-internal` 会将归档 bundle 以 `-v <bundle_path>:/bundle:ro` 挂载进容器内执行 `verify-bundle`。`evidence.write_bundle` / `export_bundle` / `execution._archive` / `persist_b03_evidence_bundle` 默认以 `0o755` 目录、`0o644`（或 `0o444`）文件生成共享只读权限；若存在历史 `0o700`/`0o600` 遗留归档包，`archived_bundle_preflight` 会在进容器前直接报错并提示修复权限。
+5. **Baseline 与 >30 天历史镜像持久化（可选但强烈建议）**：GitHub Actions `release-candidate-artifacts` 仅保留 30 天，且 `datacon release bootstrap` 初始化的 baseline 镜像可能没有对应的 Actions run。为保障“bootstrap → promote → rollback to baseline”与 >30 天历史版本回滚闭环，请配置 repository/environment variable `DATACON_IMAGE_ARCHIVE_DIR`（runner 上的持久绝对路径，禁止 symlink），并在 bootstrap 时执行：
+   ```bash
+   docker save -o "$DATACON_IMAGE_ARCHIVE_DIR/${BASELINE_ID#sha256:}.tar" "$BASELINE_IMAGE"
+   ```
+   （`promote-internal` 在配置了 `DATACON_IMAGE_ARCHIVE_DIR` 时也会自动将验证通过的候选镜像 tar 归档到 `<hex>.tar`；当 `rollback-internal` 不传 `artifact_run_id` 时，会先查 runner 本机 Docker 存储，若不存在则从 `DATACON_IMAGE_ARCHIVE_DIR/<hex>.tar` 加载，并严格校验 `docker image inspect` 不可变 ID 与 `release_events` 持久化审计记录）。
 
 ## 维护者验证命令（需仓库管理员/读权限 token）
 

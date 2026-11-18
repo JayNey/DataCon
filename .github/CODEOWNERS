@@ -1,0 +1,6 @@
+# Trusted root for CI merge gates, release workflows, and workflow contract checks.
+/.github/ @JayNey
+/src/datacon/ci_gates.py @JayNey
+/scripts/run_suite.sh @JayNey
+/tests/contract/test_ci_gates.py @JayNey
+/tests/contract/test_release_workflow.py @JayNey
