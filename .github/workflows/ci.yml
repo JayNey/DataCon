@@ -286,31 +286,13 @@ jobs:
           set -uo pipefail
           mkdir -p "$RUNNER_TEMP/ci-reports"
 
-          run_suite() {
-            local marker="$1"
-            local label="$2"
-            local report="$RUNNER_TEMP/ci-reports/${label}.xml"
-            uv run --frozen pytest -q -m "$marker" -rs --junitxml="$report"
-            uv run --frozen python - "$report" "$label" <<'PY'
-          import pathlib
-          import sys
-          from datacon.ci_gates import check_junit_report
-
-          summary = check_junit_report(pathlib.Path(sys.argv[1]), label=sys.argv[2])
-          print(
-              f"{summary['label']}: total={summary['total']} skipped={summary['skipped']} "
-              f"failures={summary['failures']} errors={summary['errors']}"
-          )
-          PY
-          }
-
           # Do not use `set -e` around the four groups: one failing group must
           # not hide the others, and every JUnit report must still be produced.
           status=0
-          run_suite "postgres and not docker" postgres || status=1
-          run_suite "postgres and docker" docker || status=1
-          run_suite asan asan || status=1
-          run_suite "not postgres and not asan" contract || status=1
+          bash scripts/run_suite.sh "postgres and not docker" postgres "$RUNNER_TEMP/ci-reports/postgres.xml" || status=1
+          bash scripts/run_suite.sh "postgres and docker" docker "$RUNNER_TEMP/ci-reports/docker.xml" || status=1
+          bash scripts/run_suite.sh asan asan "$RUNNER_TEMP/ci-reports/asan.xml" || status=1
+          bash scripts/run_suite.sh "not postgres and not asan" contract "$RUNNER_TEMP/ci-reports/contract.xml" || status=1
           exit "$status"
       - name: Upload sanitized synthetic JUnit reports
         if: always()

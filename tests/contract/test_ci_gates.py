@@ -904,3 +904,147 @@ def test_waiver_rejects_empty_package_or_target_prefix():
         with pytest.raises(ci_gates.GateError, match="scope"):
             ci_gates.evaluate_scan_findings(findings, waivers=waiver, today="2026-11-17")
         assert ci_gates._waiver_scope_matches(bad_scope, findings[0]) is False
+
+
+def test_workflow_security_rejects_secrets_inherit_external_secrets_and_with_key_expressions(
+    tmp_path,
+):
+    ext_inherit = tmp_path / "ext-inherit.yml"
+    ext_inherit.write_text(
+        "name: p\n"
+        "on: pull_request\n"
+        "permissions:\n"
+        "  contents: read\n"
+        "jobs:\n"
+        "  steal:\n"
+        "    uses: attacker/repo/.github/workflows/steal.yml@" + "1" * 40 + "\n"
+        "    secrets: inherit\n",
+        encoding="utf-8",
+    )
+    errors = ci_gates.check_workflow_security([ext_inherit])
+    assert errors and any("secrets" in err.lower() for err in errors), errors
+
+    ext_mapping = tmp_path / "ext-mapping.yml"
+    ext_mapping.write_text(
+        "name: p\n"
+        "on: pull_request\n"
+        "permissions:\n"
+        "  contents: read\n"
+        "jobs:\n"
+        "  steal:\n"
+        "    uses: attacker/repo/.github/workflows/steal.yml@" + "1" * 40 + "\n"
+        "    secrets:\n"
+        "      TOKEN: ${{ secrets.GITHUB_TOKEN }}\n",
+        encoding="utf-8",
+    )
+    errors = ci_gates.check_workflow_security([ext_mapping])
+    assert errors and any("external reusable workflow" in err for err in errors), errors
+
+    local_inherit = tmp_path / "local-inherit.yml"
+    local_inherit.write_text(
+        "name: p\n"
+        "on: pull_request\n"
+        "permissions:\n"
+        "  contents: read\n"
+        "jobs:\n"
+        "  call:\n"
+        "    uses: ./.github/workflows/ci.yml\n"
+        "    secrets: inherit\n",
+        encoding="utf-8",
+    )
+    errors = ci_gates.check_workflow_security([local_inherit])
+    assert errors and any("inherit" in err for err in errors), errors
+
+    local_mapping = tmp_path / "local-mapping.yml"
+    local_mapping.write_text(
+        "name: p\n"
+        "on: pull_request\n"
+        "permissions:\n"
+        "  contents: read\n"
+        "jobs:\n"
+        "  call:\n"
+        "    uses: ./.github/workflows/ci.yml\n"
+        "    secrets:\n"
+        "      TOKEN: ${{ secrets.GITHUB_TOKEN }}\n",
+        encoding="utf-8",
+    )
+    assert ci_gates.check_workflow_security([local_mapping]) == []
+
+    bad_with_key = tmp_path / "bad-with-key.yml"
+    bad_with_key.write_text(
+        "name: p\n"
+        "on: pull_request\n"
+        "permissions:\n"
+        "  contents: read\n"
+        "jobs:\n"
+        "  test:\n"
+        "    steps:\n"
+        "      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262\n"
+        "        with:\n"
+        "          '${{ github.event.issue.title }}': x\n",
+        encoding="utf-8",
+    )
+    errors = ci_gates.check_workflow_security([bad_with_key])
+    assert errors and any("static identifier" in err or "key" in err.lower() for err in errors), errors
+
+    good_with = tmp_path / "good-with.yml"
+    good_with.write_text(
+        "name: p\n"
+        "on: pull_request\n"
+        "permissions:\n"
+        "  contents: read\n"
+        "jobs:\n"
+        "  test:\n"
+        "    steps:\n"
+        "      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093\n"
+        "        with:\n"
+        "          name: release-candidate\n"
+        "          github-token: ${{ secrets.GITHUB_TOKEN }}\n"
+        "    env:\n"
+        "      SECRET_VAL: ${{ secrets.SOME_SECRET }}\n",
+        encoding="utf-8",
+    )
+    assert ci_gates.check_workflow_security([good_with]) == []
+
+
+def test_workflow_security_rejects_yaml_alias_bomb_within_budget(tmp_path):
+    import time
+
+    lines = [
+        "name: Bomb",
+        "on: pull_request",
+        "permissions:",
+        "  contents: read",
+        "jobs:",
+        "  test:",
+        "    steps:",
+        "      - run: echo ok",
+        "x-bomb:",
+        '  x0: &a0 ["x", "y"]',
+    ]
+    for idx in range(1, 31):
+        lines.append(f"  x{idx}: &a{idx} [*a{idx - 1}, *a{idx - 1}]")
+    bomb = tmp_path / "bomb.yml"
+    bomb.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    started = time.monotonic()
+    errors = ci_gates.check_workflow_security([bomb])
+    elapsed = time.monotonic() - started
+    assert elapsed < 1.0, f"alias bomb took {elapsed:.2f}s"
+    assert errors and any("budget" in err or "expands beyond" in err for err in errors), errors
+
+    # Direct walker/string iterator must raise GateError (not hang or RecursionError).
+    doc = ci_gates._load_workflow(bomb)
+    with pytest.raises(ci_gates.GateError, match="expands beyond|budget"):
+        for _ in ci_gates._walk_yaml(doc):
+            pass
+    with pytest.raises(ci_gates.GateError, match="expands beyond|budget"):
+        for _ in ci_gates._iter_yaml_strings(doc, prefix="root"):
+            pass
+
+    # Real repository workflows remain well inside the node budget.
+    real_workflows = [
+        REPO_ROOT / ".github" / "workflows" / "ci.yml",
+        REPO_ROOT / ".github" / "workflows" / "release.yml",
+    ]
+    assert ci_gates.check_workflow_security(real_workflows) == []

@@ -26,7 +26,17 @@ on:
         default: ""
         type: string
       artifact_run_id:
-        description: "Workflow run id holding the candidate artifact (rollback)"
+        description: "Workflow run id holding the candidate artifact (promote/rollback)"
+        required: false
+        default: ""
+        type: string
+      require_archived_bundle:
+        description: "Require a real archived evidence bundle under active evidence_root during promote"
+        required: false
+        default: true
+        type: boolean
+      archived_bundle_skip_reason:
+        description: "Explicit audit reason when require_archived_bundle is false"
         required: false
         default: ""
         type: string
@@ -48,6 +58,9 @@ concurrency:
 
 jobs:
   test-report:
+    if: >-
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+      && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
     runs-on: ubuntu-latest
     timeout-minutes: 30
     services:
@@ -98,25 +111,11 @@ jobs:
         run: |
           set -uo pipefail
           mkdir -p "$RUNNER_TEMP/release-junit"
-          run_suite() {
-            local marker="$1"
-            local label="$2"
-            uv run --frozen pytest -q -m "$marker" -rs \
-              --junitxml="$RUNNER_TEMP/release-junit/junit-${label}.xml"
-            uv run --frozen python - "$RUNNER_TEMP/release-junit/junit-${label}.xml" "$label" <<'PY'
-          import pathlib
-          import sys
-          from datacon.ci_gates import check_junit_report
-
-          summary = check_junit_report(pathlib.Path(sys.argv[1]), label=sys.argv[2])
-          print(f"{summary['label']}: total={summary['total']} skipped={summary['skipped']}")
-          PY
-          }
           status=0
-          run_suite "postgres and not docker" postgres || status=1
-          run_suite "postgres and docker" docker || status=1
-          run_suite asan asan || status=1
-          run_suite "not postgres and not asan" contract || status=1
+          bash scripts/run_suite.sh "postgres and not docker" postgres "$RUNNER_TEMP/release-junit/junit-postgres.xml" || status=1
+          bash scripts/run_suite.sh "postgres and docker" docker "$RUNNER_TEMP/release-junit/junit-docker.xml" || status=1
+          bash scripts/run_suite.sh asan asan "$RUNNER_TEMP/release-junit/junit-asan.xml" || status=1
+          bash scripts/run_suite.sh "not postgres and not asan" contract "$RUNNER_TEMP/release-junit/junit-contract.xml" || status=1
           exit "$status"
       - name: Upload sanitized JUnit reports
         if: always()
@@ -332,22 +331,19 @@ jobs:
     needs: [test-report, build-candidate]
     if: >-
       !cancelled()
-      && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+      && github.event_name == 'workflow_dispatch'
+      && github.ref == 'refs/heads/main'
+      && github.event.inputs.action == 'promote'
       && needs.test-report.result == 'success'
-      && (
-        (startsWith(github.ref, 'refs/tags/v') && needs.build-candidate.result == 'success')
-        || (
-          github.event_name == 'workflow_dispatch'
-          && github.event.inputs.action == 'promote'
-          && needs.build-candidate.result == 'skipped'
-        )
-      )
+      && needs.build-candidate.result == 'skipped'
     environment: internal-lab
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, datacon-internal]
     timeout-minutes: 20
     env:
-      EXPECTED_MANIFEST_DIGEST: ${{ github.event.inputs.expected_manifest_digest || needs.build-candidate.outputs.manifest_digest }}
+      EXPECTED_MANIFEST_DIGEST: ${{ github.event.inputs.expected_manifest_digest }}
       ARTIFACT_RUN_ID: ${{ github.event.inputs.artifact_run_id }}
+      REQUIRE_ARCHIVED_BUNDLE: ${{ github.event.inputs.require_archived_bundle }}
+      ARCHIVED_BUNDLE_SKIP_REASON: ${{ github.event.inputs.archived_bundle_skip_reason }}
       CURRENT_SHA: ${{ github.sha }}
     steps:
       - name: Verify protected ref
@@ -359,8 +355,8 @@ jobs:
         run: |
           set -euo pipefail
           case "${GITHUB_REF}" in
-            refs/heads/main|refs/tags/v*) ;;
-            *) echo "promotion is only allowed from main or a v* tag" >&2; exit 1 ;;
+            refs/heads/main) ;;
+            *) echo "promotion is only allowed from main" >&2; exit 1 ;;
           esac
           if [[ ! "${CURRENT_SHA}" =~ ^[0-9a-f]{40}$ ]]; then
             echo "GITHUB_SHA must be a 40-char commit" >&2
@@ -468,11 +464,13 @@ jobs:
               ):
                   fail("artifact run did not come from main or a release tag")
               if subprocess.run(
-                  ["git", "merge-base", "--is-ancestor", head_sha, "refs/remotes/origin/main"]
+                  ["git", "merge-base", "--is-ancestor", head_sha, "refs/remotes/origin/main"],
+                  timeout=30,
               ).returncode != 0:
                   fail("artifact run head_sha is not in origin/main history")
               if subprocess.run(
-                  ["git", "merge-base", "--is-ancestor", head_sha, current]
+                  ["git", "merge-base", "--is-ancestor", head_sha, current],
+                  timeout=30,
               ).returncode != 0:
                   fail("artifact run head_sha is not in the protected ref history")
               env_file = os.environ.get("GITHUB_ENV")
@@ -491,7 +489,6 @@ jobs:
           uv sync --frozen
 
       - name: Require an explicit artifact run for a dispatched promotion
-        if: github.event_name == 'workflow_dispatch'
         shell: bash
         run: |
           set -euo pipefail
@@ -499,14 +496,7 @@ jobs:
             echo "artifact_run_id is required to promote a previously built candidate" >&2
             exit 1
           fi
-      - name: Download the candidate artifact from this run
-        if: github.event_name != 'workflow_dispatch'
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: release-candidate-artifacts
-          path: ${{ runner.temp }}/release-artifacts
       - name: Download the candidate artifact from the selected run
-        if: github.event_name == 'workflow_dispatch'
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: release-candidate-artifacts
@@ -556,13 +546,15 @@ jobs:
                   "manifest source_commit does not match the verified artifact run head"
               )
           if subprocess.run(
-              ["git", "merge-base", "--is-ancestor", manifest["source_commit"], "refs/remotes/origin/main"]
+              ["git", "merge-base", "--is-ancestor", manifest["source_commit"], "refs/remotes/origin/main"],
+              timeout=30,
           ).returncode != 0:
               raise SystemExit(
                   "manifest source_commit is not in origin/main history"
               )
           if subprocess.run(
-              ["git", "merge-base", "--is-ancestor", manifest["source_commit"], "HEAD"]
+              ["git", "merge-base", "--is-ancestor", manifest["source_commit"], "HEAD"],
+              timeout=30,
           ).returncode != 0:
               raise SystemExit(
                   "manifest source_commit is not in the protected ref history"
@@ -739,35 +731,27 @@ jobs:
           smoke_checks = {
               "db_readability": db_readable,
           }
-          # Check local evidence_root mount first so unmounted runners are not
-          # blocked by cross-root historical jobs, while still validating DB
-          # path syntax invariants.
-          evidence_root_path = pathlib.Path(previous["evidence_root"])
-          if evidence_root_path.is_symlink():
-              raise SystemExit(
-                  f"refusing promotion: evidence_root is a symlink: {evidence_root_path}"
-              )
-          if not evidence_root_path.exists():
-              store.latest_evidence_bundle(require_active_root=False)
-              print(
-                  f"skipping archived_real_bundle: local evidence_root {evidence_root_path} "
-                  "is not mounted on this runner; relying on archived_bundle"
-              )
-          elif not evidence_root_path.is_dir():
-              raise SystemExit(
-                  f"refusing promotion: evidence_root is not a directory: {evidence_root_path}"
-              )
+          # Require a real archived evidence bundle under active evidence_root by default.
+          req_env = os.environ.get("REQUIRE_ARCHIVED_BUNDLE", "true").strip().lower()
+          if req_env not in ("true", "false", ""):
+              raise SystemExit(f"invalid REQUIRE_ARCHIVED_BUNDLE value: {req_env!r}")
+          require_archived_bundle = req_env != "false"
+          skip_reason = os.environ.get("ARCHIVED_BUNDLE_SKIP_REASON", "").strip()
+          archived_preflight = release.archived_bundle_preflight(
+              evidence_root=previous["evidence_root"],
+              store=store,
+              verify_fn=verify_bundle_in_container,
+              require_archived_bundle=require_archived_bundle,
+              skip_reason=skip_reason or None,
+          )
+          audit_metadata = {}
+          if archived_preflight["status"] == "required":
+              preflight_checks["archived_real_bundle"] = archived_preflight["check_fn"]
+              audit_metadata["archived_real_bundle"] = "verified"
+              audit_metadata["archived_real_bundle_path"] = archived_preflight["bundle_path"]
           else:
-              latest = store.latest_evidence_bundle()
-              if latest is not None:
-                  latest_path = pathlib.Path(latest["path"])
-                  if latest_path.is_symlink() or not latest_path.is_dir():
-                      raise SystemExit(
-                          f"refusing promotion: latest evidence bundle path is not a real directory: {latest_path}"
-                      )
-                  preflight_checks["archived_real_bundle"] = lambda: verify_bundle_in_container(
-                      latest["path"], latest["digest"]
-                  )
+              audit_metadata["archived_real_bundle"] = "skipped"
+              audit_metadata["archived_real_bundle_skip_reason"] = archived_preflight["reason"]
           try:
               result = release.promote_and_smoke(
                   manifest=manifest,
@@ -777,6 +761,7 @@ jobs:
                   preflight_checks=preflight_checks,
                   smoke_checks=smoke_checks,
                   rollback_fn=rollback_fn,
+                  audit_metadata=audit_metadata,
               )
           finally:
               shutil.rmtree(smoke_bundle, ignore_errors=True)
@@ -797,7 +782,7 @@ jobs:
   rollback-internal:
     if: >-
       github.event_name == 'workflow_dispatch'
-      && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+      && github.ref == 'refs/heads/main'
       && github.event.inputs.action == 'rollback'
     environment: internal-lab
     runs-on: ubuntu-latest
@@ -817,8 +802,8 @@ jobs:
         run: |
           set -euo pipefail
           case "${GITHUB_REF}" in
-            refs/heads/main|refs/tags/v*) ;;
-            *) echo "rollback is only allowed from main or a v* tag" >&2; exit 1 ;;
+            refs/heads/main) ;;
+            *) echo "rollback is only allowed from main" >&2; exit 1 ;;
           esac
           if [[ ! "${CURRENT_SHA}" =~ ^[0-9a-f]{40}$ ]]; then
             echo "GITHUB_SHA must be a 40-char commit" >&2
@@ -925,11 +910,13 @@ jobs:
           ):
               fail("artifact run did not come from main or a release tag")
           if subprocess.run(
-              ["git", "merge-base", "--is-ancestor", head_sha, "refs/remotes/origin/main"]
+              ["git", "merge-base", "--is-ancestor", head_sha, "refs/remotes/origin/main"],
+              timeout=30,
           ).returncode != 0:
               fail("artifact run head_sha is not in origin/main history")
           if subprocess.run(
-              ["git", "merge-base", "--is-ancestor", head_sha, current]
+              ["git", "merge-base", "--is-ancestor", head_sha, current],
+              timeout=30,
           ).returncode != 0:
               fail("artifact run head_sha is not in the protected ref history")
           print("protected ref and rollback artifact provenance verified")
@@ -1054,6 +1041,38 @@ jobs:
                   and parsed.get("manifest_digest") == smoke_bundle_digest
               )
 
+          def release_slots_compatible():
+              proc = subprocess.run(
+                  [
+                      "docker",
+                      "run",
+                      "--rm",
+                      "--network",
+                      "host",
+                      "-e",
+                      "DATACON_DATABASE_URL",
+                      "datacon-control-plane:candidate",
+                      "release",
+                      "slots",
+                      "--environment",
+                      "internal-lab",
+                  ],
+                  capture_output=True,
+                  text=True,
+                  timeout=60,
+              )
+              if proc.returncode != 0:
+                  return False
+              try:
+                  payload = json.loads(proc.stdout)
+              except json.JSONDecodeError:
+                  return False
+              return (
+                  isinstance(payload, dict)
+                  and "active_release" in payload
+                  and "active_slots" in payload
+              )
+
           def active_release_restored():
               active = store.active_release()
               return active is not None and active.get("image_id") == target["image_id"]
@@ -1069,6 +1088,7 @@ jobs:
                       "cli_smoke": image_help,
                       "db_readability": db_readable,
                       "archived_bundle": archived_bundle_smoke,
+                      "release_slots": release_slots_compatible,
                   },
                   post_switch_checks={
                       "active_release_restored": active_release_restored,
@@ -1081,32 +1101,11 @@ jobs:
               shutil.rmtree(smoke_bundle, ignore_errors=True)
           print(json.dumps(result, indent=2))
           PY
-      - name: Verify restored target image can observe active release state
-        shell: bash
-        env:
-          DATACON_DATABASE_URL: ${{ secrets.DATACON_DATABASE_URL }}
-        run: |
-          set -euo pipefail
-          slots_json="$(timeout 60 docker run --rm --network host \
-            -e DATACON_DATABASE_URL \
-            datacon-control-plane:candidate release slots --environment internal-lab)"
-          printf '%s\n' "$slots_json"
-          uv run --frozen python - "$slots_json" "$TARGET_DIGEST" <<'PY'
-          import json
-          import sys
-
-          payload = json.loads(sys.argv[1])
-          active = payload.get("active_release") or {}
-          if active.get("image_id") != sys.argv[2]:
-              raise SystemExit(
-                  f"post-rollback active_release.image_id mismatch: {active.get('image_id')!r} != {sys.argv[2]!r}"
-              )
-          PY
 
   b03-internal:
     if: >-
       github.event_name == 'workflow_dispatch'
-      && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+      && github.ref == 'refs/heads/main'
       && github.event.inputs.run_b03 == 'true'
     environment: internal-lab
     # This label is intentionally not a GitHub-hosted runner. The B03 replay
@@ -1124,8 +1123,8 @@ jobs:
         run: |
           set -euo pipefail
           case "${GITHUB_REF}" in
-            refs/heads/main|refs/tags/v*) ;;
-            *) echo "B03 acceptance is only allowed from main or a v* tag" >&2; exit 1 ;;
+            refs/heads/main) ;;
+            *) echo "B03 acceptance is only allowed from main" >&2; exit 1 ;;
           esac
           if [[ ! "${CURRENT_SHA}" =~ ^[0-9a-f]{40}$ ]]; then
             echo "GITHUB_SHA must be a 40-char commit" >&2
@@ -1184,10 +1183,11 @@ jobs:
           DATACON_B03_CASE_ROOT: ${{ secrets.DATACON_B03_CASE_ROOT }}
           DATACON_B03_ADMISSION: ${{ secrets.DATACON_B03_ADMISSION }}
           DATACON_B03_REVIEW: ${{ secrets.DATACON_B03_REVIEW }}
+          DATACON_B03_EVIDENCE_DIR: ${{ vars.DATACON_B03_EVIDENCE_DIR }}
         run: |
           set -euo pipefail
-          if [ -z "${DATACON_B03_CASE_ROOT}" ] || [ -z "${DATACON_B03_ADMISSION}" ] || [ -z "${DATACON_B03_REVIEW}" ]; then
-            echo "B03 requires DATACON_B03_CASE_ROOT, DATACON_B03_ADMISSION and DATACON_B03_REVIEW" >&2
+          if [ -z "${DATACON_B03_CASE_ROOT}" ] || [ -z "${DATACON_B03_ADMISSION}" ] || [ -z "${DATACON_B03_REVIEW}" ] || [ -z "${DATACON_B03_EVIDENCE_DIR:-}" ]; then
+            echo "B03 requires DATACON_B03_CASE_ROOT, DATACON_B03_ADMISSION, DATACON_B03_REVIEW and DATACON_B03_EVIDENCE_DIR" >&2
             exit 1
           fi
           uv run --frozen python - <<'PY'
@@ -1239,6 +1239,12 @@ jobs:
                   case_root=case_root,
                   job_id=job_id,
               )
+              persisted = release.persist_b03_evidence_bundle(
+                  bundle_out,
+                  persist_root=os.environ["DATACON_B03_EVIDENCE_DIR"],
+                  job_id=job_id,
+                  expected_manifest_digest=acceptance["manifest_digest"],
+              )
           finally:
               shutil.rmtree(bundle_out, ignore_errors=True)
           summary = {
@@ -1247,8 +1253,10 @@ jobs:
               "verdict": acceptance["verdict"],
               "reason_code": acceptance["reason_code"],
               "replay_count": acceptance["replay_count"],
-              "bundle_verified": acceptance["bundle_verified"],
+              "bundle_verified": persisted["bundle_verified"],
               "manifest_digest": acceptance["manifest_digest"],
+              "bundle_manifest_digest": persisted["bundle_manifest_digest"],
+              "bundle_path": persisted["bundle_path"],
               "storage_ref": acceptance["storage_ref"],
               "versions": acceptance["versions"],
           }
@@ -1273,7 +1281,7 @@ jobs:
               raise SystemExit(
                   f"B03 acceptance replay_count mismatch: {acceptance['replay_count']!r}"
               )
-          if acceptance["bundle_verified"] is not True:
+          if acceptance["bundle_verified"] is not True or persisted["bundle_verified"] is not True:
               raise SystemExit("B03 acceptance bundle_verified must be True")
           PY
       - name: Upload only the sanitized B03 summary

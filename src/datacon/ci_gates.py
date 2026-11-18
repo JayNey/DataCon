@@ -111,6 +111,8 @@ _SECRET_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
 
 _REQUIRED_WAIVER_FIELDS = frozenset({"id", "scope", "impact", "owner", "expires_at"})
 _BLOCKING_SEVERITIES = frozenset({"CRITICAL", "HIGH"})
+_YAML_NODE_BUDGET = 150_000
+_STATIC_WITH_KEY = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]*$")
 
 
 class GateError(RuntimeError):
@@ -206,17 +208,28 @@ def _check_permissions(
             )
 
 
+def _bump_yaml_budget(state: list[int], limit: int = _YAML_NODE_BUDGET) -> None:
+    state[0] += 1
+    if state[0] > limit:
+        raise GateError(
+            f"workflow YAML expands beyond the {limit}-node safety budget"
+        )
+
+
 def _walk_yaml(
-    value: Any, _seen: set[int] | None = None
+    value: Any,
+    _seen: set[int] | None = None,
+    _state: list[int] | None = None,
 ) -> Iterable[tuple[str, Any]]:
-    """Walk a parsed YAML value, converting anchor cycles into GateError.
+    """Walk a parsed YAML value, converting anchor cycles or alias bombs into GateError.
 
     PyYAML can build a self-referential list/mapping from an anchor such as
-    ``x: &a [*a]``. Recursing into it raises ``RecursionError`` and aborts the
-    gate; detecting the container identity first turns it into a deterministic
-    failure instead.
+    ``x: &a [*a]``, or an exponential DAG of shared aliases. Detecting container
+    identity prevents cycles, while a per-call node budget bounds alias expansion.
     """
     seen = _seen if _seen is not None else set()
+    state = _state if _state is not None else [0]
+    _bump_yaml_budget(state)
     if isinstance(value, Mapping):
         marker = id(value)
         if marker in seen:
@@ -224,8 +237,9 @@ def _walk_yaml(
         seen.add(marker)
         try:
             for key, item in value.items():
+                _bump_yaml_budget(state)
                 yield str(key), item
-                yield from _walk_yaml(item, seen)
+                yield from _walk_yaml(item, seen, state)
         finally:
             seen.discard(marker)
     elif isinstance(value, list):
@@ -235,7 +249,7 @@ def _walk_yaml(
         seen.add(marker)
         try:
             for item in value:
-                yield from _walk_yaml(item, seen)
+                yield from _walk_yaml(item, seen, state)
         finally:
             seen.discard(marker)
 
@@ -249,10 +263,16 @@ def _continue_on_error_is_true(value: Any) -> bool:
 
 
 def _iter_yaml_strings(
-    value: Any, *, prefix: str, _seen: set[int] | None = None
+    value: Any,
+    *,
+    prefix: str,
+    _seen: set[int] | None = None,
+    _state: list[int] | None = None,
 ) -> Iterable[tuple[str, str]]:
     """Yield ``(label, string_value)`` for every string in a YAML subtree."""
     seen = _seen if _seen is not None else set()
+    state = _state if _state is not None else [0]
+    _bump_yaml_budget(state)
     if isinstance(value, str):
         yield prefix, value
         return
@@ -263,8 +283,9 @@ def _iter_yaml_strings(
         seen.add(marker)
         try:
             for key, item in value.items():
+                _bump_yaml_budget(state)
                 yield from _iter_yaml_strings(
-                    item, prefix=f"{prefix}.{key}", _seen=seen
+                    item, prefix=f"{prefix}.{key}", _seen=seen, _state=state
                 )
         finally:
             seen.discard(marker)
@@ -276,7 +297,7 @@ def _iter_yaml_strings(
         try:
             for idx, item in enumerate(value):
                 yield from _iter_yaml_strings(
-                    item, prefix=f"{prefix}[{idx}]", _seen=seen
+                    item, prefix=f"{prefix}[{idx}]", _seen=seen, _state=state
                 )
         finally:
             seen.discard(marker)
@@ -311,12 +332,19 @@ def _check_with_expressions(
     ``run``. Passing the same expression (or ``${{ env.* }}``) straight into an
     action's ``with:`` (for example ``actions/github-script``'s ``script:``) is
     injection, so it is rejected while constant and safe references stay valid.
+    Keys inside ``with:`` must also be static identifiers without expressions.
     The sole narrow exception is ``actions/download-artifact``'s numeric
     ``run-id: ${{ env.ARTIFACT_RUN_ID }}``, which has no environment-variable
     fallback in the action and is pre-validated against the GitHub API.
     """
+    if not isinstance(with_block, Mapping):
+        return ["with: must be a mapping"]
     errors: list[str] = []
     for key, value in _walk_yaml(with_block):
+        if "${{" in key or "$" in key or not _STATIC_WITH_KEY.fullmatch(key):
+            errors.append(
+                f"with: key {key!r} must be a static identifier without expressions"
+            )
         if not isinstance(value, str):
             continue
         if (
@@ -416,6 +444,7 @@ def check_workflow_security(files: Iterable[Path]) -> list[str]:
                 except GateError as error:
                     errors.append(f"{path}: job {job_name}: {error}")
             job_uses = job.get("uses")
+            job_secrets = job.get("secrets")
             if job_uses is not None:
                 if not isinstance(job_uses, str):
                     errors.append(f"{path}: job {job_name} uses must be a string")
@@ -425,11 +454,25 @@ def check_workflow_security(files: Iterable[Path]) -> list[str]:
                             f"{path}: job {job_name} local reusable workflow '{job_uses}' "
                             "must not traverse parent directories"
                         )
-                elif not _REUSABLE_WORKFLOW_SHA.fullmatch(job_uses):
-                    errors.append(
-                        f"{path}: job {job_name} reusable workflow '{job_uses}' "
-                        "must be pinned to a 40-char commit SHA"
-                    )
+                    if isinstance(job_secrets, str) and job_secrets.strip().lower() == "inherit":
+                        errors.append(
+                            f"{path}: job {job_name} must not use 'secrets: inherit'"
+                        )
+                else:
+                    if not _REUSABLE_WORKFLOW_SHA.fullmatch(job_uses):
+                        errors.append(
+                            f"{path}: job {job_name} reusable workflow '{job_uses}' "
+                            "must be pinned to a 40-char commit SHA"
+                        )
+                    if job_secrets is not None:
+                        errors.append(
+                            f"{path}: job {job_name} external reusable workflow '{job_uses}' "
+                            "must not receive secrets"
+                        )
+            elif isinstance(job_secrets, str) and job_secrets.strip().lower() == "inherit":
+                errors.append(
+                    f"{path}: job {job_name} must not use 'secrets: inherit'"
+                )
             steps = job.get("steps")
             if not isinstance(steps, list):
                 continue

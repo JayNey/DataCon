@@ -1821,3 +1821,236 @@ def test_promote_preflight_runs_outside_transaction_and_rollback_post_switch_che
             candidate_digest=approval["candidate_digest"],
         )
     assert backend.active_release()["image_id"] == manifest["control_plane_image_id"]
+
+
+def test_rollback_release_rejects_target_equal_to_active():
+    active = {
+        "image_id": "sha256:" + "a" * 64,
+        "config": {"contract_version": 1, "migration_version": "008_release_events.sql"},
+        "migration_version": "008_release_events.sql",
+        "evidence_root": "/var/lib/datacon/evidence",
+    }
+    backend = release.DictPromotionBackend(
+        active_release=active,
+        migrations=_ledger(),
+    )
+    with pytest.raises(release.ReleaseGateError, match="already the active release"):
+        release.rollback_release(
+            target_release=dict(active),
+            backend=backend,
+            smoke_checks={"db": lambda: True},
+            post_switch_checks={"active": lambda: True},
+            approved_by="ops",
+            candidate_digest="sha256:" + "e" * 64,
+            manifest_digest="sha256:" + "f" * 64,
+        )
+    assert backend.switches == []
+    assert backend.audits == []
+    assert backend.active_release() == active
+
+
+def test_rollback_pre_switch_container_check_failure_leaves_active_unchanged():
+    previous = _previous()
+    backend = _backend(previous=previous)
+    manifest = _sample_rc_manifest()
+    approval = _approval(manifest)
+    promoted = release.promote_and_smoke(
+        manifest=manifest,
+        expected_manifest_digest=approval["candidate_digest"],
+        approval=approval,
+        backend=backend,
+        smoke_checks={"cli_smoke": lambda: True},
+        rollback_fn=lambda prev: {"restored_image": prev["image_id"], "ok": True},
+    )
+    assert promoted["status"] == "promoted"
+    switches_before = len(backend.switches)
+    audits_before = len(backend.audits)
+
+    with pytest.raises(release.ReleaseGateError, match="release_slots"):
+        release.rollback_release(
+            target_release=previous,
+            backend=backend,
+            smoke_checks={
+                "cli_smoke": lambda: True,
+                "release_slots": lambda: False,
+            },
+            post_switch_checks={"active_release_restored": lambda: True},
+            approved_by="ops",
+            candidate_digest=approval["candidate_digest"],
+        )
+    assert len(backend.switches) == switches_before
+    assert len(backend.audits) == audits_before
+    assert backend.active_release()["image_id"] == manifest["control_plane_image_id"]
+
+
+def test_promote_requires_real_archived_bundle_when_strict(tmp_path):
+    missing_root = tmp_path / "unmounted-evidence"
+
+    class _FakeBundleStore:
+        def __init__(self, bundle: dict[str, str] | None):
+            self.bundle = bundle
+
+        def latest_evidence_bundle(
+            self, *, require_active_root: bool = True, strict: bool = False
+        ):
+            if not require_active_root:
+                return self.bundle
+            if self.bundle is None and strict:
+                from datacon import state
+
+                raise state.ReleaseStateError(
+                    "no archived evidence bundle found under active evidence_root"
+                )
+            return self.bundle
+
+    with pytest.raises(release.ReleaseGateError, match="evidence volume mounted"):
+        release.archived_bundle_preflight(
+            evidence_root=missing_root,
+            store=_FakeBundleStore(None),
+            verify_fn=lambda path, digest: True,
+        )
+
+    skipped = release.archived_bundle_preflight(
+        evidence_root=missing_root,
+        store=_FakeBundleStore(None),
+        verify_fn=lambda path, digest: True,
+        require_archived_bundle=False,
+        skip_reason="initial bootstrap environment without archived jobs",
+    )
+    assert skipped["status"] == "skipped"
+    assert "initial bootstrap" in skipped["reason"]
+    assert skipped["check_fn"] is None
+
+    evidence_root = tmp_path / "mounted-evidence"
+    bundle_dir = evidence_root / "job-1" / "generation-1"
+    bundle_dir.mkdir(parents=True)
+    digest = "sha256:" + "a" * 64
+    found = release.archived_bundle_preflight(
+        evidence_root=evidence_root,
+        store=_FakeBundleStore({"path": str(bundle_dir), "digest": digest}),
+        verify_fn=lambda path, d: path == str(bundle_dir) and d == digest,
+    )
+    assert found["status"] == "required"
+    assert found["bundle_path"] == str(bundle_dir)
+    assert found["bundle_digest"] == digest
+    assert found["check_fn"]() is True
+
+
+def test_release_store_connection_ensures_release_tables_and_cli_slots_exits_2(
+    monkeypatch, capsys
+):
+    from datacon import cli, state
+
+    class _EmptySchemaConnection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def execute(self, query, params=None):
+            class _Cursor:
+                def fetchone(self):
+                    if "to_regclass" in query:
+                        return {
+                            "migrations_tbl": None,
+                            "release_tbl": None,
+                            "events_tbl": None,
+                        }
+                    raise AssertionError(f"unexpected query on unmigrated DB: {query}")
+
+            return _Cursor()
+
+    store_handle = state.ReleaseStore("postgresql://unused")
+    monkeypatch.setattr(store_handle, "_connect", lambda: _EmptySchemaConnection())
+    for method in (
+        store_handle.active_slots,
+        store_handle.active_release,
+        store_handle.events,
+        lambda: store_handle.promotion_for("sha256:" + "a" * 64),
+        lambda: store_handle.release_for_image("sha256:" + "a" * 64),
+        store_handle.latest_evidence_bundle,
+    ):
+        with pytest.raises(state.ReleaseStateError, match="datacon migrate"):
+            method()
+
+    class _UnmigratedStore:
+        def __init__(self, dsn, *, environment):
+            pass
+
+        def active_slots(self):
+            raise state.ReleaseStateError(
+                "release tables are missing; run `datacon migrate`"
+            )
+
+    monkeypatch.setenv("DATACON_DATABASE_URL", "postgresql://unused")
+    monkeypatch.setattr(cli.state, "ReleaseStore", _UnmigratedStore)
+    rc = cli.main(["release", "slots", "--environment", "internal-lab"])
+    assert rc == 2
+    err = json.loads(capsys.readouterr().err)
+    assert err["reason_code"] == "INVALID_RELEASE_STATE"
+    assert "datacon migrate" in err["message"]
+
+
+def test_persist_b03_evidence_bundle_copies_verifies_and_detects_tampering(tmp_path):
+    from datacon import evidence
+
+    root = _b03_case_root(tmp_path)
+    admission = _frozen_admission()
+    review = _review_for(admission, root)
+    bundle_out = tmp_path / "temp-bundle"
+    acceptance = release.run_b03_acceptance(
+        admission=admission,
+        sandbox=FakeB03Sandbox(toolchain=admission["build"]["toolchain_image"]),
+        normal_input=(root / "inputs" / "normal.txt").read_bytes(),
+        candidate_input=(root / "inputs" / "candidate.txt").read_bytes(),
+        bundle_out=bundle_out,
+        storage_ref="vault://datacon/private/b03/CVE-2019-13224/manifest.json",
+        review=review,
+        case_root=root,
+        job_id="11111111-1111-4111-8111-111111111111",
+    )
+    persist_root = tmp_path / "persistent-b03"
+    persisted = release.persist_b03_evidence_bundle(
+        bundle_out,
+        persist_root=persist_root,
+        job_id="11111111-1111-4111-8111-111111111111",
+        expected_manifest_digest=acceptance["manifest_digest"],
+    )
+    shutil.rmtree(bundle_out)
+    persisted_dir = Path(persisted["bundle_path"])
+    assert persisted_dir.is_dir()
+    assert persisted["bundle_verified"] is True
+    assert persisted["bundle_manifest_digest"] == acceptance["manifest_digest"]
+    verified = evidence.verify_bundle(persisted_dir)
+    assert verified.manifest_digest == acceptance["manifest_digest"]
+
+    # Tampering a persisted file must cause verify_bundle to fail closed.
+    target_file = persisted_dir / "report.md"
+    target_file.write_text(target_file.read_text(encoding="utf-8") + "tampered\n", encoding="utf-8")
+    with pytest.raises(evidence.BundleError):
+        evidence.verify_bundle(persisted_dir)
+
+
+def test_b03_pass_checks_require_nonempty_evidence():
+    with pytest.raises(release.ReleaseGateError, match="evidence"):
+        release._validate_b03_checks(
+            {
+                "public_advisory": "pass",
+                "fixed_commit": "pass",
+                "offline_build": "pass",
+                "license": "pass",
+                "shared_harness": "pass",
+            }
+        )
+    for bad_evidence in (None, "", "   "):
+        checks = json.loads(B03_PATH.read_text(encoding="utf-8"))["checks"]
+        if bad_evidence is None:
+            checks[0].pop("evidence", None)
+        else:
+            checks[0]["evidence"] = bad_evidence
+        with pytest.raises(release.ReleaseGateError, match="evidence"):
+            release._validate_b03_checks(checks)
+
+    valid_checks = json.loads(B03_PATH.read_text(encoding="utf-8"))["checks"]
+    release._validate_b03_checks(valid_checks)

@@ -71,8 +71,10 @@ def test_promote_job_requires_test_report_and_build_candidate_without_always():
     assert "always()" not in condition
     assert "!cancelled()" in condition
     assert "needs.test-report.result == 'success'" in condition
-    assert "needs.build-candidate.result == 'success'" in condition
     assert "needs.build-candidate.result == 'skipped'" in condition
+    assert "github.event_name == 'workflow_dispatch'" in condition
+    assert "github.ref == 'refs/heads/main'" in condition
+    assert "refs/tags/v" not in condition
 
 
 def test_promote_job_downloads_verifies_loads_smokes_and_audits():
@@ -132,7 +134,10 @@ def test_test_report_job_produces_four_junit_reports():
     text = _run_text(job)
     for label in ("postgres", "docker", "asan", "contract"):
         assert f"--junitxml=\"$RUNNER_TEMP/release-junit/${{label}}.xml\"" in text or label in text
-    assert "check_junit_report" in text
+    run_suite_script = REPO_ROOT / "scripts" / "run_suite.sh"
+    assert run_suite_script.is_file()
+    assert "scripts/run_suite.sh" in text
+    assert "check_junit_report" in run_suite_script.read_text(encoding="utf-8")
     assert any(
         step.get("uses", "").startswith("actions/upload-artifact@")
         for step in _steps(job)
@@ -220,15 +225,18 @@ def test_workflows_use_minimal_read_only_permissions():
 
 def test_internal_jobs_are_restricted_to_main_or_a_release_tag():
     jobs = _load(RELEASE)["jobs"]
+    build_cond = jobs["build-candidate"]["if"]
+    assert "github.ref == 'refs/heads/main'" in build_cond
+    assert "startsWith(github.ref, 'refs/tags/v')" in build_cond
     for name in (
-        "build-candidate",
         "promote-internal",
         "rollback-internal",
         "b03-internal",
     ):
         condition = jobs[name]["if"]
         assert "github.ref == 'refs/heads/main'" in condition, name
-        assert "startsWith(github.ref, 'refs/tags/v')" in condition, name
+        assert "github.event_name == 'workflow_dispatch'" in condition, name
+        assert "refs/tags/v" not in condition, name
 
 
 def test_cross_run_artifacts_are_provenance_checked():
@@ -362,7 +370,8 @@ def test_protected_secrets_are_scoped_after_ref_verification_and_uv_sync():
 
 
 def test_s1_s4_s5_s8_promote_and_rollback_safety_contracts():
-    jobs = _load(RELEASE)["jobs"]
+    document = _load(RELEASE)
+    jobs = document["jobs"]
 
     promote_steps = _steps(jobs["promote-internal"])
     promote_text = _run_text(jobs["promote-internal"])
@@ -370,28 +379,475 @@ def test_s1_s4_s5_s8_promote_and_rollback_safety_contracts():
     assert "release slots --environment internal-lab" in promote_text
     assert "verify_promotion_gate" in promote_text
     assert "preflight_checks" in promote_text
-    assert "timeout=60" in promote_text
-    assert "timeout 60 docker run" in promote_text
-    assert "evidence_root_path.exists()" in promote_text
+    assert "archived_bundle_preflight" in promote_text
     assert "archived_real_bundle" in promote_text
 
-    approval_step_idx = next(
-        idx
-        for idx, step in enumerate(promote_steps)
-        if "DATACON_RELEASE_APPROVAL" in step.get("run", "")
-    )
-    first_db_or_container_idx = next(
-        idx
-        for idx, step in enumerate(promote_steps)
-        if "DATACON_DATABASE_URL" in step.get("run", "")
-        or "docker run" in step.get("run", "")
-    )
-    assert approval_step_idx <= first_db_or_container_idx
+    _assert_secrets_scoped(document)
+    _assert_smoke_timeouts(document)
 
     rollback_text = _run_text(jobs["rollback-internal"])
     assert 'candidate_digest=os.environ["TARGET_DIGEST"]' not in rollback_text
     assert 'target.get("candidate_digest") or target.get("manifest_digest")' in rollback_text
     assert "verify-bundle" in rollback_text
-    assert "release slots --environment internal-lab" in rollback_text
     assert "post_switch_checks" in rollback_text
-    assert "timeout=60" in rollback_text
+
+
+def _eval_gha_condition(
+    expr: str,
+    *,
+    event_name: str,
+    ref: str,
+    action: str = "build",
+    run_b03: bool = False,
+    test_report_result: str = "success",
+    build_candidate_result: str = "skipped",
+    cancelled: bool = False,
+) -> bool:
+    """Evaluate a GitHub Actions job `if:` expression structurally in Python."""
+    import re
+
+    translated = expr.strip()
+    replacements = {
+        "github.event_name": repr(event_name),
+        "github.ref": repr(ref),
+        "github.event.inputs.action": repr(action),
+        "github.event.inputs.run_b03": repr("true" if run_b03 else "false"),
+        "needs.test-report.result": repr(test_report_result),
+        "needs.build-candidate.result": repr(build_candidate_result),
+    }
+    for key, val in replacements.items():
+        translated = translated.replace(key, val)
+    translated = translated.replace("!cancelled()", repr(not cancelled))
+    translated = re.sub(
+        r"startsWith\(([^,]+),\s*([^)]+)\)",
+        r"(\1).startswith(\2)",
+        translated,
+    )
+    translated = translated.replace("&&", " and ").replace("||", " or ")
+    return bool(eval(translated, {"__builtins__": {}}, {}))  # noqa: S307
+
+
+def _extract_python_heredocs(script: str) -> list[str]:
+    import re
+    import textwrap
+
+    blocks = re.findall(r"<<'?PY'?\n(.*?)\n[ \t]*PY(?:\n|$)", script, flags=re.S)
+    return [textwrap.dedent(block) for block in blocks]
+
+
+def _assert_secrets_scoped(document: dict) -> None:
+    import json
+
+    jobs = document["jobs"]
+
+    promote = jobs["promote-internal"]
+    promote_secrets = ("DATACON_DATABASE_URL", "DATACON_RELEASE_APPROVAL")
+    for secret in promote_secrets:
+        assert secret not in promote.get("env", {}), f"promote job env leaks {secret}"
+    promote_steps = _steps(promote)
+    approval_idx = next(
+        idx
+        for idx, step in enumerate(promote_steps)
+        if "verify_promotion_gate" in step.get("run", "")
+    )
+    for idx, step in enumerate(promote_steps[:approval_idx]):
+        step_env = step.get("env", {})
+        step_run = step.get("run", "")
+        step_with = json.dumps(step.get("with", {}))
+        for secret in promote_secrets:
+            assert secret not in step_env, f"promote step {idx} env leaks {secret}"
+            assert secret not in step_run, f"promote step {idx} run references {secret}"
+            assert secret not in step_with, f"promote step {idx} with references {secret}"
+    first_db_or_container_idx = next(
+        idx
+        for idx, step in enumerate(promote_steps)
+        if "DATACON_DATABASE_URL" in step.get("env", {})
+        or "DATACON_DATABASE_URL" in step.get("run", "")
+        or "docker run" in step.get("run", "")
+    )
+    assert approval_idx < first_db_or_container_idx
+
+    rollback = jobs["rollback-internal"]
+    assert "DATACON_DATABASE_URL" not in rollback.get("env", {})
+    rollback_steps = _steps(rollback)
+    restore_idx = next(
+        idx
+        for idx, step in enumerate(rollback_steps)
+        if "rollback_release" in step.get("run", "")
+    )
+    for idx, step in enumerate(rollback_steps[:restore_idx]):
+        assert "DATACON_DATABASE_URL" not in step.get("env", {}), (
+            f"rollback step {idx} leaks DATACON_DATABASE_URL"
+        )
+        assert "DATACON_DATABASE_URL" not in step.get("run", ""), (
+            f"rollback step {idx} references DATACON_DATABASE_URL"
+        )
+
+    b03 = jobs["b03-internal"]
+    b03_secrets = {"DATACON_B03_CASE_ROOT", "DATACON_B03_ADMISSION", "DATACON_B03_REVIEW"}
+    assert not (b03_secrets & set(b03.get("env", {})))
+    b03_steps = _steps(b03)
+    b03_run_idx = next(
+        idx
+        for idx, step in enumerate(b03_steps)
+        if "run_b03_acceptance" in step.get("run", "")
+    )
+    for idx, step in enumerate(b03_steps[:b03_run_idx]):
+        assert not (b03_secrets & set(step.get("env", {}))), (
+            f"b03 step {idx} leaks B03 secrets"
+        )
+
+
+def _assert_smoke_timeouts(document: dict) -> None:
+    import ast
+    import shlex
+
+    jobs = document["jobs"]
+    for job_name in ("promote-internal", "rollback-internal"):
+        found_python_docker = False
+        for step in _steps(jobs[job_name]):
+            run_script = step.get("run", "")
+            for block in _extract_python_heredocs(run_script):
+                tree = ast.parse(block)
+                for node in ast.walk(tree):
+                    if not isinstance(node, ast.Call):
+                        continue
+                    func = node.func
+                    is_subprocess_run = (
+                        isinstance(func, ast.Attribute)
+                        and func.attr == "run"
+                        and isinstance(func.value, ast.Name)
+                        and func.value.id == "subprocess"
+                    )
+                    if not is_subprocess_run:
+                        continue
+                    cmd_is_docker = False
+                    if node.args and isinstance(node.args[0], ast.List):
+                        elts = node.args[0].elts
+                        if elts and isinstance(elts[0], ast.Constant) and elts[0].value == "docker":
+                            cmd_is_docker = True
+                            found_python_docker = True
+                    timeout_kw = next(
+                        (kw for kw in node.keywords if kw.arg == "timeout"),
+                        None,
+                    )
+                    assert timeout_kw is not None, (
+                        f"{job_name}: subprocess.run missing timeout= keyword"
+                    )
+                    assert isinstance(timeout_kw.value, ast.Constant) and isinstance(
+                        timeout_kw.value.value, (int, float)
+                    ) and 0 < timeout_kw.value.value <= 300, (
+                        f"{job_name}: subprocess.run timeout must be positive <= 300"
+                    )
+                    if cmd_is_docker:
+                        assert timeout_kw.value.value == 60
+            # Check shell-level `docker run` commands outside Python heredocs.
+            import re
+
+            outside_heredoc = re.sub(
+                r"<<'?PY'?\n.*?\n[ \t]*PY(?:\n|$)",
+                "\n",
+                run_script,
+                flags=re.S,
+            )
+            outside_heredoc = re.sub(r"\\\n[ \t]*", " ", outside_heredoc)
+            for raw_line in outside_heredoc.splitlines():
+                stripped = raw_line.strip()
+                if not stripped or stripped.startswith("#"):
+                    continue
+                tokens = shlex.split(stripped, comments=True)
+                for pos in range(len(tokens) - 1):
+                    if tokens[pos] == "docker" and tokens[pos + 1] == "run":
+                        assert pos >= 2 and tokens[pos - 2] == "timeout" and tokens[pos - 1].isdigit() and int(tokens[pos - 1]) > 0, (
+                            f"{job_name}: shell docker run must be guarded by `timeout <secs>`: {raw_line!r}"
+                        )
+        assert found_python_docker, f"{job_name}: expected Python subprocess docker smoke check"
+
+
+def test_secret_jobs_only_run_on_main_workflow_dispatch_never_tags():
+    jobs = _load(RELEASE)["jobs"]
+    build_if = jobs["build-candidate"]["if"]
+    promote_if = jobs["promote-internal"]["if"]
+    rollback_if = jobs["rollback-internal"]["if"]
+    b03_if = jobs["b03-internal"]["if"]
+
+    # Tag push builds candidate without secrets, and NEVER triggers promote/rollback/b03.
+    assert _eval_gha_condition(build_if, event_name="push", ref="refs/tags/v1.0.0") is True
+    assert _eval_gha_condition(
+        promote_if,
+        event_name="push",
+        ref="refs/tags/v1.0.0",
+        build_candidate_result="success",
+    ) is False
+    assert _eval_gha_condition(rollback_if, event_name="push", ref="refs/tags/v1.0.0") is False
+    assert _eval_gha_condition(b03_if, event_name="push", ref="refs/tags/v1.0.0", run_b03=True) is False
+
+    # Dispatch on a tag or feature branch never enters secret jobs.
+    for bad_ref in ("refs/tags/v1.0.0", "refs/heads/feat/pr7"):
+        assert _eval_gha_condition(
+            promote_if,
+            event_name="workflow_dispatch",
+            ref=bad_ref,
+            action="promote",
+            build_candidate_result="skipped",
+        ) is False
+        assert _eval_gha_condition(
+            rollback_if,
+            event_name="workflow_dispatch",
+            ref=bad_ref,
+            action="rollback",
+        ) is False
+        assert _eval_gha_condition(
+            b03_if,
+            event_name="workflow_dispatch",
+            ref=bad_ref,
+            run_b03=True,
+        ) is False
+
+    # Main workflow_dispatch enters promote/rollback/b03 as requested.
+    assert _eval_gha_condition(
+        promote_if,
+        event_name="workflow_dispatch",
+        ref="refs/heads/main",
+        action="promote",
+        build_candidate_result="skipped",
+    ) is True
+    assert _eval_gha_condition(
+        rollback_if,
+        event_name="workflow_dispatch",
+        ref="refs/heads/main",
+        action="rollback",
+    ) is True
+    assert _eval_gha_condition(
+        b03_if,
+        event_name="workflow_dispatch",
+        ref="refs/heads/main",
+        run_b03=True,
+    ) is True
+
+    # Promote must not carry dead push/build-candidate fallback expressions.
+    promote = jobs["promote-internal"]
+    assert "needs.build-candidate.outputs.manifest_digest" not in promote["env"]["EXPECTED_MANIFEST_DIGEST"]
+    assert not any(
+        step.get("if") == "github.event_name != 'workflow_dispatch'"
+        for step in _steps(promote)
+    )
+
+
+def test_test_report_has_main_and_tag_ref_guard():
+    job = _load(RELEASE)["jobs"]["test-report"]
+    cond = job.get("if", "")
+    assert cond, "test-report must declare a ref guard"
+    assert _eval_gha_condition(cond, event_name="push", ref="refs/heads/main") is True
+    assert _eval_gha_condition(cond, event_name="push", ref="refs/tags/v1.0.0") is True
+    assert _eval_gha_condition(cond, event_name="workflow_dispatch", ref="refs/heads/main") is True
+    assert _eval_gha_condition(cond, event_name="workflow_dispatch", ref="refs/tags/v1.0.0") is True
+    assert _eval_gha_condition(cond, event_name="workflow_dispatch", ref="refs/heads/feat/branch") is False
+    assert _eval_gha_condition(cond, event_name="pull_request", ref="refs/pull/7/merge") is False
+
+
+def test_promote_archived_bundle_is_fail_closed_by_default_and_audited_when_skipped():
+    promote = _load(RELEASE)["jobs"]["promote-internal"]
+    promote_text = _run_text(promote)
+    assert "skipping archived_real_bundle" not in promote_text
+    assert "archived_bundle_preflight" in promote_text
+    assert "audit_metadata" in promote_text
+    assert "REQUIRE_ARCHIVED_BUNDLE" in promote["env"]
+    assert "ARCHIVED_BUNDLE_SKIP_REASON" in promote["env"]
+
+
+def test_no_secret_in_any_step_before_approval():
+    _assert_secrets_scoped(_load(RELEASE))
+
+
+def test_smoke_subprocess_calls_have_timeout():
+    _assert_smoke_timeouts(_load(RELEASE))
+
+
+def test_secret_scoping_helper_rejects_secret_inserted_before_approval():
+    import copy
+    import pytest
+
+    base_doc = _load(RELEASE)
+
+    mutated_promote = copy.deepcopy(base_doc)
+    mutated_promote["jobs"]["promote-internal"]["steps"].insert(
+        1,
+        {
+            "name": "Injected leak before approval",
+            "env": {"DATACON_DATABASE_URL": "${{ secrets.DATACON_DATABASE_URL }}"},
+            "run": "echo oops",
+        },
+    )
+    with pytest.raises(AssertionError):
+        _assert_secrets_scoped(mutated_promote)
+
+    mutated_rollback = copy.deepcopy(base_doc)
+    mutated_rollback["jobs"]["rollback-internal"]["steps"].insert(
+        1,
+        {
+            "name": "Injected rollback leak",
+            "env": {"DATACON_DATABASE_URL": "${{ secrets.DATACON_DATABASE_URL }}"},
+            "run": "echo oops",
+        },
+    )
+    with pytest.raises(AssertionError):
+        _assert_secrets_scoped(mutated_rollback)
+
+
+def test_timeout_helper_rejects_commented_or_removed_timeout():
+    import copy
+    import pytest
+
+    base_doc = _load(RELEASE)
+
+    mutated_py = copy.deepcopy(base_doc)
+    for step in mutated_py["jobs"]["promote-internal"]["steps"]:
+        if "timeout=60" in step.get("run", ""):
+            step["run"] = step["run"].replace("timeout=60,", "# timeout=60")
+    with pytest.raises(AssertionError):
+        _assert_smoke_timeouts(mutated_py)
+
+    mutated_sh = copy.deepcopy(base_doc)
+    for step in mutated_sh["jobs"]["promote-internal"]["steps"]:
+        if "timeout 60 docker run" in step.get("run", ""):
+            step["run"] = step["run"].replace("timeout 60 docker run", "docker run")
+    with pytest.raises(AssertionError):
+        _assert_smoke_timeouts(mutated_sh)
+
+
+def test_b03_persists_bundle_before_cleanup_and_fails_closed_without_dir():
+    import ast
+
+    b03 = _load(RELEASE)["jobs"]["b03-internal"]
+    b03_steps = _steps(b03)
+    run_step = next(
+        step for step in b03_steps if "run_b03_acceptance" in step.get("run", "")
+    )
+    assert "DATACON_B03_EVIDENCE_DIR" in run_step.get("env", {})
+    assert "${{ secrets.DATACON_B03_EVIDENCE_DIR" not in str(run_step.get("env", {}))
+    run_text = run_step["run"]
+    assert "DATACON_B03_EVIDENCE_DIR" in run_text.split("uv run")[0]
+    blocks = _extract_python_heredocs(run_text)
+    assert blocks
+    tree = ast.parse(blocks[0])
+    try_nodes = [node for node in ast.walk(tree) if isinstance(node, ast.Try)]
+    assert try_nodes
+    persist_in_try = any(
+        isinstance(node, ast.Attribute) and node.attr == "persist_b03_evidence_bundle"
+        for try_node in try_nodes
+        for stmt in try_node.body
+        for node in ast.walk(stmt)
+    )
+    assert persist_in_try, "persist_b03_evidence_bundle must run inside try before finally cleanup"
+    assert '"bundle_path"' in run_text
+    assert '"bundle_manifest_digest"' in run_text
+
+
+def test_rollback_runs_release_slots_compatibility_in_pre_switch_smoke_not_post_commit():
+    import ast
+
+    rollback = _load(RELEASE)["jobs"]["rollback-internal"]
+    steps = _steps(rollback)
+    assert not any(
+        "release slots" in step.get("run", "") and "rollback_release" not in step.get("run", "")
+        for step in steps
+    ), "post-commit release slots gating step must not exist"
+    restore_step = next(
+        step for step in steps if "rollback_release" in step.get("run", "")
+    )
+    blocks = _extract_python_heredocs(restore_step["run"])
+    assert blocks
+    tree = ast.parse(blocks[0])
+    rb_call = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "rollback_release"
+    )
+    smoke_kw = next(kw for kw in rb_call.keywords if kw.arg == "smoke_checks")
+    assert isinstance(smoke_kw.value, ast.Dict)
+    smoke_keys = {k.value for k in smoke_kw.value.keys if isinstance(k, ast.Constant)}
+    assert "release_slots" in smoke_keys
+    assert "active_release_restored" in restore_step["run"]
+
+
+def test_run_suite_script_respects_both_pytest_and_junit_exit_codes(tmp_path):
+    import os
+    import subprocess
+
+    script = REPO_ROOT / "scripts" / "run_suite.sh"
+    assert script.is_file()
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_uv = fake_bin / "uv"
+    fake_uv.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -uo pipefail\n"
+        "shift 2 # drop: run --frozen\n"
+        'cmd="$1"\n'
+        'if [ "$cmd" = "pytest" ]; then\n'
+        '  for arg in "$@"; do\n'
+        '    case "$arg" in --junitxml=*) xml="${arg#--junitxml=}" ;; esac\n'
+        "  done\n"
+        '  mkdir -p "$(dirname "$xml")"\n'
+        '  printf \'%s\' "$FAKE_JUNIT_XML" > "$xml"\n'
+        '  exit "${FAKE_PYTEST_RC:-0}"\n'
+        "fi\n"
+        f'exec "{REPO_ROOT / ".venv" / "bin" / "python"}" "${{@:2}}"\n',
+        encoding="utf-8",
+    )
+    fake_uv.chmod(0o755)
+
+    valid_xml = (
+        '<testsuite tests="1" skipped="0" failures="0" errors="0">'
+        '<testcase name="ok" /></testsuite>'
+    )
+    fail_xml = (
+        '<testsuite tests="1" skipped="0" failures="1" errors="0">'
+        '<testcase name="bad"><failure message="boom" /></testcase></testsuite>'
+    )
+    base_env = dict(os.environ)
+    base_env["PATH"] = f"{fake_bin}:{base_env['PATH']}"
+    base_env["PYTHONPATH"] = str(REPO_ROOT / "src")
+
+    # 1. pytest exits 1 even with a valid all-pass JUnit XML -> MUST fail (non-zero).
+    env1 = dict(base_env, FAKE_PYTEST_RC="1", FAKE_JUNIT_XML=valid_xml)
+    r1 = subprocess.run(
+        ["bash", str(script), "contract", "contract", str(tmp_path / "r1.xml")],
+        env=env1,
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    assert r1.returncode != 0, f"expected failure when pytest_rc=1: {r1.stdout} {r1.stderr}"
+
+    # 2. pytest exits 0 with failing JUnit XML -> MUST fail (non-zero).
+    env2 = dict(base_env, FAKE_PYTEST_RC="0", FAKE_JUNIT_XML=fail_xml)
+    r2 = subprocess.run(
+        ["bash", str(script), "contract", "contract", str(tmp_path / "r2.xml")],
+        env=env2,
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    assert r2.returncode != 0
+
+    # 3. pytest exits 0 with valid all-pass JUnit XML -> MUST succeed (0).
+    env3 = dict(base_env, FAKE_PYTEST_RC="0", FAKE_JUNIT_XML=valid_xml)
+    r3 = subprocess.run(
+        ["bash", str(script), "contract", "contract", str(tmp_path / "r3.xml")],
+        env=env3,
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    assert r3.returncode == 0, r3.stderr
+
+
+def test_workflows_use_shared_run_suite_script():
+    ci_text = _run_text(_load(CI)["jobs"]["test"])
+    rel_text = _run_text(_load(RELEASE)["jobs"]["test-report"])
+    assert "scripts/run_suite.sh" in ci_text
+    assert "scripts/run_suite.sh" in rel_text

@@ -1044,3 +1044,123 @@ def test_release_store_transaction_sets_timeouts_and_rejects_fake_promote_rollba
     assert active is not None
     assert active["image_id"] == PREVIOUS_IMAGE
     assert [event["action"] for event in store_handle.events()] == ["bootstrap"]
+
+
+def test_rollback_release_rejects_target_equal_to_active_in_postgres(
+    isolated_database,
+):
+    store_handle = state.ReleaseStore(isolated_database.dsn)
+    baseline = {
+        "image_id": PREVIOUS_IMAGE,
+        "config": {"policy_version": "1"},
+        "migration_version": "008_release_events.sql",
+        "evidence_root": "/var/lib/datacon/evidence",
+    }
+    store_handle.bootstrap_release(**baseline)
+    target = store_handle.release_for_image(PREVIOUS_IMAGE)
+    assert target is not None
+
+    with pytest.raises(release.ReleaseGateError, match="already the active release"):
+        release.rollback_release(
+            target_release=target,
+            backend=store_handle,
+            smoke_checks={"cli_smoke": lambda: True},
+            post_switch_checks={"active_release_restored": lambda: True},
+            approved_by="reviewer-1",
+            candidate_digest=target["candidate_digest"],
+            manifest_digest=target["manifest_digest"],
+        )
+
+    active = store_handle.active_release()
+    assert active is not None
+    assert active["image_id"] == PREVIOUS_IMAGE
+    assert active["config"] == baseline["config"]
+    assert [event["action"] for event in store_handle.events()] == ["bootstrap"]
+
+
+def test_latest_evidence_bundle_strict_requires_active_root_bundle(
+    isolated_database, tmp_path
+):
+    import uuid as uuid_mod
+    from psycopg.types.json import Jsonb
+
+    evidence_root = tmp_path / "strict-evidence"
+    evidence_root.mkdir()
+    store_handle = state.ReleaseStore(isolated_database.dsn)
+    store_handle.bootstrap_release(
+        image_id=PREVIOUS_IMAGE,
+        config={"policy_version": "1"},
+        migration_version="008_release_events.sql",
+        evidence_root=str(evidence_root),
+    )
+
+    assert store_handle.latest_evidence_bundle(strict=False) is None
+    with pytest.raises(state.ReleaseStateError, match="no archived evidence bundle"):
+        store_handle.latest_evidence_bundle(strict=True)
+
+    bundle_dir = evidence_root / str(uuid_mod.uuid4()) / "generation-1"
+    bundle_dir.mkdir(parents=True)
+    digest = "sha256:" + "a" * 64
+    isolated_database.connection.execute(
+        "INSERT INTO jobs "
+        "(job_id, request, state, stage, workflow_synced, evidence_status, "
+        "evidence_path, evidence_digest, verdict, verdict_reason, submitted_at) "
+        "VALUES (%s, %s, 'REPRODUCED', 'done', true, 'archived', %s, %s, "
+        "'REPRODUCED', 'ASAN_SIGNATURE_MATCHED', clock_timestamp())",
+        (uuid_mod.uuid4(), Jsonb({"schema_version": 1}), str(bundle_dir), digest),
+    )
+
+    found = store_handle.latest_evidence_bundle(strict=True)
+    assert found is not None
+    assert Path(found["path"]).resolve() == bundle_dir.resolve()
+    assert found["digest"] == digest
+
+
+def test_all_release_store_entrypoints_and_slots_cli_fail_closed_on_unmigrated_db(
+    postgres_dsn,
+):
+    import json
+    import psycopg
+    from psycopg import sql
+    from psycopg.conninfo import conninfo_to_dict, make_conninfo
+    import uuid as uuid_mod
+    from support import cli
+
+    empty_schema = f"datacon_unmigrated_all_{uuid_mod.uuid4().hex}"
+    with psycopg.connect(postgres_dsn, autocommit=True, connect_timeout=5) as admin:
+        admin.execute(sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(empty_schema)))
+    try:
+        params = conninfo_to_dict(postgres_dsn)
+        params["options"] = f"-csearch_path={empty_schema}"
+        empty_dsn = make_conninfo(**params)
+
+        unmigrated = state.ReleaseStore(empty_dsn)
+        for call in (
+            unmigrated.active_slots,
+            unmigrated.active_release,
+            unmigrated.events,
+            unmigrated.latest_evidence_bundle,
+            lambda: unmigrated.promotion_for("sha256:" + "a" * 64),
+            lambda: unmigrated.release_for_image("sha256:" + "a" * 64),
+        ):
+            with pytest.raises(state.ReleaseStateError, match="datacon migrate"):
+                call()
+
+        slots = cli(
+            "release",
+            "slots",
+            "--environment",
+            "internal-lab",
+            database_url=empty_dsn,
+        )
+        assert slots.returncode == 2, slots.stderr
+        err = json.loads(slots.stderr)
+        assert err["reason_code"] == "INVALID_RELEASE_STATE"
+        assert "datacon migrate" in err["message"]
+    finally:
+        with psycopg.connect(postgres_dsn, autocommit=True, connect_timeout=5) as admin:
+            admin.execute(
+                sql.SQL("DROP SCHEMA IF EXISTS {} CASCADE").format(
+                    sql.Identifier(empty_schema)
+                )
+            )

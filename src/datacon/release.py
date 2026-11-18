@@ -822,6 +822,7 @@ def promote_and_smoke(
     smoke_checks: Mapping[str, Callable[[], bool]],
     rollback_fn: Callable[[Mapping[str, Any]], Mapping[str, Any]],
     preflight_checks: Mapping[str, Callable[[], bool]] | None = None,
+    audit_metadata: Mapping[str, Any] | None = None,
     now: datetime | None = None,
 ) -> dict[str, Any]:
     """Drain-check, switch to the candidate, smoke it, and audit the outcome.
@@ -886,6 +887,9 @@ def promote_and_smoke(
                 raise ReleaseGateError(
                     f"promotion blocked: preflight check failed: {name}"
                 )
+    if audit_metadata is not None and not isinstance(audit_metadata, Mapping):
+        raise ReleaseGateError("promotion audit_metadata must be a mapping")
+    extra_audit = dict(audit_metadata) if audit_metadata is not None else {}
     smoke_results: dict[str, bool] = dict(preflight_results)
     failed_check: str | None = None
 
@@ -987,6 +991,9 @@ def promote_and_smoke(
                 "migration_ledger_verified": True,
                 "recorded_at": _utc_now(),
             }
+            for key, value in extra_audit.items():
+                if key not in result:
+                    result[key] = value
             backend.record_audit(result)
             return result
 
@@ -1008,6 +1015,9 @@ def promote_and_smoke(
             "migration_ledger_verified": True,
             "recorded_at": _utc_now(),
         }
+        for key, value in extra_audit.items():
+            if key not in result:
+                result[key] = value
         backend.record_audit(result)
         return result
 
@@ -1032,6 +1042,11 @@ def rollback_release(
     current = backend.active_release()
     if current is None:
         raise ReleaseGateError("rollback blocked: no persisted active release")
+    if _same_release(target, current):
+        raise ReleaseGateError(
+            "rollback blocked: target release is already the active release; "
+            "no state change"
+        )
     _require_drained(backend, action="rollback")
 
     resolved_manifest_digest = (
@@ -1061,6 +1076,11 @@ def rollback_release(
             raise ReleaseGateError(
                 "active release changed while rollback smoke checks ran; "
                 "refusing to overwrite a concurrent promotion"
+            )
+        if _same_release(target, latest):
+            raise ReleaseGateError(
+                "rollback blocked: target release is already the active release; "
+                "no state change"
             )
         _verify_rollback_migrations(
             target_version=target["migration_version"],
@@ -1121,6 +1141,81 @@ def rollback_release(
             result["post_switch_results"] = post_switch_results
         backend.record_audit(result)
     return result
+
+
+def archived_bundle_preflight(
+    *,
+    evidence_root: str | Path,
+    store: Any,
+    verify_fn: Callable[[str, str], bool],
+    require_archived_bundle: bool = True,
+    skip_reason: str | None = None,
+) -> dict[str, Any]:
+    """Enforce real archived bundle verification on promote unless explicitly skipped."""
+    if isinstance(evidence_root, str):
+        if not evidence_root.strip():
+            raise ReleaseGateError("refusing promotion: evidence_root must not be empty")
+        root_path = Path(evidence_root)
+    elif isinstance(evidence_root, Path):
+        root_path = evidence_root
+    else:
+        raise ReleaseGateError("refusing promotion: evidence_root must be a path")
+    if root_path.is_symlink():
+        raise ReleaseGateError(
+            f"refusing promotion: evidence_root is a symlink: {root_path}"
+        )
+    if not root_path.exists():
+        store.latest_evidence_bundle(require_active_root=False)
+        if require_archived_bundle:
+            raise ReleaseGateError(
+                f"promotion blocked: evidence_root {root_path} is not mounted; "
+                "run promotion on a runner with the evidence volume mounted"
+            )
+        if not isinstance(skip_reason, str) or not skip_reason.strip():
+            raise ReleaseGateError(
+                "promotion blocked: skipping archived_real_bundle requires a "
+                "non-empty reason"
+            )
+        return {
+            "status": "skipped",
+            "reason": skip_reason.strip(),
+            "check_fn": None,
+        }
+    if not root_path.is_dir():
+        raise ReleaseGateError(
+            f"refusing promotion: evidence_root is not a directory: {root_path}"
+        )
+    latest = store.latest_evidence_bundle(strict=require_archived_bundle)
+    if latest is None:
+        if require_archived_bundle:
+            raise ReleaseGateError(
+                f"promotion blocked: no archived evidence bundle under active "
+                f"evidence_root {root_path}; run promotion on a runner with the "
+                "evidence volume mounted"
+            )
+        if not isinstance(skip_reason, str) or not skip_reason.strip():
+            raise ReleaseGateError(
+                "promotion blocked: skipping archived_real_bundle requires a "
+                "non-empty reason"
+            )
+        return {
+            "status": "skipped",
+            "reason": skip_reason.strip(),
+            "check_fn": None,
+        }
+    latest_path = Path(latest["path"])
+    if latest_path.is_symlink() or not latest_path.is_dir():
+        raise ReleaseGateError(
+            f"refusing promotion: latest evidence bundle path is not a real directory: {latest_path}"
+        )
+    bundle_path = str(latest["path"])
+    bundle_digest = str(latest["digest"])
+    return {
+        "status": "required",
+        "bundle_path": bundle_path,
+        "bundle_digest": bundle_digest,
+        "check_fn": lambda p=bundle_path, d=bundle_digest: verify_fn(p, d),
+    }
 
 
 def write_smoke_evidence_bundle(
@@ -1716,6 +1811,13 @@ def _validate_b03_checks(checks: Any) -> None:
                 raise ReleaseGateError(
                     f"B03 admission check {check_id!r} is deferred without an "
                     f"{_B03_DEFERRED_CHECK_OWNER_FIELD}"
+                )
+        elif status == "pass":
+            ev = entry.get("evidence")
+            if not isinstance(ev, str) or not ev.strip():
+                raise ReleaseGateError(
+                    f"B03 admission check {check_id!r} with status 'pass' "
+                    "must provide non-empty evidence"
                 )
         seen[check_id] = status
     for required_id in sorted(_B03_REQUIRED_PASS_CHECKS):
@@ -2611,6 +2713,75 @@ def run_b03_acceptance(
         "versions": {"vulnerable": plan["revisions"]["vulnerable"], "fixed": plan["revisions"]["fixed"]},
         "review": accepted_review,
         "accepted_at": info.manifest["created_at"],
+    }
+
+
+_SAFE_B03_JOB_ID = re.compile(r"^[A-Za-z0-9._-]+$")
+
+
+def persist_b03_evidence_bundle(
+    bundle_src: Path | str,
+    *,
+    persist_root: Path | str,
+    job_id: str,
+    expected_manifest_digest: str | None = None,
+) -> dict[str, Any]:
+    """Copy a verified B03 bundle into persistent storage and re-verify the copy."""
+    if isinstance(persist_root, str):
+        if not persist_root.strip():
+            raise ReleaseGateError(
+                "B03 persistent evidence directory must be configured and non-empty "
+                "(DATACON_B03_EVIDENCE_DIR)"
+            )
+        root_path = Path(persist_root)
+    elif isinstance(persist_root, Path):
+        root_path = persist_root
+    else:
+        raise ReleaseGateError("persist_root must be a directory path")
+    if not root_path.is_absolute():
+        raise ReleaseGateError(
+            f"B03 persistent evidence directory must be an absolute path: {root_path}"
+        )
+    if root_path.is_symlink():
+        raise ReleaseGateError(
+            f"B03 persistent evidence directory must not be a symlink: {root_path}"
+        )
+    if (
+        not isinstance(job_id, str)
+        or not _SAFE_B03_JOB_ID.fullmatch(job_id)
+        or job_id in {".", ".."}
+    ):
+        raise ReleaseGateError(
+            f"invalid B03 job_id for persistent bundle path: {job_id!r}"
+        )
+    root_path.mkdir(parents=True, exist_ok=True)
+    destination = root_path / job_id
+    try:
+        exported = evidence.export_bundle(
+            bundle_src,
+            destination,
+            expected_manifest_digest=expected_manifest_digest,
+        )
+        reverified = evidence.verify_bundle(destination)
+    except evidence.BundleError as error:
+        raise ReleaseGateError(
+            f"B03 persistent bundle verification failed: {error}"
+        ) from error
+    if reverified.manifest_digest != exported.manifest_digest:
+        raise ReleaseGateError(
+            "B03 persistent bundle manifest digest drifted after copy"
+        )
+    if (
+        expected_manifest_digest is not None
+        and reverified.manifest_digest != expected_manifest_digest
+    ):
+        raise ReleaseGateError(
+            "B03 persistent bundle manifest digest does not match acceptance digest"
+        )
+    return {
+        "bundle_path": str(destination),
+        "bundle_manifest_digest": reverified.manifest_digest,
+        "bundle_verified": True,
     }
 
 

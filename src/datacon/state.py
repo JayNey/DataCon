@@ -1479,6 +1479,24 @@ class ReleaseStore:
             self.dsn, connect_timeout=5, row_factory=dict_row
         )
 
+    def _ensure_release_tables(self, connection) -> None:
+        reg = connection.execute(
+            "SELECT to_regclass('schema_migrations') AS migrations_tbl, "
+            "to_regclass('release_state') AS release_tbl, "
+            "to_regclass('release_events') AS events_tbl"
+        ).fetchone()
+        if (
+            reg is None
+            or reg["migrations_tbl"] is None
+            or reg["release_tbl"] is None
+            or reg["events_tbl"] is None
+        ):
+            raise ReleaseStateError(
+                "schema_migrations ledger is missing; run `datacon migrate` "
+                "against the target database before bootstrapping, promoting, "
+                "rolling back, or querying release state"
+            )
+
     @contextmanager
     def _connection(self):
         active = getattr(self._tx_local, "conn", None)
@@ -1486,6 +1504,7 @@ class ReleaseStore:
             yield active
             return
         with self._connect() as connection:
+            self._ensure_release_tables(connection)
             yield connection
 
     @contextmanager
@@ -1510,22 +1529,7 @@ class ReleaseStore:
                 "SELECT pg_advisory_xact_lock(hashtext(%s))",
                 (RELEASE_LOCK_PREFIX + self.environment,),
             )
-            reg = connection.execute(
-                "SELECT to_regclass('schema_migrations') AS migrations_tbl, "
-                "to_regclass('release_state') AS release_tbl, "
-                "to_regclass('release_events') AS events_tbl"
-            ).fetchone()
-            if (
-                reg is None
-                or reg["migrations_tbl"] is None
-                or reg["release_tbl"] is None
-                or reg["events_tbl"] is None
-            ):
-                raise ReleaseStateError(
-                    "schema_migrations ledger is missing; run `datacon migrate` "
-                    "against the target database before bootstrapping, promoting, "
-                    "or rolling back"
-                )
+            self._ensure_release_tables(connection)
             connection.execute(
                 "SELECT 1 FROM release_state WHERE environment = %s FOR UPDATE",
                 (self.environment,),
@@ -1875,9 +1879,11 @@ class ReleaseStore:
         return None
 
     def latest_evidence_bundle(
-        self, *, require_active_root: bool = True
+        self, *, require_active_root: bool = True, strict: bool = False
     ) -> dict[str, str] | None:
         """Return the newest archived evidence bundle after verifying containment."""
+        if strict and not require_active_root:
+            raise ReleaseStateError("strict=True requires require_active_root=True")
         with self._connection() as connection:
             job_rows = connection.execute(
                 "SELECT evidence_path, evidence_digest FROM jobs "
@@ -1886,6 +1892,10 @@ class ReleaseStore:
                 "ORDER BY submitted_at DESC"
             ).fetchall()
             if not job_rows:
+                if strict:
+                    raise ReleaseStateError(
+                        "no archived evidence bundle found under active evidence_root"
+                    )
                 return None
             if not require_active_root:
                 _validate_evidence_path_syntax(job_rows[0]["evidence_path"])
@@ -1937,6 +1947,10 @@ class ReleaseStore:
                 if matched_historical:
                     continue
                 raise active_error
+        if strict:
+            raise ReleaseStateError(
+                f"no archived evidence bundle found under active evidence_root {active_root!r}"
+            )
         return None
 
     def events(self) -> list[dict[str, Any]]:

@@ -361,10 +361,10 @@ def _release_slots(args) -> int:
             "active_release": active,
             "drained": slots == 0,
         }
-    except psycopg.Error as error:
-        return _error(1, "DATABASE_ERROR", _database_error_message(error))
     except (state.StateError, ValueError) as error:
         return _error(2, "INVALID_RELEASE_STATE", str(error))
+    except psycopg.Error as error:
+        return _error(1, "DATABASE_ERROR", _database_error_message(error))
     print(json.dumps(payload, ensure_ascii=False, default=str))
     return 0
 
@@ -414,10 +414,10 @@ def _release_bootstrap(args) -> int:
             migration_version=previous["migration_version"],
             evidence_root=previous["evidence_root"],
         )
-    except psycopg.Error as error:
-        return _error(1, "DATABASE_ERROR", _database_error_message(error))
     except (state.StateError, ValueError) as error:
         return _error(2, "INVALID_RELEASE_STATE", str(error))
+    except psycopg.Error as error:
+        return _error(1, "DATABASE_ERROR", _database_error_message(error))
     print(
         json.dumps(
             {
