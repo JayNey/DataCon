@@ -33,16 +33,27 @@ _ACTION_SHA = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+@[0-9a-f]{40}")
 _REUSABLE_WORKFLOW_SHA = re.compile(
     r"[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)+@[0-9a-f]{40}"
 )
-_UNTRUSTED_RUN_EXPR_TOKENS = (
-    "github.event",
-    "inputs.",
-    "github.head_ref",
-    "github.ref_name",
-    "github.base_ref",
-    "steps.",
-    "steps[",
-    "needs.",
-    "needs[",
+_UNTRUSTED_EXPR_PATTERNS: tuple[re.Pattern[str], ...] = (
+    # Dot or bracket access into untrusted github properties.
+    re.compile(
+        r"\bgithub\s*(?:\.\s*(?:event(?:_path)?|head_ref|ref_name|base_ref|ref|actor|triggering_actor)\b|\[)",
+        re.IGNORECASE,
+    ),
+    # Dot or bracket access into inputs, steps, needs, env, or matrix.
+    re.compile(
+        r"\b(?:inputs|steps|needs|env|matrix)\s*(?:\.|\[)",
+        re.IGNORECASE,
+    ),
+    # Conversion/formatting functions that serialize or assemble untrusted values.
+    re.compile(
+        r"\b(?:tojson|fromjson|format)\s*\(",
+        re.IGNORECASE,
+    ),
+    # Bare untrusted context objects passed directly (e.g. toJSON(github)).
+    re.compile(
+        r"(?:^|[,(\s!|&=])\s*(?:github|inputs|steps|needs|env|matrix)\s*(?=$|[,)\s!|&=])",
+        re.IGNORECASE,
+    ),
 )
 _DOCKER_DIGEST = re.compile(r"docker://[^\s@]+@sha256:[0-9a-f]{64}")
 _RUN_EXPRESSION = re.compile(r"\$\{\{(.*?)\}\}", re.S)
@@ -237,11 +248,45 @@ def _continue_on_error_is_true(value: Any) -> bool:
     return True
 
 
+def _iter_yaml_strings(
+    value: Any, *, prefix: str, _seen: set[int] | None = None
+) -> Iterable[tuple[str, str]]:
+    """Yield ``(label, string_value)`` for every string in a YAML subtree."""
+    seen = _seen if _seen is not None else set()
+    if isinstance(value, str):
+        yield prefix, value
+        return
+    if isinstance(value, Mapping):
+        marker = id(value)
+        if marker in seen:
+            raise GateError("workflow contains a circular YAML reference")
+        seen.add(marker)
+        try:
+            for key, item in value.items():
+                yield from _iter_yaml_strings(
+                    item, prefix=f"{prefix}.{key}", _seen=seen
+                )
+        finally:
+            seen.discard(marker)
+    elif isinstance(value, list):
+        marker = id(value)
+        if marker in seen:
+            raise GateError("workflow contains a circular YAML reference")
+        seen.add(marker)
+        try:
+            for idx, item in enumerate(value):
+                yield from _iter_yaml_strings(
+                    item, prefix=f"{prefix}[{idx}]", _seen=seen
+                )
+        finally:
+            seen.discard(marker)
+
+
 def _untrusted_expressions(text: str) -> list[str]:
     found: list[str] = []
     for match in _RUN_EXPRESSION.finditer(text):
         expression = match.group(1).lower()
-        if any(token in expression for token in _UNTRUSTED_RUN_EXPR_TOKENS):
+        if any(pattern.search(expression) for pattern in _UNTRUSTED_EXPR_PATTERNS):
             found.append(expression.strip())
     return found
 
@@ -256,18 +301,30 @@ def _check_run_expressions(text: str) -> list[str]:
     return errors
 
 
-def _check_with_expressions(with_block: Any) -> list[str]:
+def _check_with_expressions(
+    with_block: Any, *, step_uses: str | None = None
+) -> list[str]:
     """Reject attacker-controlled expressions interpolated into action inputs.
 
     ``env:`` is the supported boundary for untrusted values: the workflow may
     put ``${{ github.event... }}`` in ``env`` and reference the variable from
-    ``run``. Passing the same expression straight into an action's ``with:``
-    (for example ``actions/github-script``'s ``script:``) is injection, so it
-    is rejected while constant and safe references stay valid.
+    ``run``. Passing the same expression (or ``${{ env.* }}``) straight into an
+    action's ``with:`` (for example ``actions/github-script``'s ``script:``) is
+    injection, so it is rejected while constant and safe references stay valid.
+    The sole narrow exception is ``actions/download-artifact``'s numeric
+    ``run-id: ${{ env.ARTIFACT_RUN_ID }}``, which has no environment-variable
+    fallback in the action and is pre-validated against the GitHub API.
     """
     errors: list[str] = []
     for key, value in _walk_yaml(with_block):
         if not isinstance(value, str):
+            continue
+        if (
+            isinstance(step_uses, str)
+            and step_uses.startswith("actions/download-artifact@")
+            and key == "run-id"
+            and value.strip() == "${{ env.ARTIFACT_RUN_ID }}"
+        ):
             continue
         for expression in _untrusted_expressions(value):
             errors.append(
@@ -282,6 +339,12 @@ def check_workflow_security(files: Iterable[Path]) -> list[str]:
     errors: list[str] = []
     for path in files:
         document = _load_workflow(path)
+        try:
+            for _ in _walk_yaml(document):
+                pass
+        except GateError as error:
+            errors.append(f"{path}: {error}")
+            continue
         trigger = _workflow_trigger(document)
         trigger_text = json.dumps(trigger, default=str) if not isinstance(trigger, str) else trigger
         if "pull_request_target" in trigger_text:
@@ -326,6 +389,30 @@ def check_workflow_security(files: Iterable[Path]) -> list[str]:
                 try:
                     for problem in _check_with_expressions(job_with):
                         errors.append(f"{path}: job {job_name}: {problem}")
+                except GateError as error:
+                    errors.append(f"{path}: job {job_name}: {error}")
+            runs_on = job.get("runs-on")
+            if runs_on is not None:
+                try:
+                    for label, value in _iter_yaml_strings(runs_on, prefix="runs-on"):
+                        for expression in _untrusted_expressions(value):
+                            errors.append(
+                                f"{path}: job {job_name}: {label} contains an untrusted "
+                                f"'${{{{ ... }}}}' expression ({expression})"
+                            )
+                except GateError as error:
+                    errors.append(f"{path}: job {job_name}: {error}")
+            strategy = job.get("strategy")
+            if isinstance(strategy, Mapping) and strategy.get("matrix") is not None:
+                try:
+                    for label, value in _iter_yaml_strings(
+                        strategy["matrix"], prefix="strategy.matrix"
+                    ):
+                        for expression in _untrusted_expressions(value):
+                            errors.append(
+                                f"{path}: job {job_name}: {label} contains an untrusted "
+                                f"'${{{{ ... }}}}' expression ({expression})"
+                            )
                 except GateError as error:
                     errors.append(f"{path}: job {job_name}: {error}")
             job_uses = job.get("uses")
@@ -385,7 +472,9 @@ def check_workflow_security(files: Iterable[Path]) -> list[str]:
                                     )
                 if with_block is not None:
                     try:
-                        for problem in _check_with_expressions(with_block):
+                        for problem in _check_with_expressions(
+                            with_block, step_uses=uses if isinstance(uses, str) else None
+                        ):
                             errors.append(
                                 f"{path}: job {job_name} step {index}: {problem}"
                             )
@@ -483,9 +572,11 @@ def _waiver_scope_matches(scope: str, finding: dict[str, str]) -> bool:
     package = str(finding.get("package", "")).strip()
     target = str(finding.get("target", "")).strip()
     if lowered.startswith("package:"):
-        return package.strip().lower() == normalized.split(":", 1)[1].strip().lower()
+        expected = normalized.split(":", 1)[1].strip().lower()
+        return bool(expected) and package.strip().lower() == expected
     if lowered.startswith("target:"):
-        return target == normalized.split(":", 1)[1].strip()
+        expected = normalized.split(":", 1)[1].strip()
+        return bool(expected) and target == expected
     if not normalized:
         return False
     return normalized == package or normalized == target
@@ -521,6 +612,16 @@ def evaluate_scan_findings(
             val = entry.get(field)
             if not isinstance(val, str) or not val.strip():
                 raise GateError(f"waiver field {field} must be a non-empty string")
+        scope_text = entry["scope"].strip()
+        scope_lower = scope_text.lower()
+        if scope_lower.startswith("package:") and not scope_text.split(":", 1)[1].strip():
+            raise GateError(
+                f"waiver {entry['id']} scope {entry['scope']!r} must specify a package name"
+            )
+        if scope_lower.startswith("target:") and not scope_text.split(":", 1)[1].strip():
+            raise GateError(
+                f"waiver {entry['id']} scope {entry['scope']!r} must specify a target"
+            )
         expires_raw = entry["expires_at"].strip()
         if not _ISO_DATE.fullmatch(expires_raw):
             raise GateError(f"waiver {entry['id']} expires_at must be YYYY-MM-DD")

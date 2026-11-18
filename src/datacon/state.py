@@ -1418,22 +1418,38 @@ def _validate_evidence_bundle_path(evidence_path: Any, evidence_root: str) -> Pa
     candidate = Path(evidence_path)
     if ".." in candidate.parts:
         raise ReleaseStateError("evidence_path must not contain '..' traversal")
-    if candidate.is_absolute():
+    if not candidate.is_absolute():
+        raise ReleaseStateError(
+            "evidence_path must be an absolute path inside active release evidence_root"
+        )
+    try:
+        rel_path = candidate.relative_to(root_path)
+    except ValueError:
         try:
-            rel_path = candidate.relative_to(root_path)
-        except ValueError:
-            try:
-                rel_path = candidate.relative_to(root_path.resolve())
-            except ValueError as error:
-                raise ReleaseStateError(
-                    "evidence_path must stay inside active release evidence_root"
-                ) from error
-    else:
-        rel_path = candidate
+            rel_path = candidate.relative_to(root_path.resolve())
+        except ValueError as error:
+            raise ReleaseStateError(
+                "evidence_path must stay inside active release evidence_root"
+            ) from error
     try:
         return jsonutil.resolve_inside(root_path, rel_path.as_posix())
     except ValueError as error:
         raise ReleaseStateError(f"unsafe evidence_path: {error}") from error
+
+
+def _validate_evidence_path_syntax(evidence_path: Any) -> None:
+    """Validate non-filesystem path safety invariants when the host volume is unmounted."""
+    if not isinstance(evidence_path, str) or not evidence_path.strip():
+        raise ReleaseStateError("evidence_path must be a non-empty path")
+    if "\\" in evidence_path:
+        raise ReleaseStateError("evidence_path must use POSIX separators")
+    candidate = Path(evidence_path)
+    if ".." in candidate.parts:
+        raise ReleaseStateError("evidence_path must not contain '..' traversal")
+    if not candidate.is_absolute():
+        raise ReleaseStateError(
+            "evidence_path must be an absolute path inside active release evidence_root"
+        )
 
 
 class ReleaseStore:
@@ -1488,10 +1504,28 @@ class ReleaseStore:
             yield existing
             return
         with self._connect() as connection:
+            connection.execute("SET LOCAL lock_timeout = '10s'")
+            connection.execute("SET LOCAL statement_timeout = '60s'")
             connection.execute(
                 "SELECT pg_advisory_xact_lock(hashtext(%s))",
                 (RELEASE_LOCK_PREFIX + self.environment,),
             )
+            reg = connection.execute(
+                "SELECT to_regclass('schema_migrations') AS migrations_tbl, "
+                "to_regclass('release_state') AS release_tbl, "
+                "to_regclass('release_events') AS events_tbl"
+            ).fetchone()
+            if (
+                reg is None
+                or reg["migrations_tbl"] is None
+                or reg["release_tbl"] is None
+                or reg["events_tbl"] is None
+            ):
+                raise ReleaseStateError(
+                    "schema_migrations ledger is missing; run `datacon migrate` "
+                    "against the target database before bootstrapping, promoting, "
+                    "or rolling back"
+                )
             connection.execute(
                 "SELECT 1 FROM release_state WHERE environment = %s FOR UPDATE",
                 (self.environment,),
@@ -1566,19 +1600,29 @@ class ReleaseStore:
         snapshot_digest = jsonutil.digest_json(snapshot)
         with self.transaction() as connection:
             try:
-                recorded = connection.execute(
-                    "SELECT 1 FROM schema_migrations WHERE file = %s",
-                    (migration_version,),
-                ).fetchone()
+                ledger_rows = connection.execute(
+                    "SELECT file FROM schema_migrations ORDER BY file"
+                ).fetchall()
             except psycopg.errors.UndefinedTable as error:
                 raise ReleaseStateError(
                     "schema_migrations ledger is missing; run `datacon migrate` "
                     "against the target database before bootstrapping a release"
                 ) from error
-            if recorded is None:
+            applied_files = [
+                row["file"]
+                for row in ledger_rows
+                if isinstance(row.get("file"), str)
+            ]
+            if migration_version not in applied_files:
                 raise ReleaseStateError(
                     "bootstrap migration_version is not recorded in schema_migrations: "
                     f"{migration_version}"
+                )
+            latest_migration = max(applied_files, key=_migration_number)
+            if migration_version != latest_migration:
+                raise ReleaseStateError(
+                    f"bootstrap migration_version {migration_version} is behind the "
+                    f"latest applied migration in schema_migrations: {latest_migration}"
                 )
             connection.execute(
                 "INSERT INTO release_state "
@@ -1791,7 +1835,8 @@ class ReleaseStore:
                 "WHERE environment = %s AND active_image_id = %s "
                 "AND action IN ('promote', 'rollback', 'bootstrap') "
                 "AND status IN ('promoted', 'rolled_back', 'bootstrapped') "
-                "ORDER BY recorded_at DESC, event_id DESC LIMIT 20",
+                "ORDER BY CASE WHEN action IN ('promote', 'bootstrap') THEN 0 ELSE 1 END, "
+                "recorded_at DESC, event_id DESC LIMIT 20",
                 (self.environment, image_id),
             ).fetchall()
         for row in rows:
@@ -1829,29 +1874,70 @@ class ReleaseStore:
             }
         return None
 
-    def latest_evidence_bundle(self) -> dict[str, str] | None:
+    def latest_evidence_bundle(
+        self, *, require_active_root: bool = True
+    ) -> dict[str, str] | None:
         """Return the newest archived evidence bundle after verifying containment."""
         with self._connection() as connection:
-            row = connection.execute(
+            job_rows = connection.execute(
                 "SELECT evidence_path, evidence_digest FROM jobs "
                 "WHERE evidence_status = 'archived' "
                 "AND evidence_path IS NOT NULL AND evidence_digest IS NOT NULL "
-                "ORDER BY submitted_at DESC LIMIT 1"
-            ).fetchone()
-        if row is None:
-            return None
+                "ORDER BY submitted_at DESC"
+            ).fetchall()
+            if not job_rows:
+                return None
+            if not require_active_root:
+                _validate_evidence_path_syntax(job_rows[0]["evidence_path"])
+                return {
+                    "path": job_rows[0]["evidence_path"],
+                    "digest": job_rows[0]["evidence_digest"],
+                }
+            hist_rows = connection.execute(
+                "SELECT DISTINCT payload->>'evidence_root' AS evidence_root "
+                "FROM release_events "
+                "WHERE environment = %s "
+                "AND action IN ('promote', 'rollback', 'bootstrap') "
+                "AND status IN ('promoted', 'rolled_back', 'bootstrapped') "
+                "AND payload ? 'evidence_root'",
+                (self.environment,),
+            ).fetchall()
         active = self.active_release()
         if active is None or not isinstance(active.get("evidence_root"), str):
             raise ReleaseStateError(
                 "active release evidence_root is missing; cannot validate evidence_path"
             )
-        resolved = _validate_evidence_bundle_path(
-            row["evidence_path"], active["evidence_root"]
-        )
-        return {
-            "path": str(resolved),
-            "digest": row["evidence_digest"],
-        }
+        active_root = active["evidence_root"]
+        if Path(active_root).is_symlink():
+            raise ReleaseStateError("active release evidence_root must not be a symlink")
+        historical_roots = [
+            row["evidence_root"]
+            for row in hist_rows
+            if isinstance(row.get("evidence_root"), str)
+            and row["evidence_root"].strip()
+            and row["evidence_root"] != active_root
+        ]
+        for row in job_rows:
+            raw_path = row["evidence_path"]
+            try:
+                resolved = _validate_evidence_bundle_path(raw_path, active_root)
+                return {
+                    "path": str(resolved),
+                    "digest": row["evidence_digest"],
+                }
+            except ReleaseStateError as active_error:
+                matched_historical = False
+                for hist_root in historical_roots:
+                    try:
+                        _validate_evidence_bundle_path(raw_path, hist_root)
+                        matched_historical = True
+                        break
+                    except ReleaseStateError:
+                        continue
+                if matched_historical:
+                    continue
+                raise active_error
+        return None
 
     def events(self) -> list[dict[str, Any]]:
         with self._connection() as connection:

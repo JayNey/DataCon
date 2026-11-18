@@ -137,21 +137,56 @@ jobs:
       manifest_digest: ${{ steps.manifest.outputs.manifest_digest }}
       image_id: ${{ steps.manifest.outputs.image_id }}
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          fetch-depth: 0
       - name: Verify protected ref
         shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
+          CURRENT_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
           case "${GITHUB_REF}" in
             refs/heads/main|refs/tags/v*) ;;
             *) echo "build-candidate is only allowed from main or a v* tag" >&2; exit 1 ;;
           esac
-          if [[ ! "${GITHUB_SHA}" =~ ^[0-9a-f]{40}$ ]]; then
+          if [[ ! "${CURRENT_SHA}" =~ ^[0-9a-f]{40}$ ]]; then
             echo "GITHUB_SHA must be a 40-char commit" >&2
             exit 1
           fi
+          python3 - <<'PY'
+          import json
+          import os
+          import urllib.request
+
+          url = (
+              "https://api.github.com/repos/"
+              + os.environ["REPOSITORY"]
+              + "/compare/main..."
+              + os.environ["CURRENT_SHA"]
+          )
+          req = urllib.request.Request(
+              url,
+              headers={
+                  "Authorization": "Bearer " + os.environ["GITHUB_TOKEN"],
+                  "Accept": "application/vnd.github+json",
+                  "X-GitHub-Api-Version": "2022-11-28",
+              },
+          )
+          with urllib.request.urlopen(req, timeout=20) as resp:
+              data = json.load(resp)
+          if data.get("status") not in ("identical", "behind") or data.get("ahead_by", 1) != 0:
+              raise SystemExit(
+                  f"ref commit {os.environ['CURRENT_SHA']} is not an ancestor of origin/main "
+                  f"(status={data.get('status')!r}, ahead_by={data.get('ahead_by')!r})"
+              )
+          PY
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      - name: Verify checked-out commit ancestry
+        shell: bash
+        run: |
+          set -euo pipefail
           git fetch --no-tags origin main:refs/remotes/origin/main
           if ! git merge-base --is-ancestor "${GITHUB_SHA}" refs/remotes/origin/main; then
             echo "ref commit ${GITHUB_SHA} is not an ancestor of origin/main" >&2
@@ -313,25 +348,12 @@ jobs:
     env:
       EXPECTED_MANIFEST_DIGEST: ${{ github.event.inputs.expected_manifest_digest || needs.build-candidate.outputs.manifest_digest }}
       ARTIFACT_RUN_ID: ${{ github.event.inputs.artifact_run_id }}
-      DATACON_DATABASE_URL: ${{ secrets.DATACON_DATABASE_URL }}
-      DATACON_RELEASE_APPROVAL: ${{ secrets.DATACON_RELEASE_APPROVAL }}
+      CURRENT_SHA: ${{ github.sha }}
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          fetch-depth: 0
-      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
-        with:
-          python-version: "3.12"
-      - name: Install uv and locked dependencies
-        run: |
-          python -m pip install --disable-pip-version-check --require-hashes \
-            --only-binary :all: -r requirements-ci.txt
-          uv sync --frozen
-      - name: Verify protected ref and candidate artifact provenance
+      - name: Verify protected ref
         shell: bash
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          ARTIFACT_RUN_ID: ${{ github.event.inputs.artifact_run_id }}
           REPOSITORY: ${{ github.repository }}
           CURRENT_SHA: ${{ github.sha }}
         run: |
@@ -340,12 +362,59 @@ jobs:
             refs/heads/main|refs/tags/v*) ;;
             *) echo "promotion is only allowed from main or a v* tag" >&2; exit 1 ;;
           esac
+          if [[ ! "${CURRENT_SHA}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "GITHUB_SHA must be a 40-char commit" >&2
+            exit 1
+          fi
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          import urllib.request
+
+          run_id = os.environ.get("ARTIFACT_RUN_ID", "").strip()
+          if run_id and not re.fullmatch(r"[0-9]+", run_id):
+              raise SystemExit("artifact_run_id must be numeric")
+          url = (
+              "https://api.github.com/repos/"
+              + os.environ["REPOSITORY"]
+              + "/compare/main..."
+              + os.environ["CURRENT_SHA"]
+          )
+          req = urllib.request.Request(
+              url,
+              headers={
+                  "Authorization": "Bearer " + os.environ["GITHUB_TOKEN"],
+                  "Accept": "application/vnd.github+json",
+                  "X-GitHub-Api-Version": "2022-11-28",
+              },
+          )
+          with urllib.request.urlopen(req, timeout=20) as resp:
+              data = json.load(resp)
+          if data.get("status") not in ("identical", "behind") or data.get("ahead_by", 1) != 0:
+              raise SystemExit(
+                  f"ref commit {os.environ['CURRENT_SHA']} is not an ancestor of origin/main "
+                  f"(status={data.get('status')!r}, ahead_by={data.get('ahead_by')!r})"
+              )
+          PY
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      - name: Verify checked-out commit ancestry and candidate artifact provenance
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ARTIFACT_RUN_ID: ${{ github.event.inputs.artifact_run_id }}
+          REPOSITORY: ${{ github.repository }}
+          CURRENT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
           git fetch --no-tags origin main:refs/remotes/origin/main
           if ! git merge-base --is-ancestor "${GITHUB_SHA}" refs/remotes/origin/main; then
             echo "ref commit ${GITHUB_SHA} is not an ancestor of origin/main" >&2
             exit 1
           fi
-          uv run --frozen python - <<'PY'
+          python3 - <<'PY'
           import json
           import os
           import re
@@ -360,6 +429,8 @@ jobs:
               fail("GITHUB_SHA is not a 40-char commit")
           run_id = os.environ.get("ARTIFACT_RUN_ID", "").strip()
           if run_id:
+              if not re.fullmatch(r"[0-9]+", run_id):
+                  fail("artifact_run_id must be numeric")
               token = os.environ.get("GITHUB_TOKEN", "").strip()
               if not token:
                   fail("GITHUB_TOKEN is required to verify the artifact run")
@@ -410,6 +481,14 @@ jobs:
                       handle.write("VERIFIED_RUN_HEAD_SHA=" + head_sha + "\n")
           print("protected ref and artifact provenance verified")
           PY
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+      - name: Install uv and locked dependencies
+        run: |
+          python -m pip install --disable-pip-version-check --require-hashes \
+            --only-binary :all: -r requirements-ci.txt
+          uv sync --frozen
 
       - name: Require an explicit artifact run for a dispatched promotion
         if: github.event_name == 'workflow_dispatch'
@@ -436,6 +515,8 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
       - name: Validate the approved manifest digest, approval and loaded image id
         shell: bash
+        env:
+          DATACON_RELEASE_APPROVAL: ${{ secrets.DATACON_RELEASE_APPROVAL }}
         run: |
           set -euo pipefail
           if [[ ! "${EXPECTED_MANIFEST_DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
@@ -516,6 +597,8 @@ jobs:
           PY
       - name: Check environment preconditions and read-only candidate container DB smoke
         shell: bash
+        env:
+          DATACON_DATABASE_URL: ${{ secrets.DATACON_DATABASE_URL }}
         run: |
           set -euo pipefail
           uv run --frozen python - <<'PY'
@@ -549,6 +632,9 @@ jobs:
 
       - name: Promote through the persisted backend and record audit
         shell: bash
+        env:
+          DATACON_DATABASE_URL: ${{ secrets.DATACON_DATABASE_URL }}
+          DATACON_RELEASE_APPROVAL: ${{ secrets.DATACON_RELEASE_APPROVAL }}
         run: |
           set -euo pipefail
           out="$RUNNER_TEMP/release-artifacts"
@@ -644,37 +730,42 @@ jobs:
           def archived_bundle_smoke():
               return verify_bundle_in_container(smoke_bundle, smoke_bundle_digest)
 
-          smoke_checks = {
+          # Run heavy container smoke checks before taking the PostgreSQL
+          # exclusive advisory lock; only fast DB checks run under the lock.
+          preflight_checks = {
               "cli_smoke": image_help,
-              "db_readability": db_readable,
               "archived_bundle": archived_bundle_smoke,
           }
-          # Validate the latest archived bundle path from the target DB (fail
-          # closed on escape or symlink). Only mount and smoke it when the
-          # runner locally mounts previous["evidence_root"] as a real directory.
+          smoke_checks = {
+              "db_readability": db_readable,
+          }
+          # Check local evidence_root mount first so unmounted runners are not
+          # blocked by cross-root historical jobs, while still validating DB
+          # path syntax invariants.
           evidence_root_path = pathlib.Path(previous["evidence_root"])
-          latest = store.latest_evidence_bundle()
-          if latest is not None:
-              if evidence_root_path.is_symlink():
-                  raise SystemExit(
-                      f"refusing promotion: evidence_root is a symlink: {evidence_root_path}"
-                  )
-              if not evidence_root_path.exists():
-                  print(
-                      f"skipping archived_real_bundle: local evidence_root {evidence_root_path} "
-                      "is not mounted on this runner; relying on archived_bundle"
-                  )
-              elif not evidence_root_path.is_dir():
-                  raise SystemExit(
-                      f"refusing promotion: evidence_root is not a directory: {evidence_root_path}"
-                  )
-              else:
+          if evidence_root_path.is_symlink():
+              raise SystemExit(
+                  f"refusing promotion: evidence_root is a symlink: {evidence_root_path}"
+              )
+          if not evidence_root_path.exists():
+              store.latest_evidence_bundle(require_active_root=False)
+              print(
+                  f"skipping archived_real_bundle: local evidence_root {evidence_root_path} "
+                  "is not mounted on this runner; relying on archived_bundle"
+              )
+          elif not evidence_root_path.is_dir():
+              raise SystemExit(
+                  f"refusing promotion: evidence_root is not a directory: {evidence_root_path}"
+              )
+          else:
+              latest = store.latest_evidence_bundle()
+              if latest is not None:
                   latest_path = pathlib.Path(latest["path"])
                   if latest_path.is_symlink() or not latest_path.is_dir():
                       raise SystemExit(
                           f"refusing promotion: latest evidence bundle path is not a real directory: {latest_path}"
                       )
-                  smoke_checks["archived_real_bundle"] = lambda: verify_bundle_in_container(
+                  preflight_checks["archived_real_bundle"] = lambda: verify_bundle_in_container(
                       latest["path"], latest["digest"]
                   )
           try:
@@ -683,6 +774,7 @@ jobs:
                   expected_manifest_digest=expected,
                   approval=approval,
                   backend=store,
+                  preflight_checks=preflight_checks,
                   smoke_checks=smoke_checks,
                   rollback_fn=rollback_fn,
               )
@@ -714,36 +806,12 @@ jobs:
       TARGET_DIGEST: ${{ github.event.inputs.target_digest }}
       ARTIFACT_RUN_ID: ${{ github.event.inputs.artifact_run_id }}
       APPROVED_BY: ${{ github.actor }}
-      DATACON_DATABASE_URL: ${{ secrets.DATACON_DATABASE_URL }}
+      CURRENT_SHA: ${{ github.sha }}
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          fetch-depth: 0
-      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
-        with:
-          python-version: "3.12"
-      - name: Install uv and locked dependencies
-        run: |
-          python -m pip install --disable-pip-version-check --require-hashes \
-            --only-binary :all: -r requirements-ci.txt
-          uv sync --frozen
-      - name: Validate the rollback target digest
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [[ ! "${TARGET_DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-            echo "target_digest must be sha256:<64 hex>" >&2
-            exit 1
-          fi
-          if [ -z "${ARTIFACT_RUN_ID}" ]; then
-            echo "artifact_run_id is required to load the rollback image tar" >&2
-            exit 1
-          fi
-      - name: Verify protected ref and rollback artifact provenance
+      - name: Verify protected ref
         shell: bash
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          ARTIFACT_RUN_ID: ${{ github.event.inputs.artifact_run_id }}
           REPOSITORY: ${{ github.repository }}
           CURRENT_SHA: ${{ github.sha }}
         run: |
@@ -752,12 +820,59 @@ jobs:
             refs/heads/main|refs/tags/v*) ;;
             *) echo "rollback is only allowed from main or a v* tag" >&2; exit 1 ;;
           esac
+          if [[ ! "${CURRENT_SHA}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "GITHUB_SHA must be a 40-char commit" >&2
+            exit 1
+          fi
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          import urllib.request
+
+          run_id = os.environ.get("ARTIFACT_RUN_ID", "").strip()
+          if not re.fullmatch(r"[0-9]+", run_id):
+              raise SystemExit("artifact_run_id must be numeric")
+          url = (
+              "https://api.github.com/repos/"
+              + os.environ["REPOSITORY"]
+              + "/compare/main..."
+              + os.environ["CURRENT_SHA"]
+          )
+          req = urllib.request.Request(
+              url,
+              headers={
+                  "Authorization": "Bearer " + os.environ["GITHUB_TOKEN"],
+                  "Accept": "application/vnd.github+json",
+                  "X-GitHub-Api-Version": "2022-11-28",
+              },
+          )
+          with urllib.request.urlopen(req, timeout=20) as resp:
+              data = json.load(resp)
+          if data.get("status") not in ("identical", "behind") or data.get("ahead_by", 1) != 0:
+              raise SystemExit(
+                  f"ref commit {os.environ['CURRENT_SHA']} is not an ancestor of origin/main "
+                  f"(status={data.get('status')!r}, ahead_by={data.get('ahead_by')!r})"
+              )
+          PY
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      - name: Verify checked-out commit ancestry and rollback artifact provenance
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ARTIFACT_RUN_ID: ${{ github.event.inputs.artifact_run_id }}
+          REPOSITORY: ${{ github.repository }}
+          CURRENT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
           git fetch --no-tags origin main:refs/remotes/origin/main
           if ! git merge-base --is-ancestor "${GITHUB_SHA}" refs/remotes/origin/main; then
             echo "ref commit ${GITHUB_SHA} is not an ancestor of origin/main" >&2
             exit 1
           fi
-          uv run --frozen python - <<'PY'
+          python3 - <<'PY'
           import json
           import os
           import re
@@ -771,8 +886,8 @@ jobs:
           if not re.fullmatch(r"[0-9a-f]{40}", current):
               fail("GITHUB_SHA is not a 40-char commit")
           run_id = os.environ.get("ARTIFACT_RUN_ID", "").strip()
-          if not run_id:
-              fail("artifact_run_id is required to verify rollback provenance")
+          if not run_id or not re.fullmatch(r"[0-9]+", run_id):
+              fail("artifact_run_id must be a numeric run id to verify rollback provenance")
           token = os.environ.get("GITHUB_TOKEN", "").strip()
           if not token:
               fail("GITHUB_TOKEN is required to verify the artifact run")
@@ -819,6 +934,26 @@ jobs:
               fail("artifact run head_sha is not in the protected ref history")
           print("protected ref and rollback artifact provenance verified")
           PY
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+      - name: Install uv and locked dependencies
+        run: |
+          python -m pip install --disable-pip-version-check --require-hashes \
+            --only-binary :all: -r requirements-ci.txt
+          uv sync --frozen
+      - name: Validate the rollback target digest
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "${TARGET_DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "target_digest must be sha256:<64 hex>" >&2
+            exit 1
+          fi
+          if [ -z "${ARTIFACT_RUN_ID}" ]; then
+            echo "artifact_run_id is required to load the rollback image tar" >&2
+            exit 1
+          fi
 
       - name: Download the candidate artifact that contains the target image
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
@@ -840,6 +975,8 @@ jobs:
           fi
       - name: Smoke and restore the persisted target release
         shell: bash
+        env:
+          DATACON_DATABASE_URL: ${{ secrets.DATACON_DATABASE_URL }}
         run: |
           set -euo pipefail
           out="$RUNNER_TEMP/release-artifacts"
@@ -917,6 +1054,10 @@ jobs:
                   and parsed.get("manifest_digest") == smoke_bundle_digest
               )
 
+          def active_release_restored():
+              active = store.active_release()
+              return active is not None and active.get("image_id") == target["image_id"]
+
           approved_by = os.environ.get("APPROVED_BY", "").strip()
           if not approved_by:
               raise SystemExit("approved_by must identify the dispatching operator")
@@ -929,6 +1070,9 @@ jobs:
                       "db_readability": db_readable,
                       "archived_bundle": archived_bundle_smoke,
                   },
+                  post_switch_checks={
+                      "active_release_restored": active_release_restored,
+                  },
                   approved_by=approved_by,
                   candidate_digest=target_candidate_digest,
                   manifest_digest=target.get("manifest_digest"),
@@ -936,6 +1080,27 @@ jobs:
           finally:
               shutil.rmtree(smoke_bundle, ignore_errors=True)
           print(json.dumps(result, indent=2))
+          PY
+      - name: Verify restored target image can observe active release state
+        shell: bash
+        env:
+          DATACON_DATABASE_URL: ${{ secrets.DATACON_DATABASE_URL }}
+        run: |
+          set -euo pipefail
+          slots_json="$(timeout 60 docker run --rm --network host \
+            -e DATACON_DATABASE_URL \
+            datacon-control-plane:candidate release slots --environment internal-lab)"
+          printf '%s\n' "$slots_json"
+          uv run --frozen python - "$slots_json" "$TARGET_DIGEST" <<'PY'
+          import json
+          import sys
+
+          payload = json.loads(sys.argv[1])
+          active = payload.get("active_release") or {}
+          if active.get("image_id") != sys.argv[2]:
+              raise SystemExit(
+                  f"post-rollback active_release.image_id mismatch: {active.get('image_id')!r} != {sys.argv[2]!r}"
+              )
           PY
 
   b03-internal:
@@ -949,43 +1114,57 @@ jobs:
     # leaves the job failing/queued instead of skipping the acceptance.
     runs-on: [self-hosted, linux, x64, datacon-internal]
     timeout-minutes: 120
-    env:
-      DATACON_B03_CASE_ROOT: ${{ secrets.DATACON_B03_CASE_ROOT }}
-      DATACON_B03_ADMISSION: ${{ secrets.DATACON_B03_ADMISSION }}
-      DATACON_B03_REVIEW: ${{ secrets.DATACON_B03_REVIEW }}
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          fetch-depth: 0
       - name: Verify protected ref
         shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
+          CURRENT_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
           case "${GITHUB_REF}" in
             refs/heads/main|refs/tags/v*) ;;
             *) echo "B03 acceptance is only allowed from main or a v* tag" >&2; exit 1 ;;
           esac
-          if [[ ! "${GITHUB_SHA}" =~ ^[0-9a-f]{40}$ ]]; then
+          if [[ ! "${CURRENT_SHA}" =~ ^[0-9a-f]{40}$ ]]; then
             echo "GITHUB_SHA must be a 40-char commit" >&2
             exit 1
           fi
-          git fetch --no-tags origin main:refs/remotes/origin/main
-          if ! git merge-base --is-ancestor "${GITHUB_SHA}" refs/remotes/origin/main; then
-            echo "ref commit ${GITHUB_SHA} is not an ancestor of origin/main" >&2
-            exit 1
-          fi
-      - name: Verify protected ref
+          python3 - <<'PY'
+          import json
+          import os
+          import urllib.request
+
+          url = (
+              "https://api.github.com/repos/"
+              + os.environ["REPOSITORY"]
+              + "/compare/main..."
+              + os.environ["CURRENT_SHA"]
+          )
+          req = urllib.request.Request(
+              url,
+              headers={
+                  "Authorization": "Bearer " + os.environ["GITHUB_TOKEN"],
+                  "Accept": "application/vnd.github+json",
+                  "X-GitHub-Api-Version": "2022-11-28",
+              },
+          )
+          with urllib.request.urlopen(req, timeout=20) as resp:
+              data = json.load(resp)
+          if data.get("status") not in ("identical", "behind") or data.get("ahead_by", 1) != 0:
+              raise SystemExit(
+                  f"ref commit {os.environ['CURRENT_SHA']} is not an ancestor of origin/main "
+                  f"(status={data.get('status')!r}, ahead_by={data.get('ahead_by')!r})"
+              )
+          PY
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      - name: Verify checked-out commit ancestry
         shell: bash
         run: |
           set -euo pipefail
-          case "${GITHUB_REF}" in
-            refs/heads/main|refs/tags/v*) ;;
-            *) echo "build-candidate is only allowed from main or a v* tag" >&2; exit 1 ;;
-          esac
-          if [[ ! "${GITHUB_SHA}" =~ ^[0-9a-f]{40}$ ]]; then
-            echo "GITHUB_SHA must be a 40-char commit" >&2
-            exit 1
-          fi
           git fetch --no-tags origin main:refs/remotes/origin/main
           if ! git merge-base --is-ancestor "${GITHUB_SHA}" refs/remotes/origin/main; then
             echo "ref commit ${GITHUB_SHA} is not an ancestor of origin/main" >&2
@@ -1001,6 +1180,10 @@ jobs:
           uv sync --frozen
       - name: Run B03 acceptance and upload only a sanitized summary
         shell: bash
+        env:
+          DATACON_B03_CASE_ROOT: ${{ secrets.DATACON_B03_CASE_ROOT }}
+          DATACON_B03_ADMISSION: ${{ secrets.DATACON_B03_ADMISSION }}
+          DATACON_B03_REVIEW: ${{ secrets.DATACON_B03_REVIEW }}
         run: |
           set -euo pipefail
           if [ -z "${DATACON_B03_CASE_ROOT}" ] || [ -z "${DATACON_B03_ADMISSION}" ] || [ -z "${DATACON_B03_REVIEW}" ]; then

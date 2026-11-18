@@ -264,25 +264,47 @@ def test_b1_protected_refs_verify_origin_main_ancestry_and_reject_none_head_bran
         "rollback-internal",
         "b03-internal",
     ):
+        steps = _steps(jobs[name])
         text = _run_text(jobs[name])
+        assert "/compare/main..." in text, name
+        assert '"identical"' in text and '"behind"' in text, name
         assert "git fetch --no-tags origin main:refs/remotes/origin/main" in text, name
         assert (
             'git merge-base --is-ancestor "${GITHUB_SHA}" refs/remotes/origin/main'
             in text
         ), name
 
-    b03_steps = _steps(jobs["b03-internal"])
-    checkout_idx = next(
-        idx
-        for idx, step in enumerate(b03_steps)
-        if step.get("uses", "").startswith("actions/checkout@")
-    )
-    verify_idx = next(
-        idx
-        for idx, step in enumerate(b03_steps)
-        if step.get("name") == "Verify protected ref"
-    )
-    assert checkout_idx < verify_idx
+        verify_indices = [
+            idx
+            for idx, step in enumerate(steps)
+            if step.get("name") == "Verify protected ref"
+        ]
+        assert len(verify_indices) == 1, (name, verify_indices)
+        checkout_idx = next(
+            idx
+            for idx, step in enumerate(steps)
+            if step.get("uses", "").startswith("actions/checkout@")
+        )
+        setup_python_idx = next(
+            idx
+            for idx, step in enumerate(steps)
+            if step.get("uses", "").startswith("actions/setup-python@")
+        )
+        uv_sync_idx = next(
+            idx
+            for idx, step in enumerate(steps)
+            if "uv sync --frozen" in step.get("run", "")
+        )
+        git_ancestry_idx = next(
+            idx
+            for idx, step in enumerate(steps)
+            if 'git merge-base --is-ancestor "${GITHUB_SHA}" refs/remotes/origin/main'
+            in step.get("run", "")
+        )
+        # Pre-checkout Compare API check must gate checkout; post-checkout git
+        # ancestry check must gate setup-python and uv sync --frozen.
+        assert verify_indices[0] < checkout_idx, name
+        assert checkout_idx < git_ancestry_idx < setup_python_idx < uv_sync_idx, name
 
     for name in ("promote-internal", "rollback-internal"):
         text = _run_text(jobs[name])
@@ -297,6 +319,48 @@ def test_b1_protected_refs_verify_origin_main_ancestry_and_reject_none_head_bran
     )
 
 
+def test_protected_secrets_are_scoped_after_ref_verification_and_uv_sync():
+    jobs = _load(RELEASE)["jobs"]
+
+    promote = jobs["promote-internal"]
+    assert "DATACON_DATABASE_URL" not in promote.get("env", {})
+    assert "DATACON_RELEASE_APPROVAL" not in promote.get("env", {})
+    for step in _steps(promote):
+        uses = step.get("uses", "")
+        run = step.get("run", "")
+        if (
+            uses.startswith(("actions/checkout@", "actions/setup-python@", "actions/download-artifact@"))
+            or "uv sync --frozen" in run
+        ):
+            step_env = step.get("env", {})
+            assert "DATACON_DATABASE_URL" not in step_env
+            assert "DATACON_RELEASE_APPROVAL" not in step_env
+
+    rollback = jobs["rollback-internal"]
+    assert "DATACON_DATABASE_URL" not in rollback.get("env", {})
+    for step in _steps(rollback):
+        uses = step.get("uses", "")
+        run = step.get("run", "")
+        if (
+            uses.startswith(("actions/checkout@", "actions/setup-python@", "actions/download-artifact@"))
+            or "uv sync --frozen" in run
+        ):
+            assert "DATACON_DATABASE_URL" not in step.get("env", {})
+
+    b03 = jobs["b03-internal"]
+    b03_secrets = {"DATACON_B03_CASE_ROOT", "DATACON_B03_ADMISSION", "DATACON_B03_REVIEW"}
+    assert not (b03_secrets & set(b03.get("env", {})))
+    for step in _steps(b03):
+        uses = step.get("uses", "")
+        run = step.get("run", "")
+        if (
+            uses.startswith(("actions/checkout@", "actions/setup-python@", "actions/upload-artifact@"))
+            or "uv sync --frozen" in run
+            or step.get("name") == "Verify protected ref"
+        ):
+            assert not (b03_secrets & set(step.get("env", {})))
+
+
 def test_s1_s4_s5_s8_promote_and_rollback_safety_contracts():
     jobs = _load(RELEASE)["jobs"]
 
@@ -305,6 +369,7 @@ def test_s1_s4_s5_s8_promote_and_rollback_safety_contracts():
     assert "worker --once" not in promote_text
     assert "release slots --environment internal-lab" in promote_text
     assert "verify_promotion_gate" in promote_text
+    assert "preflight_checks" in promote_text
     assert "timeout=60" in promote_text
     assert "timeout 60 docker run" in promote_text
     assert "evidence_root_path.exists()" in promote_text
@@ -327,4 +392,6 @@ def test_s1_s4_s5_s8_promote_and_rollback_safety_contracts():
     assert 'candidate_digest=os.environ["TARGET_DIGEST"]' not in rollback_text
     assert 'target.get("candidate_digest") or target.get("manifest_digest")' in rollback_text
     assert "verify-bundle" in rollback_text
+    assert "release slots --environment internal-lab" in rollback_text
+    assert "post_switch_checks" in rollback_text
     assert "timeout=60" in rollback_text

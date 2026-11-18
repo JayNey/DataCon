@@ -817,3 +817,90 @@ def test_workflow_security_rejects_steps_and_needs_outputs_but_allows_env(tmp_pa
         encoding="utf-8",
     )
     assert ci_gates.check_workflow_security([good]) == []
+
+
+def test_workflow_security_rejects_bracket_tojson_env_matrix_ref_and_runs_on_injections(tmp_path):
+    bypass = _workflow(
+        tmp_path,
+        "name: Bypasses\n"
+        "on:\n"
+        "  pull_request:\n"
+        "permissions:\n"
+        "  contents: read\n"
+        "jobs:\n"
+        "  dyn:\n"
+        "    runs-on: ${{ github.event.pull_request.head.label }}\n"
+        "    strategy:\n"
+        "      matrix:\n"
+        "        target: ${{ fromJSON(github.event.inputs.targets) }}\n"
+        "    env:\n"
+        "      TITLE: ${{ github.event.pull_request.title }}\n"
+        "    steps:\n"
+        "      - run: echo \"${{ github['event']['pull_request']['title'] }}\"\n"
+        "      - run: echo \"${{ github[\"event\"][\"pull_request\"][\"title\"] }}\"\n"
+        "      - run: echo \"${{ inputs['target_digest'] }}\"\n"
+        "      - run: echo \"${{ toJSON(github) }}\"\n"
+        "      - run: echo \"${{ format('{0}', github.actor) }}\"\n"
+        "      - run: echo \"${{ env.TITLE }}\"\n"
+        "      - run: echo \"${{ matrix.target }}\"\n"
+        "      - run: echo \"${{ github.ref }}\"\n"
+        "      - run: echo \"${{ github.actor }}\"\n"
+        "      - run: echo \"${{ github.triggering_actor }}\"\n"
+        "      - uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea\n"
+        "        with:\n"
+        "          script: console.log('${{ env.TITLE }}')\n"
+        "      - uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea\n"
+        "        with:\n"
+        "          script: console.log('${{ toJSON(github) }}')\n",
+    )
+    errors = ci_gates.check_workflow_security([bypass])
+    assert any("runs-on" in err for err in errors), errors
+    assert any("strategy.matrix" in err for err in errors), errors
+    assert any("github['event']" in err for err in errors), errors
+    assert any('github["event"]' in err for err in errors), errors
+    assert any("inputs['target_digest']" in err for err in errors), errors
+    assert any("tojson(github)" in err for err in errors), errors
+    assert any("format(" in err for err in errors), errors
+    assert any("env.title" in err for err in errors), errors
+    assert any("matrix.target" in err for err in errors), errors
+    assert any("github.ref" in err for err in errors), errors
+    assert any("github.actor" in err for err in errors), errors
+    assert any("github.triggering_actor" in err for err in errors), errors
+    assert sum("with.script" in err for err in errors) == 2
+
+
+def test_workflow_security_reports_top_level_anchor_cycle_in_on_without_crashing(tmp_path):
+    cyclic_on = _workflow(
+        tmp_path,
+        "name: CyclicOn\n"
+        "on:\n"
+        "  pull_request:\n"
+        "    branches: &b [*b]\n"
+        "permissions:\n"
+        "  contents: read\n"
+        "jobs:\n"
+        "  test:\n"
+        "    steps:\n"
+        "      - run: echo ok\n",
+    )
+    errors = ci_gates.check_workflow_security([cyclic_on])
+    assert any("circular" in err for err in errors), errors
+
+
+def test_waiver_rejects_empty_package_or_target_prefix():
+    findings = [
+        {"id": "CVE-2025-7777", "severity": "CRITICAL", "package": "", "target": ""},
+    ]
+    for bad_scope in ("package:", "package:   ", "target:", "target: "):
+        waiver = [
+            {
+                "id": "CVE-2025-7777",
+                "scope": bad_scope,
+                "impact": "empty target bypass",
+                "owner": "sec-team",
+                "expires_at": "2026-12-31",
+            }
+        ]
+        with pytest.raises(ci_gates.GateError, match="scope"):
+            ci_gates.evaluate_scan_findings(findings, waivers=waiver, today="2026-11-17")
+        assert ci_gates._waiver_scope_matches(bad_scope, findings[0]) is False

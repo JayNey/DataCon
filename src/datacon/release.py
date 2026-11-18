@@ -821,16 +821,21 @@ def promote_and_smoke(
     backend: PromotionBackend,
     smoke_checks: Mapping[str, Callable[[], bool]],
     rollback_fn: Callable[[Mapping[str, Any]], Mapping[str, Any]],
+    preflight_checks: Mapping[str, Callable[[], bool]] | None = None,
     now: datetime | None = None,
 ) -> dict[str, Any]:
     """Drain-check, switch to the candidate, smoke it, and audit the outcome.
 
-    The candidate must become the active release *before* the smoke suite runs.
-    A smoke failure is therefore a real transition back to the persisted
-    previous release: ``rollback_fn`` must prove it restored every field and
-    the backend must expose a real rollback state change. A no-op rollback
-    callable fails closed. The candidate switch, smoke result, rollback switch
-    and audit share one backend transaction, so a failure cannot leave
+    Pure container/bundle checks that do not depend on the switched release row
+    may be passed via ``preflight_checks`` and run before acquiring the
+    exclusive release transaction lock.
+
+    The candidate must become the active release *before* the in-transaction
+    ``smoke_checks`` run. A smoke failure is therefore a real transition back to
+    the persisted previous release: ``rollback_fn`` must prove it restored every
+    field and the backend must expose a real rollback state change. A no-op
+    rollback callable fails closed. The candidate switch, smoke result, rollback
+    switch and audit share one backend transaction, so a failure cannot leave
     ``release_state`` and ``release_events`` out of sync.
     """
     if not isinstance(smoke_checks, Mapping) or not smoke_checks:
@@ -867,7 +872,21 @@ def promote_and_smoke(
             "promotion blocked: candidate release is identical to the active release"
         )
     previous_manifest_digest = _persisted_manifest_digest(backend, previous)
-    smoke_results: dict[str, bool] = {}
+    preflight_results: dict[str, bool] = {}
+    if preflight_checks is not None:
+        if not isinstance(preflight_checks, Mapping):
+            raise ReleaseGateError("promotion preflight_checks must be a mapping")
+        for name, check_fn in preflight_checks.items():
+            try:
+                ok = bool(check_fn())
+            except Exception:  # noqa: BLE001 - a failing preflight check blocks before locking
+                ok = False
+            preflight_results[name] = ok
+            if not ok:
+                raise ReleaseGateError(
+                    f"promotion blocked: preflight check failed: {name}"
+                )
+    smoke_results: dict[str, bool] = dict(preflight_results)
     failed_check: str | None = None
 
     with _backend_transaction(backend):
@@ -1001,6 +1020,7 @@ def rollback_release(
     approved_by: str,
     candidate_digest: str,
     manifest_digest: str | None = None,
+    post_switch_checks: Mapping[str, Callable[[], bool]] | None = None,
 ) -> dict[str, Any]:
     """Restore a persisted target release after the same smoke suite passes."""
     if not isinstance(smoke_checks, Mapping) or not smoke_checks:
@@ -1061,6 +1081,20 @@ def rollback_release(
                 "rollback switch did not restore the target release "
                 "(image/config/migration_version/evidence_root)"
             )
+        post_switch_results: dict[str, bool] = {}
+        if post_switch_checks is not None:
+            if not isinstance(post_switch_checks, Mapping):
+                raise ReleaseGateError("rollback post_switch_checks must be a mapping")
+            for name, check_fn in post_switch_checks.items():
+                try:
+                    ok = bool(check_fn())
+                except Exception:  # noqa: BLE001 - post-switch failure rolls back the switch
+                    ok = False
+                post_switch_results[name] = ok
+                if not ok:
+                    raise ReleaseGateError(
+                        f"rollback blocked: post-switch check failed: {name}"
+                    )
         result = {
             "schema_version": SCHEMA_VERSION,
             "status": "rolled_back",
@@ -1083,6 +1117,8 @@ def rollback_release(
             "migration_ledger_verified": True,
             "recorded_at": _utc_now(),
         }
+        if post_switch_checks is not None:
+            result["post_switch_results"] = post_switch_results
         backend.record_audit(result)
     return result
 
@@ -1689,6 +1725,11 @@ def _validate_b03_checks(checks: Any) -> None:
             )
 
 
+_B03_ALLOWED_ADMISSION_STATUSES = frozenset(
+    {"conditional_admission", "admitted", "approved"}
+)
+
+
 def _validate_b03_admission(admission: Mapping[str, Any]) -> dict[str, Any]:
     """Validate every B03 admission field the plan copies, without KeyError."""
     if not isinstance(admission, Mapping):
@@ -1702,7 +1743,7 @@ def _validate_b03_admission(admission: Mapping[str, Any]) -> dict[str, Any]:
     admission_status = admission.get("status")
     if not isinstance(admission_status, str) or not admission_status.strip():
         raise ReleaseGateError("B03 admission status must be a non-empty string")
-    if admission_status.strip().lower() in {"rejected", "denied", "blocked"}:
+    if admission_status.strip().lower() not in _B03_ALLOWED_ADMISSION_STATUSES:
         raise ReleaseGateError(
             f"B03 admission status is not admissible: {admission_status!r}"
         )
@@ -1908,7 +1949,7 @@ def prepare_b03_plan(
         raise ReleaseGateError("B03 toolchain image must be pinned by digest")
     image_digest = toolchain_image.split("@", 1)[1]
     _require_digest(image_digest, "B03 toolchain image digest")
-    if image_digest != TOOLCHAIN_IMAGE_DIGEST:
+    if toolchain_image != TOOLCHAIN_IMAGE or image_digest != TOOLCHAIN_IMAGE_DIGEST:
         raise ReleaseGateError(
             "B03 admission toolchain image does not match the pinned toolchain"
         )
@@ -2139,7 +2180,7 @@ def _require_probe(
     checks = getattr(report, "checks", None)
     if not isinstance(checks, Mapping):
         raise ReleaseGateError("B03 probe checks are incomplete")
-    if "errors" in checks and checks["errors"] != []:
+    if "errors" not in checks or checks["errors"] != []:
         raise ReleaseGateError("B03 probe recorded isolation check errors")
     for key, expected in _B03_PROBE_CHECKS.items():
         actual = checks.get(key)
@@ -2220,6 +2261,14 @@ def run_b03_acceptance(
         if case_root is not None
         else B03CaseMaterials.from_environment()
     )
+    if normal_input != materials.normal_input:
+        raise ReleaseGateError(
+            "B03 normal_input bytes do not match case_root inputs/normal.txt"
+        )
+    if candidate_input != materials.candidate_input:
+        raise ReleaseGateError(
+            "B03 candidate_input bytes do not match case_root inputs/candidate.txt"
+        )
     prepared = prepare_b03_plan(
         admission=admission,
         materials=materials,

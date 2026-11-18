@@ -38,7 +38,7 @@ def _sample_rc_manifest(**overrides) -> dict:
 def _approval(manifest: dict, **overrides) -> dict:
     approval = {
         "approved_by": "release-maintainer",
-        "approved_at": "2026-11-17T06:00:00Z",
+        "approved_at": release._utc_now(),
         "candidate_digest": release.canonical_manifest_digest(manifest),
         "ci_passed": True,
         "contract_version": 1,
@@ -908,6 +908,7 @@ class FakeB03Sandbox:
                 "no_new_privs": "1",
                 "cap_eff": "0000000000000000",
                 "cgroup_version": "2",
+                "errors": [],
             },
             compiler_version="clang 19.1.7",
             image_digest=self.toolchain.split("@", 1)[1],
@@ -1660,3 +1661,163 @@ def test_validate_evidence_bundle_path_enforces_containment_and_no_symlinks(tmp_
         )
     with pytest.raises(state.ReleaseStateError, match="inside|evidence_path"):
         state._validate_evidence_bundle_path(str(outside), str(evidence_root))
+
+    # Relative evidence_path must never be silently re-rooted under evidence_root.
+    with pytest.raises(state.ReleaseStateError, match="relative|absolute|evidence_path"):
+        state._validate_evidence_bundle_path(
+            ".datacon/evidence/job-1/generation-1", str(evidence_root)
+        )
+
+
+def test_b03_tightened_boundaries_probe_errors_status_toolchain_and_inputs(tmp_path):
+    root = _b03_case_root(tmp_path)
+    materials = release.B03CaseMaterials.load(root)
+    normal = (root / "inputs" / "normal.txt").read_bytes()
+    candidate = (root / "inputs" / "candidate.txt").read_bytes()
+
+    # 1. Explicit status allowlist rejects unapproved status values.
+    unknown_status = _frozen_admission()
+    unknown_status["status"] = "pending_review"
+    with pytest.raises(release.ReleaseGateError, match="status"):
+        release.prepare_b03_plan(
+            admission=unknown_status,
+            materials=materials,
+            normal_input=normal,
+            candidate_input=candidate,
+        )
+
+    # 2. Full toolchain_image must match TOOLCHAIN_IMAGE, not only the digest suffix.
+    spoofed_repo = _frozen_admission()
+    spoofed_repo["build"]["toolchain_image"] = (
+        "evil.invalid/backdoor@" + release.TOOLCHAIN_IMAGE_DIGEST
+    )
+    with pytest.raises(release.ReleaseGateError, match="toolchain"):
+        release.prepare_b03_plan(
+            admission=spoofed_repo,
+            materials=materials,
+            normal_input=normal,
+            candidate_input=candidate,
+        )
+
+    # 3. Missing checks['errors'] in probe must fail closed before build/replay.
+    admission = _frozen_admission()
+    review = _review_for(admission, root)
+
+    class MissingErrorsProbeSandbox(FakeB03Sandbox):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.build_calls = 0
+
+        def probe(self, *, deadline_seconds: float = 120.0) -> ProbeReport:
+            good = super().probe(deadline_seconds=deadline_seconds)
+            checks = dict(good.checks)
+            checks.pop("errors", None)
+            return ProbeReport(
+                ok=True,
+                checks=checks,
+                compiler_version=good.compiler_version,
+                image_digest=good.image_digest,
+                limits=dict(good.limits),
+                raw=good.raw,
+            )
+
+        def build(self, version: str, **kwargs):
+            self.build_calls += 1
+            return super().build(version, **kwargs)
+
+    missing_err_sb = MissingErrorsProbeSandbox(
+        toolchain=admission["build"]["toolchain_image"]
+    )
+    with pytest.raises(release.ReleaseGateError, match="errors"):
+        _run_b03(tmp_path, admission, missing_err_sb, review)
+    assert missing_err_sb.build_calls == 0
+
+    # 4. run_b03_acceptance rejects input bytes that differ from case_root on disk.
+    with pytest.raises(release.ReleaseGateError, match="normal_input"):
+        release.run_b03_acceptance(
+            admission=admission,
+            sandbox=FakeB03Sandbox(toolchain=admission["build"]["toolchain_image"]),
+            normal_input=b"tampered-normal\n",
+            candidate_input=candidate,
+            bundle_out=tmp_path / "b03-bad-normal",
+            storage_ref="vault://datacon/private/b03/CVE-2019-13224/manifest.json",
+            review=review,
+            case_root=root,
+        )
+    with pytest.raises(release.ReleaseGateError, match="candidate_input"):
+        release.run_b03_acceptance(
+            admission=admission,
+            sandbox=FakeB03Sandbox(toolchain=admission["build"]["toolchain_image"]),
+            normal_input=normal,
+            candidate_input=b"tampered-candidate\n",
+            bundle_out=tmp_path / "b03-bad-candidate",
+            storage_ref="vault://datacon/private/b03/CVE-2019-13224/manifest.json",
+            review=review,
+            case_root=root,
+        )
+
+
+def test_promote_preflight_runs_outside_transaction_and_rollback_post_switch_checks():
+    from contextlib import contextmanager
+
+    manifest = _sample_rc_manifest()
+    approval = _approval(manifest)
+    events: list[str] = []
+
+    class TrackingBackend(release.DictPromotionBackend):
+        @contextmanager
+        def transaction(self):
+            events.append("tx_enter")
+            try:
+                with super().transaction():
+                    yield self
+            finally:
+                events.append("tx_exit")
+
+    backend = TrackingBackend(active_release=_previous(), migrations=_ledger())
+    result = release.promote_and_smoke(
+        manifest=manifest,
+        expected_manifest_digest=approval["candidate_digest"],
+        approval=approval,
+        backend=backend,
+        preflight_checks={
+            "cli_smoke": lambda: events.append("preflight_cli") is None,
+        },
+        smoke_checks={
+            "db_readability": lambda: events.append("tx_smoke_db") is None,
+        },
+        rollback_fn=lambda prev: {"restored_image": prev["image_id"], "ok": True},
+    )
+    assert result["status"] == "promoted"
+    assert events.index("preflight_cli") < events.index("tx_enter")
+    assert events.index("tx_enter") < events.index("tx_smoke_db") < events.index("tx_exit")
+    assert result["smoke_results"]["cli_smoke"] is True
+    assert result["smoke_results"]["db_readability"] is True
+
+    # A failing preflight check blocks promotion before entering transaction().
+    events.clear()
+    backend2 = TrackingBackend(active_release=_previous(), migrations=_ledger())
+    with pytest.raises(release.ReleaseGateError, match="preflight"):
+        release.promote_and_smoke(
+            manifest=manifest,
+            expected_manifest_digest=approval["candidate_digest"],
+            approval=approval,
+            backend=backend2,
+            preflight_checks={"cli_smoke": lambda: False},
+            smoke_checks={"db_readability": lambda: True},
+            rollback_fn=lambda prev: {"restored_image": prev["image_id"], "ok": True},
+        )
+    assert events == []
+
+    # rollback_release supports post_switch_checks and rolls back transaction on failure.
+    target = _previous()
+    with pytest.raises(release.ReleaseGateError, match="post-switch"):
+        release.rollback_release(
+            target_release=target,
+            backend=backend,
+            smoke_checks={"cli_smoke": lambda: True},
+            post_switch_checks={"slots_check": lambda: False},
+            approved_by="reviewer-1",
+            candidate_digest=approval["candidate_digest"],
+        )
+    assert backend.active_release()["image_id"] == manifest["control_plane_image_id"]
