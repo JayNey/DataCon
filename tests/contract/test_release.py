@@ -861,6 +861,11 @@ def _frozen_admission() -> dict:
     admission["asan_signature"]["status"] = "frozen"
     admission["expected_verdict_status"] = "frozen"
     admission["repository"]["source_path"] = "parser.c"
+    admission["harness"]["candidate_clean_exit_code"] = 0
+    admission["harness"]["expected_stdout"] = {
+        "normal": "OK\n",
+        "candidate_clean": "MISMATCH_REJECTED\n",
+    }
     return admission
 
 
@@ -1372,3 +1377,286 @@ def test_b03_total_file_cap_fails_closed(tmp_path, monkeypatch):
     monkeypatch.setattr(release, "_MAX_B03_TOTAL_FILES", 3)
     with pytest.raises(release.ReleaseGateError, match="file cap"):
         release.B03CaseMaterials.load(root)
+
+
+def test_b03_probe_mismatched_limits_or_errors_fail_before_build_or_replay(tmp_path):
+    root = _b03_case_root(tmp_path)
+    admission = _frozen_admission()
+    review = _review_for(admission, root)
+
+    class CustomProbeSandbox(FakeB03Sandbox):
+        def __init__(self, *, limits=None, checks_extra=None, **kwargs):
+            super().__init__(**kwargs)
+            self._limits = limits
+            self._checks_extra = checks_extra or {}
+            self.build_calls = 0
+            self.replay_calls = 0
+
+        def probe(self, *, deadline_seconds: float = 120.0) -> ProbeReport:
+            good = super().probe(deadline_seconds=deadline_seconds)
+            checks = dict(good.checks)
+            checks.update(self._checks_extra)
+            return ProbeReport(
+                ok=True,
+                checks=checks,
+                compiler_version=good.compiler_version,
+                image_digest=good.image_digest,
+                limits=dict(good.limits) if self._limits is None else self._limits,
+                raw=good.raw,
+            )
+
+        def build(self, version: str, **kwargs):
+            self.build_calls += 1
+            return super().build(version, **kwargs)
+
+        def replay(self, version: str, phase: str, **kwargs):
+            self.replay_calls += 1
+            return super().replay(version, phase, **kwargs)
+
+    wrong_cpu = CustomProbeSandbox(
+        toolchain=admission["build"]["toolchain_image"],
+        limits={"cpu": 1, "memory_mib": 2048, "pids": 128, "scratch_mib": 512},
+    )
+    with pytest.raises(release.ReleaseGateError, match="limits"):
+        _run_b03(tmp_path, admission, wrong_cpu, review)
+    assert wrong_cpu.build_calls == 0
+    assert wrong_cpu.replay_calls == 0
+
+    bool_cpu = CustomProbeSandbox(
+        toolchain=admission["build"]["toolchain_image"],
+        limits={"cpu": True, "memory_mib": 2048, "pids": 128, "scratch_mib": 512},
+    )
+    with pytest.raises(release.ReleaseGateError, match="limits"):
+        _run_b03(tmp_path, admission, bool_cpu, review)
+    assert bool_cpu.build_calls == 0
+    assert bool_cpu.replay_calls == 0
+
+    probe_errors = CustomProbeSandbox(
+        toolchain=admission["build"]["toolchain_image"],
+        checks_extra={"errors": ["seccomp mode mismatch"]},
+    )
+    with pytest.raises(release.ReleaseGateError, match="errors"):
+        _run_b03(tmp_path, admission, probe_errors, review)
+    assert probe_errors.build_calls == 0
+    assert probe_errors.replay_calls == 0
+
+
+def test_b03_checks_reject_deferred_critical_checks_and_require_pass(tmp_path):
+    root = _b03_case_root(tmp_path)
+    materials = release.B03CaseMaterials.load(root)
+    normal = (root / "inputs" / "normal.txt").read_bytes()
+    candidate = (root / "inputs" / "candidate.txt").read_bytes()
+
+    for check_id in (
+        "public_advisory",
+        "fixed_commit",
+        "offline_build",
+        "license",
+        "shared_harness",
+    ):
+        deferred = _frozen_admission()
+        for entry in deferred["checks"]:
+            if entry["id"] == check_id:
+                entry["status"] = "deferred"
+                entry["owner_task"] = "T08"
+        with pytest.raises(release.ReleaseGateError, match=check_id):
+            release.prepare_b03_plan(
+                admission=deferred,
+                materials=materials,
+                normal_input=normal,
+                candidate_input=candidate,
+            )
+
+        missing = _frozen_admission()
+        missing["checks"] = [
+            entry for entry in missing["checks"] if entry["id"] != check_id
+        ]
+        with pytest.raises(release.ReleaseGateError, match=check_id):
+            release.prepare_b03_plan(
+                admission=missing,
+                materials=materials,
+                normal_input=normal,
+                candidate_input=candidate,
+            )
+
+
+def test_b03_requires_explicit_harness_stdout_and_clean_exit_code(tmp_path):
+    root = _b03_case_root(tmp_path)
+    materials = release.B03CaseMaterials.load(root)
+    normal = (root / "inputs" / "normal.txt").read_bytes()
+    candidate = (root / "inputs" / "candidate.txt").read_bytes()
+
+    no_stdout = _frozen_admission()
+    no_stdout["harness"].pop("expected_stdout")
+    with pytest.raises(release.ReleaseGateError, match="expected_stdout"):
+        release.prepare_b03_plan(
+            admission=no_stdout,
+            materials=materials,
+            normal_input=normal,
+            candidate_input=candidate,
+        )
+
+    no_clean_exit = _frozen_admission()
+    no_clean_exit["harness"].pop("candidate_clean_exit_code")
+    with pytest.raises(release.ReleaseGateError, match="candidate_clean_exit_code"):
+        release.prepare_b03_plan(
+            admission=no_clean_exit,
+            materials=materials,
+            normal_input=normal,
+            candidate_input=candidate,
+        )
+
+    custom = _frozen_admission()
+    custom["harness"]["candidate_clean_exit_code"] = 7
+    custom["harness"]["expected_stdout"] = {
+        "normal": "CUSTOM_NORMAL\n",
+        "candidate_clean": "CUSTOM_CLEAN\n",
+    }
+    prepared = release.prepare_b03_plan(
+        admission=custom,
+        materials=materials,
+        normal_input=normal,
+        candidate_input=candidate,
+    )
+    assert prepared["expected_exit"]["candidate_clean"] == 7
+    assert prepared["expected_stdout"] == {
+        "normal": "CUSTOM_NORMAL\n",
+        "candidate_clean": "CUSTOM_CLEAN\n",
+    }
+
+    class CustomStdoutSandbox(FakeB03Sandbox):
+        def replay(self, version: str, phase: str, **kwargs) -> ReplayResult:
+            res = super().replay(version, phase, **kwargs)
+            if phase == "normal":
+                return ReplayResult(
+                    version=res.version,
+                    phase=res.phase,
+                    status=res.status,
+                    exit_code=0,
+                    duration_seconds=res.duration_seconds,
+                    container_id=res.container_id,
+                    input_digest=res.input_digest,
+                    stdout=b"CUSTOM_NORMAL\n",
+                    stderr=res.stderr,
+                    signature=res.signature,
+                    timed_out=res.timed_out,
+                    quota_hit=res.quota_hit,
+                    log_truncated=res.log_truncated,
+                    metadata=res.metadata,
+                )
+            if version == "fixed":
+                return ReplayResult(
+                    version=res.version,
+                    phase=res.phase,
+                    status=res.status,
+                    exit_code=7,
+                    duration_seconds=res.duration_seconds,
+                    container_id=res.container_id,
+                    input_digest=res.input_digest,
+                    stdout=b"CUSTOM_CLEAN\n",
+                    stderr=res.stderr,
+                    signature=res.signature,
+                    timed_out=res.timed_out,
+                    quota_hit=res.quota_hit,
+                    log_truncated=res.log_truncated,
+                    metadata=res.metadata,
+                )
+            return res
+
+    review = _review_for(custom, root)
+    acceptance = _run_b03(
+        tmp_path,
+        custom,
+        CustomStdoutSandbox(toolchain=custom["build"]["toolchain_image"]),
+        review,
+    )
+    assert acceptance["verdict"] == "REPRODUCED"
+
+
+def test_single_environment_and_identical_release_guard(monkeypatch, capsys):
+    from datacon import cli, state
+
+    with pytest.raises(state.ReleaseStateError, match="internal-lab"):
+        state.ReleaseStore("postgresql://unused", environment="prod")
+
+    monkeypatch.setenv("DATACON_DATABASE_URL", "postgresql://unused")
+    for argv in (
+        ["release", "slots", "--environment", "prod"],
+        [
+            "release",
+            "bootstrap",
+            "--environment",
+            "prod",
+            "--image-id",
+            "sha256:" + "a" * 64,
+            "--migration-version",
+            "008_release_events.sql",
+            "--evidence-root",
+            "/var/lib/datacon/evidence",
+        ],
+    ):
+        assert cli.main(argv) == 2
+        err = json.loads(capsys.readouterr().err)
+        assert err["reason_code"] == "INVALID_RELEASE_STATE"
+
+    manifest = _sample_rc_manifest()
+    approval = _approval(manifest)
+    identical_previous = {
+        "image_id": manifest["control_plane_image_id"],
+        "config": {
+            "contract_version": manifest["contract_version"],
+            "migration_version": manifest["migration_version"],
+        },
+        "migration_version": manifest["migration_version"],
+        "evidence_root": "/var/lib/datacon/evidence",
+    }
+    backend = _backend(previous=identical_previous)
+    with pytest.raises(release.ReleaseGateError, match="identical|active release"):
+        release.promote_and_smoke(
+            manifest=manifest,
+            expected_manifest_digest=approval["candidate_digest"],
+            approval=approval,
+            backend=backend,
+            smoke_checks={"cli_smoke": lambda: True},
+            rollback_fn=lambda prev: {"restored_image": prev["image_id"], "ok": True},
+        )
+
+
+def test_validate_evidence_bundle_path_enforces_containment_and_no_symlinks(tmp_path):
+    from datacon import state
+
+    evidence_root = tmp_path / "evidence"
+    evidence_root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    valid = evidence_root / "job-1" / "generation-1"
+    valid.mkdir(parents=True)
+
+    resolved = state._validate_evidence_bundle_path(str(valid), str(evidence_root))
+    assert resolved == valid.resolve()
+
+    # Hosted VM scenario: evidence_root does not exist locally, but path is lexically inside.
+    remote_root = "/var/lib/datacon/remote-evidence"
+    remote_bundle = f"{remote_root}/job-1/generation-1"
+    remote_resolved = state._validate_evidence_bundle_path(remote_bundle, remote_root)
+    assert str(remote_resolved).endswith("remote-evidence/job-1/generation-1")
+
+    # Symlink inside evidence_root is rejected.
+    sym = evidence_root / "sym-job"
+    sym.symlink_to(outside)
+    with pytest.raises(state.ReleaseStateError, match="symlink|evidence_path"):
+        state._validate_evidence_bundle_path(str(sym / "generation-1"), str(evidence_root))
+
+    # Symlink as evidence_root itself is rejected.
+    sym_root = tmp_path / "sym-root"
+    sym_root.symlink_to(evidence_root)
+    with pytest.raises(state.ReleaseStateError, match="symlink"):
+        state._validate_evidence_bundle_path(str(sym_root / "job-1"), str(sym_root))
+
+    # Parent traversal and outside paths are rejected.
+    with pytest.raises(state.ReleaseStateError, match="traversal|escape|evidence_path"):
+        state._validate_evidence_bundle_path(
+            f"{evidence_root}/../outside", str(evidence_root)
+        )
+    with pytest.raises(state.ReleaseStateError, match="inside|evidence_path"):
+        state._validate_evidence_bundle_path(str(outside), str(evidence_root))

@@ -862,6 +862,10 @@ def promote_and_smoke(
         "migration_version": manifest["migration_version"],
         "evidence_root": previous["evidence_root"],
     }
+    if _same_release(candidate_record, previous):
+        raise ReleaseGateError(
+            "promotion blocked: candidate release is identical to the active release"
+        )
     previous_manifest_digest = _persisted_manifest_digest(backend, previous)
     smoke_results: dict[str, bool] = {}
     failed_check: str | None = None
@@ -1619,10 +1623,20 @@ def _b03_exit_code(container: Any, key: str, label: str) -> int:
 
 
 _B03_DEFERRED_CHECK_OWNER_FIELD = "owner_task"
+_B03_REQUIRED_PASS_CHECKS = frozenset(
+    {
+        "public_advisory",
+        "fixed_commit",
+        "offline_build",
+        "license",
+        "shared_harness",
+    }
+)
+_B03_DEFERRED_ALLOWED_CHECKS = frozenset({"asan_replay"})
 
 
 def _validate_b03_checks(checks: Any) -> None:
-    """Reject an admission whose critical checks failed or are not deferred."""
+    """Reject an admission whose critical checks failed or are improperly deferred."""
     if isinstance(checks, Mapping):
         entries = []
         for check_id, value in checks.items():
@@ -1636,6 +1650,7 @@ def _validate_b03_checks(checks: Any) -> None:
         raise ReleaseGateError("B03 admission checks must be a list or object")
     if not entries:
         raise ReleaseGateError("B03 admission checks must not be empty")
+    seen: dict[str, str] = {}
     for index, entry in enumerate(entries):
         if not isinstance(entry, Mapping):
             raise ReleaseGateError(
@@ -1646,6 +1661,8 @@ def _validate_b03_checks(checks: Any) -> None:
             raise ReleaseGateError(
                 f"B03 admission checks[{index}] is missing a non-empty id"
             )
+        if check_id in seen:
+            raise ReleaseGateError(f"B03 admission check {check_id!r} is duplicated")
         status = entry.get("status")
         if status not in {"pass", "deferred"}:
             raise ReleaseGateError(
@@ -1653,12 +1670,23 @@ def _validate_b03_checks(checks: Any) -> None:
                 "'pass' or an explicit deferred check is allowed"
             )
         if status == "deferred":
+            if check_id not in _B03_DEFERRED_ALLOWED_CHECKS:
+                raise ReleaseGateError(
+                    f"B03 admission check {check_id!r} cannot be deferred; "
+                    "critical admission checks must have status 'pass'"
+                )
             owner = entry.get(_B03_DEFERRED_CHECK_OWNER_FIELD)
             if not isinstance(owner, str) or not owner.strip():
                 raise ReleaseGateError(
                     f"B03 admission check {check_id!r} is deferred without an "
                     f"{_B03_DEFERRED_CHECK_OWNER_FIELD}"
                 )
+        seen[check_id] = status
+    for required_id in sorted(_B03_REQUIRED_PASS_CHECKS):
+        if seen.get(required_id) != "pass":
+            raise ReleaseGateError(
+                f"B03 admission check {required_id!r} must be present with status 'pass'"
+            )
 
 
 def _validate_b03_admission(admission: Mapping[str, Any]) -> dict[str, Any]:
@@ -1744,11 +1772,27 @@ def _validate_b03_admission(admission: Mapping[str, Any]) -> dict[str, Any]:
     asan_options = _b03_string(harness, "asan_options", "harness")
     expected_exit = {
         "normal": _b03_exit_code(harness, "normal_exit_code", "harness"),
-        "candidate_clean": 0,
+        "candidate_clean": _b03_exit_code(
+            harness, "candidate_clean_exit_code", "harness"
+        ),
         "candidate_asan": _b03_exit_code(
             harness, "candidate_asan_exit_code", "harness"
         ),
     }
+    raw_stdout = harness.get("expected_stdout")
+    if not isinstance(raw_stdout, Mapping):
+        raise ReleaseGateError(
+            "B03 admission harness.expected_stdout must be an object with "
+            "'normal' and 'candidate_clean' strings"
+        )
+    expected_stdout: dict[str, str] = {}
+    for key in ("normal", "candidate_clean"):
+        value = raw_stdout.get(key)
+        if not isinstance(value, str):
+            raise ReleaseGateError(
+                f"B03 admission harness.expected_stdout.{key} must be a string"
+            )
+        expected_stdout[key] = value
     repository = admission.get("repository")
     repository_url = _b03_url(repository, "url", "repository")
     source_path = repository.get("source_path", "src/regext.c")
@@ -1769,6 +1813,7 @@ def _validate_b03_admission(admission: Mapping[str, Any]) -> dict[str, Any]:
         "toolchain_image": toolchain_image,
         "asan_options": asan_options,
         "expected_exit": expected_exit,
+        "expected_stdout": expected_stdout,
         "repository_url": repository_url,
         "source_path": source_path,
         "advisory_url": advisory_url,
@@ -1877,10 +1922,7 @@ def prepare_b03_plan(
     asan_options = validated["asan_options"]
     asan_sig = dict(validated["asan_signature"])
     expected_exit = dict(validated["expected_exit"])
-    expected_stdout = {
-        "normal": "OK\n",
-        "candidate_clean": "MISMATCH_REJECTED\n",
-    }
+    expected_stdout = dict(validated["expected_stdout"])
     limits = dict(contracts.DEFAULT_LIMITS)
     isolation = {
         "network": "none",
@@ -2064,18 +2106,41 @@ _B03_PROBE_CHECKS = {
 }
 
 
-def _require_probe(report: Any) -> Any:
+_B03_PROBE_LIMIT_FIELDS = ("cpu", "memory_mib", "pids", "scratch_mib")
+
+
+def _require_probe(
+    report: Any,
+    *,
+    expected_limits: Mapping[str, Any] | None = None,
+) -> Any:
     """Validate every isolation probe value before any build or replay runs."""
     if getattr(report, "ok", False) is not True:
         raise ReleaseGateError("B03 sandbox probe did not succeed")
     image_digest = getattr(report, "image_digest", None)
     _require_digest(image_digest, "B03 probe image_digest")
     limits = getattr(report, "limits", None)
-    if not isinstance(limits, Mapping) or not limits:
-        raise ReleaseGateError("B03 probe limits are missing")
+    if not isinstance(limits, Mapping) or set(limits) != set(_B03_PROBE_LIMIT_FIELDS):
+        raise ReleaseGateError(
+            "B03 probe limits must contain exactly "
+            + ", ".join(_B03_PROBE_LIMIT_FIELDS)
+        )
+    for field in _B03_PROBE_LIMIT_FIELDS:
+        value = limits.get(field)
+        if type(value) is not int or value <= 0:
+            raise ReleaseGateError(
+                f"B03 probe limits.{field} must be a positive integer"
+            )
+        if expected_limits is not None and value != expected_limits.get(field):
+            raise ReleaseGateError(
+                f"B03 probe limits.{field}={value!r} does not match plan limit "
+                f"{expected_limits.get(field)!r}"
+            )
     checks = getattr(report, "checks", None)
     if not isinstance(checks, Mapping):
         raise ReleaseGateError("B03 probe checks are incomplete")
+    if "errors" in checks and checks["errors"] != []:
+        raise ReleaseGateError("B03 probe recorded isolation check errors")
     for key, expected in _B03_PROBE_CHECKS.items():
         actual = checks.get(key)
         if actual != expected:
@@ -2179,7 +2244,9 @@ def run_b03_acceptance(
     compile_args = prepared["compile_args"]
 
     resolved_job_id = _resolve_b03_job_id(sandbox, job_id)
-    probe_report = _require_probe(sandbox.probe(deadline_seconds=120.0))
+    probe_report = _require_probe(
+        sandbox.probe(deadline_seconds=120.0), expected_limits=limits
+    )
     if probe_report.image_digest != image_digest:
         raise ReleaseGateError(
             "B03 probe image_digest does not match the approved toolchain"

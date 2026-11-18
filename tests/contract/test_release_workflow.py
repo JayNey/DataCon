@@ -254,3 +254,77 @@ def test_cross_run_artifacts_are_provenance_checked():
     promote_text = _run_text(jobs["promote-internal"])
     assert "VERIFIED_RUN_HEAD_SHA" in promote_text
     assert 'manifest["source_commit"]' in promote_text
+
+
+def test_b1_protected_refs_verify_origin_main_ancestry_and_reject_none_head_branch():
+    jobs = _load(RELEASE)["jobs"]
+    for name in (
+        "build-candidate",
+        "promote-internal",
+        "rollback-internal",
+        "b03-internal",
+    ):
+        text = _run_text(jobs[name])
+        assert "git fetch --no-tags origin main:refs/remotes/origin/main" in text, name
+        assert (
+            'git merge-base --is-ancestor "${GITHUB_SHA}" refs/remotes/origin/main'
+            in text
+        ), name
+
+    b03_steps = _steps(jobs["b03-internal"])
+    checkout_idx = next(
+        idx
+        for idx, step in enumerate(b03_steps)
+        if step.get("uses", "").startswith("actions/checkout@")
+    )
+    verify_idx = next(
+        idx
+        for idx, step in enumerate(b03_steps)
+        if step.get("name") == "Verify protected ref"
+    )
+    assert checkout_idx < verify_idx
+
+    for name in ("promote-internal", "rollback-internal"):
+        text = _run_text(jobs[name])
+        assert "head_branch not in (None" not in text, name
+        assert "isinstance(head_branch, str)" in text, name
+        assert '"refs/remotes/origin/main"' in text, name
+
+    promote_text = _run_text(jobs["promote-internal"])
+    assert (
+        '["git", "merge-base", "--is-ancestor", manifest["source_commit"], "refs/remotes/origin/main"]'
+        in promote_text
+    )
+
+
+def test_s1_s4_s5_s8_promote_and_rollback_safety_contracts():
+    jobs = _load(RELEASE)["jobs"]
+
+    promote_steps = _steps(jobs["promote-internal"])
+    promote_text = _run_text(jobs["promote-internal"])
+    assert "worker --once" not in promote_text
+    assert "release slots --environment internal-lab" in promote_text
+    assert "verify_promotion_gate" in promote_text
+    assert "timeout=60" in promote_text
+    assert "timeout 60 docker run" in promote_text
+    assert "evidence_root_path.exists()" in promote_text
+    assert "archived_real_bundle" in promote_text
+
+    approval_step_idx = next(
+        idx
+        for idx, step in enumerate(promote_steps)
+        if "DATACON_RELEASE_APPROVAL" in step.get("run", "")
+    )
+    first_db_or_container_idx = next(
+        idx
+        for idx, step in enumerate(promote_steps)
+        if "DATACON_DATABASE_URL" in step.get("run", "")
+        or "docker run" in step.get("run", "")
+    )
+    assert approval_step_idx <= first_db_or_container_idx
+
+    rollback_text = _run_text(jobs["rollback-internal"])
+    assert 'candidate_digest=os.environ["TARGET_DIGEST"]' not in rollback_text
+    assert 'target.get("candidate_digest") or target.get("manifest_digest")' in rollback_text
+    assert "verify-bundle" in rollback_text
+    assert "timeout=60" in rollback_text

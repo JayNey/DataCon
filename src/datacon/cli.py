@@ -341,6 +341,13 @@ def _verify_bundle(args) -> int:
 
 
 def _release_slots(args) -> int:
+    if args.environment != state.RELEASE_ENVIRONMENT:
+        return _error(
+            2,
+            "INVALID_RELEASE_STATE",
+            f"unsupported release environment {args.environment!r}; "
+            f"only {state.RELEASE_ENVIRONMENT!r} is supported",
+        )
     dsn = _database_url()
     if not dsn:
         return _error(1, "DATABASE_NOT_CONFIGURED", "set DATACON_DATABASE_URL")
@@ -363,6 +370,13 @@ def _release_slots(args) -> int:
 
 
 def _release_bootstrap(args) -> int:
+    if args.environment != state.RELEASE_ENVIRONMENT:
+        return _error(
+            2,
+            "INVALID_RELEASE_STATE",
+            f"unsupported release environment {args.environment!r}; "
+            f"only {state.RELEASE_ENVIRONMENT!r} is supported",
+        )
     dsn = _database_url()
     if not dsn:
         return _error(1, "DATABASE_NOT_CONFIGURED", "set DATACON_DATABASE_URL")

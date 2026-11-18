@@ -773,3 +773,47 @@ def test_dependency_lock_checks_version_constraints_not_only_names(tmp_path):
     (root / "pyproject.toml").write_text(mutated, encoding="utf-8")
     errors = ci_gates.check_dependency_lock(root)
     assert any("psycopg" in error and "constraint" in error for error in errors)
+
+
+def test_workflow_security_rejects_steps_and_needs_outputs_but_allows_env(tmp_path):
+    bad = _workflow(
+        tmp_path,
+        "name: BadOutputs\n"
+        "on:\n"
+        "  workflow_dispatch:\n"
+        "permissions:\n"
+        "  contents: read\n"
+        "jobs:\n"
+        "  test:\n"
+        "    steps:\n"
+        "      - run: echo \"${{ steps.meta.outputs.title }}\"\n"
+        "      - run: echo \"${{ needs.build.outputs.tag }}\"\n"
+        "      - uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea\n"
+        "        with:\n"
+        "          script: console.log('${{ steps.meta.outputs.title }}')\n"
+        "      - uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea\n"
+        "        with:\n"
+        "          script: console.log('${{ needs.build.outputs.tag }}')\n",
+    )
+    errors = ci_gates.check_workflow_security([bad])
+    assert sum("steps.meta.outputs.title" in err for err in errors) == 2
+    assert sum("needs.build.outputs.tag" in err for err in errors) == 2
+
+    good = tmp_path / "good-outputs-env.yml"
+    good.write_text(
+        "name: GoodOutputs\n"
+        "on:\n"
+        "  workflow_dispatch:\n"
+        "permissions:\n"
+        "  contents: read\n"
+        "jobs:\n"
+        "  test:\n"
+        "    env:\n"
+        "      TAG: ${{ needs.build.outputs.tag }}\n"
+        "    steps:\n"
+        "      - env:\n"
+        "          TITLE: ${{ steps.meta.outputs.title }}\n"
+        "        run: echo \"$TITLE $TAG\"\n",
+        encoding="utf-8",
+    )
+    assert ci_gates.check_workflow_security([good]) == []

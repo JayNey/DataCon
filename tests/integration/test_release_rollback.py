@@ -292,13 +292,14 @@ def test_multiple_rollbacks_and_repeated_smoke_failures_preserve_all_audit_event
     )
     target_i0 = store_handle.release_for_image(PREVIOUS_IMAGE)
     assert target_i0 is not None
+    i0_candidate_digest = target_i0.get("candidate_digest") or target_i0["manifest_digest"]
     assert (
         release.rollback_release(
             target_release=target_i0,
             backend=store_handle,
             smoke_checks={"cli_smoke": lambda: True},
             approved_by="reviewer-1",
-            candidate_digest=PREVIOUS_IMAGE,
+            candidate_digest=i0_candidate_digest,
         )["status"]
         == "rolled_back"
     )
@@ -317,13 +318,16 @@ def test_multiple_rollbacks_and_repeated_smoke_failures_preserve_all_audit_event
     )
     target_i0_again = store_handle.release_for_image(PREVIOUS_IMAGE)
     assert target_i0_again is not None
+    i0_candidate_digest_again = (
+        target_i0_again.get("candidate_digest") or target_i0_again["manifest_digest"]
+    )
     assert (
         release.rollback_release(
             target_release=target_i0_again,
             backend=store_handle,
             smoke_checks={"cli_smoke": lambda: True},
             approved_by="reviewer-1",
-            candidate_digest=PREVIOUS_IMAGE,
+            candidate_digest=i0_candidate_digest_again,
         )["status"]
         == "rolled_back"
     )
@@ -333,8 +337,11 @@ def test_multiple_rollbacks_and_repeated_smoke_failures_preserve_all_audit_event
     assert len(rollbacks) == 2
     assert rollbacks[0]["previous_image_id"] == m1_image
     assert rollbacks[0]["active_image_id"] == PREVIOUS_IMAGE
+    assert rollbacks[0]["candidate_digest"] == i0_candidate_digest
+    assert rollbacks[0]["candidate_digest"] != PREVIOUS_IMAGE
     assert rollbacks[1]["previous_image_id"] == m2_image
     assert rollbacks[1]["active_image_id"] == PREVIOUS_IMAGE
+    assert rollbacks[1]["candidate_digest"] == i0_candidate_digest_again
 
     # Same candidate M3 fails smoke twice in a row -> both rollback audits persisted.
     a3 = _approval(m3)
@@ -542,3 +549,248 @@ def test_bootstrap_is_idempotent_and_rejects_a_conflicting_baseline(
             migration_version="007_execution_evidence_invariant.sql",
             evidence_root="/var/lib/datacon/evidence",
         )
+
+
+def test_bootstrap_rejects_migration_not_in_schema_migrations(
+    isolated_database, postgres_dsn
+):
+    import psycopg
+    from psycopg import sql
+    from psycopg.conninfo import conninfo_to_dict, make_conninfo
+    import uuid as uuid_mod
+
+    store_handle = state.ReleaseStore(isolated_database.dsn)
+    with pytest.raises(state.ReleaseStateError, match="schema_migrations"):
+        store_handle.bootstrap_release(
+            image_id=PREVIOUS_IMAGE,
+            config={"policy_version": "1"},
+            migration_version="099_missing_migration.sql",
+            evidence_root="/var/lib/datacon/evidence",
+        )
+    assert store_handle.active_release() is None
+
+    # A schema where schema_migrations does not exist at all must also fail closed.
+    empty_schema = f"datacon_no_ledger_{uuid_mod.uuid4().hex}"
+    with psycopg.connect(postgres_dsn, autocommit=True, connect_timeout=5) as admin:
+        admin.execute(sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(empty_schema)))
+    try:
+        params = conninfo_to_dict(postgres_dsn)
+        params["options"] = f"-csearch_path={empty_schema}"
+        empty_dsn = make_conninfo(**params)
+        no_ledger_store = state.ReleaseStore(empty_dsn)
+        with pytest.raises(state.ReleaseStateError, match="schema_migrations"):
+            no_ledger_store.bootstrap_release(
+                image_id=PREVIOUS_IMAGE,
+                config={"policy_version": "1"},
+                migration_version="008_release_events.sql",
+                evidence_root="/var/lib/datacon/evidence",
+            )
+    finally:
+        with psycopg.connect(postgres_dsn, autocommit=True, connect_timeout=5) as admin:
+            admin.execute(
+                sql.SQL("DROP SCHEMA IF EXISTS {} CASCADE").format(
+                    sql.Identifier(empty_schema)
+                )
+            )
+
+
+def test_replaying_promoted_manifest_after_rollback_fails_closed(isolated_database):
+    store_handle = state.ReleaseStore(isolated_database.dsn)
+    store_handle.bootstrap_release(
+        image_id=PREVIOUS_IMAGE,
+        config={"policy_version": "1"},
+        migration_version="007_execution_evidence_invariant.sql",
+        evidence_root="/var/lib/datacon/evidence",
+    )
+    m1 = _manifest_with(CANDIDATE_IMAGE, "b" * 40)
+    a1 = _approval(m1)
+    promoted = release.promote_and_smoke(
+        manifest=m1,
+        expected_manifest_digest=a1["candidate_digest"],
+        approval=a1,
+        backend=store_handle,
+        smoke_checks={"cli_smoke": lambda: True},
+        rollback_fn=lambda prev: {"restored_image": prev["image_id"], "ok": True},
+    )
+    assert promoted["status"] == "promoted"
+
+    target = store_handle.release_for_image(PREVIOUS_IMAGE)
+    assert target is not None
+    rolled_back = release.rollback_release(
+        target_release=target,
+        backend=store_handle,
+        smoke_checks={"cli_smoke": lambda: True},
+        approved_by="reviewer-1",
+        candidate_digest=target.get("candidate_digest") or target["manifest_digest"],
+    )
+    assert rolled_back["status"] == "rolled_back"
+
+    with pytest.raises(release.ReleaseGateError, match="stale approval"):
+        release.promote_and_smoke(
+            manifest=m1,
+            expected_manifest_digest=a1["candidate_digest"],
+            approval=a1,
+            backend=store_handle,
+            smoke_checks={"cli_smoke": lambda: True},
+            rollback_fn=lambda prev: {"restored_image": prev["image_id"], "ok": True},
+        )
+    active = store_handle.active_release()
+    assert active is not None
+    assert active["image_id"] == PREVIOUS_IMAGE
+
+
+def test_cli_migrate_and_release_bootstrap_end_to_end(postgres_dsn):
+    import json
+    import psycopg
+    from psycopg import sql
+    from psycopg.conninfo import conninfo_to_dict, make_conninfo
+    import uuid as uuid_mod
+    from support import cli
+
+    schema = f"datacon_cli_rel_{uuid_mod.uuid4().hex}"
+    migrations_dir = Path(__file__).resolve().parents[2] / "migrations"
+    with psycopg.connect(postgres_dsn, autocommit=True, connect_timeout=5) as admin:
+        admin.execute(sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(schema)))
+    try:
+        params = conninfo_to_dict(postgres_dsn)
+        params["options"] = f"-csearch_path={schema}"
+        schema_dsn = make_conninfo(**params)
+
+        mig = cli(
+            "migrate",
+            "--migrations-dir",
+            str(migrations_dir),
+            database_url=schema_dsn,
+        )
+        assert mig.returncode == 0, mig.stderr
+        mig_out = json.loads(mig.stdout)
+        assert "008_release_events.sql" in mig_out["applied"]
+
+        boot = cli(
+            "release",
+            "bootstrap",
+            "--image-id",
+            PREVIOUS_IMAGE,
+            "--migration-version",
+            "008_release_events.sql",
+            "--evidence-root",
+            "/var/lib/datacon/evidence",
+            "--config",
+            '{"policy_version":"1"}',
+            database_url=schema_dsn,
+        )
+        assert boot.returncode == 0, boot.stderr
+        boot_out = json.loads(boot.stdout)
+        assert boot_out["baseline"] is True
+        assert boot_out["image_id"] == PREVIOUS_IMAGE
+
+        bad_env = cli(
+            "release",
+            "bootstrap",
+            "--environment",
+            "staging",
+            "--image-id",
+            PREVIOUS_IMAGE,
+            "--migration-version",
+            "008_release_events.sql",
+            "--evidence-root",
+            "/var/lib/datacon/evidence",
+            database_url=schema_dsn,
+        )
+        assert bad_env.returncode == 2
+
+        slots = cli("release", "slots", database_url=schema_dsn)
+        assert slots.returncode == 0, slots.stderr
+        slots_out = json.loads(slots.stdout)
+        assert slots_out["active_release"]["image_id"] == PREVIOUS_IMAGE
+    finally:
+        with psycopg.connect(postgres_dsn, autocommit=True, connect_timeout=5) as admin:
+            admin.execute(
+                sql.SQL("DROP SCHEMA IF EXISTS {} CASCADE").format(
+                    sql.Identifier(schema)
+                )
+            )
+
+
+def test_latest_evidence_bundle_validates_containment_and_rejects_symlinks(
+    isolated_database, tmp_path
+):
+    import uuid as uuid_mod
+    from psycopg.types.json import Jsonb
+
+    evidence_root = tmp_path / "evidence-root"
+    evidence_root.mkdir()
+    outside_dir = tmp_path / "outside-bundle"
+    outside_dir.mkdir()
+    valid_bundle = evidence_root / str(uuid_mod.uuid4()) / "generation-1"
+    valid_bundle.mkdir(parents=True)
+
+    store_handle = state.ReleaseStore(isolated_database.dsn)
+    store_handle.bootstrap_release(
+        image_id=PREVIOUS_IMAGE,
+        config={"policy_version": "1"},
+        migration_version="008_release_events.sql",
+        evidence_root=str(evidence_root),
+    )
+
+    def _insert_archived_job(bundle_path: str):
+        jid = uuid_mod.uuid4()
+        digest = "sha256:" + "a" * 64
+        isolated_database.connection.execute(
+            "INSERT INTO jobs "
+            "(job_id, request, state, stage, workflow_synced, evidence_status, "
+            "evidence_path, evidence_digest, verdict, verdict_reason, submitted_at) "
+            "VALUES (%s, %s, 'REPRODUCED', 'done', true, 'archived', %s, %s, "
+            "'REPRODUCED', 'ASAN_SIGNATURE_MATCHED', clock_timestamp())",
+            (jid, Jsonb({"schema_version": 1}), bundle_path, digest),
+        )
+        return jid
+
+    # 1. Valid path inside evidence_root succeeds.
+    _insert_archived_job(str(valid_bundle))
+    latest = store_handle.latest_evidence_bundle()
+    assert latest is not None
+    assert Path(latest["path"]).resolve() == valid_bundle.resolve()
+
+    # 2. Symlink inside evidence_root is rejected.
+    sym_bundle = evidence_root / "sym-job"
+    sym_bundle.symlink_to(outside_dir)
+    _insert_archived_job(str(sym_bundle / "generation-1"))
+    with pytest.raises(state.ReleaseStateError, match="symlink|evidence_path"):
+        store_handle.latest_evidence_bundle()
+
+    # 3. Parent traversal '..' is rejected.
+    _insert_archived_job(str(evidence_root / ".." / "outside-bundle"))
+    with pytest.raises(state.ReleaseStateError, match="evidence_path|escape"):
+        store_handle.latest_evidence_bundle()
+
+    # 4. Path completely outside evidence_root is rejected.
+    _insert_archived_job(str(outside_dir))
+    with pytest.raises(state.ReleaseStateError, match="evidence_path|inside"):
+        store_handle.latest_evidence_bundle()
+
+
+def test_promote_and_smoke_on_release_store_rejects_noop_rollback_fn(
+    isolated_database,
+):
+    store_handle = state.ReleaseStore(isolated_database.dsn)
+    store_handle.bootstrap_release(
+        image_id=PREVIOUS_IMAGE,
+        config={"policy_version": "1"},
+        migration_version="007_execution_evidence_invariant.sql",
+        evidence_root="/var/lib/datacon/evidence",
+    )
+    manifest = _manifest()
+    approval = _approval(manifest)
+    with pytest.raises(release.ReleaseGateError, match="did not restore|state transition"):
+        release.promote_and_smoke(
+            manifest=manifest,
+            expected_manifest_digest=approval["candidate_digest"],
+            approval=approval,
+            backend=store_handle,
+            smoke_checks={"cli_smoke": lambda: False},
+            rollback_fn=lambda prev: {"restored_image": prev["image_id"], "ok": True},
+        )
+    active = store_handle.active_release()
+    assert active is not None
+    assert active["image_id"] == PREVIOUS_IMAGE

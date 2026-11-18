@@ -1406,6 +1406,36 @@ def apply_migrations_dsn(dsn: str, migrations_dir: Path | str) -> dict[str, str]
         return apply_migrations(connection, migrations_dir)
 
 
+def _validate_evidence_bundle_path(evidence_path: Any, evidence_root: str) -> Path:
+    """Validate that an archived ``evidence_path`` stays inside ``evidence_root`` without symlinks."""
+    if not isinstance(evidence_path, str) or not evidence_path.strip():
+        raise ReleaseStateError("evidence_path must be a non-empty path")
+    if "\\" in evidence_path:
+        raise ReleaseStateError("evidence_path must use POSIX separators")
+    root_path = Path(evidence_root)
+    if root_path.is_symlink():
+        raise ReleaseStateError("active release evidence_root must not be a symlink")
+    candidate = Path(evidence_path)
+    if ".." in candidate.parts:
+        raise ReleaseStateError("evidence_path must not contain '..' traversal")
+    if candidate.is_absolute():
+        try:
+            rel_path = candidate.relative_to(root_path)
+        except ValueError:
+            try:
+                rel_path = candidate.relative_to(root_path.resolve())
+            except ValueError as error:
+                raise ReleaseStateError(
+                    "evidence_path must stay inside active release evidence_root"
+                ) from error
+    else:
+        rel_path = candidate
+    try:
+        return jsonutil.resolve_inside(root_path, rel_path.as_posix())
+    except ValueError as error:
+        raise ReleaseStateError(f"unsafe evidence_path: {error}") from error
+
+
 class ReleaseStore:
     """PostgreSQL-backed promotion state and append-only audit.
 
@@ -1415,11 +1445,18 @@ class ReleaseStore:
     """
 
     def __init__(self, dsn: str, *, environment: str = RELEASE_ENVIRONMENT):
-        if not isinstance(environment, str) or not environment.strip():
-            raise ReleaseStateError("release environment must be a non-empty string")
+        if not isinstance(environment, str) or environment != RELEASE_ENVIRONMENT:
+            raise ReleaseStateError(
+                f"unsupported release environment {environment!r}; "
+                f"only {RELEASE_ENVIRONMENT!r} is supported"
+            )
         self.dsn = dsn
         self.environment = environment
         self._tx_local = threading.local()
+
+    @property
+    def switches(self) -> list[dict[str, Any]] | None:
+        return getattr(self._tx_local, "switches", None)
 
     def _connect(self):
         return psycopg.connect(
@@ -1460,10 +1497,12 @@ class ReleaseStore:
                 (self.environment,),
             )
             self._tx_local.conn = connection
+            self._tx_local.switches = []
             try:
                 yield connection
             finally:
                 self._tx_local.conn = None
+                self._tx_local.switches = None
 
     def active_slots(self) -> int:
         with self._connection() as connection:
@@ -1526,6 +1565,21 @@ class ReleaseStore:
         }
         snapshot_digest = jsonutil.digest_json(snapshot)
         with self.transaction() as connection:
+            try:
+                recorded = connection.execute(
+                    "SELECT 1 FROM schema_migrations WHERE file = %s",
+                    (migration_version,),
+                ).fetchone()
+            except psycopg.errors.UndefinedTable as error:
+                raise ReleaseStateError(
+                    "schema_migrations ledger is missing; run `datacon migrate` "
+                    "against the target database before bootstrapping a release"
+                ) from error
+            if recorded is None:
+                raise ReleaseStateError(
+                    "bootstrap migration_version is not recorded in schema_migrations: "
+                    f"{migration_version}"
+                )
             connection.execute(
                 "INSERT INTO release_state "
                 "(environment, image_id, config, migration_version, evidence_root) "
@@ -1625,6 +1679,18 @@ class ReleaseStore:
                     evidence_root,
                 ),
             )
+            tx_switches = getattr(self._tx_local, "switches", None)
+            if isinstance(tx_switches, list):
+                tx_switches.append(
+                    {
+                        "image_id": image_id,
+                        "config": dict(config),
+                        "migration_version": migration_version,
+                        "evidence_root": evidence_root,
+                        "action": action,
+                        "candidate_digest": candidate_digest,
+                    }
+                )
 
     def record_audit(self, result: Mapping[str, Any]) -> None:
         status = result.get("status")
@@ -1764,7 +1830,7 @@ class ReleaseStore:
         return None
 
     def latest_evidence_bundle(self) -> dict[str, str] | None:
-        """Return the newest archived evidence bundle for a release smoke check."""
+        """Return the newest archived evidence bundle after verifying containment."""
         with self._connection() as connection:
             row = connection.execute(
                 "SELECT evidence_path, evidence_digest FROM jobs "
@@ -1774,8 +1840,16 @@ class ReleaseStore:
             ).fetchone()
         if row is None:
             return None
+        active = self.active_release()
+        if active is None or not isinstance(active.get("evidence_root"), str):
+            raise ReleaseStateError(
+                "active release evidence_root is missing; cannot validate evidence_path"
+            )
+        resolved = _validate_evidence_bundle_path(
+            row["evidence_path"], active["evidence_root"]
+        )
         return {
-            "path": row["evidence_path"],
+            "path": str(resolved),
             "digest": row["evidence_digest"],
         }
 

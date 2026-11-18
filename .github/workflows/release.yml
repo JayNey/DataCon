@@ -140,6 +140,23 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
+      - name: Verify protected ref
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "${GITHUB_REF}" in
+            refs/heads/main|refs/tags/v*) ;;
+            *) echo "build-candidate is only allowed from main or a v* tag" >&2; exit 1 ;;
+          esac
+          if [[ ! "${GITHUB_SHA}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "GITHUB_SHA must be a 40-char commit" >&2
+            exit 1
+          fi
+          git fetch --no-tags origin main:refs/remotes/origin/main
+          if ! git merge-base --is-ancestor "${GITHUB_SHA}" refs/remotes/origin/main; then
+            echo "ref commit ${GITHUB_SHA} is not an ancestor of origin/main" >&2
+            exit 1
+          fi
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.12"
@@ -323,6 +340,11 @@ jobs:
             refs/heads/main|refs/tags/v*) ;;
             *) echo "promotion is only allowed from main or a v* tag" >&2; exit 1 ;;
           esac
+          git fetch --no-tags origin main:refs/remotes/origin/main
+          if ! git merge-base --is-ancestor "${GITHUB_SHA}" refs/remotes/origin/main; then
+            echo "ref commit ${GITHUB_SHA} is not an ancestor of origin/main" >&2
+            exit 1
+          fi
           uv run --frozen python - <<'PY'
           import json
           import os
@@ -369,10 +391,15 @@ jobs:
               if not isinstance(head_sha, str) or not re.fullmatch(r"[0-9a-f]{40}", head_sha):
                   fail("artifact run has no valid head_sha")
               head_branch = run.get("head_branch")
-              if head_branch not in (None, "main") and not re.fullmatch(
-                  r"v[0-9A-Za-z._-]+", str(head_branch)
+              if not isinstance(head_branch, str) or (
+                  head_branch != "main"
+                  and not re.fullmatch(r"v[0-9A-Za-z._-]+", head_branch)
               ):
                   fail("artifact run did not come from main or a release tag")
+              if subprocess.run(
+                  ["git", "merge-base", "--is-ancestor", head_sha, "refs/remotes/origin/main"]
+              ).returncode != 0:
+                  fail("artifact run head_sha is not in origin/main history")
               if subprocess.run(
                   ["git", "merge-base", "--is-ancestor", head_sha, current]
               ).returncode != 0:
@@ -407,7 +434,7 @@ jobs:
           path: ${{ runner.temp }}/release-artifacts
           run-id: ${{ env.ARTIFACT_RUN_ID }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
-      - name: Validate the approved manifest digest and loaded image id
+      - name: Validate the approved manifest digest, approval and loaded image id
         shell: bash
         run: |
           set -euo pipefail
@@ -427,16 +454,31 @@ jobs:
 
           out = pathlib.Path(sys.argv[1])
           expected = sys.argv[2]
+          approval_raw = os.environ.get("DATACON_RELEASE_APPROVAL", "")
+          if not approval_raw:
+              raise SystemExit(
+                  "DATACON_RELEASE_APPROVAL must be supplied by the protected "
+                  "internal-lab environment before touching candidate containers or the database"
+              )
+          approval = json.loads(approval_raw)
           manifest = json.loads(
               (out / release.RELEASE_MANIFEST_FILE).read_text(encoding="utf-8")
           )
-          actual = release.canonical_manifest_digest(manifest)
-          if actual != expected:
-              raise SystemExit(f"manifest digest mismatch: {actual} != {expected}")
+          release.verify_promotion_gate(
+              manifest,
+              expected_manifest_digest=expected,
+              approval=approval,
+          )
           expected_head = os.environ.get("VERIFIED_RUN_HEAD_SHA") or os.environ["CURRENT_SHA"]
           if manifest["source_commit"] != expected_head:
               raise SystemExit(
                   "manifest source_commit does not match the verified artifact run head"
+              )
+          if subprocess.run(
+              ["git", "merge-base", "--is-ancestor", manifest["source_commit"], "refs/remotes/origin/main"]
+          ).returncode != 0:
+              raise SystemExit(
+                  "manifest source_commit is not in origin/main history"
               )
           if subprocess.run(
               ["git", "merge-base", "--is-ancestor", manifest["source_commit"], "HEAD"]
@@ -450,7 +492,7 @@ jobs:
               migrations_dir=pathlib.Path("migrations"),
               waivers_path=pathlib.Path(".github/security-waivers.json"),
           )
-          print("manifest and evidence verified")
+          print("manifest, approval and evidence verified")
           PY
           docker load -i "$out/control-plane-image.tar"
           image_id="$(docker image inspect datacon-control-plane:candidate --format '{{.Id}}')"
@@ -472,36 +514,38 @@ jobs:
               )
           print("loaded image id verified")
           PY
-      - name: Smoke the image, database and an archived evidence bundle
+      - name: Check environment preconditions and read-only candidate container DB smoke
         shell: bash
         run: |
           set -euo pipefail
-          docker run --rm datacon-control-plane:candidate --help
-          docker run --rm datacon-control-plane:candidate worker --help
           uv run --frozen python - <<'PY'
           import os
           import psycopg
 
+          from datacon import state
+
+          store = state.ReleaseStore(os.environ["DATACON_DATABASE_URL"])
+          if store.active_release() is None:
+              raise SystemExit(
+                  "release_state is empty; bootstrap the baseline release before promoting"
+              )
+          slots = store.active_slots()
+          if slots != 0:
+              raise SystemExit(
+                  f"promotion blocked: execution slots not drained (active_slots={slots})"
+              )
           with psycopg.connect(os.environ["DATACON_DATABASE_URL"], connect_timeout=5) as conn:
               row = conn.execute("SELECT 1").fetchone()
           if row != (1,):
               raise SystemExit("database smoke failed")
-          print("database smoke ok")
+          print("database preconditions ok")
           PY
-      - name: Smoke the candidate worker from inside the container
-        shell: bash
-        run: |
-          set -euo pipefail
-          secret_file="$(mktemp)"
-          head -c 32 /dev/urandom | base64 > "${secret_file}"
-          chmod 0444 "${secret_file}"
-          trap 'rm -f "${secret_file}"' EXIT
-          docker run --rm --network host \
+          timeout 60 docker run --rm datacon-control-plane:candidate --help
+          timeout 60 docker run --rm datacon-control-plane:candidate worker --help
+          timeout 60 docker run --rm --network host \
             -e DATACON_DATABASE_URL \
-            -e DATACON_JOURNAL_SECRET_FILE=/tmp/journal-secret \
-            -v "${secret_file}:/tmp/journal-secret:ro" \
-            datacon-control-plane:candidate worker --once --prepare-only
-          echo "candidate worker database smoke ok"
+            datacon-control-plane:candidate release slots --environment internal-lab
+          echo "candidate read-only container database smoke ok"
 
       - name: Promote through the persisted backend and record audit
         shell: bash
@@ -557,6 +601,7 @@ jobs:
               return subprocess.run(
                   ["docker", "run", "--rm", "datacon-control-plane:candidate", "--help"],
                   capture_output=True,
+                  timeout=60,
               ).returncode == 0
 
           def db_readable():
@@ -583,6 +628,7 @@ jobs:
                   ],
                   capture_output=True,
                   text=True,
+                  timeout=60,
               )
               if proc.returncode != 0:
                   return False
@@ -603,13 +649,34 @@ jobs:
               "db_readability": db_readable,
               "archived_bundle": archived_bundle_smoke,
           }
-          # Prefer a real archived evidence bundle from the target database
-          # over the synthetic bundle when one exists.
+          # Validate the latest archived bundle path from the target DB (fail
+          # closed on escape or symlink). Only mount and smoke it when the
+          # runner locally mounts previous["evidence_root"] as a real directory.
+          evidence_root_path = pathlib.Path(previous["evidence_root"])
           latest = store.latest_evidence_bundle()
           if latest is not None:
-              smoke_checks["archived_real_bundle"] = lambda: verify_bundle_in_container(
-                  latest["path"], latest["digest"]
-              )
+              if evidence_root_path.is_symlink():
+                  raise SystemExit(
+                      f"refusing promotion: evidence_root is a symlink: {evidence_root_path}"
+                  )
+              if not evidence_root_path.exists():
+                  print(
+                      f"skipping archived_real_bundle: local evidence_root {evidence_root_path} "
+                      "is not mounted on this runner; relying on archived_bundle"
+                  )
+              elif not evidence_root_path.is_dir():
+                  raise SystemExit(
+                      f"refusing promotion: evidence_root is not a directory: {evidence_root_path}"
+                  )
+              else:
+                  latest_path = pathlib.Path(latest["path"])
+                  if latest_path.is_symlink() or not latest_path.is_dir():
+                      raise SystemExit(
+                          f"refusing promotion: latest evidence bundle path is not a real directory: {latest_path}"
+                      )
+                  smoke_checks["archived_real_bundle"] = lambda: verify_bundle_in_container(
+                      latest["path"], latest["digest"]
+                  )
           try:
               result = release.promote_and_smoke(
                   manifest=manifest,
@@ -685,6 +752,11 @@ jobs:
             refs/heads/main|refs/tags/v*) ;;
             *) echo "rollback is only allowed from main or a v* tag" >&2; exit 1 ;;
           esac
+          git fetch --no-tags origin main:refs/remotes/origin/main
+          if ! git merge-base --is-ancestor "${GITHUB_SHA}" refs/remotes/origin/main; then
+            echo "ref commit ${GITHUB_SHA} is not an ancestor of origin/main" >&2
+            exit 1
+          fi
           uv run --frozen python - <<'PY'
           import json
           import os
@@ -732,10 +804,15 @@ jobs:
           if not isinstance(head_sha, str) or not re.fullmatch(r"[0-9a-f]{40}", head_sha):
               fail("artifact run has no valid head_sha")
           head_branch = run.get("head_branch")
-          if head_branch not in (None, "main") and not re.fullmatch(
-              r"v[0-9A-Za-z._-]+", str(head_branch)
+          if not isinstance(head_branch, str) or (
+              head_branch != "main"
+              and not re.fullmatch(r"v[0-9A-Za-z._-]+", head_branch)
           ):
               fail("artifact run did not come from main or a release tag")
+          if subprocess.run(
+              ["git", "merge-base", "--is-ancestor", head_sha, "refs/remotes/origin/main"]
+          ).returncode != 0:
+              fail("artifact run head_sha is not in origin/main history")
           if subprocess.run(
               ["git", "merge-base", "--is-ancestor", head_sha, current]
           ).returncode != 0:
@@ -765,24 +842,42 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          uv run --frozen python - <<'PY'
+          out="$RUNNER_TEMP/release-artifacts"
+          uv run --frozen python - "$out" <<'PY'
           import json
           import os
+          import pathlib
+          import shutil
           import subprocess
+          import sys
 
           from datacon import release, state
 
+          out = pathlib.Path(sys.argv[1])
           store = state.ReleaseStore(os.environ["DATACON_DATABASE_URL"])
           target = store.release_for_image(os.environ["TARGET_DIGEST"])
           if target is None:
               raise SystemExit(
                   "no persisted release record matches target_digest; refusing rollback"
               )
+          target_candidate_digest = (
+              target.get("candidate_digest") or target.get("manifest_digest")
+          )
+          if not target_candidate_digest:
+              raise SystemExit(
+                  "persisted target release record is missing candidate_digest/manifest_digest; refusing rollback"
+              )
+          smoke_bundle = out / "smoke-bundle"
+          shutil.rmtree(smoke_bundle, ignore_errors=True)
+          smoke_bundle_digest = release.write_smoke_evidence_bundle(
+              smoke_bundle, cases_dir=pathlib.Path("tests/fixtures/cases")
+          )
 
           def image_help():
               return subprocess.run(
                   ["docker", "run", "--rm", "datacon-control-plane:candidate", "--help"],
                   capture_output=True,
+                  timeout=60,
               ).returncode == 0
 
           def db_readable():
@@ -793,17 +888,53 @@ jobs:
               ) as conn:
                   return conn.execute("SELECT 1").fetchone() == (1,)
 
+          def archived_bundle_smoke():
+              proc = subprocess.run(
+                  [
+                      "docker",
+                      "run",
+                      "--rm",
+                      "-v",
+                      f"{smoke_bundle}:/bundle:ro",
+                      "datacon-control-plane:candidate",
+                      "verify-bundle",
+                      "/bundle",
+                      "--expected-digest",
+                      smoke_bundle_digest,
+                  ],
+                  capture_output=True,
+                  text=True,
+                  timeout=60,
+              )
+              if proc.returncode != 0:
+                  return False
+              try:
+                  parsed = json.loads(proc.stdout)
+              except json.JSONDecodeError:
+                  return False
+              return (
+                  parsed.get("status") == "valid"
+                  and parsed.get("manifest_digest") == smoke_bundle_digest
+              )
+
           approved_by = os.environ.get("APPROVED_BY", "").strip()
           if not approved_by:
               raise SystemExit("approved_by must identify the dispatching operator")
-          result = release.rollback_release(
-              target_release=target,
-              backend=store,
-              smoke_checks={"cli_smoke": image_help, "db_readability": db_readable},
-              approved_by=approved_by,
-              candidate_digest=os.environ["TARGET_DIGEST"],
-              manifest_digest=target.get("manifest_digest"),
-          )
+          try:
+              result = release.rollback_release(
+                  target_release=target,
+                  backend=store,
+                  smoke_checks={
+                      "cli_smoke": image_help,
+                      "db_readability": db_readable,
+                      "archived_bundle": archived_bundle_smoke,
+                  },
+                  approved_by=approved_by,
+                  candidate_digest=target_candidate_digest,
+                  manifest_digest=target.get("manifest_digest"),
+              )
+          finally:
+              shutil.rmtree(smoke_bundle, ignore_errors=True)
           print(json.dumps(result, indent=2))
           PY
 
@@ -823,6 +954,9 @@ jobs:
       DATACON_B03_ADMISSION: ${{ secrets.DATACON_B03_ADMISSION }}
       DATACON_B03_REVIEW: ${{ secrets.DATACON_B03_REVIEW }}
     steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
       - name: Verify protected ref
         shell: bash
         run: |
@@ -835,9 +969,28 @@ jobs:
             echo "GITHUB_SHA must be a 40-char commit" >&2
             exit 1
           fi
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          fetch-depth: 0
+          git fetch --no-tags origin main:refs/remotes/origin/main
+          if ! git merge-base --is-ancestor "${GITHUB_SHA}" refs/remotes/origin/main; then
+            echo "ref commit ${GITHUB_SHA} is not an ancestor of origin/main" >&2
+            exit 1
+          fi
+      - name: Verify protected ref
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "${GITHUB_REF}" in
+            refs/heads/main|refs/tags/v*) ;;
+            *) echo "build-candidate is only allowed from main or a v* tag" >&2; exit 1 ;;
+          esac
+          if [[ ! "${GITHUB_SHA}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "GITHUB_SHA must be a 40-char commit" >&2
+            exit 1
+          fi
+          git fetch --no-tags origin main:refs/remotes/origin/main
+          if ! git merge-base --is-ancestor "${GITHUB_SHA}" refs/remotes/origin/main; then
+            echo "ref commit ${GITHUB_SHA} is not an ancestor of origin/main" >&2
+            exit 1
+          fi
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.12"

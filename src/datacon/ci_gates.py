@@ -39,6 +39,10 @@ _UNTRUSTED_RUN_EXPR_TOKENS = (
     "github.head_ref",
     "github.ref_name",
     "github.base_ref",
+    "steps.",
+    "steps[",
+    "needs.",
+    "needs[",
 )
 _DOCKER_DIGEST = re.compile(r"docker://[^\s@]+@sha256:[0-9a-f]{64}")
 _RUN_EXPRESSION = re.compile(r"\$\{\{(.*?)\}\}", re.S)
