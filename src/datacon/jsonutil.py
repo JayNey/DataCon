@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
+import sys
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -179,6 +181,33 @@ def resolve_inside(root: Path, relative: str, *, allow_dot: bool = False) -> Pat
                 f"material path {text} must not contain symlinks"
             )
     return candidate
+
+
+def reject_symlink_ancestors(
+    path: Path,
+    *,
+    label: str,
+    error_cls: type[Exception] = ValueError,
+) -> None:
+    """Reject ``path`` if it or any existing ancestor component is a symlink."""
+    ancestors = [path]
+    if path.is_absolute():
+        ancestors.extend(parent for parent in path.parents if parent != Path("/"))
+    else:
+        ancestors.extend(parent for parent in path.parents if parent != Path("."))
+    for candidate in ancestors:
+        if candidate.is_symlink():
+            if sys.platform == "darwin" and candidate in (
+                Path("/var"),
+                Path("/tmp"),
+                Path("/etc"),
+            ):
+                try:
+                    if os.readlink(candidate) == f"private/{candidate.name}":
+                        continue
+                except OSError:
+                    pass
+            raise error_cls(f"{label} must not contain symlink component: {candidate}")
 
 
 def sha256_file(path: Path) -> str:

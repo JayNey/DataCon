@@ -96,6 +96,17 @@
       "verification": "execution_deferred"
     }
   ],
+  "acceptance_workflow": {
+    "owner_task": "T08",
+    "entrypoint": "datacon.release.run_b03_acceptance",
+    "replays_per_version": {
+      "normal": 1,
+      "candidate": 2
+    },
+    "total_replays": 6,
+    "offline_verifier": "datacon.evidence.verify_bundle",
+    "private_storage_contract": "Only sanitized summary, storage_ref, and manifest_digest may be recorded in repository metadata; raw candidate inputs, build logs, full ASan diagnostics, and evidence bundles stay in authorized storage."
+  },
   "usage_boundary": "Public metadata only. No real-case input, build log, diagnostic, credential or evidence bundle is committed. Execution and release acceptance stay in the authorized Linux environment and are deferred to T05/T08.",
   "notes": [
     "This admission record selects B03 for planning; it does not claim a completed reproduction.",

@@ -2774,8 +2774,8 @@ def _archive(
         / f".generation-{context.generation}.old-{uuid.uuid4().hex}"
     )
     try:
-        evidence_root.mkdir(mode=0o700, parents=True, exist_ok=True)
-        evidence_root.chmod(0o700)
+        evidence_root.mkdir(mode=0o755, parents=True, exist_ok=True)
+        evidence_root.chmod(0o755)
         try:
             final_root = _outside_run_root(
                 evidence_root, context.run_root, "DATACON_EVIDENCE_ROOT"
@@ -2790,7 +2790,8 @@ def _archive(
             )
         if job_root.is_symlink():
             raise BundleError("SYMLINK", "evidence destination is a symlink")
-        job_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        job_root.mkdir(mode=0o755, parents=True, exist_ok=True)
+        job_root.chmod(0o755)
         job_info = job_root.lstat()
         if stat.S_ISLNK(job_info.st_mode) or not stat.S_ISDIR(job_info.st_mode):
             raise BundleError(
@@ -2810,6 +2811,8 @@ def _archive(
             # previously archived bundle. An unverified bundle is never
             # published as evidence.
             verify=verify_bundle,
+            dir_mode=0o755,
+            file_mode=0o444,
         )
         # Verification can take time. Refuse to publish unless this exact
         # generation still owns an active lease; a stale worker must never

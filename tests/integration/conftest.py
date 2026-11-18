@@ -1,3 +1,4 @@
+import hashlib
 import os
 from pathlib import Path
 import uuid
@@ -20,6 +21,23 @@ def ci_environment() -> bool:
 def apply_migrations(connection):
     for migration in MIGRATIONS:
         connection.execute(migration.read_text(encoding="utf-8"))
+    # Mirror `datacon migrate`: the promotion gate requires a ledger whose
+    # filename/sha256 pairs prove the database schema matches the manifest.
+    for migration in MIGRATIONS:
+        digest = "sha256:" + hashlib.sha256(migration.read_bytes()).hexdigest()
+        row = connection.execute(
+            "SELECT sha256 FROM schema_migrations WHERE file = %s",
+            (migration.name,),
+        ).fetchone()
+        if row is not None and row[0] != digest:
+            raise RuntimeError(
+                f"test database migration ledger digest mismatch for {migration.name}"
+            )
+        connection.execute(
+            "INSERT INTO schema_migrations (file, sha256) VALUES (%s, %s) "
+            "ON CONFLICT (file) DO UPDATE SET sha256 = EXCLUDED.sha256",
+            (migration.name, digest),
+        )
 
 
 @pytest.fixture(scope="session")

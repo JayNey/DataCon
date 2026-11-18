@@ -1,0 +1,1388 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "Release action: build, promote, or rollback"
+        required: true
+        default: "build"
+        type: choice
+        options:
+          - build
+          - promote
+          - rollback
+      target_digest:
+        description: "Target image id sha256:<64-hex> for rollback"
+        required: false
+        default: ""
+        type: string
+      expected_manifest_digest:
+        description: "Approved release-candidate manifest digest for promotion"
+        required: false
+        default: ""
+        type: string
+      artifact_run_id:
+        description: "Workflow run id holding the candidate artifact (promote/rollback)"
+        required: false
+        default: ""
+        type: string
+      require_archived_bundle:
+        description: "Require a real archived evidence bundle under active evidence_root during promote"
+        required: false
+        default: true
+        type: boolean
+      archived_bundle_skip_reason:
+        description: "Explicit audit reason when require_archived_bundle is false"
+        required: false
+        default: ""
+        type: string
+      run_b03:
+        description: "Run the authorized B03 acceptance job"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+  # Cross-run actions/download-artifact (run-id + github-token) needs read
+  # access to Actions metadata/artifacts. No write permission is ever granted.
+  actions: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test-report:
+    if: >-
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+      && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:17-bookworm@sha256:665dc7b37ac52a17e298511414c21d23ffa4e6a6ef6225b3e5d59c7afb35e994
+        env:
+          POSTGRES_USER: datacon
+          POSTGRES_HOST_AUTH_METHOD: trust
+          POSTGRES_DB: datacon
+        ports:
+          - 127.0.0.1:5432:5432
+        options: >-
+          --health-cmd "pg_isready -U datacon -d datacon"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      DATACON_DATABASE_URL: "postgresql://datacon@127.0.0.1:5432/datacon"
+      DATACON_TEST_DATABASE_URL: "postgresql://datacon@127.0.0.1:5432/datacon"
+      UV_CACHE_DIR: /tmp/uv-cache
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+      - name: Install uv and locked dependencies
+        run: |
+          python -m pip install --disable-pip-version-check --require-hashes \
+            --only-binary :all: -r requirements-ci.txt
+          uv sync --frozen
+      - name: Apply migrations and install the pinned host toolchain
+        run: |
+          uv run --frozen python - <<'PY'
+          import os
+          import pathlib
+
+          from datacon import state
+
+          state.apply_migrations_dsn(
+              os.environ["DATACON_DATABASE_URL"], pathlib.Path("migrations")
+          )
+          PY
+          sudo apt-get update
+          sudo apt-get install -y clang llvm patch
+          docker pull silkeh/clang:19-bookworm@sha256:f5ce959d91f059acf5a4b3f1c19f46713c4b2881c7d7cd1d5143ca1d1412277f
+      - name: Produce four real JUnit reports
+        shell: bash
+        run: |
+          set -uo pipefail
+          mkdir -p "$RUNNER_TEMP/release-junit"
+          status=0
+          bash scripts/run_suite.sh "postgres and not docker" postgres "$RUNNER_TEMP/release-junit/junit-postgres.xml" || status=1
+          bash scripts/run_suite.sh "postgres and docker" docker "$RUNNER_TEMP/release-junit/junit-docker.xml" || status=1
+          bash scripts/run_suite.sh asan asan "$RUNNER_TEMP/release-junit/junit-asan.xml" || status=1
+          bash scripts/run_suite.sh "not postgres and not asan" contract "$RUNNER_TEMP/release-junit/junit-contract.xml" || status=1
+          exit "$status"
+      - name: Upload sanitized JUnit reports
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-junit
+          path: ${{ runner.temp }}/release-junit/*.xml
+          retention-days: 30
+
+  build-candidate:
+    needs: test-report
+    if: >-
+      (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+      && (github.event_name != 'workflow_dispatch' || github.event.inputs.action == 'build')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      manifest_digest: ${{ steps.manifest.outputs.manifest_digest }}
+      image_id: ${{ steps.manifest.outputs.image_id }}
+    steps:
+      - name: Verify protected ref
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
+          CURRENT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          case "${GITHUB_REF}" in
+            refs/heads/main|refs/tags/v*) ;;
+            *) echo "build-candidate is only allowed from main or a v* tag" >&2; exit 1 ;;
+          esac
+          if [[ ! "${CURRENT_SHA}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "GITHUB_SHA must be a 40-char commit" >&2
+            exit 1
+          fi
+          python3 - <<'PY'
+          import json
+          import os
+          import urllib.request
+
+          url = (
+              "https://api.github.com/repos/"
+              + os.environ["REPOSITORY"]
+              + "/compare/main..."
+              + os.environ["CURRENT_SHA"]
+          )
+          req = urllib.request.Request(
+              url,
+              headers={
+                  "Authorization": "Bearer " + os.environ["GITHUB_TOKEN"],
+                  "Accept": "application/vnd.github+json",
+                  "X-GitHub-Api-Version": "2022-11-28",
+              },
+          )
+          with urllib.request.urlopen(req, timeout=20) as resp:
+              data = json.load(resp)
+          if data.get("status") not in ("identical", "behind") or data.get("ahead_by", 1) != 0:
+              raise SystemExit(
+                  f"ref commit {os.environ['CURRENT_SHA']} is not an ancestor of origin/main "
+                  f"(status={data.get('status')!r}, ahead_by={data.get('ahead_by')!r})"
+              )
+          PY
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      - name: Verify checked-out commit ancestry
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin main:refs/remotes/origin/main
+          if ! git merge-base --is-ancestor "${GITHUB_SHA}" refs/remotes/origin/main; then
+            echo "ref commit ${GITHUB_SHA} is not an ancestor of origin/main" >&2
+            exit 1
+          fi
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+      - name: Install uv and locked dependencies
+        run: |
+          python -m pip install --disable-pip-version-check --require-hashes \
+            --only-binary :all: -r requirements-ci.txt
+          uv sync --frozen
+      - name: Download the real JUnit evidence
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-junit
+          path: ${{ runner.temp }}/release-artifacts
+      - name: Build wheel, SBOM, image tar and real Trivy report
+        shell: bash
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/release-artifacts"
+          mkdir -p "$out"
+          uv build --wheel --out-dir "$out"
+          uv run --frozen python - "$out" <<'PY'
+          import pathlib
+          import sys
+
+          from datacon import release
+
+          out = pathlib.Path(sys.argv[1])
+          release.generate_sbom(
+              pyproject_path=pathlib.Path("pyproject.toml"),
+              uv_lock_path=pathlib.Path("uv.lock"),
+              out_path=out / release.SBOM_REPORT_FILE,
+          )
+          PY
+          docker build -t datacon-control-plane:candidate .
+          docker save -o "$out/control-plane-image.tar" datacon-control-plane:candidate
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$out:/out" \
+            aquasec/trivy@sha256:ab70a02200597efa04748f210f793936eb647cbcdb0ea69cc30b226d6f5a22c7 \
+            image --scanners vuln --severity HIGH,CRITICAL --format json \
+            --output /out/trivy.json --exit-code 0 datacon-control-plane:candidate
+          test -s "$out/trivy.json"
+      - name: Fail on unwaived HIGH/CRITICAL findings and run the static gates
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv run --frozen python - "$RUNNER_TEMP/release-artifacts/trivy.json" <<'PY'
+          import pathlib
+          import sys
+
+          from datacon import ci_gates
+
+          report = pathlib.Path(sys.argv[1])
+          waivers = pathlib.Path(".github/security-waivers.json")
+          summary = ci_gates.evaluate_scan_report(
+              report, waivers_path=waivers if waivers.is_file() else None
+          )
+          print(f"scan findings={summary['total']} blocked={summary['blocked']}")
+          PY
+          uv run --frozen python -m datacon.ci_gates --root . \
+            --findings "$RUNNER_TEMP/release-artifacts/trivy.json" \
+            --waivers .github/security-waivers.json --require-scan
+      - name: Emit and verify the Release Candidate Manifest
+        id: manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/release-artifacts"
+          image_id="$(docker image inspect datacon-control-plane:candidate --format '{{.Id}}')"
+          uv run --frozen python - "$out" "$GITHUB_SHA" "$image_id" <<'PY'
+          import hashlib
+          import json
+          import pathlib
+          import sys
+
+          from datacon import release
+
+          out = pathlib.Path(sys.argv[1])
+          commit = sys.argv[2]
+          image_id = sys.argv[3]
+          wheel = sorted(out.glob("*.whl"))[0]
+          wheel_digest = "sha256:" + hashlib.sha256(wheel.read_bytes()).hexdigest()
+          test_digest = release.digest_test_reports(
+              [out / name for name in release.TEST_REPORT_FILES]
+          )
+          scan_digest = "sha256:" + hashlib.sha256(
+              (out / release.SCAN_REPORT_FILE).read_bytes()
+          ).hexdigest()
+          sbom_digest = "sha256:" + hashlib.sha256(
+              (out / release.SBOM_REPORT_FILE).read_bytes()
+          ).hexdigest()
+          manifest = release.build_release_candidate_manifest(
+              source_commit=commit,
+              control_plane_image_id=image_id,
+              wheel_digest=wheel_digest,
+              migrations_dir=pathlib.Path("migrations"),
+              sbom_digest=sbom_digest,
+              test_report_digest=test_digest,
+              scan_report_digest=scan_digest,
+          )
+          release.verify_manifest_evidence(
+              manifest,
+              out,
+              migrations_dir=pathlib.Path("migrations"),
+              waivers_path=pathlib.Path(".github/security-waivers.json"),
+          )
+          (out / release.RELEASE_MANIFEST_FILE).write_text(
+              json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
+          )
+          print("rc_manifest_digest=" + release.canonical_manifest_digest(manifest))
+          print("image_id=" + image_id)
+          PY
+          digest="$(uv run --frozen python - "$out" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          from datacon import release
+
+          manifest = json.loads(
+              (pathlib.Path(sys.argv[1]) / release.RELEASE_MANIFEST_FILE).read_text(
+                  encoding="utf-8"
+              )
+          )
+          print(release.canonical_manifest_digest(manifest))
+          PY
+          )"
+          echo "manifest_digest=$digest" >> "$GITHUB_OUTPUT"
+          echo "image_id=$image_id" >> "$GITHUB_OUTPUT"
+      - name: Upload release candidate artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-candidate-artifacts
+          path: ${{ runner.temp }}/release-artifacts/*
+          retention-days: 30
+
+  promote-internal:
+    needs: [test-report, build-candidate]
+    if: >-
+      !cancelled()
+      && github.event_name == 'workflow_dispatch'
+      && github.ref == 'refs/heads/main'
+      && github.event.inputs.action == 'promote'
+      && needs.test-report.result == 'success'
+      && needs.build-candidate.result == 'skipped'
+    environment: internal-lab
+    runs-on: [self-hosted, linux, x64, datacon-internal]
+    timeout-minutes: 20
+    env:
+      EXPECTED_MANIFEST_DIGEST: ${{ github.event.inputs.expected_manifest_digest }}
+      ARTIFACT_RUN_ID: ${{ github.event.inputs.artifact_run_id }}
+      REQUIRE_ARCHIVED_BUNDLE: ${{ github.event.inputs.require_archived_bundle }}
+      ARCHIVED_BUNDLE_SKIP_REASON: ${{ github.event.inputs.archived_bundle_skip_reason }}
+      DATACON_IMAGE_ARCHIVE_DIR: ${{ vars.DATACON_IMAGE_ARCHIVE_DIR }}
+      CURRENT_SHA: ${{ github.sha }}
+    steps:
+      - name: Verify protected ref
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
+          CURRENT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          case "${GITHUB_REF}" in
+            refs/heads/main) ;;
+            *) echo "promotion is only allowed from main" >&2; exit 1 ;;
+          esac
+          if [[ ! "${CURRENT_SHA}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "GITHUB_SHA must be a 40-char commit" >&2
+            exit 1
+          fi
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          import urllib.request
+
+          run_id = os.environ.get("ARTIFACT_RUN_ID", "").strip()
+          if run_id and not re.fullmatch(r"[0-9]+", run_id):
+              raise SystemExit("artifact_run_id must be numeric")
+          url = (
+              "https://api.github.com/repos/"
+              + os.environ["REPOSITORY"]
+              + "/compare/main..."
+              + os.environ["CURRENT_SHA"]
+          )
+          req = urllib.request.Request(
+              url,
+              headers={
+                  "Authorization": "Bearer " + os.environ["GITHUB_TOKEN"],
+                  "Accept": "application/vnd.github+json",
+                  "X-GitHub-Api-Version": "2022-11-28",
+              },
+          )
+          with urllib.request.urlopen(req, timeout=20) as resp:
+              data = json.load(resp)
+          if data.get("status") not in ("identical", "behind") or data.get("ahead_by", 1) != 0:
+              raise SystemExit(
+                  f"ref commit {os.environ['CURRENT_SHA']} is not an ancestor of origin/main "
+                  f"(status={data.get('status')!r}, ahead_by={data.get('ahead_by')!r})"
+              )
+          PY
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      - name: Verify checked-out commit ancestry and candidate artifact provenance
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ARTIFACT_RUN_ID: ${{ github.event.inputs.artifact_run_id }}
+          REPOSITORY: ${{ github.repository }}
+          CURRENT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin main:refs/remotes/origin/main
+          if ! git merge-base --is-ancestor "${GITHUB_SHA}" refs/remotes/origin/main; then
+            echo "ref commit ${GITHUB_SHA} is not an ancestor of origin/main" >&2
+            exit 1
+          fi
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          import subprocess
+          import urllib.request
+
+          def fail(message):
+              raise SystemExit(message)
+
+          current = os.environ.get("CURRENT_SHA", "").strip()
+          if not re.fullmatch(r"[0-9a-f]{40}", current):
+              fail("GITHUB_SHA is not a 40-char commit")
+          run_id = os.environ.get("ARTIFACT_RUN_ID", "").strip()
+          if run_id:
+              if not re.fullmatch(r"[0-9]+", run_id):
+                  fail("artifact_run_id must be numeric")
+              token = os.environ.get("GITHUB_TOKEN", "").strip()
+              if not token:
+                  fail("GITHUB_TOKEN is required to verify the artifact run")
+              url = (
+                  "https://api.github.com/repos/"
+                  + os.environ["REPOSITORY"]
+                  + "/actions/runs/"
+                  + run_id
+              )
+              request = urllib.request.Request(
+                  url,
+                  headers={
+                      "Authorization": "Bearer " + token,
+                      "Accept": "application/vnd.github+json",
+                      "X-GitHub-Api-Version": "2022-11-28",
+                  },
+              )
+              try:
+                  with urllib.request.urlopen(request, timeout=20) as response:
+                      run = json.load(response)
+              except Exception as error:
+                  fail("cannot read artifact run metadata: " + repr(error))
+              path = str(run.get("path", ""))
+              if not path.endswith(".github/workflows/release.yml"):
+                  fail("artifact run was not produced by release.yml")
+              if run.get("status") != "completed" or run.get("conclusion") != "success":
+                  fail("artifact run did not complete successfully")
+              head_sha = run.get("head_sha")
+              if not isinstance(head_sha, str) or not re.fullmatch(r"[0-9a-f]{40}", head_sha):
+                  fail("artifact run has no valid head_sha")
+              head_branch = run.get("head_branch")
+              if not isinstance(head_branch, str) or (
+                  head_branch != "main"
+                  and not re.fullmatch(r"v[0-9A-Za-z._-]+", head_branch)
+              ):
+                  fail("artifact run did not come from main or a release tag")
+              if subprocess.run(
+                  ["git", "merge-base", "--is-ancestor", head_sha, "refs/remotes/origin/main"],
+                  timeout=30,
+              ).returncode != 0:
+                  fail("artifact run head_sha is not in origin/main history")
+              if subprocess.run(
+                  ["git", "merge-base", "--is-ancestor", head_sha, current],
+                  timeout=30,
+              ).returncode != 0:
+                  fail("artifact run head_sha is not in the protected ref history")
+              env_file = os.environ.get("GITHUB_ENV")
+              if env_file:
+                  with open(env_file, "a", encoding="utf-8") as handle:
+                      handle.write("VERIFIED_RUN_HEAD_SHA=" + head_sha + "\n")
+          print("protected ref and artifact provenance verified")
+          PY
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+      - name: Install uv and locked dependencies
+        run: |
+          python -m pip install --disable-pip-version-check --require-hashes \
+            --only-binary :all: -r requirements-ci.txt
+          uv sync --frozen
+
+      - name: Require an explicit artifact run for a dispatched promotion
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "${ARTIFACT_RUN_ID}" ]; then
+            echo "artifact_run_id is required to promote a previously built candidate" >&2
+            exit 1
+          fi
+      - name: Download the candidate artifact from the selected run
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-candidate-artifacts
+          path: ${{ runner.temp }}/release-artifacts
+          run-id: ${{ env.ARTIFACT_RUN_ID }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Validate the approved manifest digest, approval and loaded image id
+        shell: bash
+        env:
+          DATACON_RELEASE_APPROVAL: ${{ secrets.DATACON_RELEASE_APPROVAL }}
+        run: |
+          set -euo pipefail
+          if [[ ! "${EXPECTED_MANIFEST_DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "expected_manifest_digest must be sha256:<64 hex>" >&2
+            exit 1
+          fi
+          out="$RUNNER_TEMP/release-artifacts"
+          uv run --frozen python - "$out" "$EXPECTED_MANIFEST_DIGEST" <<'PY'
+          import json
+          import os
+          import pathlib
+          import subprocess
+          import sys
+
+          from datacon import release
+
+          out = pathlib.Path(sys.argv[1])
+          expected = sys.argv[2]
+          approval_raw = os.environ.get("DATACON_RELEASE_APPROVAL", "")
+          if not approval_raw:
+              raise SystemExit(
+                  "DATACON_RELEASE_APPROVAL must be supplied by the protected "
+                  "internal-lab environment before touching candidate containers or the database"
+              )
+          approval = json.loads(approval_raw)
+          manifest = json.loads(
+              (out / release.RELEASE_MANIFEST_FILE).read_text(encoding="utf-8")
+          )
+          req_env = os.environ.get("REQUIRE_ARCHIVED_BUNDLE", "true").strip().lower()
+          if req_env not in ("true", "false", ""):
+              raise SystemExit(f"invalid REQUIRE_ARCHIVED_BUNDLE value: {req_env!r}")
+          require_archived_bundle = req_env != "false"
+          skip_reason = os.environ.get("ARCHIVED_BUNDLE_SKIP_REASON", "").strip()
+          release.verify_promotion_gate(
+              manifest,
+              expected_manifest_digest=expected,
+              approval=approval,
+              require_archived_bundle=require_archived_bundle,
+              skip_reason=None if require_archived_bundle else skip_reason,
+          )
+          expected_head = os.environ.get("VERIFIED_RUN_HEAD_SHA") or os.environ["CURRENT_SHA"]
+          if manifest["source_commit"] != expected_head:
+              raise SystemExit(
+                  "manifest source_commit does not match the verified artifact run head"
+              )
+          if subprocess.run(
+              ["git", "merge-base", "--is-ancestor", manifest["source_commit"], "refs/remotes/origin/main"],
+              timeout=30,
+          ).returncode != 0:
+              raise SystemExit(
+                  "manifest source_commit is not in origin/main history"
+              )
+          if subprocess.run(
+              ["git", "merge-base", "--is-ancestor", manifest["source_commit"], "HEAD"],
+              timeout=30,
+          ).returncode != 0:
+              raise SystemExit(
+                  "manifest source_commit is not in the protected ref history"
+              )
+          release.verify_manifest_evidence(
+              manifest,
+              out,
+              migrations_dir=pathlib.Path("migrations"),
+              waivers_path=pathlib.Path(".github/security-waivers.json"),
+          )
+          print("manifest, approval and evidence verified")
+          PY
+          docker load -i "$out/control-plane-image.tar"
+          image_id="$(docker image inspect datacon-control-plane:candidate --format '{{.Id}}')"
+          uv run --frozen python - "$out" "$image_id" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          from datacon import release
+
+          manifest = json.loads(
+              (pathlib.Path(sys.argv[1]) / release.RELEASE_MANIFEST_FILE).read_text(
+                  encoding="utf-8"
+              )
+          )
+          if manifest["control_plane_image_id"] != sys.argv[2]:
+              raise SystemExit(
+                  "loaded image id does not match manifest.control_plane_image_id"
+              )
+          print("loaded image id verified")
+          PY
+          if [ -n "${DATACON_IMAGE_ARCHIVE_DIR:-}" ]; then
+            uv run --frozen python - "$out/control-plane-image.tar" "$image_id" "${DATACON_IMAGE_ARCHIVE_DIR}" <<'PY'
+          import os
+          import pathlib
+          import shutil
+          import sys
+          import uuid
+
+          from datacon import jsonutil
+
+          src_tar = pathlib.Path(sys.argv[1])
+          image_id = sys.argv[2]
+          archive_dir = pathlib.Path(sys.argv[3])
+          if not archive_dir.is_absolute() or ".." in archive_dir.parts:
+              raise SystemExit(f"DATACON_IMAGE_ARCHIVE_DIR must be an absolute path without '..': {archive_dir}")
+          jsonutil.reject_symlink_ancestors(archive_dir, label="DATACON_IMAGE_ARCHIVE_DIR")
+          archive_dir.mkdir(mode=0o755, parents=True, exist_ok=True)
+          archive_dir.chmod(0o755)
+          dest = archive_dir / f"{image_id.removeprefix('sha256:')}.tar"
+          if dest.is_symlink():
+              raise SystemExit(f"archived image tar destination must not be a symlink: {dest}")
+          if not dest.exists():
+              tmp_dest = archive_dir / f".{dest.name}.tmp-{uuid.uuid4().hex}"
+              shutil.copy2(src_tar, tmp_dest)
+              tmp_dest.chmod(0o644)
+              tmp_dest.rename(dest)
+          print(f"archived candidate image tar to {dest}")
+          PY
+          fi
+      - name: Check environment preconditions and read-only candidate container DB smoke
+        shell: bash
+        env:
+          DATACON_DATABASE_URL: ${{ secrets.DATACON_DATABASE_URL }}
+        run: |
+          set -euo pipefail
+          uv run --frozen python - <<'PY'
+          import os
+          import psycopg
+
+          from datacon import state
+
+          store = state.ReleaseStore(os.environ["DATACON_DATABASE_URL"])
+          if store.active_release() is None:
+              raise SystemExit(
+                  "release_state is empty; bootstrap the baseline release before promoting"
+              )
+          slots = store.active_slots()
+          if slots != 0:
+              raise SystemExit(
+                  f"promotion blocked: execution slots not drained (active_slots={slots})"
+              )
+          with psycopg.connect(os.environ["DATACON_DATABASE_URL"], connect_timeout=5) as conn:
+              row = conn.execute("SELECT 1").fetchone()
+          if row != (1,):
+              raise SystemExit("database smoke failed")
+          print("database preconditions ok")
+          PY
+          timeout 60 docker run --rm datacon-control-plane:candidate --help
+          timeout 60 docker run --rm datacon-control-plane:candidate worker --help
+          timeout 60 docker run --rm --network host \
+            -e DATACON_DATABASE_URL \
+            datacon-control-plane:candidate release slots --environment internal-lab
+          echo "candidate read-only container database smoke ok"
+
+      - name: Promote through the persisted backend and record audit
+        shell: bash
+        env:
+          DATACON_DATABASE_URL: ${{ secrets.DATACON_DATABASE_URL }}
+          DATACON_RELEASE_APPROVAL: ${{ secrets.DATACON_RELEASE_APPROVAL }}
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/release-artifacts"
+          uv run --frozen python - "$out" <<'PY'
+          import json
+          import os
+          import pathlib
+          import shutil
+          import subprocess
+          import sys
+
+          from datacon import release, state
+
+          out = pathlib.Path(sys.argv[1])
+          manifest = json.loads(
+              (out / release.RELEASE_MANIFEST_FILE).read_text(encoding="utf-8")
+          )
+          expected = os.environ["EXPECTED_MANIFEST_DIGEST"]
+          approval_raw = os.environ.get("DATACON_RELEASE_APPROVAL", "")
+          if not approval_raw:
+              raise SystemExit(
+                  "DATACON_RELEASE_APPROVAL must be supplied by the protected "
+                  "internal-lab environment"
+              )
+          approval = json.loads(approval_raw)
+          store = state.ReleaseStore(os.environ["DATACON_DATABASE_URL"])
+          previous = store.active_release()
+          if previous is None:
+              raise SystemExit(
+                  "release_state is empty; bootstrap the baseline release before promoting"
+              )
+          smoke_bundle = out / "smoke-bundle"
+          shutil.rmtree(smoke_bundle, ignore_errors=True)
+          smoke_bundle_digest = release.write_smoke_evidence_bundle(
+              smoke_bundle, cases_dir=pathlib.Path("tests/fixtures/cases")
+          )
+
+          def rollback_fn(prev):
+              store.switch(
+                  image_id=prev["image_id"],
+                  config=prev["config"],
+                  migration_version=prev["migration_version"],
+                  evidence_root=prev["evidence_root"],
+                  action="rollback",
+                  candidate_digest=release.canonical_manifest_digest(manifest),
+              )
+              return {"restored_image": prev["image_id"], "ok": True}
+
+          def image_help():
+              return subprocess.run(
+                  ["docker", "run", "--rm", "datacon-control-plane:candidate", "--help"],
+                  capture_output=True,
+                  timeout=60,
+              ).returncode == 0
+
+          def db_readable():
+              import psycopg
+
+              with psycopg.connect(
+                  os.environ["DATACON_DATABASE_URL"], connect_timeout=5
+              ) as conn:
+                  return conn.execute("SELECT 1").fetchone() == (1,)
+
+          def verify_bundle_in_container(bundle_path, expected_digest):
+              proc = subprocess.run(
+                  [
+                      "docker",
+                      "run",
+                      "--rm",
+                      "-v",
+                      f"{bundle_path}:/bundle:ro",
+                      "datacon-control-plane:candidate",
+                      "verify-bundle",
+                      "/bundle",
+                      "--expected-digest",
+                      expected_digest,
+                  ],
+                  capture_output=True,
+                  text=True,
+                  timeout=60,
+              )
+              if proc.returncode != 0:
+                  if proc.stderr:
+                      sys.stderr.write(proc.stderr)
+                  return False
+              try:
+                  parsed = json.loads(proc.stdout)
+              except json.JSONDecodeError:
+                  return False
+              return (
+                  parsed.get("status") == "valid"
+                  and parsed.get("manifest_digest") == expected_digest
+              )
+
+          def archived_bundle_smoke():
+              return verify_bundle_in_container(smoke_bundle, smoke_bundle_digest)
+
+          # Run heavy container smoke checks before taking the PostgreSQL
+          # exclusive advisory lock; only fast DB checks run under the lock.
+          preflight_checks = {
+              "cli_smoke": image_help,
+              "archived_bundle": archived_bundle_smoke,
+          }
+          smoke_checks = {
+              "db_readability": db_readable,
+          }
+          # Require a real archived evidence bundle under active evidence_root by default.
+          req_env = os.environ.get("REQUIRE_ARCHIVED_BUNDLE", "true").strip().lower()
+          if req_env not in ("true", "false", ""):
+              raise SystemExit(f"invalid REQUIRE_ARCHIVED_BUNDLE value: {req_env!r}")
+          require_archived_bundle = req_env != "false"
+          skip_reason = os.environ.get("ARCHIVED_BUNDLE_SKIP_REASON", "").strip()
+          archived_preflight = release.archived_bundle_preflight(
+              evidence_root=previous["evidence_root"],
+              store=store,
+              verify_fn=verify_bundle_in_container,
+              require_archived_bundle=require_archived_bundle,
+              skip_reason=skip_reason or None,
+              approval=approval,
+          )
+          audit_metadata = {}
+          if archived_preflight["status"] == "required":
+              preflight_checks["archived_real_bundle"] = archived_preflight["check_fn"]
+              audit_metadata["archived_real_bundle"] = "verified"
+              audit_metadata["archived_real_bundle_path"] = archived_preflight["bundle_path"]
+          else:
+              audit_metadata["archived_real_bundle"] = "skipped"
+              audit_metadata["archived_real_bundle_skip_reason"] = archived_preflight["reason"]
+          try:
+              result = release.promote_and_smoke(
+                  manifest=manifest,
+                  expected_manifest_digest=expected,
+                  approval=approval,
+                  backend=store,
+                  preflight_checks=preflight_checks,
+                  smoke_checks=smoke_checks,
+                  rollback_fn=rollback_fn,
+                  audit_metadata=audit_metadata,
+                  require_archived_bundle=require_archived_bundle,
+                  skip_reason=None if require_archived_bundle else skip_reason,
+              )
+          finally:
+              shutil.rmtree(smoke_bundle, ignore_errors=True)
+          (out / release.PROMOTION_RESULT_FILE).write_text(
+              json.dumps(result, indent=2) + "\n", encoding="utf-8"
+          )
+          if result["status"] != "promoted":
+              raise SystemExit(f"promotion did not succeed: {result['status']}")
+          print(json.dumps(result, indent=2))
+          PY
+      - name: Upload the promotion result
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-promotion-result
+          path: ${{ runner.temp }}/release-artifacts/promotion-result.json
+          retention-days: 30
+
+  rollback-internal:
+    if: >-
+      github.event_name == 'workflow_dispatch'
+      && github.ref == 'refs/heads/main'
+      && github.event.inputs.action == 'rollback'
+    environment: internal-lab
+    runs-on: [self-hosted, linux, x64, datacon-internal]
+    timeout-minutes: 20
+    env:
+      TARGET_DIGEST: ${{ github.event.inputs.target_digest }}
+      ARTIFACT_RUN_ID: ${{ github.event.inputs.artifact_run_id }}
+      DATACON_IMAGE_ARCHIVE_DIR: ${{ vars.DATACON_IMAGE_ARCHIVE_DIR }}
+      APPROVED_BY: ${{ github.actor }}
+      CURRENT_SHA: ${{ github.sha }}
+    steps:
+      - name: Verify protected ref
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
+          CURRENT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          case "${GITHUB_REF}" in
+            refs/heads/main) ;;
+            *) echo "rollback is only allowed from main" >&2; exit 1 ;;
+          esac
+          if [[ ! "${CURRENT_SHA}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "GITHUB_SHA must be a 40-char commit" >&2
+            exit 1
+          fi
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          import urllib.request
+
+          run_id = os.environ.get("ARTIFACT_RUN_ID", "")
+          if run_id and not re.fullmatch(r"[0-9]+", run_id):
+              raise SystemExit("artifact_run_id must be numeric")
+          url = (
+              "https://api.github.com/repos/"
+              + os.environ["REPOSITORY"]
+              + "/compare/main..."
+              + os.environ["CURRENT_SHA"]
+          )
+          req = urllib.request.Request(
+              url,
+              headers={
+                  "Authorization": "Bearer " + os.environ["GITHUB_TOKEN"],
+                  "Accept": "application/vnd.github+json",
+                  "X-GitHub-Api-Version": "2022-11-28",
+              },
+          )
+          with urllib.request.urlopen(req, timeout=20) as resp:
+              data = json.load(resp)
+          if data.get("status") not in ("identical", "behind") or data.get("ahead_by", 1) != 0:
+              raise SystemExit(
+                  f"ref commit {os.environ['CURRENT_SHA']} is not an ancestor of origin/main "
+                  f"(status={data.get('status')!r}, ahead_by={data.get('ahead_by')!r})"
+              )
+          PY
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      - name: Verify checked-out commit ancestry and rollback artifact provenance
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ARTIFACT_RUN_ID: ${{ github.event.inputs.artifact_run_id }}
+          REPOSITORY: ${{ github.repository }}
+          CURRENT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin main:refs/remotes/origin/main
+          if ! git merge-base --is-ancestor "${GITHUB_SHA}" refs/remotes/origin/main; then
+            echo "ref commit ${GITHUB_SHA} is not an ancestor of origin/main" >&2
+            exit 1
+          fi
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          import subprocess
+          import urllib.request
+
+          def fail(message):
+              raise SystemExit(message)
+
+          current = os.environ.get("CURRENT_SHA", "").strip()
+          if not re.fullmatch(r"[0-9a-f]{40}", current):
+              fail("GITHUB_SHA is not a 40-char commit")
+          run_id = os.environ.get("ARTIFACT_RUN_ID", "")
+          if run_id:
+              if not re.fullmatch(r"[0-9]+", run_id):
+                  fail("artifact_run_id must be a numeric run id to verify rollback provenance")
+              token = os.environ.get("GITHUB_TOKEN", "").strip()
+              if not token:
+                  fail("GITHUB_TOKEN is required to verify the artifact run")
+              url = (
+                  "https://api.github.com/repos/"
+                  + os.environ["REPOSITORY"]
+                  + "/actions/runs/"
+                  + run_id
+              )
+              request = urllib.request.Request(
+                  url,
+                  headers={
+                      "Authorization": "Bearer " + token,
+                      "Accept": "application/vnd.github+json",
+                      "X-GitHub-Api-Version": "2022-11-28",
+                  },
+              )
+              try:
+                  with urllib.request.urlopen(request, timeout=20) as response:
+                      run = json.load(response)
+              except Exception as error:
+                  fail("cannot read artifact run metadata: " + repr(error))
+              path = str(run.get("path", ""))
+              if not path.endswith(".github/workflows/release.yml"):
+                  fail("artifact run was not produced by release.yml")
+              if run.get("status") != "completed" or run.get("conclusion") != "success":
+                  fail("artifact run did not complete successfully")
+              head_sha = run.get("head_sha")
+              if not isinstance(head_sha, str) or not re.fullmatch(r"[0-9a-f]{40}", head_sha):
+                  fail("artifact run has no valid head_sha")
+              head_branch = run.get("head_branch")
+              if not isinstance(head_branch, str) or (
+                  head_branch != "main"
+                  and not re.fullmatch(r"v[0-9A-Za-z._-]+", head_branch)
+              ):
+                  fail("artifact run did not come from main or a release tag")
+              if subprocess.run(
+                  ["git", "merge-base", "--is-ancestor", head_sha, "refs/remotes/origin/main"],
+                  timeout=30,
+              ).returncode != 0:
+                  fail("artifact run head_sha is not in origin/main history")
+              if subprocess.run(
+                  ["git", "merge-base", "--is-ancestor", head_sha, current],
+                  timeout=30,
+              ).returncode != 0:
+                  fail("artifact run head_sha is not in the protected ref history")
+              print("protected ref and rollback artifact provenance verified")
+          else:
+              print(
+                  "artifact_run_id omitted; rollback will resolve target_digest from "
+                  "runner-local/archived image storage and require release_events provenance"
+              )
+          PY
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+      - name: Install uv and locked dependencies
+        run: |
+          python -m pip install --disable-pip-version-check --require-hashes \
+            --only-binary :all: -r requirements-ci.txt
+          uv sync --frozen
+      - name: Validate the rollback target digest
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "${TARGET_DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "target_digest must be sha256:<64 hex>" >&2
+            exit 1
+          fi
+
+      - name: Download the candidate artifact that contains the target image
+        if: env.ARTIFACT_RUN_ID != ''
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-candidate-artifacts
+          path: ${{ runner.temp }}/release-artifacts
+          run-id: ${{ env.ARTIFACT_RUN_ID }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Load the target image and verify its id
+        shell: bash
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/release-artifacts"
+          if [ -n "${ARTIFACT_RUN_ID}" ]; then
+            docker load -i "$out/control-plane-image.tar"
+            loaded="$(docker image inspect datacon-control-plane:candidate --format '{{.Id}}')"
+            if [ "$loaded" != "$TARGET_DIGEST" ]; then
+              echo "loaded image id $loaded does not match target $TARGET_DIGEST" >&2
+              exit 1
+            fi
+          else
+            if ! docker image inspect "${TARGET_DIGEST}" --format '{{.Id}}' >/dev/null 2>&1; then
+              if [ -n "${DATACON_IMAGE_ARCHIVE_DIR:-}" ]; then
+                archive_tar_file="$RUNNER_TEMP/rollback-archive-tar.txt"
+                rm -f "$archive_tar_file"
+                uv run --frozen python - "${DATACON_IMAGE_ARCHIVE_DIR}" "${TARGET_DIGEST}" "$archive_tar_file" <<'PY'
+          import pathlib
+          import sys
+
+          from datacon import jsonutil
+
+          archive_dir = pathlib.Path(sys.argv[1])
+          digest = sys.argv[2]
+          out_file = pathlib.Path(sys.argv[3])
+          if not archive_dir.is_absolute() or ".." in archive_dir.parts:
+              raise SystemExit(f"DATACON_IMAGE_ARCHIVE_DIR must be an absolute path without '..': {archive_dir}")
+          jsonutil.reject_symlink_ancestors(archive_dir, label="DATACON_IMAGE_ARCHIVE_DIR")
+          tar_path = archive_dir / f"{digest.removeprefix('sha256:')}.tar"
+          if tar_path.is_symlink():
+              raise SystemExit(f"archived image tar must not be a symlink: {tar_path}")
+          if not tar_path.is_file():
+              raise SystemExit(f"archived image tar not found for {digest}: {tar_path}")
+          out_file.write_text(str(tar_path), encoding="utf-8")
+          PY
+                archive_tar="$(cat "$archive_tar_file")"
+                docker load -i "$archive_tar"
+              fi
+            fi
+          fi
+          inspected="$(docker image inspect "${TARGET_DIGEST}" --format '{{.Id}}')"
+          if [ "$inspected" != "$TARGET_DIGEST" ]; then
+            echo "target image id $inspected does not match $TARGET_DIGEST" >&2
+            exit 1
+          fi
+      - name: Smoke and restore the persisted target release
+        shell: bash
+        env:
+          DATACON_DATABASE_URL: ${{ secrets.DATACON_DATABASE_URL }}
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/release-artifacts"
+          mkdir -p "$out"
+          uv run --frozen python - "$out" <<'PY'
+          import json
+          import os
+          import pathlib
+          import shutil
+          import subprocess
+          import sys
+
+          from datacon import release, state
+
+          out = pathlib.Path(sys.argv[1])
+          target_image = os.environ["TARGET_DIGEST"]
+          store = state.ReleaseStore(os.environ["DATACON_DATABASE_URL"])
+          current = store.active_release()
+          if current is None:
+              raise SystemExit(
+                  "release_state is empty; no active release to roll back from"
+              )
+          target = store.release_for_image(os.environ["TARGET_DIGEST"])
+          if target is None:
+              raise SystemExit(
+                  "no persisted release record matches target_digest; refusing rollback"
+              )
+          if target.get("action") not in ("bootstrap", "promote", "rollback"):
+              raise SystemExit(
+                  "target_digest lacks a persisted release_events audit record; refusing rollback"
+              )
+          target_candidate_digest = (
+              target.get("candidate_digest") or target.get("manifest_digest")
+          )
+          if not target_candidate_digest:
+              raise SystemExit(
+                  "persisted target release record is missing candidate_digest/manifest_digest; refusing rollback"
+              )
+          smoke_bundle = out / "smoke-bundle"
+          shutil.rmtree(smoke_bundle, ignore_errors=True)
+          smoke_bundle_digest = release.write_smoke_evidence_bundle(
+              smoke_bundle, cases_dir=pathlib.Path("tests/fixtures/cases")
+          )
+
+          def image_help():
+              return subprocess.run(
+                  ["docker", "run", "--rm", target_image, "--help"],
+                  capture_output=True,
+                  timeout=60,
+              ).returncode == 0
+
+          def db_readable():
+              import psycopg
+
+              with psycopg.connect(
+                  os.environ["DATACON_DATABASE_URL"], connect_timeout=5
+              ) as conn:
+                  return conn.execute("SELECT 1").fetchone() == (1,)
+
+          def archived_bundle_smoke():
+              proc = subprocess.run(
+                  [
+                      "docker",
+                      "run",
+                      "--rm",
+                      "-v",
+                      f"{smoke_bundle}:/bundle:ro",
+                      target_image,
+                      "verify-bundle",
+                      "/bundle",
+                      "--expected-digest",
+                      smoke_bundle_digest,
+                  ],
+                  capture_output=True,
+                  text=True,
+                  timeout=60,
+              )
+              if proc.returncode != 0:
+                  if proc.stderr:
+                      sys.stderr.write(proc.stderr)
+                  return False
+              try:
+                  parsed = json.loads(proc.stdout)
+              except json.JSONDecodeError:
+                  return False
+              return (
+                  parsed.get("status") == "valid"
+                  and parsed.get("manifest_digest") == smoke_bundle_digest
+              )
+
+          def release_slots_compatible(image=target_image):
+              proc = subprocess.run(
+                  [
+                      "docker",
+                      "run",
+                      "--rm",
+                      "--network",
+                      "host",
+                      "-e",
+                      "DATACON_DATABASE_URL",
+                      image,
+                      "release",
+                      "slots",
+                      "--environment",
+                      "internal-lab",
+                  ],
+                  capture_output=True,
+                  text=True,
+                  timeout=60,
+              )
+              if proc.returncode != 0:
+                  return False
+              try:
+                  payload = json.loads(proc.stdout)
+              except json.JSONDecodeError:
+                  return False
+              return (
+                  isinstance(payload, dict)
+                  and payload.get("environment") == "internal-lab"
+                  and type(payload.get("active_slots")) is int
+                  and isinstance(payload.get("active_release"), dict)
+                  and payload["active_release"].get("image_id") == current["image_id"]
+              )
+
+          def active_release_restored():
+              active = store.active_release()
+              return active is not None and active.get("image_id") == target["image_id"]
+
+          approved_by = os.environ.get("APPROVED_BY", "").strip()
+          if not approved_by:
+              raise SystemExit("approved_by must identify the dispatching operator")
+          try:
+              result = release.rollback_release(
+                  target_release=target,
+                  backend=store,
+                  smoke_checks={
+                      "cli_smoke": image_help,
+                      "db_readability": db_readable,
+                      "archived_bundle": archived_bundle_smoke,
+                      "release_slots": release_slots_compatible,
+                  },
+                  post_switch_checks={
+                      "active_release_restored": active_release_restored,
+                  },
+                  approved_by=approved_by,
+                  candidate_digest=target_candidate_digest,
+                  manifest_digest=target.get("manifest_digest"),
+              )
+          finally:
+              shutil.rmtree(smoke_bundle, ignore_errors=True)
+          print(json.dumps(result, indent=2))
+          PY
+
+  b03-internal:
+    if: >-
+      github.event_name == 'workflow_dispatch'
+      && github.ref == 'refs/heads/main'
+      && github.event.inputs.run_b03 == 'true'
+    environment: internal-lab
+    # This label is intentionally not a GitHub-hosted runner. The B03 replay
+    # must execute on the authorized internal Linux runner; a missing runner
+    # leaves the job failing/queued instead of skipping the acceptance.
+    runs-on: [self-hosted, linux, x64, datacon-internal]
+    timeout-minutes: 120
+    steps:
+      - name: Verify protected ref
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
+          CURRENT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          case "${GITHUB_REF}" in
+            refs/heads/main) ;;
+            *) echo "B03 acceptance is only allowed from main" >&2; exit 1 ;;
+          esac
+          if [[ ! "${CURRENT_SHA}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "GITHUB_SHA must be a 40-char commit" >&2
+            exit 1
+          fi
+          python3 - <<'PY'
+          import json
+          import os
+          import urllib.request
+
+          url = (
+              "https://api.github.com/repos/"
+              + os.environ["REPOSITORY"]
+              + "/compare/main..."
+              + os.environ["CURRENT_SHA"]
+          )
+          req = urllib.request.Request(
+              url,
+              headers={
+                  "Authorization": "Bearer " + os.environ["GITHUB_TOKEN"],
+                  "Accept": "application/vnd.github+json",
+                  "X-GitHub-Api-Version": "2022-11-28",
+              },
+          )
+          with urllib.request.urlopen(req, timeout=20) as resp:
+              data = json.load(resp)
+          if data.get("status") not in ("identical", "behind") or data.get("ahead_by", 1) != 0:
+              raise SystemExit(
+                  f"ref commit {os.environ['CURRENT_SHA']} is not an ancestor of origin/main "
+                  f"(status={data.get('status')!r}, ahead_by={data.get('ahead_by')!r})"
+              )
+          PY
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      - name: Verify checked-out commit ancestry
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin main:refs/remotes/origin/main
+          if ! git merge-base --is-ancestor "${GITHUB_SHA}" refs/remotes/origin/main; then
+            echo "ref commit ${GITHUB_SHA} is not an ancestor of origin/main" >&2
+            exit 1
+          fi
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+      - name: Install uv and locked dependencies
+        run: |
+          python -m pip install --disable-pip-version-check --require-hashes \
+            --only-binary :all: -r requirements-ci.txt
+          uv sync --frozen
+      - name: Run B03 acceptance and upload only a sanitized summary
+        shell: bash
+        env:
+          DATACON_B03_CASE_ROOT: ${{ secrets.DATACON_B03_CASE_ROOT }}
+          DATACON_B03_ADMISSION: ${{ secrets.DATACON_B03_ADMISSION }}
+          DATACON_B03_REVIEW: ${{ secrets.DATACON_B03_REVIEW }}
+          DATACON_B03_EVIDENCE_DIR: ${{ vars.DATACON_B03_EVIDENCE_DIR }}
+        run: |
+          set -euo pipefail
+          if [ -z "${DATACON_B03_CASE_ROOT}" ] || [ -z "${DATACON_B03_ADMISSION}" ] || [ -z "${DATACON_B03_REVIEW}" ] || [ -z "${DATACON_B03_EVIDENCE_DIR:-}" ]; then
+            echo "B03 requires DATACON_B03_CASE_ROOT, DATACON_B03_ADMISSION, DATACON_B03_REVIEW and DATACON_B03_EVIDENCE_DIR" >&2
+            exit 1
+          fi
+          uv run --frozen python - <<'PY'
+          import json
+          import os
+          import pathlib
+          import shutil
+          import uuid
+
+          from datacon import release
+
+          case_root = pathlib.Path(os.environ["DATACON_B03_CASE_ROOT"])
+          admission = json.loads(
+              pathlib.Path(os.environ["DATACON_B03_ADMISSION"]).read_text(encoding="utf-8")
+          )
+          review = json.loads(os.environ["DATACON_B03_REVIEW"])
+          materials = release.B03CaseMaterials.load(case_root)
+          normal_input = materials.normal_input
+          candidate_input = materials.candidate_input
+          prepared = release.prepare_b03_plan(
+              admission=admission,
+              materials=materials,
+              normal_input=normal_input,
+              candidate_input=candidate_input,
+          )
+          job_id = str(uuid.uuid4())
+          sandbox = release.build_b03_sandbox(
+              prepared["plan"],
+              image=prepared["toolchain_image"],
+              job_id=job_id,
+              run_root=pathlib.Path(os.environ.get("RUNNER_TEMP", "/tmp")) / "b03-runs",
+          )
+          run_id = os.environ.get("GITHUB_RUN_ID", "local")
+          run_attempt = os.environ.get("GITHUB_RUN_ATTEMPT", "1")
+          bundle_out = (
+              pathlib.Path(os.environ.get("RUNNER_TEMP", "/tmp"))
+              / f"b03-bundle-{run_id}-{run_attempt}-{job_id}"
+          )
+          shutil.rmtree(bundle_out, ignore_errors=True)
+          try:
+              acceptance = release.run_b03_acceptance(
+                  admission=admission,
+                  sandbox=sandbox,
+                  normal_input=normal_input,
+                  candidate_input=candidate_input,
+                  bundle_out=bundle_out,
+                  storage_ref=os.environ.get("DATACON_B03_STORAGE_REF", "vault://datacon/b03"),
+                  review=review,
+                  case_root=case_root,
+                  job_id=job_id,
+              )
+              persisted = release.persist_b03_evidence_bundle(
+                  bundle_out,
+                  persist_root=os.environ["DATACON_B03_EVIDENCE_DIR"],
+                  job_id=job_id,
+                  expected_manifest_digest=acceptance["manifest_digest"],
+              )
+          finally:
+              shutil.rmtree(bundle_out, ignore_errors=True)
+          summary = {
+              "benchmark_id": acceptance["benchmark_id"],
+              "cve_id": acceptance["cve_id"],
+              "verdict": acceptance["verdict"],
+              "reason_code": acceptance["reason_code"],
+              "replay_count": acceptance["replay_count"],
+              "bundle_verified": persisted["bundle_verified"],
+              "manifest_digest": acceptance["manifest_digest"],
+              "bundle_manifest_digest": persisted["bundle_manifest_digest"],
+              "bundle_path": persisted["bundle_path"],
+              "storage_ref": acceptance["storage_ref"],
+              "versions": acceptance["versions"],
+          }
+          pathlib.Path("b03-acceptance-summary.json").write_text(
+              json.dumps(summary, indent=2) + "\n", encoding="utf-8"
+          )
+          print(json.dumps(summary, indent=2))
+          expected_verdict = admission.get("expected_verdict", "REPRODUCED")
+          if expected_verdict != "REPRODUCED":
+              raise SystemExit(
+                  f"unexpected B03 expected_verdict: {expected_verdict!r}"
+              )
+          if acceptance["verdict"] != expected_verdict:
+              raise SystemExit(
+                  f"B03 acceptance verdict mismatch: {acceptance['verdict']!r} != {expected_verdict!r}"
+              )
+          if acceptance["reason_code"] != "ASAN_SIGNATURE_MATCHED":
+              raise SystemExit(
+                  f"B03 acceptance reason_code mismatch: {acceptance['reason_code']!r}"
+              )
+          if acceptance["replay_count"] != 6:
+              raise SystemExit(
+                  f"B03 acceptance replay_count mismatch: {acceptance['replay_count']!r}"
+              )
+          if acceptance["bundle_verified"] is not True or persisted["bundle_verified"] is not True:
+              raise SystemExit("B03 acceptance bundle_verified must be True")
+          PY
+      - name: Upload only the sanitized B03 summary
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: b03-acceptance-summary
+          path: b03-acceptance-summary.json
+          retention-days: 30

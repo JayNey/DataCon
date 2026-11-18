@@ -2,7 +2,7 @@
 
 DataCon 是面向授权实验环境的 CVE 复现平台项目。它的目标是让团队在隔离环境中对照运行缺陷版与修复版，并用可离线校验的证据包复核结论。
 
-**项目状态**：MVP 第一批 T01–T02、第二批 T03–T04 已合入 `main`；第三批 T05–T06 在 `feat/mvp-sandbox-evidence` 分支实现，并以 PR 审阅。当前提供本地 CLI 的任务提交、查询、Supervisor 计划生成、人工审核与恢复，PostgreSQL 业务记录与 LangGraph 持久化检查点，离线情报 / Git / Tree-sitter 分析，一次性 Linux Docker 隔离构建与 ASan 回放，六次回放判定、可离线校验的证据包和合成案例端到端 CI。B03 公开案例仍只完成准入，真实案例执行与发布验收属于 T07–T08。
+**项目状态**：MVP 第一批 T01–T02、第二批 T03–T04 已合入 `main`；第三批 T05–T06 在 `feat/mvp-sandbox-evidence` 分支实现，并以 PR 审阅；T07–T08 在本 PR 实现。当前提供本地 CLI 的任务提交、查询、Supervisor 计划生成、人工审核与恢复，PostgreSQL 业务记录与 LangGraph 持久化检查点，离线情报 / Git / Tree-sitter 分析，一次性 Linux Docker 隔离构建与 ASan 回放，六次回放判定、可离线校验的证据包、合成案例端到端 CI、PR 镜像构建门禁以及候选发布清单 / 推广 / 回滚状态机。B03 公开案例仍停在准入阶段：仓库内的 `B03-admission.json` 是 `pending_t05_replay`，`run_b03_acceptance` 会拒绝它；只有在授权 runner 上用冻结签名和真实 case 材料才能执行 B03 验收。
 
 ## 首版范围
 
@@ -23,7 +23,7 @@ DataCon 是面向授权实验环境的 CVE 复现平台项目。它的目标是�
 - 非法 CVE 格式、超出上限的预算、未知字段、重复 JSON 键和其他结构错误返回退出码 `2`，并在连接数据库前拒绝，不产生任务。
 - **T05 隔离执行、构建和测试材料**：`migrations/005_execution_evidence.sql` 增加判定与证据字段；`src/datacon/execution.py` 在 `READY` 后代次领取、复用既有尝试并编排预检 / 探针 / 双版本构建 / 六次回放；`src/datacon/tools/sandbox.py` 以固定镜像构建一次性的非 root、断网、只读根、cap-drop、no-new-privileges、显式固定 seccomp profile 容器，验证并记录 CPU / 内存 / PID / 可写空间 / 超时 / 清理；`started` / `completed` / `infra_error` 尝试、磁盘工具日志和旧代次写回围栏支持工具结束、结果入库前退出的恢复。
 - **T06 验证、报告与证据**：`src/datacon/asan.py` 解析原始 ASan 日志与签名；`src/datacon/verdict.py` 按 SRS 优先级返回 `REPRODUCED`、`NOT_REPRODUCED` 或 `INCONCLUSIVE`；`src/datacon/evidence.py` 写出 `manifest.json`、`report.json`、`report.md`、计划、审核快照、构建产物 / 日志、原始诊断和元数据，并实现 `datacon export` 与离线 `datacon verify-bundle`。`status` 返回 `verdict`、`verdict_reason`、`verdict_current` 和证据可用性 / 归档错误。
-- **B03 准入**：`B03-admission.json` / `B03-admission.md` 记录公开候选 `CVE-2019-13224` 的公告、修复提交、许可、离线构建、共享 harness 和 ASan 计划。状态为 `conditional_admission`；真实案例执行与发布验收按任务顺序留到 T08。
+- **B03 准入**：`B03-admission.json` / `B03-admission.md` 记录公开候选 `CVE-2019-13224` 的公告、修复提交、许可、离线构建、共享 harness 和 ASan 计划。仓库内状态仍是 `conditional_admission` / `expected_verdict_status=pending_t05_replay`；`release.run_b03_acceptance` 现在把该状态作为硬拒绝条件，必须由 T05 在授权环境冻结 ASan 签名后才能执行。
 
 ## 快速开始
 
@@ -66,7 +66,11 @@ for migration in migrations/*.sql; do
 done
 ```
 
-本机有 `psql` 时也可以逐个执行 `psql -v ON_ERROR_STOP=1 "$DATACON_DATABASE_URL" -f "$migration"`。七个迁移都可重复执行，但任一语句失败会立即中止并返回非 0；`001`、`002` 只增量加列和表，不删除 T01/T02 的任务；`003` 在不丢数据的前提下把旧 `002` 的 `attempts` 唯一键升级为包含 `generation` 的形状；`004` 只把旧 binary 任务的 `workflow_synced` 回填为 `true`；`005` 只增加 `verdict`、`verdict_reason` 和证据归档字段及约束；`006` 只增加可为空的 `attempts.attempt_token` 与索引，旧任务保持有效且不会被复用为无 provenance 的 journal；`007` 先把违反“归档证据不变量”（`evidence_status = 'archived'` 但缺 `evidence_path` / `evidence_digest`，或非 `'archived'` 却残留 `verdict` / `verdict_reason` / `evidence_path` / `evidence_digest`）的旧行清理为 `evidence_status = 'failed'` 且相关列置空，再添加 `jobs_archived_evidence_check` 与 `jobs_failed_evidence_no_verdict_check` 约束。`005` / `006` / `007` 在事务开头取 `pg_advisory_xact_lock(hashtext('datacon:migrations'))`，并发执行同一迁移会串行等待，不会因 `ADD CONSTRAINT` 竞态失败。
+本机有 `psql` 时也可以逐个执行 `psql -v ON_ERROR_STOP=1 "$DATACON_DATABASE_URL" -f "$migration"`。八个迁移都可重复执行，但任一语句失败会立即中止并返回非 0；`001`、`002` 只增量加列和表，不删除 T01/T02 的任务；`003` 在不丢数据的前提下把旧 `002` 的 `attempts` 唯一键升级为包含 `generation` 的形状；`004` 只把旧 binary 任务的 `workflow_synced` 回填为 `true`；`005` 只增加 `verdict`、`verdict_reason` 和证据归档字段及约束；`006` 只增加可为空的 `attempts.attempt_token` 与索引，旧任务保持有效且不会被复用为无 provenance 的 journal；`007` 先把违反“归档证据不变量”（`evidence_status = 'archived'` 但缺 `evidence_path` / `evidence_digest`，或非 `'archived'` 却残留 `verdict` / `verdict_reason` / `evidence_path` / `evidence_digest`）的旧行清理为 `evidence_status = 'failed'` 且相关列置空，再添加 `jobs_archived_evidence_check` 与 `jobs_failed_evidence_no_verdict_check` 约束；`008` 新增 `schema_migrations` 迁移账本、`release_state`（当前 active image / config / migration / evidence root）与只追加的 `release_events` 审计表；幂等键是 `WHERE action = 'promote'` 的 partial unique index `release_events_promote_unique_idx (environment, candidate_digest)`，它让重复 promote 不重复切换或重复写审计，同时允许对同一 baseline 多次 rollback。`release_events` 还记录 `bootstrap` 动作，持久化 baseline 的完整快照，避免首次 promote 覆盖 `release_state` 后无法回滚。`005` / `006` / `007` / `008` 在事务开头取 `pg_advisory_xact_lock(hashtext('datacon:migrations'))`，并发执行同一迁移会串行等待，不会因 `ADD CONSTRAINT` 竞态失败。
+
+迁移账本：推荐用 `PYTHONPATH=src python -m datacon.cli migrate --migrations-dir migrations`（安装后即 `datacon migrate`）应用迁移。它按文件名顺序执行 `migrations/*.sql`，并把每个文件的 `sha256` 写入 `schema_migrations`；重复执行时只补未记录的迁移，已记录文件的摘要发生变化会 fail closed。promote 会在切换前要求目标库账本与候选 manifest 的 `migrations` 文件名和摘要完全一致；rollback 还会检查目标版本之后跨越的迁移是否都在 `release.ROLLBACK_COMPATIBLE_MIGRATIONS` 的显式前向兼容边界内，否则拒绝回滚，避免 `release_state.migration_version` 对真实 schema 撒谎。若数据库是由旧流程直接执行 SQL（没有账本），先运行一次 `datacon migrate` 补齐（迁移本身均可重复执行）。
+
+基线发布：新环境必须先写入 baseline，否则 promote 会拒绝。使用 `datacon release bootstrap --image-id sha256:<64-hex> --migration-version 008_release_events.sql --evidence-root "$DATACON_EVIDENCE_ROOT" [--config '<json>']`；它会原子地写 `release_state` 与一条 `bootstrap` 审计事件，重复执行相同基线是幂等的，冲突基线会 fail closed。`release_state` 是控制面发布账本，只被 promote / rollback / smoke 消费，不驱动 `worker` 选择镜像；worker 仍从 `DATACON_RUN_ROOT` / 部署配置读取运行时镜像，部署入口应把同一 image id 与 `release_state` 对齐。
 
 发布说明（迁移锁）：`002` 的 `CREATE INDEX` 会短暂阻塞写入，`003` 的 `ADD CONSTRAINT ... UNIQUE` 需要扫描并重写 `attempts` 的索引，在大型表上会持有强锁。对已有大量数据的部署应在维护窗口执行，或先评估“`CREATE UNIQUE INDEX CONCURRENTLY` + 以现有唯一索引挂接约束”的方案；`CONCURRENTLY` 不能在事务块内运行，也不能与当前按文件整段执行的迁移脚本混用。本仓库的合成数据集很小，不在迁移中自动切换，以免改变可审计的建表顺序。
 
@@ -119,6 +123,9 @@ uv run datacon verify-bundle ./evidence-export
 | `datacon worker [--once] [--poll-seconds N] [--prepare-only]` | 领取队列 / 待审 / 已决任务，领取 `READY` 执行或恢复 `RUNNING` / `ARCHIVING`；重启后读取持久化记录。`--prepare-only` 只同步工作流，不执行目标 |
 | `datacon export JOB_ID --out DIR` | 校验并复制已归档证据包；不覆盖非空目录 |
 | `datacon verify-bundle DIR [--expected-digest SHA256]` | 离线校验清单、文件摘要、路径与符号链接；不访问数据库或网络 |
+| `datacon migrate [--migrations-dir DIR]` | 按文件名顺序应用 SQL 迁移并写入 `schema_migrations` 账本；已记录迁移摘要变化会 fail closed |
+| `datacon release slots [--environment internal-lab]` | 从 PostgreSQL 读取真实 active slots 与当前 active release（仅支持单一控制面环境 `internal-lab`，其他值 fail closed）；推广 workflow 不再由调用方手填这两个值 |
+| `datacon release bootstrap --image-id DIGEST --migration-version FILE --evidence-root DIR [--config JSON \| --config-file PATH] [--environment internal-lab]` | 在 `internal-lab` 写入基线 `release_state` 与 `bootstrap` 审计快照；要求 `migration_version` 已在 `schema_migrations` 账本中记录 |
 
 | 退出码 | 含义 |
 | ---: | --- |
@@ -319,24 +326,31 @@ src/datacon/
   verdict.py            SRS 判定优先级
   asan.py               原始 ASan 日志解析与签名匹配
   evidence.py           证据包写入、离线校验与导出
+  ci_gates.py           T07 静态规范、链接、REQ/TC、Action SHA、JUnit、密钥与漏洞豁免门禁
+  b04_eval.py           T07 B04 离线标注集三轮 Agent 评估门禁
+  release.py            T07/T08 候选发布清单、CycloneDX SBOM、推广冒烟、回滚与 B03 验收
   agent_contracts.py    AgentInput / AgentOutput / Finding
   agents/analysis.py    离线情报、版本、diff、事实 / 假设与计划冻结
   tools/source.py       受限 Git 与 Tree-sitter
   tools/sandbox.py      一次性 Docker 隔离探针、构建与回放
   data/cases/           wheel 默认案例注册表与合成材料
   data/seccomp/         固定 seccomp profile（计划记录其 canonical 摘要）
-migrations/             001 任务表、002 工作流增量、003 attempts 代次键升级、004 旧 binary 回填、005 判定 / 证据、006 journal provenance token、007 归档证据不变量修复与 CHECK
+migrations/             001 任务表、002 工作流增量、003 attempts 代次键升级、004 旧 binary 回填、005 判定 / 证据、006 journal provenance token、007 归档证据不变量修复与 CHECK、008 发布状态 / 审计事件 / 迁移账本
 examples/               示例请求
-tests/contract/         请求、计划、Agent、分析、判定、证据、沙箱策略、wheel 与案例材料 / B03
-tests/integration/      真实 PostgreSQL CLI / 审核 / 恢复 / 重试 / 迁移 / 执行 / ASan 回放
+tests/contract/         请求、计划、Agent、分析、判定、证据、沙箱策略、wheel、CI 门禁、B04、发布与 B03
+tests/integration/      真实 PostgreSQL CLI / 审核 / 恢复 / 重试 / 迁移 / 执行 / 回滚 / ASan 回放
 tests/e2e/              真实 Docker 的 MVP-01 至 MVP-04
-tests/fixtures/cases/   测试基线镜像（合成材料、Git bundle、公告、注册表与 B03）
-.github/workflows/      PR CI
+tests/fixtures/cases/   测试基线镜像（合成材料、Git bundle、公告、注册表、B03 与 B04）
+.github/workflows/      CI 合并门禁（ci.yml）与候选发布/推广/回滚（release.yml）
+Dockerfile              T07 控制面非 root 容器镜像构建配方
 ```
 
-## 范围外
+## M3 交付（T07–T08）
 
-T07–T08 仍不包含在本批：真实公开 CVE 的发布验收、控制面镜像 / 工具链镜像发布、SBOM 与镜像扫描、按摘要晋级与回滚演练留在后续任务。本批也不实现二进制逆向、CodeQL、AFL++ / libFuzzer 搜索和 Web 界面。真实案例只在授权实验环境执行。
+- **T07 CI 与制品生成**：`src/datacon/ci_gates.py` 用 PyYAML 解析 workflow，先检测整份文档（含 `on:`）的 YAML anchor 环并强制 `_walk_yaml` / `_iter_yaml_strings` 150,000 节点预算（阻断指数级 YAML alias bomb），只接受 `contents: read` / `actions: read`，拒绝 `pull_request_target`、任何 write 权限、`continue-on-error` 真值、未固定到 40 位 SHA 的 Action 或外部 reusable workflow、任何 `secrets: inherit` 以及外部 reusable workflow 的 `secrets` 映射（仅保留本地 `./` reusable workflow 的 `secrets:` 映射），并拒绝 `run:`、`with:`（同时校验 `with:` 的 key 必须为静态标识符、不允许 `${{` / `$` 表达式）、`runs-on:`、`strategy.matrix:` 中的表达式注入：必须通过 `env:` + shell 变量（如 `"$TITLE"`）引用，禁止直接使用 `${{ env.* }}`、`${{ matrix.* }}`、方括号索引（如 `github['event']` / `inputs[...]` / `steps[...]` / `needs[...]`）、`toJSON(github)` / `fromJSON(...)` / `format(...)` 及 `github.event*` / `github.ref` / `github.actor` / `github.triggering_actor` / `github.*_ref`（仅 `actions/download-artifact` 的数值型 `with.run-id: ${{ env.ARTIFACT_RUN_ID }}` 经前置 API 校验后允许）；waiver 拒绝空前缀 `package:` / `target:`；`scan_secrets` 扫描 `git` 工作树中的测试、示例、`Dockerfile` 和 `uv.lock`；`check_dependency_lock` 用 `tomllib` 解析 `pyproject.toml` / `uv.lock`，注释行不能满足 pin。PR CI 的独立 `image` job 真实执行 `docker build`、默认 entrypoint / `worker --help`、非 root UID、`docker` / `git` / `clang` 与缺失 journal secret 的 fail-closed smoke；测试 job 通过共享脚本 `scripts/run_suite.sh` 执行四组测试，同时尊重 `pytest` 与 `check_junit_report` 退出码，并在四组 marker 全集上断言两两不交且覆盖全部用例。B04 使用显式注入的 `OfflineContractModel`（不是默认空模型；它是离线契约替身，不代表真实 LLM 的模型质量），要求 `model_invocations > 0`、`expected_evidence_refs` 被实际证据覆盖，零事实 / 零下游记 0 而不是 1.0。`Dockerfile` 两处 `FROM` 使用同一个当前有效 digest，builder venv 固定在 `/app/.venv`，runtime 安装 `docker` / `git` / `clang` 并通过非 root entrypoint 启动。
+- **T08 发布、B03 验收与回滚**：`src/datacon/release.py` 与 `.github/workflows/release.yml` 实现 CycloneDX SBOM、Release Candidate Manifest（`control_plane_image_id`、JUnit test digest、Trivy scan digest、wheel / SBOM / migrations digest）、`verify_manifest_evidence` 产物重算、Promotion Gate（approval 有效期 / 绑定 / 槽位 / 持久化 previous release）、`state.ReleaseStore` 的 `release_state` + `release_events` 审计与幂等、以及“先切到 candidate 再跑 smoke”的因果回滚：控制面固定单环境 `internal-lab`（`ReleaseStore` 与 CLI 对其他环境名 fail closed），且禁止推广四字段与当前完全相同的版本；纯容器/镜像校验通过 `preflight_checks` 在获取 PostgreSQL 排他 advisory lock 之前运行，`ReleaseStore._connection()` 与 `ReleaseStore.transaction()` 均通过 `to_regclass` 校验 `schema_migrations` / `release_state` / `release_events` 存在性，使未迁移数据库上的所有 `ReleaseStore` 公开入口（`active_release`、`active_slots`、`promotion_for`、`release_for_image`、`latest_evidence_bundle`、`events`、`bootstrap_release` 等）均抛出 `ReleaseStateError`，`datacon release slots` 与 `datacon release bootstrap` 一样在未迁移库上返回退出码 `2`（`INVALID_RELEASE_STATE`）；smoke 失败时 `rollback_fn` 必须真实把 backend 从 candidate 切回 previous 的 image / config / migration / evidence_root，no-op 或 `action="promote"` 假回滚在 `DictPromotionBackend` 与 `ReleaseStore` 上均会抛 `ReleaseGateError`；`rollback_release` 也拒绝“目标等于当前 active release”的 no-op 回滚（在切换前与事务内重读后均 fail closed，不写 `switch` 或审计）；`release_for_image` 优先回溯镜像自身最近一次 `promote` / `bootstrap` 溯源记录，避免失败 smoke 的自动回滚覆盖 `candidate_digest` / `source_commit`；promote 在切换前核对目标库 `schema_migrations` 账本与 manifest，bootstrap 要求 `migration_version` 等于 `schema_migrations` 中序号最新的迁移文件，rollback 强制检查前向兼容边界并支持事务内 `post_switch_checks`。`release.yml` 中 `test-report` 限制在 `main` / `v*` 的 `push` 或 `workflow_dispatch`，`build-candidate` 保留 `main` / `v*` tag 构建（无敏感 secrets），而所有带敏感 secrets 的 job（`promote-internal` / `rollback-internal` / `b03-internal`）**只允许从 `refs/heads/main` 的 `workflow_dispatch` 进入**（已移除 tag push 自动 promote 死路径）；所有四个内部 job 均在 `actions/checkout` 前通过 GitHub Compare API 校验 `origin/main` 祖先关系，在 `setup-python` / `uv sync --frozen` 前复核本地 git 历史并将敏感 secrets 收窄到最终需要的 step。B03 job 只在 `main` 的 `workflow_dispatch` 且 `run_b03=true` 时运行，`runs-on: [self-hosted, linux, x64, datacon-internal]`、`environment: internal-lab`，在清理临时目录前把完整 bundle 持久化到 `DATACON_B03_EVIDENCE_DIR/<job_id>/` 并以 `evidence.verify_bundle` 复验（未配置 `DATACON_B03_EVIDENCE_DIR` 时 fail closed），Actions artifact 只上传脱敏 summary（含 `bundle_path`、`bundle_manifest_digest`、`bundle_verified`），绝不上传完整 case bundle；仓库内 pending admission 会被拒绝，`prepare_b03_plan` 要求 `admission["status"]` 属于显式允许列表、`toolchain_image == TOOLCHAIN_IMAGE`、全部关键准入检查为 `pass`（要求非空 `evidence` 字段；仅 `asan_replay` 允许显式 `deferred`）且由 `admission["harness"]` 显式提供 `expected_stdout` 与 `candidate_clean_exit_code`，`_require_probe` 强制要求 `checks["errors"] == []`，`run_b03_acceptance` 校验传入输入字节与 `case_root` 一致。TC-10 测试断言回滚后 active image / config / migration 真的回到 previous，而不仅是数据库视图不变。
+- **发布镜像的 digest 边界、30 天 artifact 保留边界与 baseline 回滚**：本 PR 不向 ghcr.io 推送镜像（推送需要 `packages: write`，与 CI 最小权限门禁冲突）。因此 manifest 字段是 `control_plane_image_id`（`docker save` tar 中的本机 image id），不是可跨 registry 推广的 digest；`release.yml` 用同一 tar 和 image id 做 promote / rollback，且 `release-candidate-artifacts`（含 `control-plane-image.tar`）的 GitHub Actions `retention-days` 为 30 天。对于 `datacon release bootstrap` 初始化的 baseline 镜像或超过 30 天已过期的历史版本，`rollback-internal` 支持省略 `artifact_run_id`：优先复用 runner 本地 Docker 存储或持久镜像归档目录 `DATACON_IMAGE_ARCHIVE_DIR/<hex>.tar`，并通过 `docker image inspect "$TARGET_DIGEST"` 精确比对不可变 ID 以及校验 `release_events` 持久化审计记录（严禁未在 `release_events` 登记的镜像被回滚）。
+- **internal-lab 环境与历史 tag 风险（必检仓库设置）**：代码不能创建 GitHub Environment，也不能追溯修改历史提交（例如旧 PR 提交 `04f45b8`）里的旧版 `release.yml`；由于 `04f45b8` 已存在于远端对象库中，即使合入时使用 squash merge，任何能推送 `v*` tag 的用户仍可将 `v*` tag 指向 `04f45b8` 触发旧 workflow 并接触 `internal-lab` secrets。因此维护者**必须在合入前同时完成** [docs/release-settings.md](docs/release-settings.md) 中的全部控制面设置：在 Settings → Environments 创建 `internal-lab`（Deployment branches and tags 限制为**仅 `main`**，开启 required reviewers，并配置 `DATACON_DATABASE_URL`、`DATACON_RELEASE_APPROVAL`、B03 secrets 及 `DATACON_B03_EVIDENCE_DIR`），开启 **`v*` tag protection**，并在 `main` 分支开启 `Require review from Code Owners`（配合 [CODEOWNERS](.github/CODEOWNERS)）。`squash merge` 仅作整洁历史建议，不构成安全替代；在完成并确认这些设置及自托管 runner 在线前，控制面保护与内部发布仍处于阻塞状态。
 
 ## 安全与数据
 
@@ -350,7 +364,42 @@ T07–T08 仍不包含在本批：真实公开 CVE 的发布验收、控制面�
 
 ## CI
 
-`.github/workflows/ci.yml` 在 Pull Request 和 `main` 分支推送时运行：安装锁定依赖、启动固定 digest 的 PostgreSQL 17、按文件名顺序应用 `migrations/*.sql`、安装宿主 `clang` / LLVM symbolizer / patch，并在 pytest 前显式检查 `DATACON_TEST_DATABASE_URL`、这些工具、Docker 和固定 clang 镜像。CI 把契约、PostgreSQL、真实 Docker 隔离 / 合成端到端和 ASan 用例分成四组执行，逐个解析 JUnit 报告，要求每组 `total > 0` 且 `skipped=0`；缺少数据库、clang、llvm-symbolizer、Docker 或镜像时会在测试侧 `fail` 而不是 skip。wheel 冒烟会把构建产物安装进临时 venv，执行 `datacon --help`，断言 `importlib.metadata` 的版本 / 依赖 / `datacon = datacon.cli:main` entry point，并从安装后的 wheel 解析和 `analyze_case` 默认案例。`uv` 按 `requirements-ci.txt` 中的 wheel hash 安装；构建后端固定为 uv 自带的 `uv_build==0.12.7`，`uv sync --frozen` 不解析或安装 setuptools，CI 还会以 verbose 重装确认实际使用的是内置后端。第三方 Action 固定到完整提交 SHA，工作流只有 `contents: read` 权限。真实 Docker 组在一次性 Linux runner 上运行固定镜像探针、双版本构建、六次回放、恢复和验包，不接触真实案例材料。本地未设置 `DATACON_TEST_DATABASE_URL`、缺少 clang 或 Docker 守护进程时仍允许显式 skip；`CI=true` 时不允许。
+`.github/workflows/ci.yml` 在 Pull Request 和 `main` 分支推送时运行：安装锁定依赖、启动固定 digest 的 PostgreSQL 17、按文件名顺序应用 `migrations/*.sql`、安装宿主 `clang` / LLVM symbolizer / patch，并在 pytest 前显式检查 `DATACON_TEST_DATABASE_URL`、这些工具、Docker 和固定 clang 镜像。独立 `image` job 在每个 PR 上真实 `docker build` 控制面镜像并 smoke 默认 / `worker` entrypoint、非 root UID 和运行时工具。测试 job 先用 `pytest --collect-only` 比较四组 marker 的 total 之和与全集，再逐个解析 JUnit 报告，要求每组 `total > 0` 且 `skipped=0`；四组用累计 `status` 收集结果，某一组失败不会掩盖其余组，JUnit 仍 `always()` 上传。缺少数据库、clang、llvm-symbolizer、Docker 或镜像时会在测试侧 `fail` 而不是 skip。`python -m datacon.ci_gates --root .` 在 PR 中运行显式的 secret / lock / workflow 静态子集；真实 Trivy 报告和 `evaluate_scan_findings` 在 `release.yml` 的 build-candidate 中执行，缺失报告时 release 直接失败。wheel 冒烟会把构建产物安装进临时 venv，执行 `datacon --help`，断言 `importlib.metadata` 的版本 / 依赖 / `datacon = datacon.cli:main` entry point，并从安装后的 wheel 解析和 `analyze_case` 默认案例。`uv` 按 `requirements-ci.txt` 中的 wheel hash 安装；构建后端固定为 uv 自带的 `uv_build==0.12.7`，`uv sync --frozen` 不解析或安装 setuptools，CI 还会以 verbose 重装确认实际使用的是内置后端。第三方 Action 固定到完整提交 SHA；`ci.yml` 只有 `contents: read`，`release.yml` 因跨 run 下载 artifact 只有 `contents: read` + `actions: read`，二者都没有任何 write 权限。真实 Docker 组在一次性 Linux runner 上运行固定镜像探针、双版本构建、六次回放、恢复和验包，不接触真实案例材料。本地未设置 `DATACON_TEST_DATABASE_URL`、缺少 clang 或 Docker 守护进程时仍允许显式 skip；`CI=true` 时不允许。
+
+### 发布 workflow（`release.yml`）
+
+`release.yml` 的 `build-candidate`（支持 `main` / `v*` tag push 及 `action=build` 的 dispatch，无敏感 secrets）会产出 wheel、CycloneDX SBOM、`control-plane-image.tar`、四份真实 JUnit 与 Trivy JSON，并在重算摘要之外实际解析 JUnit（`scripts/run_suite.sh` 同时尊重 `pytest` 与 `check_junit_report` 退出码，要求 testcase 数量 > 0 且 0 skip/failure/error）与 Trivy（非空扫描目标、waiver 的 id+scope），不再只比对 sha256；promote / rollback 只消费这些 artifact，不再用 `echo` 冒充切换。`test-report` 通过 `if:` 限制为 `main` / `v*` 的 `push` 或 `workflow_dispatch`（分支 dispatch 不跑）。所有带敏感 secrets 的 job（`promote-internal` / `rollback-internal` / `b03-internal`）仅允许 `refs/heads/main` 上的 `workflow_dispatch`（tag push 只构包不 promote），并在 `actions/checkout` 之前通过 GitHub Compare API 校验 `GITHUB_SHA` 属于 `main` 历史，在 `setup-python` / `uv sync --frozen` 之前拉取 `origin/main` 再次验证 `GITHUB_SHA` 与 `manifest["source_commit"]` 均属于 `refs/remotes/origin/main` 历史；跨 run 的 `artifact_run_id` 会通过 GitHub API 校验 workflow 为 `release.yml`、结论为 success、拒绝 `head_branch` 为 `None`、要求 `head_sha` 属于 `refs/remotes/origin/main` 与当前受保护 ref 历史，且 manifest 的 `source_commit` 与该 run 的 head 一致。`promote-internal`、`rollback-internal` 与 `b03-internal` 三个敏感内部 job 均统一运行在挂载证据卷并可访问内网数据库的授权自托管 runner `[self-hosted, linux, x64, datacon-internal]` 上（不使用 `ubuntu-latest`）。`promote-internal` 仅向需要凭证的 step 注入敏感 secret env，在连接数据库或启动候选容器前先验证 `DATACON_RELEASE_APPROVAL`、基线存在及 `active_slots == 0`，随后在候选容器内运行只读 `datacon release slots --environment internal-lab`（不调用 `worker --once --prepare-only`，不消费或修改 `jobs` 队列），并将纯容器/bundle smoke 放在 `preflight_checks` 中于持锁事务前完成；`archived_real_bundle` 默认 **fail closed**：`ReleaseStore.latest_evidence_bundle(..., strict=True)` 与 `release.archived_bundle_preflight` 要求 active `evidence_root` 已挂载且存在合法归档 bundle（跨代次历史根仍会被隔离跳过，但 active root 下无 bundle 时会报错提示在挂载证据卷的 runner 上推广）；仅当显式传入 `require_archived_bundle=false`、非空 `archived_bundle_skip_reason` 且 `DATACON_RELEASE_APPROVAL` 同步签署 `allow_skip_archived_bundle: true` 与一致的 `archived_bundle_skip_reason` 时才允许跳过，并把 `archived_real_bundle: "skipped"` 与原因写入 `promotion-result.json` 和 `release_events` 审计表。`rollback-internal` 在 `rollback_release` 切换前的 `smoke_checks` 中执行带超时（60s）的目标镜像 `release slots --environment internal-lab` 兼容性检查（只校验 exit 0、JSON 结构与可读 DB，不在切换前断言 target 已是 active）及合成包 `verify-bundle` smoke，在事务内通过 `post_switch_checks` 使用同一 `ReleaseStore` 连接校验 `active_release_restored`（并已移除提交后的 gating `release slots` 步骤，避免旧镜像在 switch 提交后才失败导致状态残留），使用真实 `github.actor` 作为 `approved_by`，并从持久化记录读取 `candidate_digest` 与 `manifest_digest`（传入 `artifact_run_id` 时走 Actions artifact 溯源下载；省略 `artifact_run_id` 时支持从 runner 本地 Docker 存储或 `DATACON_IMAGE_ARCHIVE_DIR/<hex>.tar` 按不可变 `TARGET_DIGEST` 与 `release_events` 审计记录受控回滚 baseline 及 >30 天历史版本）。触发前必须由维护者按 [docs/release-settings.md](docs/release-settings.md) 完成 `internal-lab` 环境规则（仅允许 `main`、required reviewers）和 `v*` tag protection，代码无法阻止旧 commit 上的历史 workflow 被 tag 召回；`release.yml` 从未在真实 GitHub Actions 中运行，首次 dispatch 仍待实测验证。
+
+```bash
+# 0. 应用迁移、归档 baseline 镜像 tar 并初始化 baseline（仅首次/新环境）
+PYTHONPATH=src python -m datacon.cli migrate --migrations-dir migrations
+BASELINE_ID="$(docker image inspect datacon-control-plane:baseline --format '{{.Id}}')"
+mkdir -p "$DATACON_IMAGE_ARCHIVE_DIR" && chmod 0755 "$DATACON_IMAGE_ARCHIVE_DIR"
+docker save -o "$DATACON_IMAGE_ARCHIVE_DIR/${BASELINE_ID#sha256:}.tar" "$BASELINE_ID"
+PYTHONPATH=src python -m datacon.cli release bootstrap \
+  --image-id "$BASELINE_ID" --migration-version 008_release_events.sql \
+  --evidence-root "$DATACON_EVIDENCE_ROOT" --config '{"policy_version":"1"}'
+
+# 1. 在 main 或 v* tag 上构建候选，记录 run id 与 manifest digest
+gh workflow run release.yml --ref main -f action=build
+gh run list --workflow=release.yml --limit 1
+
+# 2. 在 main 上用显式 artifact_run_id 与 expected_manifest_digest 推广
+#    （默认 fail closed 要求 active evidence_root 下的真实归档 bundle；若跳过真实 bundle 检查，
+#     必须同时在 DATACON_RELEASE_APPROVAL 中签署 allow_skip_archived_bundle=true 及一致的 archived_bundle_skip_reason）
+gh workflow run release.yml --ref main -f action=promote -f artifact_run_id=<build-run-id> -f expected_manifest_digest=sha256:<64-hex>
+
+# 3. 在 main 上回滚到持久化审计中存在的非当前 active 目标 image id
+#    3a. 使用 30 天内的 Actions run artifact：
+gh workflow run release.yml --ref main -f action=rollback -f artifact_run_id=<run-with-target-tar> -f target_digest=sha256:<64-hex>
+#    3b. 回滚到 bootstrapped baseline 或 >30 天历史版本（省略 artifact_run_id，由 runner 本地 Docker / DATACON_IMAGE_ARCHIVE_DIR 按不可变 image id 解析）：
+gh workflow run release.yml --ref main -f action=rollback -f target_digest=sha256:<64-hex>
+
+# 4. 在 main 上触发 B03（只在授权 runner 上执行，需要 DATACON_B03_EVIDENCE_DIR；仓库内 pending admission 会被拒绝）
+gh workflow run release.yml --ref main -f action=build -f run_b03=true
+```
+
+`release.yml` 在本 PR 前**从未真实运行**，上述 dispatch 命令也未在本环境中执行；任何首次真实 dispatch 均需保留 run id 作为验证依据。
 
 ## 开发方式
 

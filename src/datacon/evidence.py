@@ -85,6 +85,8 @@ _ROLE_NAMES = frozenset(
         "material_source_vulnerable",
         "material_source_fixed",
         "material_patch",
+        "material_repository_bundle",
+        "material_advisory",
         "case_config",
         "symbolizer_log",
     }
@@ -258,6 +260,22 @@ def _read_bounded(path: Path, *, expected_size: int) -> bytes:
         ) from error
 
 
+def _apply_bundle_modes(
+    root: Path, *, dir_mode: int, file_mode: int
+) -> None:
+    """Apply explicit directory/file permissions bottom-up, overriding process umask."""
+    for directory in sorted(
+        (item for item in root.rglob("*") if item.is_dir() and not item.is_symlink()),
+        key=lambda item: len(item.parts),
+        reverse=True,
+    ):
+        directory.chmod(dir_mode)
+    for item in root.rglob("*"):
+        if item.is_file() and not item.is_symlink():
+            item.chmod(file_mode)
+    root.chmod(dir_mode)
+
+
 def write_bundle(
     root: Path | str,
     *,
@@ -269,6 +287,8 @@ def write_bundle(
     verdict: str | None = None,
     created_at: str | None = None,
     verify: Callable[[Path], object] | None = None,
+    dir_mode: int = 0o755,
+    file_mode: int = 0o644,
 ) -> BundleInfo:
     """Create a new bundle directory and its manifest.
 
@@ -343,7 +363,8 @@ def write_bundle(
     # A possibly pre-existing symlink at the temp name is never followed.
     if temporary.exists() or temporary.is_symlink():
         raise BundleError("BUNDLE_EXISTS", "temporary bundle path already exists")
-    temporary.mkdir(mode=0o700)
+    temporary.mkdir(mode=dir_mode)
+    temporary.chmod(dir_mode)
     try:
         entries: list[dict[str, Any]] = []
         markdown_bytes = report_markdown.encode("utf-8")
@@ -388,7 +409,7 @@ def write_bundle(
             destination = temporary / PurePosixPath(path)
             destination.parent.mkdir(parents=True, exist_ok=True)
             destination.write_bytes(data)
-            destination.chmod(0o600)
+            destination.chmod(file_mode)
             role = (
                 "report_json"
                 if path == "report.json"
@@ -421,14 +442,8 @@ def write_bundle(
             raise BundleError("INVALID_MANIFEST", "manifest verdict is invalid")
         manifest_bytes = canonical_manifest_bytes(manifest) + b"\n"
         (temporary / "manifest.json").write_bytes(manifest_bytes)
-        (temporary / "manifest.json").chmod(0o600)
-        for directory in sorted(
-            (item for item in temporary.rglob("*") if item.is_dir()),
-            key=lambda item: len(item.parts),
-            reverse=True,
-        ):
-            directory.chmod(0o700)
-        temporary.chmod(0o700)
+        (temporary / "manifest.json").chmod(file_mode)
+        _apply_bundle_modes(temporary, dir_mode=dir_mode, file_mode=file_mode)
         if verify is not None:
             # Sample the completed staging directory before it becomes the
             # archived bundle. A bundle that cannot verify offline must never
@@ -682,6 +697,22 @@ def _single_role_path(
     return matches[0]
 
 
+def _role_paths(
+    listed: Mapping[str, Mapping[str, Any]], role: str
+) -> list[tuple[str, Mapping[str, Any]]]:
+    matches = [
+        (path, entry)
+        for path, entry in listed.items()
+        if entry["role"] == role
+    ]
+    if not matches:
+        raise BundleError(
+            "INVALID_MANIFEST",
+            f"expected at least one {role} evidence file, found 0",
+        )
+    return matches
+
+
 def _case_binding(
     plan: Mapping[str, Any],
     listed: Mapping[str, Mapping[str, Any]],
@@ -820,18 +851,107 @@ def _verify_materials(
                 "DIGEST_MISMATCH",
                 f"{role} path is not pinned by the plan case config",
             )
-    for role in ("material_source_vulnerable", "material_source_fixed"):
-        path, entry = _single_role_path(listed, role)
-        if not path.startswith("materials/"):
+    for role, prefix in (
+        ("material_source_vulnerable", "vulnerable/"),
+        ("material_source_fixed", "fixed/"),
+    ):
+        matches = _role_paths(listed, role)
+        bundled_relatives: set[str] = set()
+        for path, _entry in matches:
+            if not path.startswith("materials/"):
+                raise BundleError(
+                    "INVALID_MANIFEST", f"{role} must be a materials/* evidence file"
+                )
+            relative = path[len("materials/") :]
+            if materials.get(relative) != _digest(data[path]):
+                raise BundleError(
+                    "DIGEST_MISMATCH",
+                    f"{role} is not pinned by the plan case config",
+                )
+            bundled_relatives.add(relative)
+        expected_relatives = {
+            relative for relative in materials if relative.startswith(prefix)
+        }
+        missing_sources = sorted(expected_relatives - bundled_relatives)
+        if missing_sources:
             raise BundleError(
-                "INVALID_MANIFEST", f"{role} must be a materials/* evidence file"
+                "INVALID_MANIFEST",
+                f"{role} is missing pinned source files: {', '.join(missing_sources)}",
             )
-        relative = path[len("materials/") :]
-        if materials.get(relative) != _digest(data[path]):
-            raise BundleError(
-                "DIGEST_MISMATCH",
-                f"{role} is not pinned by the plan case config",
-            )
+    # A case config may pin the repository bundle and advisory snapshot as
+    # materials (B03 does). When it does, the bundle must contain those exact
+    # files at the named paths. B01/B02 case configs do not pin them, so their
+    # older bundles keep verifying unchanged.
+    registry_entry = case_config.get("registry_entry")
+    if isinstance(registry_entry, Mapping):
+        repository_entry = registry_entry.get("repository")
+        if isinstance(repository_entry, Mapping):
+            bundle_relative = repository_entry.get("bundle")
+            if (
+                isinstance(bundle_relative, str)
+                and bundle_relative in materials
+            ):
+                _verify_named_material(
+                    "materials/" + bundle_relative,
+                    "material_repository_bundle",
+                    plan.get("repository", {}).get("bundle_digest"),
+                    listed,
+                    data,
+                    materials,
+                    "repository bundle",
+                )
+        advisory_entry = registry_entry.get("advisory")
+        if isinstance(advisory_entry, Mapping):
+            snapshot = advisory_entry.get("path")
+            if isinstance(snapshot, str) and snapshot in materials:
+                intel = plan.get("intel")
+                expected = intel.get("content_digest") if isinstance(intel, Mapping) else None
+                _verify_named_material(
+                    "materials/" + snapshot,
+                    "material_advisory",
+                    expected,
+                    listed,
+                    data,
+                    materials,
+                    "advisory snapshot",
+                )
+
+
+def _verify_named_material(
+    path: str,
+    role: str,
+    expected_digest: Any,
+    listed: Mapping[str, Mapping[str, Any]],
+    data: Mapping[str, bytes],
+    materials: Mapping[str, str],
+    label: str,
+) -> None:
+    """Require one named material at its exact path with a matching digest."""
+    entry = listed.get(path)
+    if entry is None:
+        raise BundleError(
+            "INVALID_MANIFEST", f"required {label} is missing from the bundle: {path}"
+        )
+    if entry.get("role") != role:
+        raise BundleError(
+            "INVALID_MANIFEST",
+            f"{label} {path} must carry the {role} role, not {entry.get('role')!r}",
+        )
+    content = data.get(path)
+    if content is None:
+        raise BundleError("MISSING_FILE", f"required {label} is not readable: {path}")
+    actual = _digest(content)
+    if actual != expected_digest:
+        raise BundleError(
+            "DIGEST_MISMATCH",
+            f"{label} digest does not match the plan: {path}",
+        )
+    relative = path[len("materials/") :]
+    if materials.get(relative) != actual:
+        raise BundleError(
+            "DIGEST_MISMATCH",
+            f"{label} is not pinned by the plan case config: {relative}",
+        )
 
 
 def _compile_args_from_recipe(recipe: bytes) -> list[str]:
@@ -2405,6 +2525,8 @@ def export_bundle(
     destination: Path | str,
     *,
     expected_manifest_digest: str | None = None,
+    dir_mode: int = 0o755,
+    file_mode: int = 0o644,
 ) -> BundleInfo:
     """Copy a verified bundle to a new directory, verifying the copy."""
     if expected_manifest_digest is not None and not _DIGEST.fullmatch(
@@ -2445,7 +2567,8 @@ def export_bundle(
     parent = target.parent
     parent.mkdir(parents=True, exist_ok=True)
     temporary = parent / f".{target.name}.export-{uuid.uuid4().hex}"
-    temporary.mkdir(mode=0o700)
+    temporary.mkdir(mode=dir_mode)
+    temporary.chmod(dir_mode)
     temporary_resolved = temporary.resolve()
     try:
         for relative in sorted(verified.file_data):
@@ -2469,11 +2592,12 @@ def export_bundle(
                     "UNSAFE_PATH", f"export path escapes the bundle: {relative}"
                 )
             output.write_bytes(verified.file_data[relative])
-            output.chmod(0o600)
+            output.chmod(file_mode)
         # Copy the exact bytes that were verified and hashed, never a reread
         # from the mutable source directory.
         (temporary / "manifest.json").write_bytes(verified.manifest_bytes)
-        (temporary / "manifest.json").chmod(0o600)
+        (temporary / "manifest.json").chmod(file_mode)
+        _apply_bundle_modes(temporary, dir_mode=dir_mode, file_mode=file_mode)
         copied = verify_bundle(temporary)
         if copied.manifest_digest != verified.manifest_digest:
             raise BundleError("DIGEST_MISMATCH", "exported manifest digest changed")
