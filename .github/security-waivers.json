@@ -1,1 +1,1507 @@
-[]
+[
+  {
+    "id": "CVE-2026-53613",
+    "scope": "package:bsdutils",
+    "impact": "The control plane never mounts filesystems or edits partition tables; it runs as 65534:65534 without CAP_SYS_ADMIN and without privileged mode, so util-linux mount/blkid paths fail closed. The worker invokes only docker, git and clang, not these helper binaries. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-53615",
+    "scope": "package:bsdutils",
+    "impact": "The control plane never mounts filesystems or edits partition tables; it runs as 65534:65534 without CAP_SYS_ADMIN and without privileged mode, so util-linux mount/blkid paths fail closed. The worker invokes only docker, git and clang, not these helper binaries. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-78410",
+    "scope": "package:bsdutils",
+    "impact": "The control plane never mounts filesystems or edits partition tables; it runs as 65534:65534 without CAP_SYS_ADMIN and without privileged mode, so util-linux mount/blkid paths fail closed. The worker invokes only docker, git and clang, not these helper binaries. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-46680",
+    "scope": "package:containerd",
+    "impact": "containerd is installed only as a docker.io dependency and is never started; container execution is delegated to the host daemon over the mounted docker socket. The control-plane process runs as 65534:65534 without CAP_SYS_ADMIN. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-53488",
+    "scope": "package:containerd",
+    "impact": "containerd is installed only as a docker.io dependency and is never started; container execution is delegated to the host daemon over the mounted docker socket. The control-plane process runs as 65534:65534 without CAP_SYS_ADMIN. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-95837",
+    "scope": "package:containerd",
+    "impact": "containerd is installed only as a docker.io dependency and is never started; container execution is delegated to the host daemon over the mounted docker socket. The control-plane process runs as 65534:65534 without CAP_SYS_ADMIN. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2024-24557",
+    "scope": "package:docker.io",
+    "impact": "Only the docker CLI is used, against the host daemon over /var/run/docker.sock; the bundled dockerd and its BuildKit/plugin frontends are never started in this image. The worker calls fixed lifecycle verbs on predefined images and runs as 65534:65534 without CAP_SYS_ADMIN. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2024-29018",
+    "scope": "package:docker.io",
+    "impact": "Only the docker CLI is used, against the host daemon over /var/run/docker.sock; the bundled dockerd and its BuildKit/plugin frontends are never started in this image. The worker calls fixed lifecycle verbs on predefined images and runs as 65534:65534 without CAP_SYS_ADMIN. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2024-36623",
+    "scope": "package:docker.io",
+    "impact": "Only the docker CLI is used, against the host daemon over /var/run/docker.sock; the bundled dockerd and its BuildKit/plugin frontends are never started in this image. The worker calls fixed lifecycle verbs on predefined images and runs as 65534:65534 without CAP_SYS_ADMIN. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-33747",
+    "scope": "package:docker.io",
+    "impact": "Only the docker CLI is used, against the host daemon over /var/run/docker.sock; the bundled dockerd and its BuildKit/plugin frontends are never started in this image. The worker calls fixed lifecycle verbs on predefined images and runs as 65534:65534 without CAP_SYS_ADMIN. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-33748",
+    "scope": "package:docker.io",
+    "impact": "Only the docker CLI is used, against the host daemon over /var/run/docker.sock; the bundled dockerd and its BuildKit/plugin frontends are never started in this image. The worker calls fixed lifecycle verbs on predefined images and runs as 65534:65534 without CAP_SYS_ADMIN. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-33997",
+    "scope": "package:docker.io",
+    "impact": "Only the docker CLI is used, against the host daemon over /var/run/docker.sock; the bundled dockerd and its BuildKit/plugin frontends are never started in this image. The worker calls fixed lifecycle verbs on predefined images and runs as 65534:65534 without CAP_SYS_ADMIN. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-34040",
+    "scope": "package:docker.io",
+    "impact": "Only the docker CLI is used, against the host daemon over /var/run/docker.sock; the bundled dockerd and its BuildKit/plugin frontends are never started in this image. The worker calls fixed lifecycle verbs on predefined images and runs as 65534:65534 without CAP_SYS_ADMIN. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-41567",
+    "scope": "package:docker.io",
+    "impact": "Only the docker CLI is used, against the host daemon over /var/run/docker.sock; the bundled dockerd and its BuildKit/plugin frontends are never started in this image. The worker calls fixed lifecycle verbs on predefined images and runs as 65534:65534 without CAP_SYS_ADMIN. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-42306",
+    "scope": "package:docker.io",
+    "impact": "Only the docker CLI is used, against the host daemon over /var/run/docker.sock; the bundled dockerd and its BuildKit/plugin frontends are never started in this image. The worker calls fixed lifecycle verbs on predefined images and runs as 65534:65534 without CAP_SYS_ADMIN. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-92542",
+    "scope": "package:docker.io",
+    "impact": "Only the docker CLI is used, against the host daemon over /var/run/docker.sock; the bundled dockerd and its BuildKit/plugin frontends are never started in this image. The worker calls fixed lifecycle verbs on predefined images and runs as 65534:65534 without CAP_SYS_ADMIN. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-92543",
+    "scope": "package:docker.io",
+    "impact": "Only the docker CLI is used, against the host daemon over /var/run/docker.sock; the bundled dockerd and its BuildKit/plugin frontends are never started in this image. The worker calls fixed lifecycle verbs on predefined images and runs as 65534:65534 without CAP_SYS_ADMIN. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-105437",
+    "scope": "package:git",
+    "impact": "Git is invoked only through fixed command templates against operator-provided local bare repositories, with system/global config, hooks, external diff/textconv, submodules and transport helpers disabled. No untrusted remote clone or fetch path is exposed by the control plane. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-111760",
+    "scope": "package:git",
+    "impact": "Git is invoked only through fixed command templates against operator-provided local bare repositories, with system/global config, hooks, external diff/textconv, submodules and transport helpers disabled. No untrusted remote clone or fetch path is exposed by the control plane. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-114466",
+    "scope": "package:git",
+    "impact": "Git is invoked only through fixed command templates against operator-provided local bare repositories, with system/global config, hooks, external diff/textconv, submodules and transport helpers disabled. No untrusted remote clone or fetch path is exposed by the control plane. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-105437",
+    "scope": "package:git-man",
+    "impact": "Git is invoked only through fixed command templates against operator-provided local bare repositories, with system/global config, hooks, external diff/textconv, submodules and transport helpers disabled. No untrusted remote clone or fetch path is exposed by the control plane. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-111760",
+    "scope": "package:git-man",
+    "impact": "Git is invoked only through fixed command templates against operator-provided local bare repositories, with system/global config, hooks, external diff/textconv, submodules and transport helpers disabled. No untrusted remote clone or fetch path is exposed by the control plane. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-114466",
+    "scope": "package:git-man",
+    "impact": "Git is invoked only through fixed command templates against operator-provided local bare repositories, with system/global config, hooks, external diff/textconv, submodules and transport helpers disabled. No untrusted remote clone or fetch path is exposed by the control plane. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-41992",
+    "scope": "package:gzip",
+    "impact": "gzip is only used to unpack trusted internal build artifacts; the control plane exposes no decompression service and never opens a user-supplied archive. Debian has deferred the fix for bookworm; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-54369",
+    "scope": "package:libacl1",
+    "impact": "POSIX ACLs are not applied to untrusted paths; run, evidence and staging directories are owned by 65534:65534 and accessed through the application file IO layer. Debian has deferred the fix for bookworm; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-53613",
+    "scope": "package:libblkid1",
+    "impact": "The control plane never mounts filesystems or edits partition tables; it runs as 65534:65534 without CAP_SYS_ADMIN and without privileged mode, so util-linux mount/blkid paths fail closed. The worker invokes only docker, git and clang, not these helper binaries. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-53615",
+    "scope": "package:libblkid1",
+    "impact": "The control plane never mounts filesystems or edits partition tables; it runs as 65534:65534 without CAP_SYS_ADMIN and without privileged mode, so util-linux mount/blkid paths fail closed. The worker invokes only docker, git and clang, not these helper binaries. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-78410",
+    "scope": "package:libblkid1",
+    "impact": "The control plane never mounts filesystems or edits partition tables; it runs as 65534:65534 without CAP_SYS_ADMIN and without privileged mode, so util-linux mount/blkid paths fail closed. The worker invokes only docker, git and clang, not these helper binaries. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-12064",
+    "scope": "package:libcurl3-gnutls",
+    "impact": "No attacker-controlled URL is fetched: git operates on local bare repositories and the worker performs no runtime HTTP downloads. libcurl remains a transitive base-image dependency. Debian has deferred the fix for bookworm; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-6276",
+    "scope": "package:libcurl3-gnutls",
+    "impact": "No attacker-controlled URL is fetched: git operates on local bare repositories and the worker performs no runtime HTTP downloads. libcurl remains a transitive base-image dependency. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-8286",
+    "scope": "package:libcurl3-gnutls",
+    "impact": "No attacker-controlled URL is fetched: git operates on local bare repositories and the worker performs no runtime HTTP downloads. libcurl remains a transitive base-image dependency. Debian has deferred the fix for bookworm; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-8458",
+    "scope": "package:libcurl3-gnutls",
+    "impact": "No attacker-controlled URL is fetched: git operates on local bare repositories and the worker performs no runtime HTTP downloads. libcurl remains a transitive base-image dependency. Debian has deferred the fix for bookworm; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-8927",
+    "scope": "package:libcurl3-gnutls",
+    "impact": "No attacker-controlled URL is fetched: git operates on local bare repositories and the worker performs no runtime HTTP downloads. libcurl remains a transitive base-image dependency. Debian has deferred the fix for bookworm; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-113351",
+    "scope": "package:libexpat1",
+    "impact": "The control plane parses JSON contracts, not XML. No attacker-controlled XML document reaches libexpat and the image exposes no XML service. Debian has deferred the fix for bookworm; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-115506",
+    "scope": "package:libexpat1",
+    "impact": "The control plane parses JSON contracts, not XML. No attacker-controlled XML document reaches libexpat and the image exposes no XML service. Debian has deferred the fix for bookworm; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-117610",
+    "scope": "package:libexpat1",
+    "impact": "The control plane parses JSON contracts, not XML. No attacker-controlled XML document reaches libexpat and the image exposes no XML service. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-118370",
+    "scope": "package:libexpat1",
+    "impact": "The control plane parses JSON contracts, not XML. No attacker-controlled XML document reaches libexpat and the image exposes no XML service. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-107364",
+    "scope": "package:libgssapi-krb5-2",
+    "impact": "Kerberos/GSSAPI is not configured or invoked: the container holds no KDC credentials, exposes no KDC-facing service, and the control plane never parses untrusted krb5/GSSAPI network input. The package is a transitive base dependency. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-112315",
+    "scope": "package:libgssapi-krb5-2",
+    "impact": "Kerberos/GSSAPI is not configured or invoked: the container holds no KDC credentials, exposes no KDC-facing service, and the control plane never parses untrusted krb5/GSSAPI network input. The package is a transitive base dependency. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-112316",
+    "scope": "package:libgssapi-krb5-2",
+    "impact": "Kerberos/GSSAPI is not configured or invoked: the container holds no KDC credentials, exposes no KDC-facing service, and the control plane never parses untrusted krb5/GSSAPI network input. The package is a transitive base dependency. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-112317",
+    "scope": "package:libgssapi-krb5-2",
+    "impact": "Kerberos/GSSAPI is not configured or invoked: the container holds no KDC credentials, exposes no KDC-facing service, and the control plane never parses untrusted krb5/GSSAPI network input. The package is a transitive base dependency. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-112318",
+    "scope": "package:libgssapi-krb5-2",
+    "impact": "Kerberos/GSSAPI is not configured or invoked: the container holds no KDC credentials, exposes no KDC-facing service, and the control plane never parses untrusted krb5/GSSAPI network input. The package is a transitive base dependency. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-112319",
+    "scope": "package:libgssapi-krb5-2",
+    "impact": "Kerberos/GSSAPI is not configured or invoked: the container holds no KDC credentials, exposes no KDC-facing service, and the control plane never parses untrusted krb5/GSSAPI network input. The package is a transitive base dependency. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-112320",
+    "scope": "package:libgssapi-krb5-2",
+    "impact": "Kerberos/GSSAPI is not configured or invoked: the container holds no KDC credentials, exposes no KDC-facing service, and the control plane never parses untrusted krb5/GSSAPI network input. The package is a transitive base dependency. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-112321",
+    "scope": "package:libgssapi-krb5-2",
+    "impact": "Kerberos/GSSAPI is not configured or invoked: the container holds no KDC credentials, exposes no KDC-facing service, and the control plane never parses untrusted krb5/GSSAPI network input. The package is a transitive base dependency. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-112322",
+    "scope": "package:libgssapi-krb5-2",
+    "impact": "Kerberos/GSSAPI is not configured or invoked: the container holds no KDC credentials, exposes no KDC-facing service, and the control plane never parses untrusted krb5/GSSAPI network input. The package is a transitive base dependency. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-112323",
+    "scope": "package:libgssapi-krb5-2",
+    "impact": "Kerberos/GSSAPI is not configured or invoked: the container holds no KDC credentials, exposes no KDC-facing service, and the control plane never parses untrusted krb5/GSSAPI network input. The package is a transitive base dependency. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-118380",
+    "scope": "package:libgssapi-krb5-2",
+    "impact": "Kerberos/GSSAPI is not configured or invoked: the container holds no KDC credentials, exposes no KDC-facing service, and the control plane never parses untrusted krb5/GSSAPI network input. The package is a transitive base dependency. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-119079",
+    "scope": "package:libgssapi-krb5-2",
+    "impact": "Kerberos/GSSAPI is not configured or invoked: the container holds no KDC credentials, exposes no KDC-facing service, and the control plane never parses untrusted krb5/GSSAPI network input. The package is a transitive base dependency. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-71199",
+    "scope": "package:libgssapi-krb5-2",
+    "impact": "Kerberos/GSSAPI is not configured or invoked: the container holds no KDC credentials, exposes no KDC-facing service, and the control plane never parses untrusted krb5/GSSAPI network input. The package is a transitive base dependency. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-71200",
+    "scope": "package:libgssapi-krb5-2",
+    "impact": "Kerberos/GSSAPI is not configured or invoked: the container holds no KDC credentials, exposes no KDC-facing service, and the control plane never parses untrusted krb5/GSSAPI network input. The package is a transitive base dependency. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-107364",
+    "scope": "package:libk5crypto3",
+    "impact": "Kerberos/GSSAPI is not configured or invoked: the container holds no KDC credentials, exposes no KDC-facing service, and the control plane never parses untrusted krb5/GSSAPI network input. The package is a transitive base dependency. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-112315",
+    "scope": "package:libk5crypto3",
+    "impact": "Kerberos/GSSAPI is not configured or invoked: the container holds no KDC credentials, exposes no KDC-facing service, and the control plane never parses untrusted krb5/GSSAPI network input. The package is a transitive base dependency. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-112316",
+    "scope": "package:libk5crypto3",
+    "impact": "Kerberos/GSSAPI is not configured or invoked: the container holds no KDC credentials, exposes no KDC-facing service, and the control plane never parses untrusted krb5/GSSAPI network input. The package is a transitive base dependency. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-112317",
+    "scope": "package:libk5crypto3",
+    "impact": "Kerberos/GSSAPI is not configured or invoked: the container holds no KDC credentials, exposes no KDC-facing service, and the control plane never parses untrusted krb5/GSSAPI network input. The package is a transitive base dependency. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-112318",
+    "scope": "package:libk5crypto3",
+    "impact": "Kerberos/GSSAPI is not configured or invoked: the container holds no KDC credentials, exposes no KDC-facing service, and the control plane never parses untrusted krb5/GSSAPI network input. The package is a transitive base dependency. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-112319",
+    "scope": "package:libk5crypto3",
+    "impact": "Kerberos/GSSAPI is not configured or invoked: the container holds no KDC credentials, exposes no KDC-facing service, and the control plane never parses untrusted krb5/GSSAPI network input. The package is a transitive base dependency. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-112320",
+    "scope": "package:libk5crypto3",
+    "impact": "Kerberos/GSSAPI is not configured or invoked: the container holds no KDC credentials, exposes no KDC-facing service, and the control plane never parses untrusted krb5/GSSAPI network input. The package is a transitive base dependency. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-112321",
+    "scope": "package:libk5crypto3",
+    "impact": "Kerberos/GSSAPI is not configured or invoked: the container holds no KDC credentials, exposes no KDC-facing service, and the control plane never parses untrusted krb5/GSSAPI network input. The package is a transitive base dependency. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-112322",
+    "scope": "package:libk5crypto3",
+    "impact": "Kerberos/GSSAPI is not configured or invoked: the container holds no KDC credentials, exposes no KDC-facing service, and the control plane never parses untrusted krb5/GSSAPI network input. The package is a transitive base dependency. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-112323",
+    "scope": "package:libk5crypto3",
+    "impact": "Kerberos/GSSAPI is not configured or invoked: the container holds no KDC credentials, exposes no KDC-facing service, and the control plane never parses untrusted krb5/GSSAPI network input. The package is a transitive base dependency. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-118380",
+    "scope": "package:libk5crypto3",
+    "impact": "Kerberos/GSSAPI is not configured or invoked: the container holds no KDC credentials, exposes no KDC-facing service, and the control plane never parses untrusted krb5/GSSAPI network input. The package is a transitive base dependency. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-119079",
+    "scope": "package:libk5crypto3",
+    "impact": "Kerberos/GSSAPI is not configured or invoked: the container holds no KDC credentials, exposes no KDC-facing service, and the control plane never parses untrusted krb5/GSSAPI network input. The package is a transitive base dependency. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-71199",
+    "scope": "package:libk5crypto3",
+    "impact": "Kerberos/GSSAPI is not configured or invoked: the container holds no KDC credentials, exposes no KDC-facing service, and the control plane never parses untrusted krb5/GSSAPI network input. The package is a transitive base dependency. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-71200",
+    "scope": "package:libk5crypto3",
+    "impact": "Kerberos/GSSAPI is not configured or invoked: the container holds no KDC credentials, exposes no KDC-facing service, and the control plane never parses untrusted krb5/GSSAPI network input. The package is a transitive base dependency. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-107364",
+    "scope": "package:libkrb5-3",
+    "impact": "Kerberos/GSSAPI is not configured or invoked: the container holds no KDC credentials, exposes no KDC-facing service, and the control plane never parses untrusted krb5/GSSAPI network input. The package is a transitive base dependency. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-112315",
+    "scope": "package:libkrb5-3",
+    "impact": "Kerberos/GSSAPI is not configured or invoked: the container holds no KDC credentials, exposes no KDC-facing service, and the control plane never parses untrusted krb5/GSSAPI network input. The package is a transitive base dependency. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-112316",
+    "scope": "package:libkrb5-3",
+    "impact": "Kerberos/GSSAPI is not configured or invoked: the container holds no KDC credentials, exposes no KDC-facing service, and the control plane never parses untrusted krb5/GSSAPI network input. The package is a transitive base dependency. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-112317",
+    "scope": "package:libkrb5-3",
+    "impact": "Kerberos/GSSAPI is not configured or invoked: the container holds no KDC credentials, exposes no KDC-facing service, and the control plane never parses untrusted krb5/GSSAPI network input. The package is a transitive base dependency. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-112318",
+    "scope": "package:libkrb5-3",
+    "impact": "Kerberos/GSSAPI is not configured or invoked: the container holds no KDC credentials, exposes no KDC-facing service, and the control plane never parses untrusted krb5/GSSAPI network input. The package is a transitive base dependency. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-112319",
+    "scope": "package:libkrb5-3",
+    "impact": "Kerberos/GSSAPI is not configured or invoked: the container holds no KDC credentials, exposes no KDC-facing service, and the control plane never parses untrusted krb5/GSSAPI network input. The package is a transitive base dependency. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-112320",
+    "scope": "package:libkrb5-3",
+    "impact": "Kerberos/GSSAPI is not configured or invoked: the container holds no KDC credentials, exposes no KDC-facing service, and the control plane never parses untrusted krb5/GSSAPI network input. The package is a transitive base dependency. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-112321",
+    "scope": "package:libkrb5-3",
+    "impact": "Kerberos/GSSAPI is not configured or invoked: the container holds no KDC credentials, exposes no KDC-facing service, and the control plane never parses untrusted krb5/GSSAPI network input. The package is a transitive base dependency. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-112322",
+    "scope": "package:libkrb5-3",
+    "impact": "Kerberos/GSSAPI is not configured or invoked: the container holds no KDC credentials, exposes no KDC-facing service, and the control plane never parses untrusted krb5/GSSAPI network input. The package is a transitive base dependency. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-112323",
+    "scope": "package:libkrb5-3",
+    "impact": "Kerberos/GSSAPI is not configured or invoked: the container holds no KDC credentials, exposes no KDC-facing service, and the control plane never parses untrusted krb5/GSSAPI network input. The package is a transitive base dependency. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-118380",
+    "scope": "package:libkrb5-3",
+    "impact": "Kerberos/GSSAPI is not configured or invoked: the container holds no KDC credentials, exposes no KDC-facing service, and the control plane never parses untrusted krb5/GSSAPI network input. The package is a transitive base dependency. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-119079",
+    "scope": "package:libkrb5-3",
+    "impact": "Kerberos/GSSAPI is not configured or invoked: the container holds no KDC credentials, exposes no KDC-facing service, and the control plane never parses untrusted krb5/GSSAPI network input. The package is a transitive base dependency. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-71199",
+    "scope": "package:libkrb5-3",
+    "impact": "Kerberos/GSSAPI is not configured or invoked: the container holds no KDC credentials, exposes no KDC-facing service, and the control plane never parses untrusted krb5/GSSAPI network input. The package is a transitive base dependency. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-71200",
+    "scope": "package:libkrb5-3",
+    "impact": "Kerberos/GSSAPI is not configured or invoked: the container holds no KDC credentials, exposes no KDC-facing service, and the control plane never parses untrusted krb5/GSSAPI network input. The package is a transitive base dependency. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-107364",
+    "scope": "package:libkrb5support0",
+    "impact": "Kerberos/GSSAPI is not configured or invoked: the container holds no KDC credentials, exposes no KDC-facing service, and the control plane never parses untrusted krb5/GSSAPI network input. The package is a transitive base dependency. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-112315",
+    "scope": "package:libkrb5support0",
+    "impact": "Kerberos/GSSAPI is not configured or invoked: the container holds no KDC credentials, exposes no KDC-facing service, and the control plane never parses untrusted krb5/GSSAPI network input. The package is a transitive base dependency. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-112316",
+    "scope": "package:libkrb5support0",
+    "impact": "Kerberos/GSSAPI is not configured or invoked: the container holds no KDC credentials, exposes no KDC-facing service, and the control plane never parses untrusted krb5/GSSAPI network input. The package is a transitive base dependency. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-112317",
+    "scope": "package:libkrb5support0",
+    "impact": "Kerberos/GSSAPI is not configured or invoked: the container holds no KDC credentials, exposes no KDC-facing service, and the control plane never parses untrusted krb5/GSSAPI network input. The package is a transitive base dependency. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-112318",
+    "scope": "package:libkrb5support0",
+    "impact": "Kerberos/GSSAPI is not configured or invoked: the container holds no KDC credentials, exposes no KDC-facing service, and the control plane never parses untrusted krb5/GSSAPI network input. The package is a transitive base dependency. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-112319",
+    "scope": "package:libkrb5support0",
+    "impact": "Kerberos/GSSAPI is not configured or invoked: the container holds no KDC credentials, exposes no KDC-facing service, and the control plane never parses untrusted krb5/GSSAPI network input. The package is a transitive base dependency. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-112320",
+    "scope": "package:libkrb5support0",
+    "impact": "Kerberos/GSSAPI is not configured or invoked: the container holds no KDC credentials, exposes no KDC-facing service, and the control plane never parses untrusted krb5/GSSAPI network input. The package is a transitive base dependency. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-112321",
+    "scope": "package:libkrb5support0",
+    "impact": "Kerberos/GSSAPI is not configured or invoked: the container holds no KDC credentials, exposes no KDC-facing service, and the control plane never parses untrusted krb5/GSSAPI network input. The package is a transitive base dependency. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-112322",
+    "scope": "package:libkrb5support0",
+    "impact": "Kerberos/GSSAPI is not configured or invoked: the container holds no KDC credentials, exposes no KDC-facing service, and the control plane never parses untrusted krb5/GSSAPI network input. The package is a transitive base dependency. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-112323",
+    "scope": "package:libkrb5support0",
+    "impact": "Kerberos/GSSAPI is not configured or invoked: the container holds no KDC credentials, exposes no KDC-facing service, and the control plane never parses untrusted krb5/GSSAPI network input. The package is a transitive base dependency. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-118380",
+    "scope": "package:libkrb5support0",
+    "impact": "Kerberos/GSSAPI is not configured or invoked: the container holds no KDC credentials, exposes no KDC-facing service, and the control plane never parses untrusted krb5/GSSAPI network input. The package is a transitive base dependency. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-119079",
+    "scope": "package:libkrb5support0",
+    "impact": "Kerberos/GSSAPI is not configured or invoked: the container holds no KDC credentials, exposes no KDC-facing service, and the control plane never parses untrusted krb5/GSSAPI network input. The package is a transitive base dependency. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-71199",
+    "scope": "package:libkrb5support0",
+    "impact": "Kerberos/GSSAPI is not configured or invoked: the container holds no KDC credentials, exposes no KDC-facing service, and the control plane never parses untrusted krb5/GSSAPI network input. The package is a transitive base dependency. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-71200",
+    "scope": "package:libkrb5support0",
+    "impact": "Kerberos/GSSAPI is not configured or invoked: the container holds no KDC credentials, exposes no KDC-facing service, and the control plane never parses untrusted krb5/GSSAPI network input. The package is a transitive base dependency. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2023-2953",
+    "scope": "package:libldap-2.5-0",
+    "impact": "No LDAP client is configured and no LDAP URL or bind credential is accepted. The library is a transitive base-image dependency of the unprivileged runtime. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-53613",
+    "scope": "package:libmount1",
+    "impact": "The control plane never mounts filesystems or edits partition tables; it runs as 65534:65534 without CAP_SYS_ADMIN and without privileged mode, so util-linux mount/blkid paths fail closed. The worker invokes only docker, git and clang, not these helper binaries. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-53615",
+    "scope": "package:libmount1",
+    "impact": "The control plane never mounts filesystems or edits partition tables; it runs as 65534:65534 without CAP_SYS_ADMIN and without privileged mode, so util-linux mount/blkid paths fail closed. The worker invokes only docker, git and clang, not these helper binaries. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-78410",
+    "scope": "package:libmount1",
+    "impact": "The control plane never mounts filesystems or edits partition tables; it runs as 65534:65534 without CAP_SYS_ADMIN and without privileged mode, so util-linux mount/blkid paths fail closed. The worker invokes only docker, git and clang, not these helper binaries. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2025-69720",
+    "scope": "package:libncursesw6",
+    "impact": "Terminal/terminfo support is only present for interactive host tooling. The control plane runs non-interactively as 65534:65534 and never processes untrusted terminfo databases. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2025-6020",
+    "scope": "package:libpam-modules",
+    "impact": "No PAM login path exists in the container: the entrypoint runs directly as 65534:65534 and never invokes login/su/pam_namespace. The package is a transitive base-image dependency. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2025-6020",
+    "scope": "package:libpam-modules-bin",
+    "impact": "No PAM login path exists in the container: the entrypoint runs directly as 65534:65534 and never invokes login/su/pam_namespace. The package is a transitive base-image dependency. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2025-6020",
+    "scope": "package:libpam-runtime",
+    "impact": "No PAM login path exists in the container: the entrypoint runs directly as 65534:65534 and never invokes login/su/pam_namespace. The package is a transitive base-image dependency. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2025-6020",
+    "scope": "package:libpam0g",
+    "impact": "No PAM login path exists in the container: the entrypoint runs directly as 65534:65534 and never invokes login/su/pam_namespace. The package is a transitive base-image dependency. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-9538",
+    "scope": "package:libperl5.36",
+    "impact": "Perl is a base-image dependency used by Debian maintainer tooling only; the control plane never executes Perl or passes attacker-controlled data to a Perl interpreter. Debian has deferred the fix for bookworm; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-53613",
+    "scope": "package:libsmartcols1",
+    "impact": "The control plane never mounts filesystems or edits partition tables; it runs as 65534:65534 without CAP_SYS_ADMIN and without privileged mode, so util-linux mount/blkid paths fail closed. The worker invokes only docker, git and clang, not these helper binaries. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-53615",
+    "scope": "package:libsmartcols1",
+    "impact": "The control plane never mounts filesystems or edits partition tables; it runs as 65534:65534 without CAP_SYS_ADMIN and without privileged mode, so util-linux mount/blkid paths fail closed. The worker invokes only docker, git and clang, not these helper binaries. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-78410",
+    "scope": "package:libsmartcols1",
+    "impact": "The control plane never mounts filesystems or edits partition tables; it runs as 65534:65534 without CAP_SYS_ADMIN and without privileged mode, so util-linux mount/blkid paths fail closed. The worker invokes only docker, git and clang, not these helper binaries. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2025-7458",
+    "scope": "package:libsqlite3-0",
+    "impact": "The production journal uses PostgreSQL, not SQLite; the control plane never opens an attacker-controlled SQLite database. The library is a transitive base-image dependency. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-11822",
+    "scope": "package:libsqlite3-0",
+    "impact": "The production journal uses PostgreSQL, not SQLite; the control plane never opens an attacker-controlled SQLite database. The library is a transitive base-image dependency. Debian has deferred the fix for bookworm; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-11824",
+    "scope": "package:libsqlite3-0",
+    "impact": "The production journal uses PostgreSQL, not SQLite; the control plane never opens an attacker-controlled SQLite database. The library is a transitive base-image dependency. Debian has deferred the fix for bookworm; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-119373",
+    "scope": "package:libsqlite3-0",
+    "impact": "The production journal uses PostgreSQL, not SQLite; the control plane never opens an attacker-controlled SQLite database. The library is a transitive base-image dependency. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-119374",
+    "scope": "package:libsqlite3-0",
+    "impact": "The production journal uses PostgreSQL, not SQLite; the control plane never opens an attacker-controlled SQLite database. The library is a transitive base-image dependency. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-119379",
+    "scope": "package:libsqlite3-0",
+    "impact": "The production journal uses PostgreSQL, not SQLite; the control plane never opens an attacker-controlled SQLite database. The library is a transitive base-image dependency. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-16742",
+    "scope": "package:libsystemd0",
+    "impact": "systemd/udev are not the init system inside the container; the datacon entrypoint runs directly as 65534:65534, so journald/udev device-parsing paths are never active. Debian has deferred the fix for bookworm; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2025-69720",
+    "scope": "package:libtinfo6",
+    "impact": "Terminal/terminfo support is only present for interactive host tooling. The control plane runs non-interactively as 65534:65534 and never processes untrusted terminfo databases. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-16742",
+    "scope": "package:libudev1",
+    "impact": "systemd/udev are not the init system inside the container; the datacon entrypoint runs directly as 65534:65534, so journald/udev device-parsing paths are never active. Debian has deferred the fix for bookworm; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-53613",
+    "scope": "package:libuuid1",
+    "impact": "The control plane never mounts filesystems or edits partition tables; it runs as 65534:65534 without CAP_SYS_ADMIN and without privileged mode, so util-linux mount/blkid paths fail closed. The worker invokes only docker, git and clang, not these helper binaries. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-53615",
+    "scope": "package:libuuid1",
+    "impact": "The control plane never mounts filesystems or edits partition tables; it runs as 65534:65534 without CAP_SYS_ADMIN and without privileged mode, so util-linux mount/blkid paths fail closed. The worker invokes only docker, git and clang, not these helper binaries. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-78410",
+    "scope": "package:libuuid1",
+    "impact": "The control plane never mounts filesystems or edits partition tables; it runs as 65534:65534 without CAP_SYS_ADMIN and without privileged mode, so util-linux mount/blkid paths fail closed. The worker invokes only docker, git and clang, not these helper binaries. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-6653",
+    "scope": "package:libxml2",
+    "impact": "The control plane consumes JSON, not XML; no attacker-controlled XML document is parsed by the worker and no XML service is exposed. Debian has deferred the fix for bookworm; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-74860",
+    "scope": "package:libxml2",
+    "impact": "The control plane consumes JSON, not XML; no attacker-controlled XML document is parsed by the worker and no XML service is exposed. Debian has deferred the fix for bookworm; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-86138",
+    "scope": "package:libxml2",
+    "impact": "The control plane consumes JSON, not XML; no attacker-controlled XML document is parsed by the worker and no XML service is exposed. Debian has deferred the fix for bookworm; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-86140",
+    "scope": "package:libxml2",
+    "impact": "The control plane consumes JSON, not XML; no attacker-controlled XML document is parsed by the worker and no XML service is exposed. Debian has deferred the fix for bookworm; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-86142",
+    "scope": "package:libxml2",
+    "impact": "The control plane consumes JSON, not XML; no attacker-controlled XML document is parsed by the worker and no XML service is exposed. Debian has deferred the fix for bookworm; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-86143",
+    "scope": "package:libxml2",
+    "impact": "The control plane consumes JSON, not XML; no attacker-controlled XML document is parsed by the worker and no XML service is exposed. Debian has deferred the fix for bookworm; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-86144",
+    "scope": "package:libxml2",
+    "impact": "The control plane consumes JSON, not XML; no attacker-controlled XML document is parsed by the worker and no XML service is exposed. Debian has deferred the fix for bookworm; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2013-7445",
+    "scope": "package:linux-libc-dev",
+    "impact": "Header-only package: it ships kernel UAPI headers for building, not executable kernel code. The runtime image runs the datacon entrypoint as 65534:65534 with no CAP_SYS_ADMIN, and no code from this package is executed. Debian marks this CVE will_not_fix for bookworm; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2019-19449",
+    "scope": "package:linux-libc-dev",
+    "impact": "Header-only package: it ships kernel UAPI headers for building, not executable kernel code. The runtime image runs the datacon entrypoint as 65534:65534 with no CAP_SYS_ADMIN, and no code from this package is executed. Debian has deferred the fix for bookworm; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2019-19814",
+    "scope": "package:linux-libc-dev",
+    "impact": "Header-only package: it ships kernel UAPI headers for building, not executable kernel code. The runtime image runs the datacon entrypoint as 65534:65534 with no CAP_SYS_ADMIN, and no code from this package is executed. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2021-3847",
+    "scope": "package:linux-libc-dev",
+    "impact": "Header-only package: it ships kernel UAPI headers for building, not executable kernel code. The runtime image runs the datacon entrypoint as 65534:65534 with no CAP_SYS_ADMIN, and no code from this package is executed. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2021-3864",
+    "scope": "package:linux-libc-dev",
+    "impact": "Header-only package: it ships kernel UAPI headers for building, not executable kernel code. The runtime image runs the datacon entrypoint as 65534:65534 with no CAP_SYS_ADMIN, and no code from this package is executed. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2023-52624",
+    "scope": "package:linux-libc-dev",
+    "impact": "Header-only package: it ships kernel UAPI headers for building, not executable kernel code. The runtime image runs the datacon entrypoint as 65534:65534 with no CAP_SYS_ADMIN, and no code from this package is executed. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2023-53218",
+    "scope": "package:linux-libc-dev",
+    "impact": "Header-only package: it ships kernel UAPI headers for building, not executable kernel code. The runtime image runs the datacon entrypoint as 65534:65534 with no CAP_SYS_ADMIN, and no code from this package is executed. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2024-21803",
+    "scope": "package:linux-libc-dev",
+    "impact": "Header-only package: it ships kernel UAPI headers for building, not executable kernel code. The runtime image runs the datacon entrypoint as 65534:65534 with no CAP_SYS_ADMIN, and no code from this package is executed. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2024-21963",
+    "scope": "package:linux-libc-dev",
+    "impact": "Header-only package: it ships kernel UAPI headers for building, not executable kernel code. The runtime image runs the datacon entrypoint as 65534:65534 with no CAP_SYS_ADMIN, and no code from this package is executed. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2024-26836",
+    "scope": "package:linux-libc-dev",
+    "impact": "Header-only package: it ships kernel UAPI headers for building, not executable kernel code. The runtime image runs the datacon entrypoint as 65534:65534 with no CAP_SYS_ADMIN, and no code from this package is executed. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2024-26913",
+    "scope": "package:linux-libc-dev",
+    "impact": "Header-only package: it ships kernel UAPI headers for building, not executable kernel code. The runtime image runs the datacon entrypoint as 65534:65534 with no CAP_SYS_ADMIN, and no code from this package is executed. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2024-26914",
+    "scope": "package:linux-libc-dev",
+    "impact": "Header-only package: it ships kernel UAPI headers for building, not executable kernel code. The runtime image runs the datacon entrypoint as 65534:65534 with no CAP_SYS_ADMIN, and no code from this package is executed. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2024-26944",
+    "scope": "package:linux-libc-dev",
+    "impact": "Header-only package: it ships kernel UAPI headers for building, not executable kernel code. The runtime image runs the datacon entrypoint as 65534:65534 with no CAP_SYS_ADMIN, and no code from this package is executed. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2024-42118",
+    "scope": "package:linux-libc-dev",
+    "impact": "Header-only package: it ships kernel UAPI headers for building, not executable kernel code. The runtime image runs the datacon entrypoint as 65534:65534 with no CAP_SYS_ADMIN, and no code from this package is executed. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2024-42162",
+    "scope": "package:linux-libc-dev",
+    "impact": "Header-only package: it ships kernel UAPI headers for building, not executable kernel code. The runtime image runs the datacon entrypoint as 65534:65534 with no CAP_SYS_ADMIN, and no code from this package is executed. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2024-46729",
+    "scope": "package:linux-libc-dev",
+    "impact": "Header-only package: it ships kernel UAPI headers for building, not executable kernel code. The runtime image runs the datacon entrypoint as 65534:65534 with no CAP_SYS_ADMIN, and no code from this package is executed. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2024-47691",
+    "scope": "package:linux-libc-dev",
+    "impact": "Header-only package: it ships kernel UAPI headers for building, not executable kernel code. The runtime image runs the datacon entrypoint as 65534:65534 with no CAP_SYS_ADMIN, and no code from this package is executed. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2024-50217",
+    "scope": "package:linux-libc-dev",
+    "impact": "Header-only package: it ships kernel UAPI headers for building, not executable kernel code. The runtime image runs the datacon entrypoint as 65534:65534 with no CAP_SYS_ADMIN, and no code from this package is executed. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2024-50282",
+    "scope": "package:linux-libc-dev",
+    "impact": "Header-only package: it ships kernel UAPI headers for building, not executable kernel code. The runtime image runs the datacon entrypoint as 65534:65534 with no CAP_SYS_ADMIN, and no code from this package is executed. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2024-53218",
+    "scope": "package:linux-libc-dev",
+    "impact": "Header-only package: it ships kernel UAPI headers for building, not executable kernel code. The runtime image runs the datacon entrypoint as 65534:65534 with no CAP_SYS_ADMIN, and no code from this package is executed. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2024-56775",
+    "scope": "package:linux-libc-dev",
+    "impact": "Header-only package: it ships kernel UAPI headers for building, not executable kernel code. The runtime image runs the datacon entrypoint as 65534:65534 with no CAP_SYS_ADMIN, and no code from this package is executed. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2024-57900",
+    "scope": "package:linux-libc-dev",
+    "impact": "Header-only package: it ships kernel UAPI headers for building, not executable kernel code. The runtime image runs the datacon entrypoint as 65534:65534 with no CAP_SYS_ADMIN, and no code from this package is executed. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2025-21985",
+    "scope": "package:linux-libc-dev",
+    "impact": "Header-only package: it ships kernel UAPI headers for building, not executable kernel code. The runtime image runs the datacon entrypoint as 65534:65534 with no CAP_SYS_ADMIN, and no code from this package is executed. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2025-23133",
+    "scope": "package:linux-libc-dev",
+    "impact": "Header-only package: it ships kernel UAPI headers for building, not executable kernel code. The runtime image runs the datacon entrypoint as 65534:65534 with no CAP_SYS_ADMIN, and no code from this package is executed. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2025-37776",
+    "scope": "package:linux-libc-dev",
+    "impact": "Header-only package: it ships kernel UAPI headers for building, not executable kernel code. The runtime image runs the datacon entrypoint as 65534:65534 with no CAP_SYS_ADMIN, and no code from this package is executed. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2025-37777",
+    "scope": "package:linux-libc-dev",
+    "impact": "Header-only package: it ships kernel UAPI headers for building, not executable kernel code. The runtime image runs the datacon entrypoint as 65534:65534 with no CAP_SYS_ADMIN, and no code from this package is executed. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2025-38369",
+    "scope": "package:linux-libc-dev",
+    "impact": "Header-only package: it ships kernel UAPI headers for building, not executable kernel code. The runtime image runs the datacon entrypoint as 65534:65534 with no CAP_SYS_ADMIN, and no code from this package is executed. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2025-38585",
+    "scope": "package:linux-libc-dev",
+    "impact": "Header-only package: it ships kernel UAPI headers for building, not executable kernel code. The runtime image runs the datacon entrypoint as 65534:65534 with no CAP_SYS_ADMIN, and no code from this package is executed. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2025-40333",
+    "scope": "package:linux-libc-dev",
+    "impact": "Header-only package: it ships kernel UAPI headers for building, not executable kernel code. The runtime image runs the datacon entrypoint as 65534:65534 with no CAP_SYS_ADMIN, and no code from this package is executed. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2025-40354",
+    "scope": "package:linux-libc-dev",
+    "impact": "Header-only package: it ships kernel UAPI headers for building, not executable kernel code. The runtime image runs the datacon entrypoint as 65534:65534 with no CAP_SYS_ADMIN, and no code from this package is executed. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-0004",
+    "scope": "package:linux-libc-dev",
+    "impact": "Header-only package: it ships kernel UAPI headers for building, not executable kernel code. The runtime image runs the datacon entrypoint as 65534:65534 with no CAP_SYS_ADMIN, and no code from this package is executed. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-100072",
+    "scope": "package:linux-libc-dev",
+    "impact": "Header-only package: it ships kernel UAPI headers for building, not executable kernel code. The runtime image runs the datacon entrypoint as 65534:65534 with no CAP_SYS_ADMIN, and no code from this package is executed. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-31493",
+    "scope": "package:linux-libc-dev",
+    "impact": "Header-only package: it ships kernel UAPI headers for building, not executable kernel code. The runtime image runs the datacon entrypoint as 65534:65534 with no CAP_SYS_ADMIN, and no code from this package is executed. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-31527",
+    "scope": "package:linux-libc-dev",
+    "impact": "Header-only package: it ships kernel UAPI headers for building, not executable kernel code. The runtime image runs the datacon entrypoint as 65534:65534 with no CAP_SYS_ADMIN, and no code from this package is executed. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-31568",
+    "scope": "package:linux-libc-dev",
+    "impact": "Header-only package: it ships kernel UAPI headers for building, not executable kernel code. The runtime image runs the datacon entrypoint as 65534:65534 with no CAP_SYS_ADMIN, and no code from this package is executed. Debian marks this CVE will_not_fix for bookworm; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-31729",
+    "scope": "package:linux-libc-dev",
+    "impact": "Header-only package: it ships kernel UAPI headers for building, not executable kernel code. The runtime image runs the datacon entrypoint as 65534:65534 with no CAP_SYS_ADMIN, and no code from this package is executed. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-46054",
+    "scope": "package:linux-libc-dev",
+    "impact": "Header-only package: it ships kernel UAPI headers for building, not executable kernel code. The runtime image runs the datacon entrypoint as 65534:65534 with no CAP_SYS_ADMIN, and no code from this package is executed. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-46068",
+    "scope": "package:linux-libc-dev",
+    "impact": "Header-only package: it ships kernel UAPI headers for building, not executable kernel code. The runtime image runs the datacon entrypoint as 65534:65534 with no CAP_SYS_ADMIN, and no code from this package is executed. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-46130",
+    "scope": "package:linux-libc-dev",
+    "impact": "Header-only package: it ships kernel UAPI headers for building, not executable kernel code. The runtime image runs the datacon entrypoint as 65534:65534 with no CAP_SYS_ADMIN, and no code from this package is executed. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-46219",
+    "scope": "package:linux-libc-dev",
+    "impact": "Header-only package: it ships kernel UAPI headers for building, not executable kernel code. The runtime image runs the datacon entrypoint as 65534:65534 with no CAP_SYS_ADMIN, and no code from this package is executed. Debian marks this CVE will_not_fix for bookworm; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-46293",
+    "scope": "package:linux-libc-dev",
+    "impact": "Header-only package: it ships kernel UAPI headers for building, not executable kernel code. The runtime image runs the datacon entrypoint as 65534:65534 with no CAP_SYS_ADMIN, and no code from this package is executed. Debian marks this CVE will_not_fix for bookworm; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-53091",
+    "scope": "package:linux-libc-dev",
+    "impact": "Header-only package: it ships kernel UAPI headers for building, not executable kernel code. The runtime image runs the datacon entrypoint as 65534:65534 with no CAP_SYS_ADMIN, and no code from this package is executed. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-53115",
+    "scope": "package:linux-libc-dev",
+    "impact": "Header-only package: it ships kernel UAPI headers for building, not executable kernel code. The runtime image runs the datacon entrypoint as 65534:65534 with no CAP_SYS_ADMIN, and no code from this package is executed. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-53117",
+    "scope": "package:linux-libc-dev",
+    "impact": "Header-only package: it ships kernel UAPI headers for building, not executable kernel code. The runtime image runs the datacon entrypoint as 65534:65534 with no CAP_SYS_ADMIN, and no code from this package is executed. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-53118",
+    "scope": "package:linux-libc-dev",
+    "impact": "Header-only package: it ships kernel UAPI headers for building, not executable kernel code. The runtime image runs the datacon entrypoint as 65534:65534 with no CAP_SYS_ADMIN, and no code from this package is executed. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-53120",
+    "scope": "package:linux-libc-dev",
+    "impact": "Header-only package: it ships kernel UAPI headers for building, not executable kernel code. The runtime image runs the datacon entrypoint as 65534:65534 with no CAP_SYS_ADMIN, and no code from this package is executed. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-53143",
+    "scope": "package:linux-libc-dev",
+    "impact": "Header-only package: it ships kernel UAPI headers for building, not executable kernel code. The runtime image runs the datacon entrypoint as 65534:65534 with no CAP_SYS_ADMIN, and no code from this package is executed. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-53156",
+    "scope": "package:linux-libc-dev",
+    "impact": "Header-only package: it ships kernel UAPI headers for building, not executable kernel code. The runtime image runs the datacon entrypoint as 65534:65534 with no CAP_SYS_ADMIN, and no code from this package is executed. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-53179",
+    "scope": "package:linux-libc-dev",
+    "impact": "Header-only package: it ships kernel UAPI headers for building, not executable kernel code. The runtime image runs the datacon entrypoint as 65534:65534 with no CAP_SYS_ADMIN, and no code from this package is executed. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-64001",
+    "scope": "package:linux-libc-dev",
+    "impact": "Header-only package: it ships kernel UAPI headers for building, not executable kernel code. The runtime image runs the datacon entrypoint as 65534:65534 with no CAP_SYS_ADMIN, and no code from this package is executed. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-64026",
+    "scope": "package:linux-libc-dev",
+    "impact": "Header-only package: it ships kernel UAPI headers for building, not executable kernel code. The runtime image runs the datacon entrypoint as 65534:65534 with no CAP_SYS_ADMIN, and no code from this package is executed. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-68470",
+    "scope": "package:linux-libc-dev",
+    "impact": "Header-only package: it ships kernel UAPI headers for building, not executable kernel code. The runtime image runs the datacon entrypoint as 65534:65534 with no CAP_SYS_ADMIN, and no code from this package is executed. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-72042",
+    "scope": "package:linux-libc-dev",
+    "impact": "Header-only package: it ships kernel UAPI headers for building, not executable kernel code. The runtime image runs the datacon entrypoint as 65534:65534 with no CAP_SYS_ADMIN, and no code from this package is executed. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-74752",
+    "scope": "package:linux-libc-dev",
+    "impact": "Header-only package: it ships kernel UAPI headers for building, not executable kernel code. The runtime image runs the datacon entrypoint as 65534:65534 with no CAP_SYS_ADMIN, and no code from this package is executed. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-89675",
+    "scope": "package:linux-libc-dev",
+    "impact": "Header-only package: it ships kernel UAPI headers for building, not executable kernel code. The runtime image runs the datacon entrypoint as 65534:65534 with no CAP_SYS_ADMIN, and no code from this package is executed. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-89708",
+    "scope": "package:linux-libc-dev",
+    "impact": "Header-only package: it ships kernel UAPI headers for building, not executable kernel code. The runtime image runs the datacon entrypoint as 65534:65534 with no CAP_SYS_ADMIN, and no code from this package is executed. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-90036",
+    "scope": "package:linux-libc-dev",
+    "impact": "Header-only package: it ships kernel UAPI headers for building, not executable kernel code. The runtime image runs the datacon entrypoint as 65534:65534 with no CAP_SYS_ADMIN, and no code from this package is executed. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-90227",
+    "scope": "package:linux-libc-dev",
+    "impact": "Header-only package: it ships kernel UAPI headers for building, not executable kernel code. The runtime image runs the datacon entrypoint as 65534:65534 with no CAP_SYS_ADMIN, and no code from this package is executed. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-90315",
+    "scope": "package:linux-libc-dev",
+    "impact": "Header-only package: it ships kernel UAPI headers for building, not executable kernel code. The runtime image runs the datacon entrypoint as 65534:65534 with no CAP_SYS_ADMIN, and no code from this package is executed. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-98103",
+    "scope": "package:linux-libc-dev",
+    "impact": "Header-only package: it ships kernel UAPI headers for building, not executable kernel code. The runtime image runs the datacon entrypoint as 65534:65534 with no CAP_SYS_ADMIN, and no code from this package is executed. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-98107",
+    "scope": "package:linux-libc-dev",
+    "impact": "Header-only package: it ships kernel UAPI headers for building, not executable kernel code. The runtime image runs the datacon entrypoint as 65534:65534 with no CAP_SYS_ADMIN, and no code from this package is executed. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-98111",
+    "scope": "package:linux-libc-dev",
+    "impact": "Header-only package: it ships kernel UAPI headers for building, not executable kernel code. The runtime image runs the datacon entrypoint as 65534:65534 with no CAP_SYS_ADMIN, and no code from this package is executed. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-98222",
+    "scope": "package:linux-libc-dev",
+    "impact": "Header-only package: it ships kernel UAPI headers for building, not executable kernel code. The runtime image runs the datacon entrypoint as 65534:65534 with no CAP_SYS_ADMIN, and no code from this package is executed. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-98364",
+    "scope": "package:linux-libc-dev",
+    "impact": "Header-only package: it ships kernel UAPI headers for building, not executable kernel code. The runtime image runs the datacon entrypoint as 65534:65534 with no CAP_SYS_ADMIN, and no code from this package is executed. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-98466",
+    "scope": "package:linux-libc-dev",
+    "impact": "Header-only package: it ships kernel UAPI headers for building, not executable kernel code. The runtime image runs the datacon entrypoint as 65534:65534 with no CAP_SYS_ADMIN, and no code from this package is executed. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-98715",
+    "scope": "package:linux-libc-dev",
+    "impact": "Header-only package: it ships kernel UAPI headers for building, not executable kernel code. The runtime image runs the datacon entrypoint as 65534:65534 with no CAP_SYS_ADMIN, and no code from this package is executed. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-98853",
+    "scope": "package:linux-libc-dev",
+    "impact": "Header-only package: it ships kernel UAPI headers for building, not executable kernel code. The runtime image runs the datacon entrypoint as 65534:65534 with no CAP_SYS_ADMIN, and no code from this package is executed. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-99109",
+    "scope": "package:linux-libc-dev",
+    "impact": "Header-only package: it ships kernel UAPI headers for building, not executable kernel code. The runtime image runs the datacon entrypoint as 65534:65534 with no CAP_SYS_ADMIN, and no code from this package is executed. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-99272",
+    "scope": "package:linux-libc-dev",
+    "impact": "Header-only package: it ships kernel UAPI headers for building, not executable kernel code. The runtime image runs the datacon entrypoint as 65534:65534 with no CAP_SYS_ADMIN, and no code from this package is executed. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-99281",
+    "scope": "package:linux-libc-dev",
+    "impact": "Header-only package: it ships kernel UAPI headers for building, not executable kernel code. The runtime image runs the datacon entrypoint as 65534:65534 with no CAP_SYS_ADMIN, and no code from this package is executed. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-99284",
+    "scope": "package:linux-libc-dev",
+    "impact": "Header-only package: it ships kernel UAPI headers for building, not executable kernel code. The runtime image runs the datacon entrypoint as 65534:65534 with no CAP_SYS_ADMIN, and no code from this package is executed. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-53613",
+    "scope": "package:mount",
+    "impact": "The control plane never mounts filesystems or edits partition tables; it runs as 65534:65534 without CAP_SYS_ADMIN and without privileged mode, so util-linux mount/blkid paths fail closed. The worker invokes only docker, git and clang, not these helper binaries. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-53615",
+    "scope": "package:mount",
+    "impact": "The control plane never mounts filesystems or edits partition tables; it runs as 65534:65534 without CAP_SYS_ADMIN and without privileged mode, so util-linux mount/blkid paths fail closed. The worker invokes only docker, git and clang, not these helper binaries. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-78410",
+    "scope": "package:mount",
+    "impact": "The control plane never mounts filesystems or edits partition tables; it runs as 65534:65534 without CAP_SYS_ADMIN and without privileged mode, so util-linux mount/blkid paths fail closed. The worker invokes only docker, git and clang, not these helper binaries. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2025-69720",
+    "scope": "package:ncurses-base",
+    "impact": "Terminal/terminfo support is only present for interactive host tooling. The control plane runs non-interactively as 65534:65534 and never processes untrusted terminfo databases. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2025-69720",
+    "scope": "package:ncurses-bin",
+    "impact": "Terminal/terminfo support is only present for interactive host tooling. The control plane runs non-interactively as 65534:65534 and never processes untrusted terminfo databases. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-9538",
+    "scope": "package:perl",
+    "impact": "Perl is a base-image dependency used by Debian maintainer tooling only; the control plane never executes Perl or passes attacker-controlled data to a Perl interpreter. Debian has deferred the fix for bookworm; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-9538",
+    "scope": "package:perl-base",
+    "impact": "Perl is a base-image dependency used by Debian maintainer tooling only; the control plane never executes Perl or passes attacker-controlled data to a Perl interpreter. Debian has deferred the fix for bookworm; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-9538",
+    "scope": "package:perl-modules-5.36",
+    "impact": "Perl is a base-image dependency used by Debian maintainer tooling only; the control plane never executes Perl or passes attacker-controlled data to a Perl interpreter. Debian has deferred the fix for bookworm; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2025-31133",
+    "scope": "package:runc",
+    "impact": "runc is never executed inside the control-plane image; nested container creation is delegated to the host daemon over the docker socket. No untrusted OCI bundle is assembled by the unprivileged 65534 process. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2025-52565",
+    "scope": "package:runc",
+    "impact": "runc is never executed inside the control-plane image; nested container creation is delegated to the host daemon over the docker socket. No untrusted OCI bundle is assembled by the unprivileged 65534 process. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2025-52881",
+    "scope": "package:runc",
+    "impact": "runc is never executed inside the control-plane image; nested container creation is delegated to the host daemon over the docker socket. No untrusted OCI bundle is assembled by the unprivileged 65534 process. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-53613",
+    "scope": "package:util-linux",
+    "impact": "The control plane never mounts filesystems or edits partition tables; it runs as 65534:65534 without CAP_SYS_ADMIN and without privileged mode, so util-linux mount/blkid paths fail closed. The worker invokes only docker, git and clang, not these helper binaries. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-53615",
+    "scope": "package:util-linux",
+    "impact": "The control plane never mounts filesystems or edits partition tables; it runs as 65534:65534 without CAP_SYS_ADMIN and without privileged mode, so util-linux mount/blkid paths fail closed. The worker invokes only docker, git and clang, not these helper binaries. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-78410",
+    "scope": "package:util-linux",
+    "impact": "The control plane never mounts filesystems or edits partition tables; it runs as 65534:65534 without CAP_SYS_ADMIN and without privileged mode, so util-linux mount/blkid paths fail closed. The worker invokes only docker, git and clang, not these helper binaries. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-53613",
+    "scope": "package:util-linux-extra",
+    "impact": "The control plane never mounts filesystems or edits partition tables; it runs as 65534:65534 without CAP_SYS_ADMIN and without privileged mode, so util-linux mount/blkid paths fail closed. The worker invokes only docker, git and clang, not these helper binaries. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-53615",
+    "scope": "package:util-linux-extra",
+    "impact": "The control plane never mounts filesystems or edits partition tables; it runs as 65534:65534 without CAP_SYS_ADMIN and without privileged mode, so util-linux mount/blkid paths fail closed. The worker invokes only docker, git and clang, not these helper binaries. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-78410",
+    "scope": "package:util-linux-extra",
+    "impact": "The control plane never mounts filesystems or edits partition tables; it runs as 65534:65534 without CAP_SYS_ADMIN and without privileged mode, so util-linux mount/blkid paths fail closed. The worker invokes only docker, git and clang, not these helper binaries. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2023-45853",
+    "scope": "package:zlib1g",
+    "impact": "zlib is reached only while handling trusted internal build artifacts; no attacker-controlled compressed stream is decompressed by the control plane. Debian marks this CVE will_not_fix for bookworm; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-85091",
+    "scope": "package:zlib1g",
+    "impact": "zlib is reached only while handling trusted internal build artifacts; no attacker-controlled compressed stream is decompressed by the control plane. No fixed Debian package is available for bookworm at scan time; this waiver is temporary scaffolding to be removed with the base-image refresh batch.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  }
+]

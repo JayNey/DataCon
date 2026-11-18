@@ -32,6 +32,15 @@ TOOLCHAIN_IMAGE = (
     "@sha256:f5ce959d91f059acf5a4b3f1c19f46713c4b2881c7d7cd1d5143ca1d1412277f"
 )
 TOOLCHAIN_IMAGE_DIGEST = TOOLCHAIN_IMAGE.split("@", 1)[1]
+# The image vulnerability scanner is pinned the same way. ci.yml, vuln-scan.yml
+# and release.yml keep the literal digest because workflows cannot import Python
+# constants; tests/contract/test_release_workflow.py asserts every copy matches
+# this single source of truth so a scanner upgrade cannot drift per workflow.
+TRIVY_IMAGE = (
+    "aquasec/trivy"
+    "@sha256:ab70a02200597efa04748f210f793936eb647cbcdb0ea69cc30b226d6f5a22c7"
+)
+TRIVY_IMAGE_DIGEST = TRIVY_IMAGE.split("@", 1)[1]
 SECCOMP_PROFILE_DIGEST = (
     "sha256:885442dc08f21f8d60f99ea43d59af88b1c529103815fe24bbf9ce998d3a609d"
 )
