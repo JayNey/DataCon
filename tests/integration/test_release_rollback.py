@@ -159,7 +159,7 @@ def test_promotion_and_rollback_change_the_persisted_active_release(
     assert rolled_back["image_id"] == previous["image_id"]
     assert rolled_back["migration_version"] == previous["migration_version"]
     assert rolled_back["config"] == previous["config"]
-    assert [event["action"] for event in store_handle.events()] == ["rollback"]
+    assert [event["action"] for event in store_handle.events()] == ["bootstrap", "rollback"]
 
     # 4. A clean promotion switches the active image and is idempotent.
     promoted = release.promote_and_smoke(
@@ -176,7 +176,7 @@ def test_promotion_and_rollback_change_the_persisted_active_release(
     assert active["image_id"] == CANDIDATE_IMAGE
     assert active["migration_version"] == manifest["migration_version"]
     events_after_promote = store_handle.events()
-    assert [event["action"] for event in events_after_promote] == ["rollback", "promote"]
+    assert [event["action"] for event in events_after_promote] == ["bootstrap", "rollback", "promote"]
 
     repeated = release.promote_and_smoke(
         manifest=manifest,
@@ -401,7 +401,7 @@ def test_release_store_transaction_rolls_back_switch_when_audit_fails(
     active = store_handle.active_release()
     assert active is not None
     assert active["image_id"] == PREVIOUS_IMAGE
-    assert store_handle.events() == []
+    assert [event["action"] for event in store_handle.events()] == ["bootstrap"]
 
 
 def test_migration_008_upgrades_legacy_unique_constraint_idempotently(
@@ -433,3 +433,112 @@ def test_migration_008_upgrades_legacy_unique_constraint_idempotently(
         "AND indexname = 'release_events_promote_unique_idx'"
     ).fetchone()
     assert new_index is not None
+
+
+def test_release_for_image_skips_a_malformed_but_valid_looking_event(
+    isolated_database,
+):
+    import uuid as uuid_mod
+
+    store_handle = state.ReleaseStore(isolated_database.dsn)
+    baseline = {
+        "image_id": PREVIOUS_IMAGE,
+        "config": {"policy_version": "1"},
+        "migration_version": "007_execution_evidence_invariant.sql",
+        "evidence_root": "/var/lib/datacon/evidence",
+    }
+    store_handle.bootstrap_release(**baseline)
+    # A newer row with a structurally valid envelope but an unusable payload
+    # must not become rollback provenance.
+    isolated_database.connection.execute(
+        "INSERT INTO release_events "
+        "(event_id, environment, action, status, candidate_digest, "
+        "manifest_digest, previous_image_id, active_image_id, payload) "
+        "VALUES (%s, %s, 'rollback', 'rolled_back', %s, %s, NULL, %s, %s)",
+        (
+            uuid_mod.uuid4(),
+            state.RELEASE_ENVIRONMENT,
+            "sha256:" + "a" * 64,
+            "sha256:" + "b" * 64,
+            PREVIOUS_IMAGE,
+            "{}",
+        ),
+    )
+    record = store_handle.release_for_image(PREVIOUS_IMAGE)
+    assert record is not None
+    assert record["config"] == baseline["config"]
+    assert record["evidence_root"] == baseline["evidence_root"]
+    assert record["manifest_digest"].startswith("sha256:")
+
+
+def test_migration_008_is_idempotent_with_existing_release_events(isolated_database):
+    store_handle = state.ReleaseStore(isolated_database.dsn)
+    baseline = {
+        "image_id": PREVIOUS_IMAGE,
+        "config": {"policy_version": "1"},
+        "migration_version": "007_execution_evidence_invariant.sql",
+        "evidence_root": "/var/lib/datacon/evidence",
+    }
+    store_handle.bootstrap_release(**baseline)
+    manifest = _manifest_with(CANDIDATE_IMAGE, "b" * 40)
+    approval = _approval(manifest)
+    promoted = release.promote_and_smoke(
+        manifest=manifest,
+        expected_manifest_digest=approval["candidate_digest"],
+        approval=approval,
+        backend=store_handle,
+        smoke_checks={"cli_smoke": lambda: True},
+        rollback_fn=lambda prev: {
+            "restored_image": prev["image_id"],
+            "ok": True,
+        },
+    )
+    assert promoted["status"] == "promoted"
+    before = store_handle.events()
+    assert [event["action"] for event in before] == ["bootstrap", "promote"]
+
+    migration_sql = (
+        Path(__file__).resolve().parents[2]
+        / "migrations"
+        / "008_release_events.sql"
+    ).read_text(encoding="utf-8")
+    isolated_database.connection.execute(migration_sql)
+    isolated_database.connection.execute(migration_sql)
+
+    assert store_handle.events() == before
+    assert store_handle.active_release()["image_id"] == CANDIDATE_IMAGE
+    bootstrap_index = isolated_database.connection.execute(
+        "SELECT 1 FROM pg_indexes "
+        "WHERE schemaname = current_schema() AND tablename = 'release_events' "
+        "AND indexname = 'release_events_bootstrap_unique_idx'"
+    ).fetchone()
+    assert bootstrap_index is not None
+    ledger_rows = isolated_database.connection.execute(
+        "SELECT count(*) FROM schema_migrations"
+    ).fetchone()[0]
+    assert ledger_rows == len(
+        list((Path(__file__).resolve().parents[2] / "migrations").glob("*.sql"))
+    )
+
+
+def test_bootstrap_is_idempotent_and_rejects_a_conflicting_baseline(
+    isolated_database,
+):
+    store_handle = state.ReleaseStore(isolated_database.dsn)
+    baseline = {
+        "image_id": PREVIOUS_IMAGE,
+        "config": {"policy_version": "1"},
+        "migration_version": "007_execution_evidence_invariant.sql",
+        "evidence_root": "/var/lib/datacon/evidence",
+    }
+    store_handle.bootstrap_release(**baseline)
+    first = store_handle.events()
+    store_handle.bootstrap_release(**baseline)
+    assert store_handle.events() == first
+    with pytest.raises(state.ReleaseStateError, match="conflicts"):
+        store_handle.bootstrap_release(
+            image_id="sha256:" + "1" * 64,
+            config={"policy_version": "1"},
+            migration_version="007_execution_evidence_invariant.sql",
+            evidence_root="/var/lib/datacon/evidence",
+        )

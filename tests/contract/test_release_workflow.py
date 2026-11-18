@@ -148,6 +148,9 @@ def test_b03_job_requires_authorized_runner_and_upload_only_summary():
     text = _run_text(job)
     assert "run_b03_acceptance" in text
     assert "B03CaseMaterials" in text
+    assert "materials.normal_input" in text
+    assert "materials.candidate_input" in text
+    assert 'normal.txt").read_bytes()' not in text
     assert "b03-acceptance-summary.json" in text
     assert "REPRODUCED" in text
     assert "ASAN_SIGNATURE_MATCHED" in text
@@ -199,7 +202,55 @@ def test_ci_test_job_runs_b04_with_injected_model_and_partition_check():
 
 def test_no_continue_on_error_anywhere():
     for path in (CI, RELEASE):
-        document = _load(path)
         text = path.read_text(encoding="utf-8")
         assert "continue-on-error" not in text
-        assert document["permissions"] == {"contents": "read"}
+
+
+def test_workflows_use_minimal_read_only_permissions():
+    ci_permissions = _load(CI)["permissions"]
+    release_permissions = _load(RELEASE)["permissions"]
+    # ci.yml has no cross-run artifact reads; release.yml needs actions: read
+    # for actions/download-artifact with run-id + github-token.
+    assert ci_permissions == {"contents": "read"}
+    assert release_permissions == {"contents": "read", "actions": "read"}
+    for document in (_load(CI), _load(RELEASE)):
+        for level in document["permissions"].values():
+            assert level == "read"
+
+
+def test_internal_jobs_are_restricted_to_main_or_a_release_tag():
+    jobs = _load(RELEASE)["jobs"]
+    for name in (
+        "build-candidate",
+        "promote-internal",
+        "rollback-internal",
+        "b03-internal",
+    ):
+        condition = jobs[name]["if"]
+        assert "github.ref == 'refs/heads/main'" in condition, name
+        assert "startsWith(github.ref, 'refs/tags/v')" in condition, name
+
+
+def test_cross_run_artifacts_are_provenance_checked():
+    jobs = _load(RELEASE)["jobs"]
+    for name in ("promote-internal", "rollback-internal"):
+        steps = _steps(jobs[name])
+        downloads = [
+            step
+            for step in steps
+            if step.get("uses", "").startswith("actions/download-artifact@")
+        ]
+        cross_run = [step for step in downloads if "run-id" in step.get("with", {})]
+        assert cross_run
+        for step in cross_run:
+            # Untrusted run ids are passed through env, never directly from an
+            # expression into a reusable action input.
+            assert step["with"]["run-id"] == "${{ env.ARTIFACT_RUN_ID }}"
+            assert step["with"]["github-token"] == "${{ secrets.GITHUB_TOKEN }}"
+        run_text = _run_text(jobs[name])
+        assert "api.github.com" in run_text
+        assert "merge-base" in run_text
+        assert "GITHUB_REF" in run_text
+    promote_text = _run_text(jobs["promote-internal"])
+    assert "VERIFIED_RUN_HEAD_SHA" in promote_text
+    assert 'manifest["source_commit"]' in promote_text

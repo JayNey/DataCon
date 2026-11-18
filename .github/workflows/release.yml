@@ -38,6 +38,9 @@ on:
 
 permissions:
   contents: read
+  # Cross-run actions/download-artifact (run-id + github-token) needs read
+  # access to Actions metadata/artifacts. No write permission is ever granted.
+  actions: read
 
 concurrency:
   group: release-${{ github.ref }}
@@ -80,11 +83,12 @@ jobs:
           uv run --frozen python - <<'PY'
           import os
           import pathlib
-          import psycopg
 
-          with psycopg.connect(os.environ["DATACON_DATABASE_URL"], autocommit=True) as conn:
-              for migration in sorted(pathlib.Path("migrations").glob("*.sql")):
-                  conn.execute(migration.read_text(encoding="utf-8"))
+          from datacon import state
+
+          state.apply_migrations_dsn(
+              os.environ["DATACON_DATABASE_URL"], pathlib.Path("migrations")
+          )
           PY
           sudo apt-get update
           sudo apt-get install -y clang llvm patch
@@ -124,7 +128,9 @@ jobs:
 
   build-candidate:
     needs: test-report
-    if: github.event_name != 'workflow_dispatch' || github.event.inputs.action == 'build'
+    if: >-
+      (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+      && (github.event_name != 'workflow_dispatch' || github.event.inputs.action == 'build')
     runs-on: ubuntu-latest
     timeout-minutes: 30
     outputs:
@@ -132,6 +138,8 @@ jobs:
       image_id: ${{ steps.manifest.outputs.image_id }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.12"
@@ -233,7 +241,10 @@ jobs:
               scan_report_digest=scan_digest,
           )
           release.verify_manifest_evidence(
-              manifest, out, migrations_dir=pathlib.Path("migrations")
+              manifest,
+              out,
+              migrations_dir=pathlib.Path("migrations"),
+              waivers_path=pathlib.Path(".github/security-waivers.json"),
           )
           (out / release.RELEASE_MANIFEST_FILE).write_text(
               json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
@@ -269,6 +280,7 @@ jobs:
     needs: [test-report, build-candidate]
     if: >-
       !cancelled()
+      && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
       && needs.test-report.result == 'success'
       && (
         (startsWith(github.ref, 'refs/tags/v') && needs.build-candidate.result == 'success')
@@ -288,6 +300,8 @@ jobs:
       DATACON_RELEASE_APPROVAL: ${{ secrets.DATACON_RELEASE_APPROVAL }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.12"
@@ -296,6 +310,80 @@ jobs:
           python -m pip install --disable-pip-version-check --require-hashes \
             --only-binary :all: -r requirements-ci.txt
           uv sync --frozen
+      - name: Verify protected ref and candidate artifact provenance
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ARTIFACT_RUN_ID: ${{ github.event.inputs.artifact_run_id }}
+          REPOSITORY: ${{ github.repository }}
+          CURRENT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          case "${GITHUB_REF}" in
+            refs/heads/main|refs/tags/v*) ;;
+            *) echo "promotion is only allowed from main or a v* tag" >&2; exit 1 ;;
+          esac
+          uv run --frozen python - <<'PY'
+          import json
+          import os
+          import re
+          import subprocess
+          import urllib.request
+
+          def fail(message):
+              raise SystemExit(message)
+
+          current = os.environ.get("CURRENT_SHA", "").strip()
+          if not re.fullmatch(r"[0-9a-f]{40}", current):
+              fail("GITHUB_SHA is not a 40-char commit")
+          run_id = os.environ.get("ARTIFACT_RUN_ID", "").strip()
+          if run_id:
+              token = os.environ.get("GITHUB_TOKEN", "").strip()
+              if not token:
+                  fail("GITHUB_TOKEN is required to verify the artifact run")
+              url = (
+                  "https://api.github.com/repos/"
+                  + os.environ["REPOSITORY"]
+                  + "/actions/runs/"
+                  + run_id
+              )
+              request = urllib.request.Request(
+                  url,
+                  headers={
+                      "Authorization": "Bearer " + token,
+                      "Accept": "application/vnd.github+json",
+                      "X-GitHub-Api-Version": "2022-11-28",
+                  },
+              )
+              try:
+                  with urllib.request.urlopen(request, timeout=20) as response:
+                      run = json.load(response)
+              except Exception as error:
+                  fail("cannot read artifact run metadata: " + repr(error))
+              path = str(run.get("path", ""))
+              if not path.endswith(".github/workflows/release.yml"):
+                  fail("artifact run was not produced by release.yml")
+              if run.get("status") != "completed" or run.get("conclusion") != "success":
+                  fail("artifact run did not complete successfully")
+              head_sha = run.get("head_sha")
+              if not isinstance(head_sha, str) or not re.fullmatch(r"[0-9a-f]{40}", head_sha):
+                  fail("artifact run has no valid head_sha")
+              head_branch = run.get("head_branch")
+              if head_branch not in (None, "main") and not re.fullmatch(
+                  r"v[0-9A-Za-z._-]+", str(head_branch)
+              ):
+                  fail("artifact run did not come from main or a release tag")
+              if subprocess.run(
+                  ["git", "merge-base", "--is-ancestor", head_sha, current]
+              ).returncode != 0:
+                  fail("artifact run head_sha is not in the protected ref history")
+              env_file = os.environ.get("GITHUB_ENV")
+              if env_file:
+                  with open(env_file, "a", encoding="utf-8") as handle:
+                      handle.write("VERIFIED_RUN_HEAD_SHA=" + head_sha + "\n")
+          print("protected ref and artifact provenance verified")
+          PY
+
       - name: Require an explicit artifact run for a dispatched promotion
         if: github.event_name == 'workflow_dispatch'
         shell: bash
@@ -317,7 +405,7 @@ jobs:
         with:
           name: release-candidate-artifacts
           path: ${{ runner.temp }}/release-artifacts
-          run-id: ${{ github.event.inputs.artifact_run_id }}
+          run-id: ${{ env.ARTIFACT_RUN_ID }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
       - name: Validate the approved manifest digest and loaded image id
         shell: bash
@@ -330,7 +418,9 @@ jobs:
           out="$RUNNER_TEMP/release-artifacts"
           uv run --frozen python - "$out" "$EXPECTED_MANIFEST_DIGEST" <<'PY'
           import json
+          import os
           import pathlib
+          import subprocess
           import sys
 
           from datacon import release
@@ -343,8 +433,22 @@ jobs:
           actual = release.canonical_manifest_digest(manifest)
           if actual != expected:
               raise SystemExit(f"manifest digest mismatch: {actual} != {expected}")
+          expected_head = os.environ.get("VERIFIED_RUN_HEAD_SHA") or os.environ["CURRENT_SHA"]
+          if manifest["source_commit"] != expected_head:
+              raise SystemExit(
+                  "manifest source_commit does not match the verified artifact run head"
+              )
+          if subprocess.run(
+              ["git", "merge-base", "--is-ancestor", manifest["source_commit"], "HEAD"]
+          ).returncode != 0:
+              raise SystemExit(
+                  "manifest source_commit is not in the protected ref history"
+              )
           release.verify_manifest_evidence(
-              manifest, out, migrations_dir=pathlib.Path("migrations")
+              manifest,
+              out,
+              migrations_dir=pathlib.Path("migrations"),
+              waivers_path=pathlib.Path(".github/security-waivers.json"),
           )
           print("manifest and evidence verified")
           PY
@@ -384,6 +488,21 @@ jobs:
               raise SystemExit("database smoke failed")
           print("database smoke ok")
           PY
+      - name: Smoke the candidate worker from inside the container
+        shell: bash
+        run: |
+          set -euo pipefail
+          secret_file="$(mktemp)"
+          head -c 32 /dev/urandom | base64 > "${secret_file}"
+          chmod 0444 "${secret_file}"
+          trap 'rm -f "${secret_file}"' EXIT
+          docker run --rm --network host \
+            -e DATACON_DATABASE_URL \
+            -e DATACON_JOURNAL_SECRET_FILE=/tmp/journal-secret \
+            -v "${secret_file}:/tmp/journal-secret:ro" \
+            datacon-control-plane:candidate worker --once --prepare-only
+          echo "candidate worker database smoke ok"
+
       - name: Promote through the persisted backend and record audit
         shell: bash
         run: |
@@ -448,19 +567,19 @@ jobs:
               ) as conn:
                   return conn.execute("SELECT 1").fetchone() == (1,)
 
-          def archived_bundle_smoke():
+          def verify_bundle_in_container(bundle_path, expected_digest):
               proc = subprocess.run(
                   [
                       "docker",
                       "run",
                       "--rm",
                       "-v",
-                      f"{smoke_bundle}:/bundle:ro",
+                      f"{bundle_path}:/bundle:ro",
                       "datacon-control-plane:candidate",
                       "verify-bundle",
                       "/bundle",
                       "--expected-digest",
-                      smoke_bundle_digest,
+                      expected_digest,
                   ],
                   capture_output=True,
                   text=True,
@@ -473,20 +592,31 @@ jobs:
                   return False
               return (
                   parsed.get("status") == "valid"
-                  and parsed.get("manifest_digest") == smoke_bundle_digest
+                  and parsed.get("manifest_digest") == expected_digest
               )
 
+          def archived_bundle_smoke():
+              return verify_bundle_in_container(smoke_bundle, smoke_bundle_digest)
+
+          smoke_checks = {
+              "cli_smoke": image_help,
+              "db_readability": db_readable,
+              "archived_bundle": archived_bundle_smoke,
+          }
+          # Prefer a real archived evidence bundle from the target database
+          # over the synthetic bundle when one exists.
+          latest = store.latest_evidence_bundle()
+          if latest is not None:
+              smoke_checks["archived_real_bundle"] = lambda: verify_bundle_in_container(
+                  latest["path"], latest["digest"]
+              )
           try:
               result = release.promote_and_smoke(
                   manifest=manifest,
                   expected_manifest_digest=expected,
                   approval=approval,
                   backend=store,
-                  smoke_checks={
-                      "cli_smoke": image_help,
-                      "db_readability": db_readable,
-                      "archived_bundle": archived_bundle_smoke,
-                  },
+                  smoke_checks=smoke_checks,
                   rollback_fn=rollback_fn,
               )
           finally:
@@ -506,16 +636,22 @@ jobs:
           retention-days: 30
 
   rollback-internal:
-    if: github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'rollback'
+    if: >-
+      github.event_name == 'workflow_dispatch'
+      && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+      && github.event.inputs.action == 'rollback'
     environment: internal-lab
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
       TARGET_DIGEST: ${{ github.event.inputs.target_digest }}
       ARTIFACT_RUN_ID: ${{ github.event.inputs.artifact_run_id }}
+      APPROVED_BY: ${{ github.actor }}
       DATACON_DATABASE_URL: ${{ secrets.DATACON_DATABASE_URL }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.12"
@@ -536,12 +672,83 @@ jobs:
             echo "artifact_run_id is required to load the rollback image tar" >&2
             exit 1
           fi
+      - name: Verify protected ref and rollback artifact provenance
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ARTIFACT_RUN_ID: ${{ github.event.inputs.artifact_run_id }}
+          REPOSITORY: ${{ github.repository }}
+          CURRENT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          case "${GITHUB_REF}" in
+            refs/heads/main|refs/tags/v*) ;;
+            *) echo "rollback is only allowed from main or a v* tag" >&2; exit 1 ;;
+          esac
+          uv run --frozen python - <<'PY'
+          import json
+          import os
+          import re
+          import subprocess
+          import urllib.request
+
+          def fail(message):
+              raise SystemExit(message)
+
+          current = os.environ.get("CURRENT_SHA", "").strip()
+          if not re.fullmatch(r"[0-9a-f]{40}", current):
+              fail("GITHUB_SHA is not a 40-char commit")
+          run_id = os.environ.get("ARTIFACT_RUN_ID", "").strip()
+          if not run_id:
+              fail("artifact_run_id is required to verify rollback provenance")
+          token = os.environ.get("GITHUB_TOKEN", "").strip()
+          if not token:
+              fail("GITHUB_TOKEN is required to verify the artifact run")
+          url = (
+              "https://api.github.com/repos/"
+              + os.environ["REPOSITORY"]
+              + "/actions/runs/"
+              + run_id
+          )
+          request = urllib.request.Request(
+              url,
+              headers={
+                  "Authorization": "Bearer " + token,
+                  "Accept": "application/vnd.github+json",
+                  "X-GitHub-Api-Version": "2022-11-28",
+              },
+          )
+          try:
+              with urllib.request.urlopen(request, timeout=20) as response:
+                  run = json.load(response)
+          except Exception as error:
+              fail("cannot read artifact run metadata: " + repr(error))
+          path = str(run.get("path", ""))
+          if not path.endswith(".github/workflows/release.yml"):
+              fail("artifact run was not produced by release.yml")
+          if run.get("status") != "completed" or run.get("conclusion") != "success":
+              fail("artifact run did not complete successfully")
+          head_sha = run.get("head_sha")
+          if not isinstance(head_sha, str) or not re.fullmatch(r"[0-9a-f]{40}", head_sha):
+              fail("artifact run has no valid head_sha")
+          head_branch = run.get("head_branch")
+          if head_branch not in (None, "main") and not re.fullmatch(
+              r"v[0-9A-Za-z._-]+", str(head_branch)
+          ):
+              fail("artifact run did not come from main or a release tag")
+          if subprocess.run(
+              ["git", "merge-base", "--is-ancestor", head_sha, current]
+          ).returncode != 0:
+              fail("artifact run head_sha is not in the protected ref history")
+          print("protected ref and rollback artifact provenance verified")
+          PY
+
       - name: Download the candidate artifact that contains the target image
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: release-candidate-artifacts
           path: ${{ runner.temp }}/release-artifacts
-          run-id: ${{ github.event.inputs.artifact_run_id }}
+          run-id: ${{ env.ARTIFACT_RUN_ID }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
       - name: Load the target image and verify its id
         shell: bash
@@ -586,18 +793,25 @@ jobs:
               ) as conn:
                   return conn.execute("SELECT 1").fetchone() == (1,)
 
+          approved_by = os.environ.get("APPROVED_BY", "").strip()
+          if not approved_by:
+              raise SystemExit("approved_by must identify the dispatching operator")
           result = release.rollback_release(
               target_release=target,
               backend=store,
               smoke_checks={"cli_smoke": image_help, "db_readability": db_readable},
-              approved_by="internal-lab-environment",
+              approved_by=approved_by,
               candidate_digest=os.environ["TARGET_DIGEST"],
+              manifest_digest=target.get("manifest_digest"),
           )
           print(json.dumps(result, indent=2))
           PY
 
   b03-internal:
-    if: github.event_name == 'workflow_dispatch' && github.event.inputs.run_b03 == 'true'
+    if: >-
+      github.event_name == 'workflow_dispatch'
+      && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+      && github.event.inputs.run_b03 == 'true'
     environment: internal-lab
     # This label is intentionally not a GitHub-hosted runner. The B03 replay
     # must execute on the authorized internal Linux runner; a missing runner
@@ -609,7 +823,21 @@ jobs:
       DATACON_B03_ADMISSION: ${{ secrets.DATACON_B03_ADMISSION }}
       DATACON_B03_REVIEW: ${{ secrets.DATACON_B03_REVIEW }}
     steps:
+      - name: Verify protected ref
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "${GITHUB_REF}" in
+            refs/heads/main|refs/tags/v*) ;;
+            *) echo "B03 acceptance is only allowed from main or a v* tag" >&2; exit 1 ;;
+          esac
+          if [[ ! "${GITHUB_SHA}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "GITHUB_SHA must be a 40-char commit" >&2
+            exit 1
+          fi
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.12"
@@ -641,8 +869,8 @@ jobs:
           )
           review = json.loads(os.environ["DATACON_B03_REVIEW"])
           materials = release.B03CaseMaterials.load(case_root)
-          normal_input = (case_root / "inputs" / "normal.txt").read_bytes()
-          candidate_input = (case_root / "inputs" / "candidate.txt").read_bytes()
+          normal_input = materials.normal_input
+          candidate_input = materials.candidate_input
           prepared = release.prepare_b03_plan(
               admission=admission,
               materials=materials,

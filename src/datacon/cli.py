@@ -9,11 +9,12 @@ import os
 import re
 import sys
 from pathlib import Path
+from typing import Any
 from uuid import UUID
 
 import psycopg
 
-from datacon import evidence, state, store, workflow
+from datacon import evidence, jsonutil, release, state, store, workflow
 from datacon.contracts import MAX_REQUEST_BYTES, InvalidRequest, parse_request
 
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
@@ -91,6 +92,32 @@ def _parser() -> argparse.ArgumentParser:
         "slots", help="show active execution slots and the active release"
     )
     slots.add_argument("--environment", default="internal-lab")
+    bootstrap = release_commands.add_parser(
+        "bootstrap",
+        help="persist the baseline release and its audit snapshot for an environment",
+    )
+    bootstrap.add_argument("--environment", default="internal-lab")
+    bootstrap.add_argument("--image-id", required=True)
+    bootstrap.add_argument("--migration-version", required=True)
+    bootstrap.add_argument("--evidence-root", required=True)
+    bootstrap_config = bootstrap.add_mutually_exclusive_group()
+    bootstrap_config.add_argument(
+        "--config",
+        default=None,
+        help="release config as a JSON object (default: {})",
+    )
+    bootstrap_config.add_argument(
+        "--config-file",
+        type=Path,
+        default=None,
+        help="path to a JSON object file for the release config",
+    )
+
+    migrate = commands.add_parser(
+        "migrate",
+        help="apply SQL migrations in order and record them in schema_migrations",
+    )
+    migrate.add_argument("--migrations-dir", type=Path, default=Path("migrations"))
     return parser
 
 
@@ -335,6 +362,84 @@ def _release_slots(args) -> int:
     return 0
 
 
+def _release_bootstrap(args) -> int:
+    dsn = _database_url()
+    if not dsn:
+        return _error(1, "DATABASE_NOT_CONFIGURED", "set DATACON_DATABASE_URL")
+    raw_config = args.config
+    if args.config_file is not None:
+        try:
+            raw_config = args.config_file.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as error:
+            return _error(2, "INVALID_REQUEST", f"cannot read config file: {error}")
+    if raw_config is None:
+        config: Any = {}
+    else:
+        try:
+            config = jsonutil.loads_strict(raw_config)
+        except jsonutil.StrictJsonError as error:
+            return _error(2, "INVALID_REQUEST", f"config is not strict JSON: {error}")
+    if not isinstance(config, dict):
+        return _error(2, "INVALID_REQUEST", "config must be a JSON object")
+    try:
+        previous = release.validate_previous_release(
+            {
+                "image_id": args.image_id,
+                "config": config,
+                "migration_version": args.migration_version,
+                "evidence_root": args.evidence_root,
+            }
+        )
+    except release.ReleaseGateError as error:
+        return _error(2, "INVALID_RELEASE_STATE", str(error))
+    try:
+        store_handle = state.ReleaseStore(dsn, environment=args.environment)
+        store_handle.bootstrap_release(
+            image_id=previous["image_id"],
+            config=previous["config"],
+            migration_version=previous["migration_version"],
+            evidence_root=previous["evidence_root"],
+        )
+    except psycopg.Error as error:
+        return _error(1, "DATABASE_ERROR", _database_error_message(error))
+    except (state.StateError, ValueError) as error:
+        return _error(2, "INVALID_RELEASE_STATE", str(error))
+    print(
+        json.dumps(
+            {
+                "environment": args.environment,
+                "image_id": previous["image_id"],
+                "migration_version": previous["migration_version"],
+                "evidence_root": previous["evidence_root"],
+                "config": previous["config"],
+                "baseline": True,
+            },
+            ensure_ascii=False,
+            default=str,
+        )
+    )
+    return 0
+
+
+def _migrate(args) -> int:
+    dsn = _database_url()
+    if not dsn:
+        return _error(1, "DATABASE_NOT_CONFIGURED", "set DATACON_DATABASE_URL")
+    try:
+        applied = state.apply_migrations_dsn(dsn, args.migrations_dir)
+    except psycopg.Error as error:
+        return _error(1, "DATABASE_ERROR", _database_error_message(error))
+    except (state.StateError, OSError) as error:
+        return _error(2, "INVALID_RELEASE_STATE", str(error))
+    print(
+        json.dumps(
+            {"applied": sorted(applied), "count": len(applied)},
+            ensure_ascii=False,
+        )
+    )
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     if args.command == "submit":
@@ -349,8 +454,16 @@ def main(argv: list[str] | None = None) -> int:
         return _export(args)
     if args.command == "verify-bundle":
         return _verify_bundle(args)
+    if args.command == "migrate":
+        return _migrate(args)
     if args.command == "release":
         if args.release_command == "slots":
             return _release_slots(args)
+        if args.release_command == "bootstrap":
+            return _release_bootstrap(args)
         return _error(2, "INVALID_REQUEST", "unknown release command")
     return _error(2, "INVALID_REQUEST", "unknown command")
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

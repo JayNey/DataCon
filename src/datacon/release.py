@@ -16,7 +16,7 @@ import tomllib
 from typing import Any, Callable, Mapping, Protocol, Sequence
 import uuid
 
-from datacon import contracts, evidence, jsonutil
+from datacon import contracts, evidence, fileio, jsonutil
 from datacon.tools.sandbox import _extract_compile_args
 from datacon.verdict import RunObservation, VerdictPolicy, decide_verdict
 
@@ -52,6 +52,23 @@ PROMOTION_RESULT_FILE = "promotion-result.json"
 _SHA256 = re.compile(r"sha256:[0-9a-f]{64}")
 _GIT_SHA40 = re.compile(r"[0-9a-f]{40}")
 _MIGRATION_NAME = re.compile(r"[0-9]{3}_[A-Za-z0-9_]+\.sql")
+_MIGRATION_NUMBER = re.compile(r"^([0-9]{3})_")
+# Migrations that may be crossed when rolling an image back. A rollback never
+# reverts PostgreSQL DDL; it is only safe when every migration newer than the
+# target is additive/backward-compatible for the older image. Anything not
+# listed here fails closed so release_state.migration_version cannot lie about
+# a schema the target image was not built for. 003 (unique-key replacement) and
+# 007 (cleanup + constraints) are intentionally absent: rolling across them
+# requires an explicit operator decision and a new compatibility entry.
+ROLLBACK_COMPATIBLE_MIGRATIONS = frozenset(
+    {
+        "002_workflow.sql",
+        "004_legacy_binary_sync.sql",
+        "005_execution_evidence.sql",
+        "006_attempt_journal_provenance.sql",
+        "008_release_events.sql",
+    }
+)
 _CVE_ID = re.compile(r"CVE-[0-9]{4}-[0-9]{4,}")
 _HTTP_URL = re.compile(r"https?://\S+")
 _B03_VERDICTS = frozenset({"REPRODUCED", "NOT_REPRODUCED", "INCONCLUSIVE"})
@@ -207,9 +224,16 @@ def validate_release_candidate_manifest(manifest: Mapping[str, Any]) -> None:
         _require_digest(entry.get("sha256"), "migration entry sha256")
         if set(entry.keys()) != {"file", "sha256"}:
             raise ReleaseGateError("migration entry has unknown fields")
+    numbers = [int(_MIGRATION_NUMBER.match(name).group(1)) for name in names]
+    if numbers != list(range(1, len(numbers) + 1)):
+        raise ReleaseGateError(
+            "migrations must be numbered consecutively from 001"
+        )
     if manifest["migration_version"] != names[-1]:
         raise ReleaseGateError("migration_version must match the latest migration file")
-    _parse_instant(manifest["created_at"], "created_at")
+    created_at = _parse_instant(manifest["created_at"], "created_at")
+    if created_at > datetime.now(timezone.utc) + APPROVAL_FUTURE_SKEW:
+        raise ReleaseGateError("release candidate created_at is in the future")
 
 
 def verify_manifest_against_disk(
@@ -256,12 +280,16 @@ def verify_manifest_evidence(
     artifacts_dir: Path,
     *,
     migrations_dir: Path | None = None,
+    waivers_path: Path | None = None,
 ) -> dict[str, str]:
     """Recompute every evidence digest from artifacts and compare to the manifest.
 
     The promote job calls this before switching traffic. A tampered JUnit XML,
     scanner JSON, SBOM, wheel, or migration therefore blocks promotion even
-    when the manifest's own canonical digest still matches the approval.
+    when the manifest's own canonical digest still matches the approval. A
+    digest-only comparison is not enough: the four JUnit reports must prove
+    that every test really ran with zero skips/failures, and the scanner report
+    must be a real non-empty Trivy result that passes the waiver gate.
     """
     validate_release_candidate_manifest(manifest)
     artifacts = Path(artifacts_dir)
@@ -309,6 +337,27 @@ def verify_manifest_evidence(
             )
     if migrations_dir is not None:
         verify_manifest_against_disk(manifest, migrations_dir)
+
+    # Content validation after the digest match: an attacker cannot satisfy
+    # this by rewriting both the file and the manifest, because the manifest
+    # digest is bound by the reviewer approval.
+    from datacon import ci_gates
+
+    for path in report_paths:
+        try:
+            ci_gates.check_junit_report(path, label=path.name)
+        except ci_gates.GateError as error:
+            raise ReleaseGateError(str(error)) from error
+    if waivers_path is None:
+        # The repository's structured waivers are authoritative when present;
+        # an explicit path is still honored (and fails closed when missing).
+        repository_waivers = Path(".github/security-waivers.json")
+        if repository_waivers.is_file():
+            waivers_path = repository_waivers
+    try:
+        ci_gates.evaluate_scan_report(scan_path, waivers_path=waivers_path)
+    except ci_gates.GateError as error:
+        raise ReleaseGateError(str(error)) from error
     return computed
 
 
@@ -495,12 +544,21 @@ class DictPromotionBackend:
         active_release: Mapping[str, Any],
         active_slots: int = 0,
         promotions: Mapping[str, Mapping[str, Any]] | None = None,
+        migrations: Mapping[str, str] | None = None,
     ):
         self._active = validate_previous_release(active_release)
         self._slots = active_slots
         self.promotions = dict(promotions or {})
+        self._migrations = dict(migrations or {})
         self.switches: list[dict[str, Any]] = []
         self.audits: list[dict[str, Any]] = []
+
+    def applied_migrations(self) -> Mapping[str, str]:
+        if not self._migrations:
+            raise ReleaseGateError(
+                "dict backend has no migration ledger; configure it in the test"
+            )
+        return dict(self._migrations)
 
     def active_slots(self) -> int:
         return self._slots
@@ -596,6 +654,140 @@ def _same_release(left: Mapping[str, Any], right: Mapping[str, Any]) -> bool:
     )
 
 
+def _migration_ledger(backend: PromotionBackend) -> dict[str, str]:
+    """Read and validate the target database's migration ledger.
+
+    Promotion must prove the real schema matches the candidate manifest. A
+    backend without a ledger fails closed rather than silently trusting the
+    approval record's ``migration_compatible`` boolean.
+    """
+    getter = getattr(backend, "applied_migrations", None)
+    if not callable(getter):
+        raise ReleaseGateError(
+            "release blocked: the promotion backend does not expose a "
+            "schema_migrations ledger"
+        )
+    applied = getter()
+    if not isinstance(applied, Mapping):
+        raise ReleaseGateError("release blocked: the migration ledger is malformed")
+    normalized: dict[str, str] = {}
+    for name, digest in applied.items():
+        if not isinstance(name, str) or not _MIGRATION_NAME.fullmatch(name):
+            raise ReleaseGateError(
+                f"release blocked: invalid migration ledger file name {name!r}"
+            )
+        _require_digest(digest, f"migration ledger digest for {name}")
+        normalized[name] = digest
+    return normalized
+
+
+def _verify_manifest_migrations(
+    manifest: Mapping[str, Any], applied: Mapping[str, str]
+) -> dict[str, str]:
+    """Require the ledger to contain exactly the manifest's files and digests."""
+    expected = {entry["file"]: entry["sha256"] for entry in manifest["migrations"]}
+    missing = sorted(set(expected) - set(applied))
+    extra = sorted(set(applied) - set(expected))
+    mismatched = sorted(
+        name
+        for name in expected
+        if name in applied and applied[name] != expected[name]
+    )
+    if missing or extra or mismatched:
+        raise ReleaseGateError(
+            "promotion blocked: database migration ledger does not match the "
+            f"candidate manifest (missing={missing} extra={extra} "
+            f"mismatched={mismatched})"
+        )
+    return expected
+
+
+def _migration_ordinal(name: str, label: str) -> int:
+    match = _MIGRATION_NUMBER.match(name)
+    if match is None:
+        raise ReleaseGateError(f"{label} is not a NNN_*.sql migration: {name!r}")
+    return int(match.group(1))
+
+
+def _verify_rollback_migrations(
+    *,
+    target_version: str,
+    current_version: str,
+    applied: Mapping[str, str],
+) -> int:
+    """Enforce the forward-compatibility boundary for a rollback.
+
+    PostgreSQL migrations are never reverted by a rollback. The target image is
+    only safe when every migration newer than its version is declared
+    rollback-compatible; otherwise this fails closed instead of letting
+    ``release_state.migration_version`` claim a schema the image cannot use.
+    """
+    if target_version not in applied:
+        raise ReleaseGateError(
+            "rollback blocked: target migration_version is not in the applied "
+            f"migration ledger: {target_version}"
+        )
+    if current_version not in applied:
+        raise ReleaseGateError(
+            "rollback blocked: active migration_version is not in the applied "
+            f"migration ledger: {current_version}"
+        )
+    target_number = _migration_ordinal(target_version, "target migration_version")
+    current_number = _migration_ordinal(
+        current_version, "active migration_version"
+    )
+    if target_number > current_number:
+        raise ReleaseGateError(
+            "rollback blocked: target migration_version is newer than the "
+            "active schema"
+        )
+    crossed = sorted(
+        name
+        for name in applied
+        if _migration_ordinal(name, "migration ledger entry") > target_number
+    )
+    incompatible = [
+        name for name in crossed if name not in ROLLBACK_COMPATIBLE_MIGRATIONS
+    ]
+    if incompatible:
+        raise ReleaseGateError(
+            "rollback blocked: target crosses migrations without a declared "
+            f"backward-compatibility boundary: {', '.join(incompatible)}"
+        )
+    return target_number
+
+
+def _release_record_digest(record: Mapping[str, Any]) -> str:
+    return jsonutil.digest_json(
+        {
+            "image_id": record["image_id"],
+            "config": dict(record["config"]),
+            "migration_version": record["migration_version"],
+            "evidence_root": record["evidence_root"],
+        }
+    )
+
+
+def _persisted_manifest_digest(
+    backend: PromotionBackend, record: Mapping[str, Any]
+) -> str:
+    """Return the target release's manifest digest, never its image id.
+
+    Promoted releases have an approved manifest digest in the audit log. A
+    bootstrapped baseline has no candidate manifest, so a digest of the
+    baseline snapshot is used and remains clearly distinguishable from an RC
+    manifest digest.
+    """
+    getter = getattr(backend, "release_for_image", None)
+    if callable(getter):
+        found = getter(record["image_id"])
+        if isinstance(found, Mapping):
+            digest = found.get("manifest_digest")
+            if isinstance(digest, str) and _SHA256.fullmatch(digest):
+                return digest
+    return _release_record_digest(record)
+
+
 def _existing_promotion(
     backend: PromotionBackend, existing: Mapping[str, Any]
 ) -> dict[str, Any]:
@@ -603,10 +795,19 @@ def _existing_promotion(
         raise ReleaseGateError(
             "candidate already has a non-promoted audit record; refusing to replay"
         )
+    expected = validate_previous_release(
+        {
+            "image_id": existing.get("active_image_id"),
+            "config": existing.get("config"),
+            "migration_version": existing.get("migration_version"),
+            "evidence_root": existing.get("evidence_root"),
+        }
+    )
     active = backend.active_release()
-    if active is None or active.get("image_id") != existing.get("active_image_id"):
+    if active is None or not _same_release(active, expected):
         raise ReleaseGateError(
-            "candidate was previously promoted but the active release changed; "
+            "candidate was previously promoted but the active release no longer "
+            "matches its persisted image/config/migration/evidence_root; "
             "refusing to replay a stale approval"
         )
     return dict(existing)
@@ -622,14 +823,15 @@ def promote_and_smoke(
     rollback_fn: Callable[[Mapping[str, Any]], Mapping[str, Any]],
     now: datetime | None = None,
 ) -> dict[str, Any]:
-    """Drain-check, promote, run smoke checks, switch state and audit.
+    """Drain-check, switch to the candidate, smoke it, and audit the outcome.
 
-    Promotion is idempotent for a candidate digest: a repeated call returns the
-    already recorded result and never switches or audits twice. A smoke failure
-    is not swallowed: the rollback callable must prove it restored the previous
-    image, and the persisted active release must actually change back. The
-    switch and its audit share one backend transaction, so an audit failure can
-    never leave release_state and release_events out of sync.
+    The candidate must become the active release *before* the smoke suite runs.
+    A smoke failure is therefore a real transition back to the persisted
+    previous release: ``rollback_fn`` must prove it restored every field and
+    the backend must expose a real rollback state change. A no-op rollback
+    callable fails closed. The candidate switch, smoke result, rollback switch
+    and audit share one backend transaction, so a failure cannot leave
+    ``release_state`` and ``release_events`` out of sync.
     """
     if not isinstance(smoke_checks, Mapping) or not smoke_checks:
         raise ReleaseGateError("promotion requires at least one smoke check")
@@ -652,63 +854,21 @@ def promote_and_smoke(
         )
     previous = validate_previous_release(previous)
 
-    smoke_results: dict[str, bool] = {}
-    failed_check: str | None = None
-    for name, check_fn in smoke_checks.items():
-        try:
-            ok = bool(check_fn())
-        except Exception:  # noqa: BLE001 - a failing smoke check is a gate failure
-            ok = False
-        smoke_results[name] = ok
-        if not ok:
-            failed_check = name
-            break
-
-    if failed_check is not None:
-        with _backend_transaction(backend):
-            current = backend.active_release()
-            if current is None or not _same_release(current, previous):
-                raise ReleaseGateError(
-                    "active release changed during the smoke failure; refusing "
-                    "to roll back a release this attempt no longer owns"
-                )
-            try:
-                rollback_outcome = rollback_fn(previous)
-            except Exception as error:  # noqa: BLE001 - never swallow rollback failures
-                raise ReleaseGateError(f"rollback failed: {error}") from error
-            rollback_outcome = validate_rollback_outcome(
-                rollback_outcome, expected_image=previous["image_id"]
-            )
-            restored = backend.active_release()
-            if restored is None or restored.get("image_id") != previous["image_id"]:
-                raise ReleaseGateError(
-                    "rollback callable returned success but the backend did not "
-                    "restore the previous image"
-                )
-            result = {
-                "schema_version": SCHEMA_VERSION,
-                "status": "rolled_back",
-                "failed_check": failed_check,
-                "candidate_digest": candidate_digest,
-                "source_commit": manifest["source_commit"],
-                "previous_image_id": previous["image_id"],
-                "active_image_id": previous["image_id"],
-                "approved_by": approval["approved_by"],
-                "migration_version": previous["migration_version"],
-                "config": dict(previous["config"]),
-                "evidence_root": previous["evidence_root"],
-                "smoke_results": smoke_results,
-                "rollback": rollback_outcome,
-                "recorded_at": _utc_now(),
-            }
-            backend.record_audit(result)
-        return result
-
     candidate_image = manifest["control_plane_image_id"]
     config = _candidate_config(manifest)
+    candidate_record = {
+        "image_id": candidate_image,
+        "config": config,
+        "migration_version": manifest["migration_version"],
+        "evidence_root": previous["evidence_root"],
+    }
+    previous_manifest_digest = _persisted_manifest_digest(backend, previous)
+    smoke_results: dict[str, bool] = {}
+    failed_check: str | None = None
+
     with _backend_transaction(backend):
         # Re-read inside the transaction: another promotion may have finished
-        # while the smoke checks ran, and this attempt must not overwrite it.
+        # while the drain check ran, and this attempt must not overwrite it.
         existing = backend.promotion_for(candidate_digest)
         if existing is not None:
             return _existing_promotion(backend, existing)
@@ -716,9 +876,10 @@ def promote_and_smoke(
         current = backend.active_release()
         if current is None or not _same_release(current, previous):
             raise ReleaseGateError(
-                "active release changed while smoke checks ran; refusing to "
-                "overwrite a concurrent promotion"
+                "active release changed before the candidate switch; refusing "
+                "to overwrite a concurrent promotion"
             )
+        _verify_manifest_migrations(manifest, _migration_ledger(backend))
         backend.switch(
             image_id=candidate_image,
             config=config,
@@ -727,20 +888,91 @@ def promote_and_smoke(
             action="promote",
             candidate_digest=candidate_digest,
         )
-        active = backend.active_release()
-        if active is None or active.get("image_id") != candidate_image:
+        switched = backend.active_release()
+        if switched is None or not _same_release(switched, candidate_record):
             raise ReleaseGateError(
-                "promotion switch did not make the candidate image active"
+                "promotion switch did not make the candidate release active with "
+                "its exact image/config/migration/evidence_root"
             )
-        if active.get("migration_version") != manifest["migration_version"]:
-            raise ReleaseGateError(
-                "promotion switch did not apply the candidate migration_version"
+
+        for name, check_fn in smoke_checks.items():
+            try:
+                ok = bool(check_fn())
+            except Exception:  # noqa: BLE001 - a failing smoke check is a gate failure
+                ok = False
+            smoke_results[name] = ok
+            if not ok:
+                failed_check = name
+                break
+
+        if failed_check is not None:
+            before_rollback = (
+                len(backend.switches)
+                if isinstance(getattr(backend, "switches", None), list)
+                else None
             )
+            try:
+                rollback_outcome = rollback_fn(previous)
+            except Exception as error:  # noqa: BLE001 - never swallow rollback failures
+                raise ReleaseGateError(f"rollback failed: {error}") from error
+            rollback_outcome = validate_rollback_outcome(
+                rollback_outcome, expected_image=previous["image_id"]
+            )
+            restored = backend.active_release()
+            if restored is None or not _same_release(restored, previous):
+                raise ReleaseGateError(
+                    "rollback callable returned success but the backend did not "
+                    "restore the previous release "
+                    "(image/config/migration_version/evidence_root)"
+                )
+            if before_rollback is not None:
+                for entry in backend.switches[before_rollback:]:
+                    if entry.get("action") != "rollback":
+                        continue
+                    switched_release = {
+                        field: entry.get(field)
+                        for field in (
+                            "image_id",
+                            "config",
+                            "migration_version",
+                            "evidence_root",
+                        )
+                    }
+                    if _same_release(switched_release, previous):
+                        break
+                else:
+                    raise ReleaseGateError(
+                        "rollback callable did not perform a real rollback state "
+                        "transition"
+                    )
+            result = {
+                "schema_version": SCHEMA_VERSION,
+                "status": "rolled_back",
+                "failed_check": failed_check,
+                "candidate_digest": candidate_digest,
+                "manifest_digest": previous_manifest_digest,
+                "source_commit": manifest["source_commit"],
+                "previous_image_id": candidate_image,
+                "active_image_id": previous["image_id"],
+                "approved_by": approval["approved_by"],
+                "migration_version": previous["migration_version"],
+                "previous_migration_version": candidate_record["migration_version"],
+                "config": dict(previous["config"]),
+                "evidence_root": previous["evidence_root"],
+                "smoke_results": smoke_results,
+                "rollback": rollback_outcome,
+                "migration_ledger_verified": True,
+                "recorded_at": _utc_now(),
+            }
+            backend.record_audit(result)
+            return result
+
         result = {
             "schema_version": SCHEMA_VERSION,
             "status": "promoted",
             "failed_check": None,
             "candidate_digest": candidate_digest,
+            "manifest_digest": candidate_digest,
             "source_commit": manifest["source_commit"],
             "previous_image_id": previous["image_id"],
             "active_image_id": candidate_image,
@@ -750,10 +982,11 @@ def promote_and_smoke(
             "evidence_root": previous["evidence_root"],
             "smoke_results": smoke_results,
             "rollback": None,
+            "migration_ledger_verified": True,
             "recorded_at": _utc_now(),
         }
         backend.record_audit(result)
-    return result
+        return result
 
 
 def rollback_release(
@@ -763,6 +996,7 @@ def rollback_release(
     smoke_checks: Mapping[str, Callable[[], bool]],
     approved_by: str,
     candidate_digest: str,
+    manifest_digest: str | None = None,
 ) -> dict[str, Any]:
     """Restore a persisted target release after the same smoke suite passes."""
     if not isinstance(smoke_checks, Mapping) or not smoke_checks:
@@ -775,6 +1009,18 @@ def rollback_release(
     if current is None:
         raise ReleaseGateError("rollback blocked: no persisted active release")
     _require_drained(backend, action="rollback")
+
+    resolved_manifest_digest = (
+        manifest_digest if manifest_digest is not None else target.get("manifest_digest")
+    )
+    if not isinstance(resolved_manifest_digest, str) or not _SHA256.fullmatch(
+        resolved_manifest_digest
+    ):
+        raise ReleaseGateError(
+            "rollback requires the target release's manifest_digest from the "
+            "persisted audit record; an image id is not a manifest digest"
+        )
+
     smoke_results: dict[str, bool] = {}
     for name, check_fn in smoke_checks.items():
         try:
@@ -792,6 +1038,11 @@ def rollback_release(
                 "active release changed while rollback smoke checks ran; "
                 "refusing to overwrite a concurrent promotion"
             )
+        _verify_rollback_migrations(
+            target_version=target["migration_version"],
+            current_version=latest["migration_version"],
+            applied=_migration_ledger(backend),
+        )
         backend.switch(
             image_id=target["image_id"],
             config=target["config"],
@@ -801,18 +1052,23 @@ def rollback_release(
             candidate_digest=candidate_digest,
         )
         active = backend.active_release()
-        if active is None or active.get("image_id") != target["image_id"]:
-            raise ReleaseGateError("rollback switch did not restore the target image")
+        if active is None or not _same_release(active, target):
+            raise ReleaseGateError(
+                "rollback switch did not restore the target release "
+                "(image/config/migration_version/evidence_root)"
+            )
         result = {
             "schema_version": SCHEMA_VERSION,
             "status": "rolled_back",
             "failed_check": None,
             "candidate_digest": candidate_digest,
-            "source_commit": None,
+            "manifest_digest": resolved_manifest_digest,
+            "source_commit": target.get("source_commit"),
             "previous_image_id": current["image_id"],
             "active_image_id": target["image_id"],
             "approved_by": approved_by,
             "migration_version": target["migration_version"],
+            "previous_migration_version": latest["migration_version"],
             "config": dict(target["config"]),
             "evidence_root": target["evidence_root"],
             "smoke_results": smoke_results,
@@ -820,6 +1076,7 @@ def rollback_release(
                 "ok": True,
                 "restored_image": target["image_id"],
             },
+            "migration_ledger_verified": True,
             "recorded_at": _utc_now(),
         }
         backend.record_audit(result)
@@ -1185,25 +1442,35 @@ _B03_REQUIRED_FILES = (
 )
 _B03_REQUIRED_TREES = ("vulnerable", "fixed")
 _MAX_B03_MATERIAL_BYTES = 128 * 1024 * 1024
+_MAX_B03_TOTAL_FILES = 4096
+_MAX_B03_TOTAL_BYTES = 256 * 1024 * 1024
 
 
 def _safe_child(root: Path, relative: str, label: str) -> Path:
-    normalized = jsonutil.safe_relative_path(relative, label)
-    candidate = (root / PurePosixPath(normalized)).resolve()
-    resolved_root = root.resolve()
-    if candidate != resolved_root and resolved_root not in candidate.parents:
-        raise ReleaseGateError(f"{label} escapes the B03 case root: {relative}")
-    return candidate
+    try:
+        return jsonutil.resolve_inside(root, relative)
+    except ValueError as error:
+        raise ReleaseGateError(
+            f"{label} is not a safe B03 path: {error}"
+        ) from error
 
 
 def _read_material(path: Path, label: str) -> bytes:
-    if path.is_symlink():
-        raise ReleaseGateError(f"{label} must not be a symlink: {path}")
-    if not path.is_file():
-        raise ReleaseGateError(f"required B03 material is missing: {label}")
-    if path.stat().st_size > _MAX_B03_MATERIAL_BYTES:
-        raise ReleaseGateError(f"B03 material exceeds the size cap: {label}")
-    return path.read_bytes()
+    """Read one B03 material through the bounded, symlink-safe helper.
+
+    ``read_regular_file_bounded`` opens with ``O_NOFOLLOW`` and re-checks
+    ``fstat``, so a symlink or a file that changes/grows during the read is
+    rejected instead of being silently followed (the old
+    ``is_symlink()`` + ``read_bytes()`` pair was a TOCTOU window).
+    """
+    try:
+        return fileio.read_regular_file_bounded(
+            path, max_bytes=_MAX_B03_MATERIAL_BYTES
+        )
+    except fileio.UnsafeFileError as error:
+        raise ReleaseGateError(
+            f"unsafe B03 material {label}: {error.kind}: {error.message}"
+        ) from error
 
 
 @dataclass(frozen=True)
@@ -1221,6 +1488,8 @@ class B03CaseMaterials:
     patch: bytes
     repository_bundle: bytes
     advisory: bytes
+    normal_input: bytes
+    candidate_input: bytes
     vulnerable_sources: Mapping[str, bytes]
     fixed_sources: Mapping[str, bytes]
 
@@ -1253,26 +1522,43 @@ class B03CaseMaterials:
             ) from error
         if not resolved.is_dir():
             raise ReleaseGateError(f"B03 case root must be a directory: {resolved}")
+        file_count = 0
+        total_bytes = 0
+
+        def load_file(relative: str, label: str) -> bytes:
+            nonlocal file_count, total_bytes
+            data = _read_material(_safe_child(resolved, relative, label), label)
+            file_count += 1
+            total_bytes += len(data)
+            if file_count > _MAX_B03_TOTAL_FILES:
+                raise ReleaseGateError(
+                    f"B03 case root exceeds the {_MAX_B03_TOTAL_FILES}-file cap"
+                )
+            if total_bytes > _MAX_B03_TOTAL_BYTES:
+                raise ReleaseGateError(
+                    f"B03 case root exceeds the {_MAX_B03_TOTAL_BYTES}-byte cap"
+                )
+            return data
+
         payload = {
-            name: _read_material(_safe_child(resolved, name, name), name)
-            for name in _B03_REQUIRED_FILES
+            name: load_file(name, name) for name in _B03_REQUIRED_FILES
         }
         trees: dict[str, dict[str, bytes]] = {}
         for tree in _B03_REQUIRED_TREES:
             tree_path = _safe_child(resolved, tree, tree)
-            if not tree_path.is_dir() or tree_path.is_symlink():
+            if not tree_path.is_dir():
                 raise ReleaseGateError(f"required B03 material tree is missing: {tree}/")
             files: dict[str, bytes] = {}
             for path in sorted(tree_path.rglob("*")):
                 if path.is_dir():
                     continue
-                if path.is_symlink():
-                    raise ReleaseGateError(f"B03 material tree contains a symlink: {path}")
                 relative = path.relative_to(tree_path).as_posix()
-                files[relative] = _read_material(path, f"{tree}/{relative}")
+                files[relative] = load_file(f"{tree}/{relative}", f"{tree}/{relative}")
             if not files:
                 raise ReleaseGateError(f"required B03 material tree is empty: {tree}/")
             trees[tree] = files
+        normal_input = load_file("inputs/normal.txt", "inputs/normal.txt")
+        candidate_input = load_file("inputs/candidate.txt", "inputs/candidate.txt")
         try:
             advisory = jsonutil.loads_strict(payload["advisory.json"])
         except jsonutil.StrictJsonError as error:
@@ -1287,6 +1573,8 @@ class B03CaseMaterials:
             patch=payload["fix.patch"],
             repository_bundle=payload["b03-repo.bundle"],
             advisory=payload["advisory.json"],
+            normal_input=normal_input,
+            candidate_input=candidate_input,
             vulnerable_sources=trees["vulnerable"],
             fixed_sources=trees["fixed"],
         )
@@ -1330,12 +1618,68 @@ def _b03_exit_code(container: Any, key: str, label: str) -> int:
     return value
 
 
+_B03_DEFERRED_CHECK_OWNER_FIELD = "owner_task"
+
+
+def _validate_b03_checks(checks: Any) -> None:
+    """Reject an admission whose critical checks failed or are not deferred."""
+    if isinstance(checks, Mapping):
+        entries = []
+        for check_id, value in checks.items():
+            if isinstance(value, Mapping):
+                entries.append(dict(value, id=check_id))
+            else:
+                entries.append({"id": check_id, "status": value})
+    elif isinstance(checks, list):
+        entries = checks
+    else:
+        raise ReleaseGateError("B03 admission checks must be a list or object")
+    if not entries:
+        raise ReleaseGateError("B03 admission checks must not be empty")
+    for index, entry in enumerate(entries):
+        if not isinstance(entry, Mapping):
+            raise ReleaseGateError(
+                f"B03 admission checks[{index}] must be an object"
+            )
+        check_id = entry.get("id")
+        if not isinstance(check_id, str) or not check_id.strip():
+            raise ReleaseGateError(
+                f"B03 admission checks[{index}] is missing a non-empty id"
+            )
+        status = entry.get("status")
+        if status not in {"pass", "deferred"}:
+            raise ReleaseGateError(
+                f"B03 admission check {check_id!r} has status {status!r}; only "
+                "'pass' or an explicit deferred check is allowed"
+            )
+        if status == "deferred":
+            owner = entry.get(_B03_DEFERRED_CHECK_OWNER_FIELD)
+            if not isinstance(owner, str) or not owner.strip():
+                raise ReleaseGateError(
+                    f"B03 admission check {check_id!r} is deferred without an "
+                    f"{_B03_DEFERRED_CHECK_OWNER_FIELD}"
+                )
+
+
 def _validate_b03_admission(admission: Mapping[str, Any]) -> dict[str, Any]:
     """Validate every B03 admission field the plan copies, without KeyError."""
     if not isinstance(admission, Mapping):
         raise ReleaseGateError("B03 admission must be an object")
     if admission.get("benchmark_id") != "B03":
         raise ReleaseGateError("B03 admission benchmark_id must be B03")
+    if admission.get("decision") != "admit_to_planning":
+        raise ReleaseGateError(
+            "B03 admission decision must be admit_to_planning"
+        )
+    admission_status = admission.get("status")
+    if not isinstance(admission_status, str) or not admission_status.strip():
+        raise ReleaseGateError("B03 admission status must be a non-empty string")
+    if admission_status.strip().lower() in {"rejected", "denied", "blocked"}:
+        raise ReleaseGateError(
+            f"B03 admission status is not admissible: {admission_status!r}"
+        )
+    _validate_b03_checks(admission.get("checks"))
+    _b03_string(admission, "usage_boundary", "admission")
     cve_id = _b03_string(admission, "cve_id", "admission")
     if not _CVE_ID.fullmatch(cve_id):
         raise ReleaseGateError("B03 admission cve_id must be a CVE identifier")
@@ -1438,23 +1782,36 @@ def _validate_b03_advisory(
     vulnerable_commit: str,
     fixed_commit: str,
 ) -> None:
-    """Reject a case root whose advisory contradicts the admission record."""
+    """Reject an empty or contradictory case advisory.
+
+    An empty ``{}`` is not evidence: the advisory must name the CVE and at
+    least one of the vulnerable/fixed commits, and every commit it does name
+    must match the admission record.
+    """
     if not isinstance(advisory, Mapping):
         raise ReleaseGateError("B03 advisory.json must be a JSON object")
     advisory_cve = advisory.get("cve_id")
-    if advisory_cve is not None and advisory_cve != cve_id:
+    if advisory_cve != cve_id:
         raise ReleaseGateError(
-            "B03 advisory.json cve_id does not match the admission"
+            "B03 advisory.json must contain a cve_id matching the admission"
         )
+    matched_commits = 0
     for key, expected in (
         ("vulnerable_commit", vulnerable_commit),
         ("fixed_commit", fixed_commit),
     ):
         value = advisory.get(key)
-        if value is not None and value != expected:
-            raise ReleaseGateError(
-                f"B03 advisory.json {key} does not match the admission"
-            )
+        if value is not None:
+            if value != expected:
+                raise ReleaseGateError(
+                    f"B03 advisory.json {key} does not match the admission"
+                )
+            matched_commits += 1
+    if matched_commits == 0:
+        raise ReleaseGateError(
+            "B03 advisory.json must record at least one of vulnerable_commit "
+            "or fixed_commit"
+        )
     sources = advisory.get("sources")
     if sources is not None:
         if not isinstance(sources, list):
@@ -1479,20 +1836,14 @@ def _validate_b03_advisory(
 def _b03_source_bytes(
     sources: Mapping[str, bytes], source_path: str
 ) -> bytes:
+    """Return the exact approved source path; never fall back to a basename."""
     direct = sources.get(source_path)
-    if direct is not None:
-        return direct
-    basename = PurePosixPath(source_path).name
-    matches = [
-        data
-        for relative, data in sources.items()
-        if PurePosixPath(relative).name == basename
-    ]
-    if len(matches) == 1:
-        return matches[0]
-    raise ReleaseGateError(
-        f"B03 repository.source_path is not present in the vulnerable tree: {source_path}"
-    )
+    if direct is None:
+        raise ReleaseGateError(
+            "B03 repository.source_path is not present in the vulnerable tree: "
+            f"{source_path}"
+        )
+    return direct
 
 
 def prepare_b03_plan(
@@ -1659,6 +2010,7 @@ def prepare_b03_plan(
         "registry_entry": registry_entry,
         "expected_exit": expected_exit,
         "expected_stdout": expected_stdout,
+        "expected_verdict": validated["expected_verdict"],
         "asan_options": asan_options,
         "asan_signature": asan_sig,
         "image_digest": image_digest,
@@ -1670,7 +2022,12 @@ def prepare_b03_plan(
     }
 
 
-def _validate_b03_review(review: Mapping[str, Any], *, plan_digest: str) -> dict[str, Any]:
+def _validate_b03_review(
+    review: Mapping[str, Any],
+    *,
+    plan_digest: str,
+    now: datetime | None = None,
+) -> dict[str, Any]:
     if not isinstance(review, Mapping):
         raise ReleaseGateError("B03 review must be supplied by the reviewer")
     missing = sorted({"reviewer_id", "decision", "plan_digest", "decided_at"} - set(review))
@@ -1684,7 +2041,12 @@ def _validate_b03_review(review: Mapping[str, Any], *, plan_digest: str) -> dict
         raise ReleaseGateError("B03 review reviewer_id is required")
     if review.get("plan_digest") != plan_digest:
         raise ReleaseGateError("B03 review plan_digest does not match the plan")
-    _parse_instant(review.get("decided_at"), "B03 review decided_at")
+    decided_at = _parse_instant(review.get("decided_at"), "B03 review decided_at")
+    reference = now or datetime.now(timezone.utc)
+    if decided_at > reference + APPROVAL_FUTURE_SKEW:
+        raise ReleaseGateError("B03 review is from the future")
+    if reference - decided_at > APPROVAL_MAX_AGE:
+        raise ReleaseGateError("B03 review has expired")
     return {
         "reviewer_id": review["reviewer_id"],
         "decision": "approve",
@@ -1693,7 +2055,17 @@ def _validate_b03_review(review: Mapping[str, Any], *, plan_digest: str) -> dict
     }
 
 
+_B03_PROBE_CHECKS = {
+    "uid": "65534",
+    "seccomp": "2",
+    "no_new_privs": "1",
+    "cap_eff": "0000000000000000",
+    "cgroup_version": "2",
+}
+
+
 def _require_probe(report: Any) -> Any:
+    """Validate every isolation probe value before any build or replay runs."""
     if getattr(report, "ok", False) is not True:
         raise ReleaseGateError("B03 sandbox probe did not succeed")
     image_digest = getattr(report, "image_digest", None)
@@ -1702,9 +2074,15 @@ def _require_probe(report: Any) -> Any:
     if not isinstance(limits, Mapping) or not limits:
         raise ReleaseGateError("B03 probe limits are missing")
     checks = getattr(report, "checks", None)
-    required = {"uid", "seccomp", "no_new_privs", "cap_eff", "cgroup_version"}
-    if not isinstance(checks, Mapping) or not required <= set(checks):
+    if not isinstance(checks, Mapping):
         raise ReleaseGateError("B03 probe checks are incomplete")
+    for key, expected in _B03_PROBE_CHECKS.items():
+        actual = checks.get(key)
+        if actual != expected:
+            raise ReleaseGateError(
+                "B03 probe isolation check failed: "
+                f"{key}={actual!r} (expected {expected!r})"
+            )
     return report
 
 
@@ -1789,6 +2167,7 @@ def run_b03_acceptance(
     cve_id = plan["cve_id"]
     expected_exit = prepared["expected_exit"]
     expected_stdout = prepared["expected_stdout"]
+    expected_verdict = prepared["expected_verdict"]
     asan_options = prepared["asan_options"]
     asan_sig = prepared["asan_signature"]
     image_digest = prepared["image_digest"]
@@ -1988,6 +2367,11 @@ def run_b03_acceptance(
         expected_stdout=expected_stdout,
     )
     decision = decide_verdict(policy, replay_obs, builds=build_docs)
+    if decision.verdict != expected_verdict:
+        raise ReleaseGateError(
+            "B03 acceptance verdict does not match the admission's frozen "
+            f"expected_verdict: {decision.verdict!r} != {expected_verdict!r}"
+        )
 
     execution_metadata = {
         "job_id": resolved_job_id,

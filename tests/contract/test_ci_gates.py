@@ -245,9 +245,35 @@ def test_workflow_security_rejects_unpinned_reusable_workflow_and_branch_run_exp
     assert all("untrusted '${{ ... }}'" in err for err in errors)
 
 
+def _junit(
+    tests: int,
+    *,
+    skipped: int = 0,
+    failures: int = 0,
+    errors: int = 0,
+) -> str:
+    cases = []
+    for index in range(tests):
+        if index < failures:
+            child = "<failure message=\"boom\" />"
+        elif index < failures + errors:
+            child = "<error message=\"boom\" />"
+        elif index < failures + errors + skipped:
+            child = "<skipped />"
+        else:
+            child = ""
+        cases.append(f'<testcase name="t{index}">{child}</testcase>')
+    return (
+        f'<testsuite tests="{tests}" skipped="{skipped}" '
+        f'failures="{failures}" errors="{errors}">'
+        + "".join(cases)
+        + "</testsuite>"
+    )
+
+
 def test_junit_gate_rejects_failures_skips_and_empty_suites(tmp_path):
     ok = tmp_path / "ok.xml"
-    ok.write_text('<testsuite tests="3" skipped="0" failures="0" errors="0"/>', encoding="utf-8")
+    ok.write_text(_junit(3), encoding="utf-8")
     assert ci_gates.check_junit_report(ok, label="contract") == {
         "label": "contract",
         "total": 3,
@@ -257,19 +283,52 @@ def test_junit_gate_rejects_failures_skips_and_empty_suites(tmp_path):
     }
 
     skipped = tmp_path / "skip.xml"
-    skipped.write_text('<testsuite tests="3" skipped="1" failures="0" errors="0"/>', encoding="utf-8")
+    skipped.write_text(_junit(3, skipped=1), encoding="utf-8")
     with pytest.raises(ci_gates.GateError, match="zero skips"):
         ci_gates.check_junit_report(skipped, label="postgres")
 
     failed = tmp_path / "fail.xml"
-    failed.write_text('<testsuite tests="3" skipped="0" failures="1" errors="0"/>', encoding="utf-8")
+    failed.write_text(_junit(3, failures=1), encoding="utf-8")
     with pytest.raises(ci_gates.GateError, match="zero skips"):
         ci_gates.check_junit_report(failed, label="asan")
 
     empty = tmp_path / "empty.xml"
-    empty.write_text('<testsuite tests="0" skipped="0" failures="0" errors="0"/>', encoding="utf-8")
+    empty.write_text(_junit(0), encoding="utf-8")
     with pytest.raises(ci_gates.GateError, match="did not run"):
         ci_gates.check_junit_report(empty, label="docker")
+
+
+def test_junit_gate_rejects_attribute_child_contradictions_and_deep_nesting(tmp_path):
+    spoofed = tmp_path / "spoofed.xml"
+    spoofed.write_text(
+        '<testsuite tests="1" skipped="0" failures="0" errors="0">'
+        '<testcase name="hidden"><failure message="boom" /></testcase>'
+        "</testsuite>",
+        encoding="utf-8",
+    )
+    with pytest.raises(ci_gates.GateError, match="disagree|contradictory"):
+        ci_gates.check_junit_report(spoofed, label="contract")
+
+    miscounted = tmp_path / "miscounted.xml"
+    miscounted.write_text(
+        '<testsuite tests="2" skipped="0" failures="0" errors="0">'
+        '<testcase name="only-one" /></testsuite>',
+        encoding="utf-8",
+    )
+    with pytest.raises(ci_gates.GateError, match="contradictory"):
+        ci_gates.check_junit_report(miscounted, label="contract")
+
+    nested = tmp_path / "nested.xml"
+    nested.write_text(
+        "<testsuites><testsuite tests=\"1\" skipped=\"0\" failures=\"0\" "
+        "errors=\"0\"><testcase name=\"ok\" /></testsuite>"
+        "<testsuite tests=\"2\" skipped=\"1\" failures=\"0\" errors=\"0\">"
+        "<testcase name=\"a\" /><testcase name=\"b\"><skipped /></testcase>"
+        "</testsuite></testsuites>",
+        encoding="utf-8",
+    )
+    with pytest.raises(ci_gates.GateError, match="zero skips"):
+        ci_gates.check_junit_report(nested, label="postgres")
 
 
 def test_vulnerability_scan_blocks_critical_high_and_invalid_waivers(tmp_path):
@@ -319,7 +378,7 @@ def test_vulnerability_scan_blocks_critical_high_and_invalid_waivers(tmp_path):
     valid_waiver = [
         {
             "id": "CVE-2025-1111",
-            "scope": "test dependency only",
+            "scope": "package:demo",
             "impact": "not shipped in control plane image",
             "owner": "security-owner",
             "expires_at": "2026-12-31",
@@ -331,9 +390,11 @@ def test_vulnerability_scan_blocks_critical_high_and_invalid_waivers(tmp_path):
 
 
 def test_trivy_report_is_parsed_and_required():
-    clean = {"Results": [{"Target": "image", "Vulnerabilities": []}]}
+    clean = {"SchemaVersion": 2, "ArtifactName": "image", "Results": [{"Target": "image", "Vulnerabilities": []}]}
     assert ci_gates.parse_trivy_findings(clean) == []
     high = {
+        "SchemaVersion": 2,
+        "ArtifactName": "image",
         "Results": [
             {
                 "Vulnerabilities": [
@@ -347,9 +408,9 @@ def test_trivy_report_is_parsed_and_required():
         ]
     }
     assert ci_gates.parse_trivy_findings(high) == [
-        {"id": "CVE-2025-3333", "severity": "HIGH", "package": "openssl"}
+        {"id": "CVE-2025-3333", "severity": "HIGH", "package": "openssl", "target": ""}
     ]
-    with pytest.raises(ci_gates.GateError, match="Results"):
+    with pytest.raises(ci_gates.GateError, match="SchemaVersion|Results"):
         ci_gates.parse_trivy_findings({"not": "a scan"})
 
 
@@ -450,7 +511,10 @@ def test_dependency_lock_rejects_commented_requirement_and_bad_pyproject(tmp_pat
 
 def test_scan_findings_gate_is_wired_into_repo_static_gates(tmp_path):
     clean = tmp_path / "clean.json"
-    clean.write_text(json.dumps({"Results": [{"Vulnerabilities": []}]}), encoding="utf-8")
+    clean.write_text(
+        json.dumps({"SchemaVersion": 2, "ArtifactName": "image", "Results": [{"Target": "image", "Vulnerabilities": []}]}),
+        encoding="utf-8",
+    )
     report = ci_gates.run_repo_static_gates(
         REPO_ROOT, findings_path=clean, require_scan=True
     )
@@ -461,6 +525,8 @@ def test_scan_findings_gate_is_wired_into_repo_static_gates(tmp_path):
     high.write_text(
         json.dumps(
             {
+                "SchemaVersion": 2,
+                "ArtifactName": "image",
                 "Results": [
                     {
                         "Vulnerabilities": [
@@ -548,3 +614,162 @@ def test_repo_ci_gates_and_dockerfile_pass():
     assert ci_gates.check_workflow_security(
         [REPO_ROOT / ".github" / "workflows" / "ci.yml", release_wf]
     ) == []
+
+
+def test_trivy_gate_rejects_empty_or_metadata_less_reports(tmp_path):
+    empty = tmp_path / "empty.json"
+    empty.write_text(json.dumps({"SchemaVersion": 2, "Results": []}), encoding="utf-8")
+    with pytest.raises(ci_gates.GateError, match="no scan targets"):
+        ci_gates.evaluate_scan_report(empty)
+
+    metadata_less = tmp_path / "metadata-less.json"
+    metadata_less.write_text(json.dumps({"Results": [{"Vulnerabilities": []}]}), encoding="utf-8")
+    with pytest.raises(ci_gates.GateError, match="SchemaVersion|metadata"):
+        ci_gates.evaluate_scan_report(metadata_less)
+
+    duplicate_keys = tmp_path / "duplicate.json"
+    duplicate_keys.write_text(
+        '{"SchemaVersion": 2, "SchemaVersion": 2, "Results": []}', encoding="utf-8"
+    )
+    with pytest.raises(ci_gates.GateError, match="strictly|duplicate"):
+        ci_gates.evaluate_scan_report(duplicate_keys)
+
+
+def test_waiver_scope_is_bound_to_the_package_or_target(tmp_path):
+    findings = [
+        {"id": "CVE-2025-7777", "severity": "CRITICAL", "package": "pkg-a", "target": "img"},
+        {"id": "CVE-2025-7777", "severity": "CRITICAL", "package": "openssl", "target": "img"},
+    ]
+    waiver = [
+        {
+            "id": "CVE-2025-7777",
+            "scope": "package:pkg-a",
+            "impact": "not reachable in pkg-a build",
+            "owner": "sec-team",
+            "expires_at": "2026-12-31",
+        }
+    ]
+    with pytest.raises(ci_gates.GateError, match="openssl"):
+        ci_gates.evaluate_scan_findings(findings, waivers=waiver, today="2026-11-17")
+
+    only_pkg_a = [findings[0]]
+    summary = ci_gates.evaluate_scan_findings(
+        only_pkg_a, waivers=waiver, today="2026-11-17"
+    )
+    assert summary["waived"] == 1 and summary["blocked"] == 0
+
+    conflicting = [waiver[0], dict(waiver[0])]
+    with pytest.raises(ci_gates.GateError, match="duplicate|conflicting"):
+        ci_gates.evaluate_scan_findings(
+            only_pkg_a, waivers=conflicting, today="2026-11-17"
+        )
+
+
+def test_workflow_security_rejects_with_injection_but_allows_env_indirection(tmp_path):
+    bad = _workflow(
+        tmp_path,
+        "name: Bad\n"
+        "on:\n"
+        "  workflow_dispatch:\n"
+        "permissions:\n"
+        "  contents: read\n"
+        "jobs:\n"
+        "  test:\n"
+        "    steps:\n"
+        "      - uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea\n"
+        "        with:\n"
+        "          script: console.log('${{ github.event.pull_request.title }}')\n",
+    )
+    errors = ci_gates.check_workflow_security([bad])
+    assert any("with.script" in error for error in errors)
+
+    good = tmp_path / "good-env.yml"
+    good.write_text(
+        "name: Good\n"
+        "on:\n"
+        "  pull_request:\n"
+        "permissions:\n"
+        "  contents: read\n"
+        "jobs:\n"
+        "  test:\n"
+        "    env:\n"
+        "      TITLE: ${{ github.event.pull_request.title }}\n"
+        "    steps:\n"
+        "      - run: echo \"$TITLE\"\n",
+        encoding="utf-8",
+    )
+    assert ci_gates.check_workflow_security([good]) == []
+
+
+def test_workflow_security_reports_yaml_anchor_cycles_instead_of_crashing(tmp_path):
+    cyclic = tmp_path / "cyclic.yml"
+    cyclic.write_text(
+        "name: Cyclic\n"
+        "on:\n"
+        "  pull_request:\n"
+        "permissions:\n"
+        "  contents: read\n"
+        "jobs:\n"
+        "  test:\n"
+        "    steps:\n"
+        "      - run: echo ok\n"
+        "        env:\n"
+        "          LOOP: &loop [*loop]\n",
+        encoding="utf-8",
+    )
+    errors = ci_gates.check_workflow_security([cyclic])
+    assert any("circular" in error for error in errors)
+
+
+def test_static_gates_scan_yaml_workflows_too(tmp_path):
+    root = tmp_path / "repo"
+    (root / ".github" / "workflows").mkdir(parents=True)
+    (root / "src").mkdir()
+    (root / "examples").mkdir()
+    (root / "tests").mkdir()
+    shutil.copy2(REPO_ROOT / "pyproject.toml", root / "pyproject.toml")
+    shutil.copy2(REPO_ROOT / "uv.lock", root / "uv.lock")
+    shutil.copy2(REPO_ROOT / "requirements-ci.txt", root / "requirements-ci.txt")
+    shutil.copy2(REPO_ROOT / "examples" / "request.json", root / "examples" / "request.json")
+    (root / "README.md").write_text("# Fixture\n", encoding="utf-8")
+    (root / ".github" / "workflows" / "good.yml").write_text(
+        "name: Good\n"
+        "on:\n"
+        "  pull_request:\n"
+        "permissions:\n"
+        "  contents: read\n"
+        "jobs:\n"
+        "  test:\n"
+        "    steps:\n"
+        "      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262\n",
+        encoding="utf-8",
+    )
+    (root / ".github" / "workflows" / "evil.yaml").write_text(
+        "name: Evil\n"
+        "on:\n"
+        "  pull_request_target:\n"
+        "permissions: write-all\n"
+        "jobs:\n"
+        "  test:\n"
+        "    steps:\n"
+        "      - uses: actions/checkout@v4\n"
+        "      - run: echo \"${{ github.event.pull_request.head.sha }}\"\n",
+        encoding="utf-8",
+    )
+    report = ci_gates.run_repo_static_gates(root)
+    assert report["ok"] is False
+    assert report["checked_workflows"] == 2
+    assert any("evil.yaml" in error for error in report["errors"])
+
+
+def test_dependency_lock_checks_version_constraints_not_only_names(tmp_path):
+    root = tmp_path / "repo"
+    root.mkdir()
+    shutil.copy2(REPO_ROOT / "uv.lock", root / "uv.lock")
+    shutil.copy2(REPO_ROOT / "requirements-ci.txt", root / "requirements-ci.txt")
+    pyproject = (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    mutated = pyproject.replace('"psycopg[binary]>=3.2,<4"', '"psycopg[binary]>=9.9"')
+    assert mutated != pyproject
+    (root / "pyproject.toml").write_text(mutated, encoding="utf-8")
+    errors = ci_gates.check_dependency_lock(root)
+    assert any("psycopg" in error and "constraint" in error for error in errors)

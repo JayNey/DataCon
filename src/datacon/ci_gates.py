@@ -20,6 +20,7 @@ import xml.etree.ElementTree as ET
 
 import yaml
 
+from datacon import jsonutil
 from datacon.contracts import InvalidRequest, parse_request
 
 VALID_REQS = frozenset(f"REQ-{i:02d}" for i in range(1, 11))
@@ -190,14 +191,38 @@ def _check_permissions(
             )
 
 
-def _walk_yaml(value: Any) -> Iterable[tuple[str, Any]]:
+def _walk_yaml(
+    value: Any, _seen: set[int] | None = None
+) -> Iterable[tuple[str, Any]]:
+    """Walk a parsed YAML value, converting anchor cycles into GateError.
+
+    PyYAML can build a self-referential list/mapping from an anchor such as
+    ``x: &a [*a]``. Recursing into it raises ``RecursionError`` and aborts the
+    gate; detecting the container identity first turns it into a deterministic
+    failure instead.
+    """
+    seen = _seen if _seen is not None else set()
     if isinstance(value, Mapping):
-        for key, item in value.items():
-            yield str(key), item
-            yield from _walk_yaml(item)
+        marker = id(value)
+        if marker in seen:
+            raise GateError("workflow contains a circular YAML reference")
+        seen.add(marker)
+        try:
+            for key, item in value.items():
+                yield str(key), item
+                yield from _walk_yaml(item, seen)
+        finally:
+            seen.discard(marker)
     elif isinstance(value, list):
-        for item in value:
-            yield from _walk_yaml(item)
+        marker = id(value)
+        if marker in seen:
+            raise GateError("workflow contains a circular YAML reference")
+        seen.add(marker)
+        try:
+            for item in value:
+                yield from _walk_yaml(item, seen)
+        finally:
+            seen.discard(marker)
 
 
 def _continue_on_error_is_true(value: Any) -> bool:
@@ -208,14 +233,42 @@ def _continue_on_error_is_true(value: Any) -> bool:
     return True
 
 
-def _check_run_expressions(text: str) -> list[str]:
-    errors: list[str] = []
+def _untrusted_expressions(text: str) -> list[str]:
+    found: list[str] = []
     for match in _RUN_EXPRESSION.finditer(text):
         expression = match.group(1).lower()
         if any(token in expression for token in _UNTRUSTED_RUN_EXPR_TOKENS):
+            found.append(expression.strip())
+    return found
+
+
+def _check_run_expressions(text: str) -> list[str]:
+    errors: list[str] = []
+    for expression in _untrusted_expressions(text):
+        errors.append(
+            "run: contains an untrusted '${{ ... }}' expression "
+            f"({expression}); pass it through env: instead"
+        )
+    return errors
+
+
+def _check_with_expressions(with_block: Any) -> list[str]:
+    """Reject attacker-controlled expressions interpolated into action inputs.
+
+    ``env:`` is the supported boundary for untrusted values: the workflow may
+    put ``${{ github.event... }}`` in ``env`` and reference the variable from
+    ``run``. Passing the same expression straight into an action's ``with:``
+    (for example ``actions/github-script``'s ``script:``) is injection, so it
+    is rejected while constant and safe references stay valid.
+    """
+    errors: list[str] = []
+    for key, value in _walk_yaml(with_block):
+        if not isinstance(value, str):
+            continue
+        for expression in _untrusted_expressions(value):
             errors.append(
-                "run: contains an untrusted '${{ ... }}' expression; pass it "
-                "through env: instead"
+                f"with.{key} contains an untrusted '${{{{ ... }}}}' expression "
+                f"({expression}); pass it through env: instead"
             )
     return errors
 
@@ -255,11 +308,22 @@ def check_workflow_security(files: Iterable[Path]) -> list[str]:
                     label=f"job {job_name}",
                     errors=errors,
                 )
-            for key, value in _walk_yaml(job):
-                if key == "continue-on-error" and _continue_on_error_is_true(value):
-                    errors.append(
-                        f"{path}: job {job_name} uses continue-on-error: {value!r}"
-                    )
+            try:
+                for key, value in _walk_yaml(job):
+                    if key == "continue-on-error" and _continue_on_error_is_true(value):
+                        errors.append(
+                            f"{path}: job {job_name} uses continue-on-error: {value!r}"
+                        )
+            except GateError as error:
+                errors.append(f"{path}: job {job_name}: {error}")
+                continue
+            job_with = job.get("with")
+            if job_with is not None:
+                try:
+                    for problem in _check_with_expressions(job_with):
+                        errors.append(f"{path}: job {job_name}: {problem}")
+                except GateError as error:
+                    errors.append(f"{path}: job {job_name}: {error}")
             job_uses = job.get("uses")
             if job_uses is not None:
                 if not isinstance(job_uses, str):
@@ -282,6 +346,7 @@ def check_workflow_security(files: Iterable[Path]) -> list[str]:
                 if not isinstance(step, Mapping):
                     errors.append(f"{path}: job {job_name} step {index} must be a mapping")
                     continue
+                with_block = step.get("with")
                 uses = step.get("uses")
                 if uses is not None:
                     if not isinstance(uses, str):
@@ -300,7 +365,6 @@ def check_workflow_security(files: Iterable[Path]) -> list[str]:
                             "must be pinned to a 40-char commit SHA"
                         )
                     if isinstance(uses, str) and uses.startswith("actions/checkout"):
-                        with_block = step.get("with")
                         if isinstance(with_block, Mapping):
                             ref = with_block.get("ref")
                             if isinstance(ref, str):
@@ -315,6 +379,14 @@ def check_workflow_security(files: Iterable[Path]) -> list[str]:
                                         "checkout ref comes from an expression; "
                                         "pin a literal ref instead"
                                     )
+                if with_block is not None:
+                    try:
+                        for problem in _check_with_expressions(with_block):
+                            errors.append(
+                                f"{path}: job {job_name} step {index}: {problem}"
+                            )
+                    except GateError as error:
+                        errors.append(f"{path}: job {job_name} step {index}: {error}")
                 run_text = step.get("run")
                 if isinstance(run_text, str):
                     for problem in _check_run_expressions(run_text):
@@ -322,18 +394,65 @@ def check_workflow_security(files: Iterable[Path]) -> list[str]:
     return errors
 
 
+def _junit_count(element: Any, attribute: str, label: str) -> int:
+    raw = element.get(attribute)
+    if raw is None or raw.strip() == "":
+        return 0
+    try:
+        value = int(raw)
+    except (TypeError, ValueError) as error:
+        raise GateError(
+            f"JUnit report {label} has a non-integer {attribute} attribute: {raw!r}"
+        ) from error
+    if value < 0:
+        raise GateError(
+            f"JUnit report {label} has a negative {attribute} attribute: {raw!r}"
+        )
+    return value
+
+
 def check_junit_report(path: Path, *, label: str) -> dict[str, Any]:
-    """Fail closed if a JUnit report has 0 tests, any skipped, or any failure/error."""
+    """Fail closed if a JUnit report is empty, skipped, failed, or contradictory.
+
+    The check walks every ``testsuite`` (including nested ``testsuites``),
+    counts the real ``<testcase>`` elements, and requires the element-level
+    ``<failure>``/``<error>``/``<skipped>`` nodes to agree with the suite
+    attributes. A report whose attributes claim zero failures while a testcase
+    carries a ``<failure>`` child is rejected.
+    """
     if not path.is_file():
         raise GateError(f"JUnit report missing for {label}: {path}")
-    root = ET.parse(path).getroot()
-    suites = [root] if root.tag == "testsuite" else root.findall("testsuite")
-    total = sum(int(suite.get("tests", 0)) for suite in suites)
-    skipped = sum(int(suite.get("skipped", 0)) for suite in suites)
-    failures = sum(int(suite.get("failures", 0)) for suite in suites)
-    errors = sum(int(suite.get("errors", 0)) for suite in suites)
-    if total == 0:
+    try:
+        root = ET.parse(path).getroot()
+    except (ET.ParseError, OSError) as error:
+        raise GateError(f"JUnit report cannot be parsed for {label}: {error}") from error
+    suites = list(root.iter("testsuite"))
+    if not suites:
         raise GateError(f"the {label} suite did not run any tests")
+    total = sum(_junit_count(suite, "tests", label) for suite in suites)
+    skipped = sum(_junit_count(suite, "skipped", label) for suite in suites)
+    failures = sum(_junit_count(suite, "failures", label) for suite in suites)
+    errors = sum(_junit_count(suite, "errors", label) for suite in suites)
+    testcases = list(root.iter("testcase"))
+    # Count the element-level result nodes across the whole document, including
+    # nested testsuites and failure/error children placed directly on a suite.
+    child_skipped = sum(1 for _ in root.iter("skipped"))
+    child_failures = sum(1 for _ in root.iter("failure"))
+    child_errors = sum(1 for _ in root.iter("error"))
+    if total == 0 or not testcases:
+        raise GateError(f"the {label} suite did not run any tests")
+    if len(testcases) != total:
+        raise GateError(
+            f"JUnit report {label} is contradictory: tests={total} but "
+            f"testcase elements={len(testcases)}"
+        )
+    if (child_skipped, child_failures, child_errors) != (skipped, failures, errors):
+        raise GateError(
+            f"JUnit report {label} attributes disagree with testcase children "
+            f"(attributes: skipped={skipped} failures={failures} errors={errors}; "
+            f"children: skipped={child_skipped} failures={child_failures} "
+            f"errors={child_errors})"
+        )
     if skipped or failures or errors:
         raise GateError(
             f"CI requires the {label} suite to pass with zero skips "
@@ -348,18 +467,44 @@ def check_junit_report(path: Path, *, label: str) -> dict[str, Any]:
     }
 
 
+def _waiver_scope_matches(scope: str, finding: dict[str, str]) -> bool:
+    """Match a waiver scope against a finding's package or scan target.
+
+    Supported forms are ``package:<name>``, the bare package name, ``target:``
+    plus the scan target, and the bare target string. Any other human-readable
+    scope is documentation only and never waives a finding.
+    """
+    normalized = scope.strip()
+    lowered = normalized.lower()
+    package = str(finding.get("package", "")).strip()
+    target = str(finding.get("target", "")).strip()
+    if lowered.startswith("package:"):
+        return package.strip().lower() == normalized.split(":", 1)[1].strip().lower()
+    if lowered.startswith("target:"):
+        return target == normalized.split(":", 1)[1].strip()
+    if not normalized:
+        return False
+    return normalized == package or normalized == target
+
+
 def evaluate_scan_findings(
     findings: Sequence[dict[str, Any]],
     *,
     waivers: Sequence[dict[str, Any]] = (),
     today: str | None = None,
 ) -> dict[str, int]:
-    """Block unwaived CRITICAL/HIGH findings; validate structured waivers."""
+    """Block unwaived CRITICAL/HIGH findings; validate structured waivers.
+
+    A waiver is bound to ``(id, scope)``. A waiver for ``pkg-a`` therefore
+    cannot silence the same CVE on ``openssl``. Duplicate ``(id, scope)``
+    entries are rejected as a conflicting waiver set.
+    """
     try:
         current_day = date.fromisoformat(today) if today else date.today()
     except ValueError as error:
         raise GateError(f"invalid evaluation date {today!r}") from error
-    waiver_map: dict[str, dict[str, Any]] = {}
+    waiver_scopes: dict[str, list[dict[str, Any]]] = {}
+    seen_scopes: set[tuple[str, str]] = set()
     for entry in waivers:
         if not isinstance(entry, dict):
             raise GateError("waiver entry must be an object")
@@ -383,39 +528,72 @@ def evaluate_scan_findings(
             ) from error
         if expires < current_day:
             raise GateError(f"waiver {entry['id']} is expired ({expires_raw})")
-        waiver_map[entry["id"]] = entry
+        key = (entry["id"].strip(), entry["scope"].strip())
+        if key in seen_scopes:
+            raise GateError(
+                f"duplicate/conflicting waiver for id={key[0]!r} scope={key[1]!r}"
+            )
+        seen_scopes.add(key)
+        waiver_scopes.setdefault(key[0], []).append(entry)
 
     blocked = 0
     waived = 0
     for finding in findings:
         severity = str(finding.get("severity", "")).upper()
-        fid = str(finding.get("id", ""))
-        if severity in _BLOCKING_SEVERITIES:
-            if fid in waiver_map:
-                waived += 1
-            else:
-                blocked += 1
-                raise GateError(
-                    f"unwaived {severity} vulnerability finding: {fid}"
-                )
+        fid = str(finding.get("id", "")).strip()
+        if severity not in _BLOCKING_SEVERITIES:
+            continue
+        matching = [
+            entry
+            for entry in waiver_scopes.get(fid, ())
+            if _waiver_scope_matches(entry["scope"], finding)
+        ]
+        if matching:
+            waived += 1
+        else:
+            blocked += 1
+            scope = str(finding.get("package") or finding.get("target") or "<unknown>")
+            raise GateError(
+                f"unwaived {severity} vulnerability finding: {fid} (scope={scope})"
+            )
     return {"total": len(findings), "blocked": blocked, "waived": waived}
 
 
 def parse_trivy_findings(report: Any) -> list[dict[str, str]]:
     """Convert a Trivy JSON report into the flat finding shape the gate uses.
 
-    A report without the expected ``Results`` list is rejected: an unreadable
-    or truncated scanner output must never look like a clean scan.
+    An empty ``{"Results": []}`` or a report that lacks the schema/scan target
+    metadata is rejected: an unreadable, truncated, or zero-target scanner
+    output must never look like a clean scan.
     """
     if not isinstance(report, Mapping):
         raise GateError("scanner report must be a JSON object")
+    schema_version = report.get("SchemaVersion")
+    if type(schema_version) is not int or schema_version <= 0:
+        raise GateError("scanner report is missing a valid SchemaVersion")
     results = report.get("Results")
-    if not isinstance(results, list):
-        raise GateError("scanner report is missing the Results list")
+    if not isinstance(results, list) or not results:
+        raise GateError(
+            "scanner report has no scan targets (Results must be a non-empty list)"
+        )
+    artifact_name = report.get("ArtifactName")
+    if not isinstance(artifact_name, str) or not artifact_name.strip():
+        # A filesystem/config scan may omit ArtifactName, but every result must
+        # then carry an explicit target.
+        for result in results:
+            if not isinstance(result, Mapping):
+                raise GateError("scanner result entry must be an object")
+            target = result.get("Target")
+            if not isinstance(target, str) or not target.strip():
+                raise GateError(
+                    "scanner report is missing scan metadata "
+                    "(ArtifactName or a non-empty result Target)"
+                )
     findings: list[dict[str, str]] = []
     for result in results:
         if not isinstance(result, Mapping):
             raise GateError("scanner result entry must be an object")
+        target = result.get("Target")
         vulnerabilities = result.get("Vulnerabilities", [])
         if vulnerabilities is None:
             vulnerabilities = []
@@ -435,6 +613,7 @@ def parse_trivy_findings(report: Any) -> list[dict[str, str]]:
                     "id": finding_id,
                     "severity": severity.upper(),
                     "package": str(vulnerability.get("PkgName", "")),
+                    "target": str(target) if isinstance(target, str) else "",
                 }
             )
     return findings
@@ -450,17 +629,17 @@ def evaluate_scan_report(
     if not report_path.is_file():
         raise GateError(f"scanner report is missing: {report_path}")
     try:
-        report = json.loads(report_path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as error:
-        raise GateError(f"scanner report cannot be read: {error}") from error
+        report = jsonutil.loads_strict(report_path.read_bytes())
+    except (OSError, jsonutil.StrictJsonError) as error:
+        raise GateError(f"scanner report cannot be read strictly: {error}") from error
     waivers: list[dict[str, Any]] = []
     if waivers_path is not None:
         if not waivers_path.is_file():
             raise GateError(f"waiver file is missing: {waivers_path}")
         try:
-            waiver_document = json.loads(waivers_path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeError, json.JSONDecodeError) as error:
-            raise GateError(f"waiver file cannot be read: {error}") from error
+            waiver_document = jsonutil.loads_strict(waivers_path.read_bytes())
+        except (OSError, jsonutil.StrictJsonError) as error:
+            raise GateError(f"waiver file cannot be read strictly: {error}") from error
         if not isinstance(waiver_document, list):
             raise GateError("waiver file must contain a JSON list")
         waivers = waiver_document
@@ -500,6 +679,18 @@ def scan_secrets(files: Iterable[Path]) -> list[str]:
                 if pattern.search(line):
                     hits.append(f"{path}:{line_no}: potential secret ({name})")
     return hits
+
+
+_REQUIREMENT = re.compile(r"^([A-Za-z0-9_.-]+)(?:\[[^\]]*\])?\s*(.*)$")
+
+
+def _requirement_parts(requirement: Any) -> tuple[str, str]:
+    if not isinstance(requirement, str):
+        raise GateError(f"dependency requirement must be a string: {requirement!r}")
+    match = _REQUIREMENT.match(requirement.strip())
+    if match is None:
+        raise GateError(f"dependency requirement is malformed: {requirement!r}")
+    return match.group(1), match.group(2).strip()
 
 
 def check_dependency_lock(root: Path) -> list[str]:
@@ -566,13 +757,36 @@ def check_dependency_lock(root: Path) -> list[str]:
         for dependency in datacon.get("dependencies", [])
         if isinstance(dependency, Mapping)
     }
-    project_dependencies = {
-        re.split(r"[<>=!~;\[]", requirement, maxsplit=1)[0].strip()
-        for requirement in project.get("dependencies", [])
-    }
-    missing = sorted(project_dependencies - locked_dependencies)
+    try:
+        project_dependencies = {
+            name: specifier
+            for name, specifier in (
+                _requirement_parts(requirement)
+                for requirement in project.get("dependencies", [])
+            )
+        }
+    except GateError as error:
+        errors.append(str(error))
+        project_dependencies = {}
+    missing = sorted(set(project_dependencies) - locked_dependencies)
     if missing:
         errors.append(f"uv.lock datacon dependencies are missing: {', '.join(missing)}")
+    requires_dist = {
+        entry.get("name"): str(entry.get("specifier", "")).strip()
+        for entry in datacon.get("metadata", {}).get("requires-dist", [])
+        if isinstance(entry, Mapping)
+    }
+    for name, specifier in sorted(project_dependencies.items()):
+        if name not in requires_dist:
+            errors.append(
+                f"uv.lock metadata.requires-dist is missing {name} from pyproject"
+            )
+            continue
+        if requires_dist[name] != specifier:
+            errors.append(
+                f"uv.lock version constraint for {name} {requires_dist[name]!r} "
+                f"does not match pyproject {specifier!r}"
+            )
     dev_dependencies = {
         dependency.get("name")
         for dependency in datacon.get("dev-dependencies", {}).get("dev", [])
@@ -630,8 +844,17 @@ def run_repo_static_gates(
         for path in [root / "README.md", *sorted((root / "tests").rglob("*.md"))]
         if path.is_file()
     ]
-    workflow_files = sorted((root / ".github" / "workflows").glob("*.yml"))
+    workflow_dir = root / ".github" / "workflows"
+    workflow_files = sorted(
+        [*workflow_dir.glob("*.yml"), *workflow_dir.glob("*.yaml")]
+    )
     errors: list[str] = []
+    if workflow_dir.is_dir():
+        for path in sorted(workflow_dir.iterdir()):
+            if path.is_file() and path.suffix.lower() not in (".yml", ".yaml"):
+                errors.append(
+                    f"{path}: unexpected non-YAML file in .github/workflows"
+                )
     errors.extend(check_markdown_links(md_files, root=root))
     errors.extend(check_req_tc_consistency(md_files))
     errors.extend(check_workflow_security(workflow_files))

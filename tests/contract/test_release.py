@@ -54,12 +54,23 @@ def _previous() -> dict:
         "config": {"policy_version": "1"},
         "migration_version": "007_execution_evidence_invariant.sql",
         "evidence_root": "/var/lib/datacon/evidence",
+        "manifest_digest": "sha256:" + "9" * 64,
+        "source_commit": "a" * 40,
+    }
+
+
+def _ledger() -> dict[str, str]:
+    return {
+        path.name: _sha(path.read_bytes())
+        for path in sorted((REPO_ROOT / "migrations").glob("*.sql"))
     }
 
 
 def _backend(*, slots: int = 0, previous: dict | None = None) -> release.DictPromotionBackend:
     return release.DictPromotionBackend(
-        active_release=previous or _previous(), active_slots=slots
+        active_release=previous or _previous(),
+        active_slots=slots,
+        migrations=_ledger(),
     )
 
 
@@ -67,12 +78,23 @@ def _write_evidence_artifacts(tmp_path: Path) -> Path:
     artifacts = tmp_path / "artifacts"
     artifacts.mkdir(parents=True)
     for index, name in enumerate(release.TEST_REPORT_FILES, start=1):
+        cases = "".join(
+            f'<testcase name="t{item}" />' for item in range(index)
+        )
         (artifacts / name).write_text(
-            f'<testsuite tests="{index}" skipped="0" failures="0" errors="0"/>',
+            f'<testsuite tests="{index}" skipped="0" failures="0" errors="0">'
+            f"{cases}</testsuite>",
             encoding="utf-8",
         )
     (artifacts / release.SCAN_REPORT_FILE).write_text(
-        json.dumps({"Results": [{"Vulnerabilities": []}]}), encoding="utf-8"
+        json.dumps(
+            {
+                "SchemaVersion": 2,
+                "ArtifactName": "datacon-control-plane:candidate",
+                "Results": [{"Target": "image", "Vulnerabilities": []}],
+            }
+        ),
+        encoding="utf-8",
     )
     (artifacts / release.SBOM_REPORT_FILE).write_text(
         '{"bomFormat":"CycloneDX"}\n', encoding="utf-8"
@@ -208,6 +230,27 @@ def test_verify_manifest_evidence_accepts_real_files_and_rejects_tampering(tmp_p
         release.verify_manifest_evidence(manifest, wheel_dir)
 
 
+def test_verify_manifest_evidence_checks_content_not_only_digests(tmp_path):
+    report_dir = _write_evidence_artifacts(tmp_path / "content-report")
+    (report_dir / release.TEST_REPORT_FILES[0]).write_text(
+        '<testsuite tests="1" skipped="0" failures="0" errors="0">'
+        '<testcase name="hidden"><failure message="boom" /></testcase>'
+        "</testsuite>",
+        encoding="utf-8",
+    )
+    report_manifest = _manifest_for_artifacts(report_dir)
+    with pytest.raises(release.ReleaseGateError, match="JUnit|disagree|zero skips"):
+        release.verify_manifest_evidence(report_manifest, report_dir)
+
+    scan_dir = _write_evidence_artifacts(tmp_path / "content-scan")
+    (scan_dir / release.SCAN_REPORT_FILE).write_text(
+        json.dumps({"SchemaVersion": 2, "Results": []}), encoding="utf-8"
+    )
+    scan_manifest = _manifest_for_artifacts(scan_dir)
+    with pytest.raises(release.ReleaseGateError, match="scan|Results|target"):
+        release.verify_manifest_evidence(scan_manifest, scan_dir)
+
+
 def test_promotion_gate_blocks_unverified_stale_or_incompatible_candidate():
     manifest = _sample_rc_manifest()
     approval = _approval(manifest)
@@ -323,6 +366,8 @@ def test_smoke_failure_restores_previous_release_and_changes_active_state():
     previous = _previous()
     backend = _backend(previous=previous)
     approval = _approval(manifest)
+    candidate_image = manifest["control_plane_image_id"]
+    observed: dict[str, str] = {}
 
     def rollback(prev):
         backend.switch(
@@ -335,24 +380,43 @@ def test_smoke_failure_restores_previous_release_and_changes_active_state():
         )
         return {"restored_image": prev["image_id"], "ok": True}
 
+    def cli_smoke():
+        observed["cli_active"] = backend.active_release()["image_id"]
+        return True
+
+    def failing_probe():
+        observed["probe_active"] = backend.active_release()["image_id"]
+        return False
+
     result = release.promote_and_smoke(
         manifest=manifest,
         expected_manifest_digest=approval["candidate_digest"],
         approval=approval,
         backend=backend,
         smoke_checks={
-            "cli_smoke": lambda: True,
-            "sandbox_probe": lambda: False,
+            "cli_smoke": cli_smoke,
+            "sandbox_probe": failing_probe,
             "synthetic_regression": lambda: True,
         },
         rollback_fn=rollback,
     )
+    # The candidate must actually have been active while the smoke ran.
+    assert observed == {
+        "cli_active": candidate_image,
+        "probe_active": candidate_image,
+    }
+    assert [item["action"] for item in backend.switches] == ["promote", "rollback"]
     assert result["status"] == "rolled_back"
     assert result["failed_check"] == "sandbox_probe"
     assert result["rollback"]["ok"] is True
+    assert result["previous_image_id"] == candidate_image
+    assert result["active_image_id"] == previous["image_id"]
+    assert backend.audits[-1]["previous_image_id"] == candidate_image
+    assert backend.audits[-1]["active_image_id"] == previous["image_id"]
     assert backend.active_release()["image_id"] == previous["image_id"]
     assert backend.active_release()["migration_version"] == previous["migration_version"]
-    assert any(item["action"] == "rollback" for item in backend.switches)
+    assert backend.active_release()["config"] == previous["config"]
+    assert backend.active_release()["evidence_root"] == previous["evidence_root"]
 
 
 def test_promotion_blocks_when_execution_slots_are_not_drained():
@@ -381,6 +445,7 @@ def test_previous_release_requires_every_persisted_field():
         backend.promotions = {}  # type: ignore[attr-defined]
         backend.switches = []  # type: ignore[attr-defined]
         backend.audits = []  # type: ignore[attr-defined]
+        backend._migrations = _ledger()  # type: ignore[attr-defined]
         with pytest.raises(release.ReleaseGateError, match=missing):
             release.promote_and_smoke(
                 manifest=manifest,
@@ -420,12 +485,147 @@ def test_rollback_fn_exception_or_invalid_result_fails_closed():
         )
 
 
+def test_noop_rollback_fn_fails_closed_after_a_real_candidate_switch():
+    manifest = _sample_rc_manifest()
+    previous = _previous()
+    backend = _backend(previous=previous)
+    approval = _approval(manifest)
+    observed: dict[str, str] = {}
+
+    def noop_rollback(prev):
+        # Deliberately does not call backend.switch.
+        return {"restored_image": prev["image_id"], "ok": True}
+
+    with pytest.raises(release.ReleaseGateError, match="did not restore|state transition"):
+        release.promote_and_smoke(
+            manifest=manifest,
+            expected_manifest_digest=approval["candidate_digest"],
+            approval=approval,
+            backend=backend,
+            smoke_checks={
+                "cli_smoke": lambda: observed.setdefault(
+                    "active", backend.active_release()["image_id"]
+                )
+                and False
+            },
+            rollback_fn=noop_rollback,
+        )
+    assert observed["active"] == manifest["control_plane_image_id"]
+    # The failed attempt is fully rolled back, leaving the previous release.
+    assert backend.active_release()["image_id"] == previous["image_id"]
+
+
+def test_sloppy_backend_that_only_changes_image_id_fails_closed():
+    manifest = _sample_rc_manifest()
+    previous = _previous()
+    backend = _backend(previous=previous)
+    approval = _approval(manifest)
+
+    class SloppyBackend(release.DictPromotionBackend):
+        def switch(self, **kwargs):
+            # Simulates a backend that forgets config/migration/evidence_root.
+            self.switches.append(dict(kwargs))
+            self._active = {"image_id": kwargs["image_id"]}
+
+    sloppy = SloppyBackend(
+        active_release=previous, migrations=_ledger()
+    )
+    with pytest.raises(release.ReleaseGateError, match="exact image/config|migration"):
+        release.promote_and_smoke(
+            manifest=manifest,
+            expected_manifest_digest=approval["candidate_digest"],
+            approval=approval,
+            backend=sloppy,
+            smoke_checks={"cli_smoke": lambda: True},
+            rollback_fn=lambda prev: {"restored_image": prev["image_id"], "ok": True},
+        )
+
+
+def test_rollback_release_requires_a_real_manifest_digest():
+    target = {
+        "image_id": "sha256:" + "7" * 64,
+        "config": {"policy_version": "0"},
+        "migration_version": "007_execution_evidence_invariant.sql",
+        "evidence_root": "/var/lib/datacon/evidence",
+    }
+    with pytest.raises(release.ReleaseGateError, match="manifest_digest"):
+        release.rollback_release(
+            target_release=target,
+            backend=_backend(),
+            smoke_checks={"cli_smoke": lambda: True},
+            approved_by="reviewer-1",
+            candidate_digest="sha256:" + "6" * 64,
+        )
+
+
+def test_rollback_release_rejects_crossing_an_incompatible_migration(monkeypatch):
+    target = {
+        "image_id": "sha256:" + "7" * 64,
+        "config": {"policy_version": "0"},
+        "migration_version": "003_attempts_generation.sql",
+        "evidence_root": "/var/lib/datacon/evidence",
+        "manifest_digest": "sha256:" + "9" * 64,
+    }
+    backend = _backend()
+    with pytest.raises(release.ReleaseGateError, match="backward-compatibility"):
+        release.rollback_release(
+            target_release=target,
+            backend=backend,
+            smoke_checks={"cli_smoke": lambda: True},
+            approved_by="reviewer-1",
+            candidate_digest="sha256:" + "6" * 64,
+        )
+
+
+def test_rollback_release_rejects_a_ledger_that_does_not_match():
+    ledger = _ledger()
+    ledger.pop("007_execution_evidence_invariant.sql")
+    backend = release.DictPromotionBackend(
+        active_release=_previous(), migrations=ledger
+    )
+    target = {
+        "image_id": "sha256:" + "7" * 64,
+        "config": {"policy_version": "0"},
+        "migration_version": "007_execution_evidence_invariant.sql",
+        "evidence_root": "/var/lib/datacon/evidence",
+        "manifest_digest": "sha256:" + "9" * 64,
+    }
+    with pytest.raises(release.ReleaseGateError, match="not in the applied"):
+        release.rollback_release(
+            target_release=target,
+            backend=backend,
+            smoke_checks={"cli_smoke": lambda: True},
+            approved_by="reviewer-1",
+            candidate_digest="sha256:" + "6" * 64,
+        )
+
+
+def test_promotion_rejects_a_manifest_ledger_mismatch():
+    manifest = _sample_rc_manifest()
+    approval = _approval(manifest)
+    ledger = _ledger()
+    ledger["008_release_events.sql"] = "sha256:" + "0" * 64
+    backend = release.DictPromotionBackend(
+        active_release=_previous(), migrations=ledger
+    )
+    with pytest.raises(release.ReleaseGateError, match="migration ledger"):
+        release.promote_and_smoke(
+            manifest=manifest,
+            expected_manifest_digest=approval["candidate_digest"],
+            approval=approval,
+            backend=backend,
+            smoke_checks={"cli_smoke": lambda: True},
+            rollback_fn=lambda prev: {"restored_image": prev["image_id"], "ok": True},
+        )
+
+
 def test_rollback_release_restores_target_config_and_migration():
     target = {
         "image_id": "sha256:" + "7" * 64,
         "config": {"policy_version": "0"},
         "migration_version": "007_execution_evidence_invariant.sql",
         "evidence_root": "/var/lib/datacon/evidence",
+        "manifest_digest": "sha256:" + "9" * 64,
     }
     current = _previous()
     backend = _backend(previous=current)
@@ -448,6 +648,7 @@ def test_rollback_release_rejects_active_execution_slots():
         "config": {"policy_version": "0"},
         "migration_version": "007_execution_evidence_invariant.sql",
         "evidence_root": "/var/lib/datacon/evidence",
+        "manifest_digest": "sha256:" + "9" * 64,
     }
     with pytest.raises(release.ReleaseGateError, match="slot"):
         release.rollback_release(
@@ -540,6 +741,80 @@ def test_cli_release_slots_reads_active_slots_once(monkeypatch, capsys):
     assert output["drained"] is False
 
 
+def test_cli_release_bootstrap_persists_a_validated_baseline(monkeypatch, capsys):
+    from datacon import cli
+
+    captured: dict = {}
+
+    class FakeStore:
+        def __init__(self, dsn, *, environment):
+            captured["dsn"] = dsn
+            captured["environment"] = environment
+
+        def bootstrap_release(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setenv("DATACON_DATABASE_URL", "postgresql://unused")
+    monkeypatch.setattr(cli.state, "ReleaseStore", FakeStore)
+    image = "sha256:" + "a" * 64
+    code = cli.main(
+        [
+            "release",
+            "bootstrap",
+            "--image-id",
+            image,
+            "--migration-version",
+            "008_release_events.sql",
+            "--evidence-root",
+            "/var/lib/datacon/evidence",
+            "--config",
+            '{"policy_version":"1"}',
+        ]
+    )
+    assert code == 0
+    assert captured["image_id"] == image
+    assert captured["config"] == {"policy_version": "1"}
+    output = json.loads(capsys.readouterr().out)
+    assert output["baseline"] is True
+    assert output["image_id"] == image
+
+    bad = cli.main(
+        [
+            "release",
+            "bootstrap",
+            "--image-id",
+            "sha256:short",
+            "--migration-version",
+            "008_release_events.sql",
+            "--evidence-root",
+            "/var/lib/datacon/evidence",
+        ]
+    )
+    assert bad == 2
+
+
+def test_cli_migrate_reports_the_applied_ledger(monkeypatch, capsys):
+    from datacon import cli
+
+    monkeypatch.setenv("DATACON_DATABASE_URL", "postgresql://unused")
+    monkeypatch.setattr(
+        cli.state,
+        "apply_migrations_dsn",
+        lambda dsn, migrations_dir: {
+            "001_create_jobs.sql": "sha256:" + "1" * 64,
+            "008_release_events.sql": "sha256:" + "8" * 64,
+        },
+    )
+    code = cli.main(["migrate", "--migrations-dir", "migrations"])
+    assert code == 0
+    output = json.loads(capsys.readouterr().out)
+    assert output["count"] == 2
+    assert output["applied"] == [
+        "001_create_jobs.sql",
+        "008_release_events.sql",
+    ]
+
+
 def test_write_smoke_evidence_bundle_is_verifiable_and_world_readable(tmp_path):
     bundle_dir = tmp_path / "smoke-bundle"
     digest = release.write_smoke_evidence_bundle(
@@ -602,7 +877,7 @@ def _review_for(admission: dict, root: Path) -> dict:
         "reviewer_id": "internal-reviewer",
         "decision": "approve",
         "plan_digest": prepared["plan_digest"],
-        "decided_at": "2026-11-17T11:30:00Z",
+        "decided_at": release._utc_now(),
     }
 
 
@@ -895,6 +1170,9 @@ def test_b03_multifile_source_trees_verify_and_detect_any_tampered_file(tmp_path
     admission = _frozen_admission()
     admission["asan_signature"]["operation"] = "READ"
     admission["asan_signature"]["access_size"] = 4
+    # This replay exercises multi-file staging with a partial signature, so the
+    # deterministically computed verdict is INCONCLUSIVE rather than the default.
+    admission["expected_verdict"] = "INCONCLUSIVE"
     review = _review_for(admission, root)
 
     prepared = release.prepare_b03_plan(
@@ -990,3 +1268,107 @@ def test_b03_rejects_malformed_admission_and_mismatched_advisory(tmp_path):
             normal_input=normal,
             candidate_input=candidate,
         )
+
+
+def test_manifest_rejects_future_created_at_and_nonconsecutive_migration_numbers():
+    with pytest.raises(release.ReleaseGateError, match="future"):
+        _sample_rc_manifest(created_at="2099-01-01T00:00:00Z")
+
+    manifest = _sample_rc_manifest()
+    broken = dict(manifest)
+    broken["migrations"] = [manifest["migrations"][0], *manifest["migrations"][2:]]
+    broken["migration_version"] = broken["migrations"][-1]["file"]
+    with pytest.raises(release.ReleaseGateError, match="consecutively"):
+        release.validate_release_candidate_manifest(broken)
+
+
+def test_b03_inputs_symlink_is_rejected(tmp_path):
+    root = _b03_case_root(tmp_path)
+    (root / "inputs" / "normal.txt").unlink()
+    (root / "inputs" / "normal.txt").symlink_to(root / "inputs" / "candidate.txt")
+    with pytest.raises(release.ReleaseGateError, match="symlink"):
+        release.B03CaseMaterials.load(root)
+
+
+def test_b03_wrong_probe_values_fail_before_any_build_or_replay(tmp_path):
+    root = _b03_case_root(tmp_path)
+    admission = _frozen_admission()
+    review = _review_for(admission, root)
+
+    class BadProbeSandbox(FakeB03Sandbox):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.build_calls = 0
+            self.replay_calls = 0
+
+        def probe(self, *, deadline_seconds: float = 120.0) -> ProbeReport:
+            good = super().probe(deadline_seconds=deadline_seconds)
+            checks = dict(good.checks)
+            checks["uid"] = "0"
+            return ProbeReport(
+                ok=True,
+                checks=checks,
+                compiler_version=good.compiler_version,
+                image_digest=good.image_digest,
+                limits=dict(good.limits),
+                raw=good.raw,
+            )
+
+        def build(self, version: str, **kwargs):
+            self.build_calls += 1
+            return super().build(version, **kwargs)
+
+        def replay(self, version: str, phase: str, **kwargs):
+            self.replay_calls += 1
+            return super().replay(version, phase, **kwargs)
+
+    sandbox = BadProbeSandbox(toolchain=admission["build"]["toolchain_image"])
+    with pytest.raises(release.ReleaseGateError, match="uid=.*65534|isolation check"):
+        _run_b03(tmp_path, admission, sandbox, review)
+    assert sandbox.build_calls == 0
+    assert sandbox.replay_calls == 0
+
+
+def test_b03_empty_advisory_is_rejected(tmp_path):
+    root = _b03_case_root(tmp_path)
+    (root / "advisory.json").write_text("{}\n", encoding="utf-8")
+    admission = _frozen_admission()
+    with pytest.raises(release.ReleaseGateError, match="advisory"):
+        release.prepare_b03_plan(
+            admission=admission,
+            materials=release.B03CaseMaterials.load(root),
+            normal_input=(root / "inputs" / "normal.txt").read_bytes(),
+            candidate_input=(root / "inputs" / "candidate.txt").read_bytes(),
+        )
+
+
+def test_b03_review_expiry_and_future_times_are_rejected(tmp_path):
+    root = _b03_case_root(tmp_path)
+    admission = _frozen_admission()
+    valid_review = _review_for(admission, root)
+    sandbox = FakeB03Sandbox(toolchain=admission["build"]["toolchain_image"])
+
+    expired = dict(valid_review, decided_at="2020-01-01T00:00:00Z")
+    with pytest.raises(release.ReleaseGateError, match="expired"):
+        _run_b03(tmp_path, admission, sandbox, expired)
+
+    future = dict(valid_review, decided_at="2099-01-01T00:00:00Z")
+    with pytest.raises(release.ReleaseGateError, match="future"):
+        _run_b03(tmp_path, admission, sandbox, future)
+
+
+def test_b03_verdict_must_match_the_frozen_expected_verdict(tmp_path):
+    root = _b03_case_root(tmp_path)
+    admission = _frozen_admission()
+    admission["expected_verdict"] = "NOT_REPRODUCED"
+    review = _review_for(admission, root)
+    sandbox = FakeB03Sandbox(toolchain=admission["build"]["toolchain_image"])
+    with pytest.raises(release.ReleaseGateError, match="expected_verdict"):
+        _run_b03(tmp_path, admission, sandbox, review)
+
+
+def test_b03_total_file_cap_fails_closed(tmp_path, monkeypatch):
+    root = _b03_case_root(tmp_path)
+    monkeypatch.setattr(release, "_MAX_B03_TOTAL_FILES", 3)
+    with pytest.raises(release.ReleaseGateError, match="file cap"):
+        release.B03CaseMaterials.load(root)

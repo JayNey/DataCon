@@ -108,7 +108,20 @@ def _apply_mutation(case_root: Path, mutation: dict[str, Any]) -> None:
     if kind == "none":
         return
     if kind == "delete_file":
-        (case_root / mutation["path"]).unlink()
+        try:
+            target = jsonutil.resolve_inside(case_root, mutation["path"])
+        except (KeyError, ValueError) as error:
+            raise B04GateError(
+                f"delete_file mutation path is unsafe: {error}",
+                reason_code="UNSAFE_MUTATION",
+            ) from error
+        try:
+            target.unlink()
+        except OSError as error:
+            raise B04GateError(
+                f"delete_file mutation failed: {error}",
+                reason_code="UNSAFE_MUTATION",
+            ) from error
         return
     if kind == "corrupt_advisory_conflict":
         adv_path = case_root / "advisory.json"

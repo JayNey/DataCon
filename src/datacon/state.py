@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass
+import hashlib
+from pathlib import Path
 import re
 import threading
 import uuid
@@ -21,6 +23,11 @@ REVIEW_WINDOW_HOURS = 24
 # legitimate single analysis pass cannot be stolen mid-flight. A production
 # heartbeat can extend this later; the lease is never shorter than the budget.
 LEASE_SECONDS = 600
+# The single control-plane release environment. It is defined before the job
+# claim path because claiming a job and switching a release must take the same
+# advisory lock (shared for claim, exclusive for promote/rollback).
+RELEASE_ENVIRONMENT = "internal-lab"
+RELEASE_LOCK_PREFIX = "datacon:release:"
 ATTEMPT_STATUSES = frozenset({"started", "completed", "infra_error"})
 # Attempt results are structured metadata, not a second copy of raw logs.
 # Keeping them bounded prevents a chatty tool from bloating PostgreSQL or
@@ -200,6 +207,15 @@ def claim_next(
                    AND (lease_expires_at IS NULL
                         OR lease_expires_at <= clock_timestamp()))"""
     with _connect(dsn) as connection:
+        # A claim may run while a release is being promoted. Take the shared
+        # side of the release lock for this transaction so a promotion that
+        # holds the exclusive side (and observed zero active slots) cannot be
+        # interleaved with a new claim; the claim waits until the promotion
+        # commits and then targets the new release.
+        connection.execute(
+            "SELECT pg_advisory_xact_lock_shared(hashtext(%s))",
+            (RELEASE_LOCK_PREFIX + RELEASE_ENVIRONMENT,),
+        )
         row = connection.execute(
             f"""
             SELECT job_id, state, workflow_synced
@@ -1301,9 +1317,9 @@ def status(dsn: str, job_id: UUID) -> dict[str, Any] | None:
 # Release promotion / rollback persistence (T08, TC-10, SF2)
 # ---------------------------------------------------------------------------
 
-RELEASE_ENVIRONMENT = "internal-lab"
 RELEASE_ACTIVE_STATES = ("PREPARING", "RUNNING", "ARCHIVING")
 _RELEASE_DIGEST_FIELDS = ("candidate_digest", "manifest_digest")
+_MIGRATION_FILE = re.compile(r"^([0-9]{3})_[A-Za-z0-9_]+\.sql$")
 
 
 class ReleaseStateError(StateError):
@@ -1314,6 +1330,80 @@ def _release_digest(value: Any, label: str) -> str:
     if not isinstance(value, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", value):
         raise ReleaseStateError(f"{label} must be a sha256 digest")
     return value
+
+
+def _migration_sha256(path: Path) -> str:
+    return "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _migration_number(name: str) -> int:
+    match = _MIGRATION_FILE.fullmatch(name)
+    if match is None:
+        raise ReleaseStateError(
+            f"migration file must be NNN_name.sql: {name!r}"
+        )
+    return int(match.group(1))
+
+
+def apply_migrations(connection, migrations_dir: Path | str) -> dict[str, str]:
+    """Apply every migration in order and record filename + sha256 in the ledger.
+
+    The caller must use an autocommit connection: each migration file contains
+    its own ``BEGIN``/``COMMIT`` and is designed to be repeatable. A migration
+    that is already recorded is skipped, and a recorded filename whose on-disk
+    digest changed fails closed instead of silently applying a different file.
+    This is the only supported way to make the ledger match the real schema.
+    """
+    paths = sorted(Path(migrations_dir).glob("*.sql"))
+    if not paths:
+        raise ReleaseStateError(f"no SQL migrations found in {migrations_dir}")
+    numbers = [_migration_number(path.name) for path in paths]
+    if numbers != list(range(1, len(numbers) + 1)):
+        raise ReleaseStateError(
+            "migrations must be numbered consecutively from 001"
+        )
+    connection.execute(
+        "CREATE TABLE IF NOT EXISTS schema_migrations ("
+        "file text PRIMARY KEY, "
+        "sha256 text NOT NULL, "
+        "applied_at timestamptz NOT NULL DEFAULT clock_timestamp(), "
+        "CONSTRAINT schema_migrations_file_check "
+        "CHECK (file ~ '^[0-9]{3}_[A-Za-z0-9_]+\\.sql$'), "
+        "CONSTRAINT schema_migrations_sha256_check "
+        "CHECK (sha256 ~ '^sha256:[0-9a-f]{64}$'))"
+    )
+    applied: dict[str, str] = {}
+    for path in paths:
+        name = path.name
+        digest = _migration_sha256(path)
+        row = connection.execute(
+            "SELECT sha256 FROM schema_migrations WHERE file = %s", (name,)
+        ).fetchone()
+        if row is not None:
+            recorded = row["sha256"]
+            if recorded != digest:
+                raise ReleaseStateError(
+                    f"migration {name} was already applied with a different "
+                    "digest; refusing to re-run a changed migration"
+                )
+            applied[name] = digest
+            continue
+        connection.execute(path.read_text(encoding="utf-8"))
+        connection.execute(
+            "INSERT INTO schema_migrations (file, sha256) VALUES (%s, %s) "
+            "ON CONFLICT (file) DO NOTHING",
+            (name, digest),
+        )
+        applied[name] = digest
+    return applied
+
+
+def apply_migrations_dsn(dsn: str, migrations_dir: Path | str) -> dict[str, str]:
+    """Apply migrations on a dedicated autocommit connection (CLI/workflow)."""
+    with psycopg.connect(
+        dsn, autocommit=True, connect_timeout=5, row_factory=dict_row
+    ) as connection:
+        return apply_migrations(connection, migrations_dir)
 
 
 class ReleaseStore:
@@ -1351,8 +1441,10 @@ class ReleaseStore:
 
         Acquires a per-environment advisory lock and locks the ``release_state``
         row so concurrent workflows cannot interleave or overwrite
-        ``previous_image_id``. Any exception rolls back both ``release_state``
-        and ``release_events`` together.
+        ``previous_image_id``. The same lock is taken in shared mode by
+        ``claim_next``, so a claim cannot slip in between the drain check and
+        the switch. Any exception rolls back both ``release_state`` and
+        ``release_events`` together.
         """
         existing = getattr(self._tx_local, "conn", None)
         if existing is not None:
@@ -1360,8 +1452,8 @@ class ReleaseStore:
             return
         with self._connect() as connection:
             connection.execute(
-                "SELECT pg_advisory_xact_lock(hashtext('datacon:release:' || %s))",
-                (self.environment,),
+                "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                (RELEASE_LOCK_PREFIX + self.environment,),
             )
             connection.execute(
                 "SELECT 1 FROM release_state WHERE environment = %s FOR UPDATE",
@@ -1406,9 +1498,34 @@ class ReleaseStore:
         migration_version: str,
         evidence_root: str,
     ) -> None:
-        """Insert the baseline release once; an existing row is never overwritten."""
+        """Insert the baseline release and its audit snapshot exactly once.
+
+        The baseline has no prior promotion event, so without its own
+        ``release_events`` row a later promotion would overwrite
+        ``release_state`` and make rollback to the baseline impossible. The
+        snapshot is written in the same transaction as the state row and is
+        idempotent: repeating an identical bootstrap writes nothing, while a
+        conflicting bootstrap fails closed instead of silently replacing it.
+        """
         _release_digest(image_id, "bootstrap image_id")
-        with self._connection() as connection:
+        if not isinstance(config, Mapping):
+            raise ReleaseStateError("bootstrap config must be an object")
+        if not isinstance(migration_version, str) or not _MIGRATION_FILE.fullmatch(
+            migration_version
+        ):
+            raise ReleaseStateError(
+                "bootstrap migration_version must be an NNN_*.sql migration name"
+            )
+        if not isinstance(evidence_root, str) or not evidence_root.strip():
+            raise ReleaseStateError("bootstrap evidence_root must be a path")
+        snapshot = {
+            "image_id": image_id,
+            "config": dict(config),
+            "migration_version": migration_version,
+            "evidence_root": evidence_root,
+        }
+        snapshot_digest = jsonutil.digest_json(snapshot)
+        with self.transaction() as connection:
             connection.execute(
                 "INSERT INTO release_state "
                 "(environment, image_id, config, migration_version, evidence_root) "
@@ -1419,6 +1536,50 @@ class ReleaseStore:
                     Jsonb(dict(config)),
                     migration_version,
                     evidence_root,
+                ),
+            )
+            existing = connection.execute(
+                "SELECT payload FROM release_events "
+                "WHERE environment = %s AND action = 'bootstrap'",
+                (self.environment,),
+            ).fetchone()
+            if existing is not None:
+                payload = existing["payload"]
+                if not isinstance(payload, Mapping) or any(
+                    payload.get(field) != snapshot[field] for field in snapshot
+                ):
+                    raise ReleaseStateError(
+                        "bootstrap_release conflicts with the persisted baseline"
+                    )
+                return
+            row = connection.execute(
+                "SELECT image_id, config, migration_version, evidence_root "
+                "FROM release_state WHERE environment = %s",
+                (self.environment,),
+            ).fetchone()
+            if row is None:
+                raise ReleaseStateError("bootstrap_release did not persist release_state")
+            if any(
+                row[field] != snapshot[field]
+                for field in ("image_id", "config", "migration_version", "evidence_root")
+            ):
+                raise ReleaseStateError(
+                    "release_state already exists with a different baseline; "
+                    "refusing to record a mismatched bootstrap event"
+                )
+            connection.execute(
+                "INSERT INTO release_events "
+                "(event_id, environment, action, status, candidate_digest, "
+                "manifest_digest, previous_image_id, active_image_id, payload) "
+                "VALUES (%s, %s, 'bootstrap', 'bootstrapped', %s, %s, NULL, %s, %s) "
+                "ON CONFLICT (environment) WHERE action = 'bootstrap' DO NOTHING",
+                (
+                    uuid.uuid4(),
+                    self.environment,
+                    snapshot_digest,
+                    snapshot_digest,
+                    image_id,
+                    Jsonb(snapshot),
                 ),
             )
 
@@ -1475,9 +1636,13 @@ class ReleaseStore:
         )
         manifest_digest = result.get("manifest_digest")
         if manifest_digest is None:
-            # A promotion result is bound to the approved manifest; a manual
-            # rollback result records the target image id instead.
-            manifest_digest = candidate_digest
+            # The manifest digest identifies the approved candidate or -- for a
+            # baseline rollback -- the persisted release snapshot. An image id
+            # is not a manifest digest and must never be substituted for one.
+            raise ReleaseStateError(
+                "release result is missing manifest_digest; refusing to record "
+                "an image id as a manifest digest"
+            )
         manifest_digest = _release_digest(manifest_digest, "manifest_digest")
         active_image = _release_digest(result.get("active_image_id"), "active_image_id")
         previous_image = result.get("previous_image_id")
@@ -1520,54 +1685,83 @@ class ReleaseStore:
             row = connection.execute(
                 "SELECT payload FROM release_events "
                 "WHERE environment = %s AND action = 'promote' "
-                "AND candidate_digest = %s",
+                "AND status = 'promoted' AND candidate_digest = %s",
                 (self.environment, candidate_digest),
             ).fetchone()
         return dict(row["payload"]) if row is not None else None
 
+    def applied_migrations(self) -> dict[str, str]:
+        """Return the verifiable migration ledger as ``{file: sha256}``.
+
+        A missing ledger fails closed: the promotion gate must never trust a
+        manifest migration list against a database it cannot prove.
+        """
+        try:
+            with self._connection() as connection:
+                rows = connection.execute(
+                    "SELECT file, sha256 FROM schema_migrations ORDER BY file"
+                ).fetchall()
+        except psycopg.errors.UndefinedTable as error:
+            raise ReleaseStateError(
+                "schema_migrations ledger is missing; run `datacon migrate` "
+                "against the target database before promoting or rolling back"
+            ) from error
+        return {row["file"]: row["sha256"] for row in rows}
+
     def release_for_image(self, image_id: str) -> dict[str, Any] | None:
-        """Return the most recent persisted release record for one image id.
+        """Return the most recent valid persisted release record for one image id.
 
         Rollback must restore the image together with its config, migration
         version and evidence root. Reading them from the audit log avoids a
-        workflow supplying a half-invented previous release.
+        workflow supplying a half-invented previous release. Only successful
+        event/status pairs are considered, so a malformed or failed audit row
+        can never become rollback provenance.
         """
         _release_digest(image_id, "image_id")
         with self._connection() as connection:
-            row = connection.execute(
-                "SELECT payload FROM release_events "
+            rows = connection.execute(
+                "SELECT action, status, candidate_digest, manifest_digest, payload "
+                "FROM release_events "
                 "WHERE environment = %s AND active_image_id = %s "
-                "ORDER BY recorded_at DESC LIMIT 1",
+                "AND action IN ('promote', 'rollback', 'bootstrap') "
+                "AND status IN ('promoted', 'rolled_back', 'bootstrapped') "
+                "ORDER BY recorded_at DESC, event_id DESC LIMIT 20",
                 (self.environment, image_id),
-            ).fetchone()
-        if row is None:
-            # A bootstrapped baseline release has no event yet. It is still a
-            # persisted release_state row, so rollback may target it.
-            active = self.active_release()
-            if active is not None and active.get("image_id") == image_id:
-                return {
-                    "image_id": active["image_id"],
-                    "config": active["config"],
-                    "migration_version": active["migration_version"],
-                    "evidence_root": active["evidence_root"],
-                }
-            return None
-        payload = row["payload"]
-        if not isinstance(payload, dict):
-            return None
-        config = payload.get("config")
-        evidence_root = payload.get("evidence_root")
-        migration_version = payload.get("migration_version")
-        if not isinstance(config, dict) or not isinstance(evidence_root, str):
-            return None
-        if not isinstance(migration_version, str):
-            return None
-        return {
-            "image_id": image_id,
-            "config": config,
-            "migration_version": migration_version,
-            "evidence_root": evidence_root,
-        }
+            ).fetchall()
+        for row in rows:
+            payload = row["payload"]
+            if not isinstance(payload, dict):
+                continue
+            config = payload.get("config")
+            evidence_root = payload.get("evidence_root")
+            migration_version = payload.get("migration_version")
+            if not isinstance(config, dict) or not isinstance(evidence_root, str):
+                continue
+            if not isinstance(migration_version, str):
+                continue
+            return {
+                "image_id": image_id,
+                "config": config,
+                "migration_version": migration_version,
+                "evidence_root": evidence_root,
+                "manifest_digest": row["manifest_digest"],
+                "candidate_digest": row["candidate_digest"],
+                "source_commit": payload.get("source_commit"),
+                "baseline": row["action"] == "bootstrap",
+                "action": row["action"],
+            }
+        # Legacy databases bootstrapped before the bootstrap event existed
+        # still expose the active row. It has no manifest provenance, so
+        # callers that require one fail closed instead of inventing it.
+        active = self.active_release()
+        if active is not None and active.get("image_id") == image_id:
+            return {
+                "image_id": active["image_id"],
+                "config": active["config"],
+                "migration_version": active["migration_version"],
+                "evidence_root": active["evidence_root"],
+            }
+        return None
 
     def latest_evidence_bundle(self) -> dict[str, str] | None:
         """Return the newest archived evidence bundle for a release smoke check."""
