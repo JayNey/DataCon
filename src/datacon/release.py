@@ -1143,6 +1143,10 @@ def rollback_release(
     return result
 
 
+def _reject_symlink_ancestors(path: Path, *, label: str) -> None:
+    jsonutil.reject_symlink_ancestors(path, label=label, error_cls=ReleaseGateError)
+
+
 def archived_bundle_preflight(
     *,
     evidence_root: str | Path,
@@ -1160,10 +1164,26 @@ def archived_bundle_preflight(
         root_path = evidence_root
     else:
         raise ReleaseGateError("refusing promotion: evidence_root must be a path")
-    if root_path.is_symlink():
-        raise ReleaseGateError(
-            f"refusing promotion: evidence_root is a symlink: {root_path}"
-        )
+    _reject_symlink_ancestors(root_path, label="evidence_root")
+    active_release_fn = getattr(store, "active_release", None)
+    if callable(active_release_fn):
+        active = active_release_fn()
+        if active is not None:
+            active_root = (
+                active.get("evidence_root") if isinstance(active, Mapping) else None
+            )
+            if not isinstance(active_root, str) or not active_root.strip():
+                raise ReleaseGateError(
+                    "refusing promotion: active release is missing evidence_root"
+                )
+            _reject_symlink_ancestors(
+                Path(active_root), label="active release evidence_root"
+            )
+            if Path(active_root) != root_path:
+                raise ReleaseGateError(
+                    f"refusing promotion: evidence_root {root_path} does not match "
+                    f"active release evidence_root {active_root}"
+                )
     if not root_path.exists():
         store.latest_evidence_bundle(require_active_root=False)
         if require_archived_bundle:
@@ -1204,7 +1224,8 @@ def archived_bundle_preflight(
             "check_fn": None,
         }
     latest_path = Path(latest["path"])
-    if latest_path.is_symlink() or not latest_path.is_dir():
+    _reject_symlink_ancestors(latest_path, label="latest evidence bundle path")
+    if not latest_path.is_dir():
         raise ReleaseGateError(
             f"refusing promotion: latest evidence bundle path is not a real directory: {latest_path}"
         )
@@ -2742,10 +2763,7 @@ def persist_b03_evidence_bundle(
         raise ReleaseGateError(
             f"B03 persistent evidence directory must be an absolute path: {root_path}"
         )
-    if root_path.is_symlink():
-        raise ReleaseGateError(
-            f"B03 persistent evidence directory must not be a symlink: {root_path}"
-        )
+    _reject_symlink_ancestors(root_path, label="B03 persistent evidence directory")
     if (
         not isinstance(job_id, str)
         or not _SAFE_B03_JOB_ID.fullmatch(job_id)

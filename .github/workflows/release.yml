@@ -785,7 +785,7 @@ jobs:
       && github.ref == 'refs/heads/main'
       && github.event.inputs.action == 'rollback'
     environment: internal-lab
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, datacon-internal]
     timeout-minutes: 20
     env:
       TARGET_DIGEST: ${{ github.event.inputs.target_digest }}
@@ -979,6 +979,11 @@ jobs:
 
           out = pathlib.Path(sys.argv[1])
           store = state.ReleaseStore(os.environ["DATACON_DATABASE_URL"])
+          current = store.active_release()
+          if current is None:
+              raise SystemExit(
+                  "release_state is empty; no active release to roll back from"
+              )
           target = store.release_for_image(os.environ["TARGET_DIGEST"])
           if target is None:
               raise SystemExit(
@@ -1069,8 +1074,10 @@ jobs:
                   return False
               return (
                   isinstance(payload, dict)
-                  and "active_release" in payload
-                  and "active_slots" in payload
+                  and payload.get("environment") == "internal-lab"
+                  and type(payload.get("active_slots")) is int
+                  and isinstance(payload.get("active_release"), dict)
+                  and payload["active_release"].get("image_id") == current["image_id"]
               )
 
           def active_release_restored():

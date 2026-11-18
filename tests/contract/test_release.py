@@ -1654,6 +1654,13 @@ def test_validate_evidence_bundle_path_enforces_containment_and_no_symlinks(tmp_
     with pytest.raises(state.ReleaseStateError, match="symlink"):
         state._validate_evidence_bundle_path(str(sym_root / "job-1"), str(sym_root))
 
+    # Symlink in an ancestor directory of evidence_root is rejected.
+    sym_parent = tmp_path / "sym-parent"
+    sym_parent.symlink_to(tmp_path)
+    nested_root = sym_parent / "evidence"
+    with pytest.raises(state.ReleaseStateError, match="symlink"):
+        state._validate_evidence_bundle_path(str(nested_root / "job-1"), str(nested_root))
+
     # Parent traversal and outside paths are rejected.
     with pytest.raises(state.ReleaseStateError, match="traversal|escape|evidence_path"):
         state._validate_evidence_bundle_path(
@@ -1934,6 +1941,134 @@ def test_promote_requires_real_archived_bundle_when_strict(tmp_path):
     assert found["bundle_path"] == str(bundle_dir)
     assert found["bundle_digest"] == digest
     assert found["check_fn"]() is True
+
+
+def test_archived_bundle_preflight_rejects_ancestor_symlink_and_active_root_mismatch(tmp_path):
+    real_parent = tmp_path / "real-parent"
+    real_parent.mkdir()
+    sym_parent = tmp_path / "sym-parent"
+    sym_parent.symlink_to(real_parent)
+    sym_root = sym_parent / "evidence"
+    real_bundle = real_parent / "evidence" / "job-1" / "gen-1"
+    real_bundle.mkdir(parents=True)
+
+    class _ActiveStore:
+        def __init__(self, active_root: str, bundle: dict[str, str] | None = None):
+            self._active_root = active_root
+            self._bundle = bundle
+
+        def active_release(self):
+            return {
+                "image_id": "sha256:" + "a" * 64,
+                "config": {"policy_version": "1"},
+                "migration_version": "008_release_events.sql",
+                "evidence_root": self._active_root,
+            }
+
+        def latest_evidence_bundle(
+            self, *, require_active_root: bool = True, strict: bool = False
+        ):
+            return self._bundle
+
+    with pytest.raises(release.ReleaseGateError, match="symlink"):
+        release.archived_bundle_preflight(
+            evidence_root=sym_root,
+            store=_ActiveStore(
+                str(sym_root),
+                {
+                    "path": str(sym_root / "job-1" / "gen-1"),
+                    "digest": "sha256:" + "a" * 64,
+                },
+            ),
+            verify_fn=lambda path, d: True,
+        )
+
+    actual_root = tmp_path / "actual-evidence"
+    actual_root.mkdir()
+    other_root = tmp_path / "other-evidence"
+    other_root.mkdir()
+    with pytest.raises(release.ReleaseGateError, match="evidence_root"):
+        release.archived_bundle_preflight(
+            evidence_root=other_root,
+            store=_ActiveStore(str(actual_root)),
+            verify_fn=lambda path, d: True,
+            require_archived_bundle=False,
+            skip_reason="should fail before skipping",
+        )
+
+
+def test_persist_b03_evidence_bundle_rejects_symlink_ancestor(tmp_path):
+    root = _b03_case_root(tmp_path)
+    admission = _frozen_admission()
+    review = _review_for(admission, root)
+    bundle_out = tmp_path / "temp-bundle-sym"
+    acceptance = release.run_b03_acceptance(
+        admission=admission,
+        sandbox=FakeB03Sandbox(toolchain=admission["build"]["toolchain_image"]),
+        normal_input=(root / "inputs" / "normal.txt").read_bytes(),
+        candidate_input=(root / "inputs" / "candidate.txt").read_bytes(),
+        bundle_out=bundle_out,
+        storage_ref="vault://datacon/private/b03/CVE-2019-13224/manifest.json",
+        review=review,
+        case_root=root,
+        job_id="11111111-1111-4111-8111-111111111111",
+    )
+    real_parent = tmp_path / "real-b03"
+    real_parent.mkdir()
+    sym_parent = tmp_path / "sym-b03"
+    sym_parent.symlink_to(real_parent)
+    with pytest.raises(release.ReleaseGateError, match="symlink"):
+        release.persist_b03_evidence_bundle(
+            bundle_out,
+            persist_root=sym_parent / "persistent-b03",
+            job_id="11111111-1111-4111-8111-111111111111",
+            expected_manifest_digest=acceptance["manifest_digest"],
+        )
+
+
+def test_latest_evidence_bundle_require_active_root_false_validates_all_rows(monkeypatch):
+    from datacon import state
+
+    rows = [
+        {
+            "evidence_path": "/var/lib/datacon/evidence/job-1/gen-1",
+            "evidence_digest": "sha256:" + "a" * 64,
+        },
+        {
+            "evidence_path": ".datacon/relative/job-0/gen-1",
+            "evidence_digest": "sha256:" + "b" * 64,
+        },
+    ]
+
+    class _FakeConn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def execute(self, query, params=None):
+            class _Cursor:
+                def fetchone(self):
+                    if "to_regclass" in query:
+                        return {
+                            "migrations_tbl": "schema_migrations",
+                            "release_tbl": "release_state",
+                            "events_tbl": "release_events",
+                        }
+                    return None
+
+                def fetchall(self):
+                    if "FROM jobs" in query:
+                        return rows
+                    return []
+
+            return _Cursor()
+
+    store_handle = state.ReleaseStore("postgresql://unused")
+    monkeypatch.setattr(store_handle, "_connect", lambda: _FakeConn())
+    with pytest.raises(state.ReleaseStateError, match="absolute|evidence_path"):
+        store_handle.latest_evidence_bundle(require_active_root=False)
 
 
 def test_release_store_connection_ensures_release_tables_and_cli_slots_exits_2(

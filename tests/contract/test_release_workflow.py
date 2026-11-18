@@ -646,14 +646,133 @@ def test_test_report_has_main_and_tag_ref_guard():
     assert _eval_gha_condition(cond, event_name="pull_request", ref="refs/pull/7/merge") is False
 
 
-def test_promote_archived_bundle_is_fail_closed_by_default_and_audited_when_skipped():
+def test_sensitive_internal_jobs_use_datacon_internal_runner():
+    jobs = _load(RELEASE)["jobs"]
+    expected_runner = ["self-hosted", "linux", "x64", "datacon-internal"]
+    for job_name in ("promote-internal", "rollback-internal", "b03-internal"):
+        assert jobs[job_name]["runs-on"] == expected_runner, job_name
+        assert jobs[job_name]["runs-on"] != "ubuntu-latest", job_name
+
+
+def test_promote_archived_bundle_is_fail_closed_by_default_and_audited_when_skipped(
+    tmp_path, monkeypatch
+):
+    import sys
+    import types
+
     promote = _load(RELEASE)["jobs"]["promote-internal"]
-    promote_text = _run_text(promote)
-    assert "skipping archived_real_bundle" not in promote_text
-    assert "archived_bundle_preflight" in promote_text
-    assert "audit_metadata" in promote_text
+    promote_steps = _steps(promote)
     assert "REQUIRE_ARCHIVED_BUNDLE" in promote["env"]
     assert "ARCHIVED_BUNDLE_SKIP_REASON" in promote["env"]
+    promote_step = next(
+        step for step in promote_steps if "archived_bundle_preflight" in step.get("run", "")
+    )
+    blocks = _extract_python_heredocs(promote_step["run"])
+    assert len(blocks) == 1
+    code = compile(blocks[0], "<promote-heredoc>", "exec")
+
+    def _run_promote_heredoc(req_env: str, skip_reason: str, preflight_mode: str):
+        art_dir = tmp_path / f"art-{req_env or 'empty'}-{preflight_mode}"
+        art_dir.mkdir(exist_ok=True)
+        (art_dir / "release-candidate-manifest.json").write_text(
+            '{"control_plane_image_id": "sha256:' + "c" * 64 + '"}',
+            encoding="utf-8",
+        )
+        captured: dict = {}
+
+        class _FakeStore:
+            def __init__(self, dsn):
+                self.dsn = dsn
+
+            def active_release(self):
+                return {
+                    "image_id": "sha256:" + "0" * 64,
+                    "config": {"policy_version": "1"},
+                    "migration_version": "008_release_events.sql",
+                    "evidence_root": "/var/lib/datacon/evidence",
+                }
+
+        def _fake_preflight(
+            *, evidence_root, store, verify_fn, require_archived_bundle=True, skip_reason=None
+        ):
+            captured["preflight_args"] = {
+                "evidence_root": evidence_root,
+                "require_archived_bundle": require_archived_bundle,
+                "skip_reason": skip_reason,
+            }
+            if preflight_mode == "verified":
+                return {
+                    "status": "required",
+                    "bundle_path": "/var/lib/datacon/evidence/job-1/gen-1",
+                    "bundle_digest": "sha256:" + "d" * 64,
+                    "check_fn": lambda: True,
+                }
+            return {
+                "status": "skipped",
+                "reason": skip_reason,
+                "check_fn": None,
+            }
+
+        def _fake_promote_and_smoke(**kwargs):
+            captured["promote_kwargs"] = kwargs
+            return {"status": "promoted", "smoke_results": {}}
+
+        fake_release = types.ModuleType("datacon.release")
+        fake_release.RELEASE_MANIFEST_FILE = "release-candidate-manifest.json"
+        fake_release.PROMOTION_RESULT_FILE = "promotion-result.json"
+        fake_release.write_smoke_evidence_bundle = lambda *a, **kw: "sha256:" + "e" * 64
+        fake_release.archived_bundle_preflight = _fake_preflight
+        fake_release.promote_and_smoke = _fake_promote_and_smoke
+        fake_release.canonical_manifest_digest = lambda m: "sha256:" + "f" * 64
+
+        fake_state = types.ModuleType("datacon.state")
+        fake_state.ReleaseStore = _FakeStore
+
+        fake_datacon = types.ModuleType("datacon")
+        fake_datacon.release = fake_release
+        fake_datacon.state = fake_state
+
+        fake_psycopg = types.ModuleType("psycopg")
+        fake_psycopg.connect = lambda *a, **kw: None
+
+        monkeypatch.setitem(sys.modules, "datacon", fake_datacon)
+        monkeypatch.setitem(sys.modules, "datacon.release", fake_release)
+        monkeypatch.setitem(sys.modules, "datacon.state", fake_state)
+        monkeypatch.setitem(sys.modules, "psycopg", fake_psycopg)
+        monkeypatch.setenv("EXPECTED_MANIFEST_DIGEST", "sha256:" + "f" * 64)
+        monkeypatch.setenv("DATACON_RELEASE_APPROVAL", '{"approved_by": "ops"}')
+        monkeypatch.setenv("DATACON_DATABASE_URL", "postgresql://unused")
+        monkeypatch.setenv("REQUIRE_ARCHIVED_BUNDLE", req_env)
+        monkeypatch.setenv("ARCHIVED_BUNDLE_SKIP_REASON", skip_reason)
+        monkeypatch.setattr(sys, "argv", ["promote.py", str(art_dir)])
+
+        ns = {"__name__": "__main__"}
+        exec(code, ns, ns)  # noqa: S102
+        return captured
+
+    import pytest
+
+    with pytest.raises(SystemExit, match="REQUIRE_ARCHIVED_BUNDLE"):
+        _run_promote_heredoc("invalid", "", "verified")
+
+    for req_val in ("", "true"):
+        cap = _run_promote_heredoc(req_val, "", "verified")
+        assert cap["preflight_args"]["require_archived_bundle"] is True
+        assert cap["preflight_args"]["skip_reason"] is None
+        assert "archived_real_bundle" in cap["promote_kwargs"]["preflight_checks"]
+        assert cap["promote_kwargs"]["audit_metadata"] == {
+            "archived_real_bundle": "verified",
+            "archived_real_bundle_path": "/var/lib/datacon/evidence/job-1/gen-1",
+        }
+
+    cap_skip = _run_promote_heredoc("false", "initial bootstrap lab", "skipped")
+    assert cap_skip["preflight_args"]["require_archived_bundle"] is False
+    assert cap_skip["preflight_args"]["skip_reason"] == "initial bootstrap lab"
+    assert "archived_real_bundle" not in cap_skip["promote_kwargs"]["preflight_checks"]
+    assert cap_skip["promote_kwargs"]["audit_metadata"] == {
+        "archived_real_bundle": "skipped",
+        "archived_real_bundle_skip_reason": "initial bootstrap lab",
+    }
 
 
 def test_no_secret_in_any_step_before_approval():
@@ -716,8 +835,10 @@ def test_timeout_helper_rejects_commented_or_removed_timeout():
         _assert_smoke_timeouts(mutated_sh)
 
 
-def test_b03_persists_bundle_before_cleanup_and_fails_closed_without_dir():
+def test_b03_persists_bundle_before_cleanup_and_fails_closed_without_dir(tmp_path):
     import ast
+    import os
+    import subprocess
 
     b03 = _load(RELEASE)["jobs"]["b03-internal"]
     b03_steps = _steps(b03)
@@ -727,7 +848,24 @@ def test_b03_persists_bundle_before_cleanup_and_fails_closed_without_dir():
     assert "DATACON_B03_EVIDENCE_DIR" in run_step.get("env", {})
     assert "${{ secrets.DATACON_B03_EVIDENCE_DIR" not in str(run_step.get("env", {}))
     run_text = run_step["run"]
-    assert "DATACON_B03_EVIDENCE_DIR" in run_text.split("uv run")[0]
+    shell_guard = run_text.split("uv run")[0]
+    guard_env = dict(
+        os.environ,
+        DATACON_B03_CASE_ROOT="/tmp/case",
+        DATACON_B03_ADMISSION="/tmp/admission.json",
+        DATACON_B03_REVIEW='{"reviewer":"ops"}',
+        DATACON_B03_EVIDENCE_DIR="",
+    )
+    guard_proc = subprocess.run(
+        ["bash", "-c", shell_guard],
+        env=guard_env,
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    assert guard_proc.returncode != 0
+    assert "DATACON_B03_EVIDENCE_DIR" in guard_proc.stderr
+
     blocks = _extract_python_heredocs(run_text)
     assert blocks
     tree = ast.parse(blocks[0])
@@ -740,12 +878,32 @@ def test_b03_persists_bundle_before_cleanup_and_fails_closed_without_dir():
         for node in ast.walk(stmt)
     )
     assert persist_in_try, "persist_b03_evidence_bundle must run inside try before finally cleanup"
-    assert '"bundle_path"' in run_text
-    assert '"bundle_manifest_digest"' in run_text
+
+    summary_assign = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Assign)
+        and any(isinstance(t, ast.Name) and t.id == "summary" for t in node.targets)
+        and isinstance(node.value, ast.Dict)
+    )
+    summary_map = {
+        k.value: v
+        for k, v in zip(summary_assign.value.keys, summary_assign.value.values)
+        if isinstance(k, ast.Constant) and isinstance(k.value, str)
+    }
+    for key in ("bundle_verified", "bundle_path", "bundle_manifest_digest"):
+        assert key in summary_map, f"summary missing {key}"
+        val = summary_map[key]
+        assert isinstance(val, ast.Subscript)
+        assert isinstance(val.value, ast.Name) and val.value.id == "persisted"
+        assert isinstance(val.slice, ast.Constant) and val.slice.value == key
 
 
 def test_rollback_runs_release_slots_compatibility_in_pre_switch_smoke_not_post_commit():
     import ast
+    import json
+    import subprocess
+    import types
 
     rollback = _load(RELEASE)["jobs"]["rollback-internal"]
     steps = _steps(rollback)
@@ -771,6 +929,78 @@ def test_rollback_runs_release_slots_compatibility_in_pre_switch_smoke_not_post_
     smoke_keys = {k.value for k in smoke_kw.value.keys if isinstance(k, ast.Constant)}
     assert "release_slots" in smoke_keys
     assert "active_release_restored" in restore_step["run"]
+
+    # Verify `current = store.active_release()` is read and checked before switching,
+    # and test the extracted `release_slots_compatible` function with positive/negative payloads.
+    active_release_calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "active_release"
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "store"
+    ]
+    assert len(active_release_calls) >= 2, (
+        "rollback script must read current = store.active_release() before switching "
+        "as well as inside active_release_restored()"
+    )
+    compat_fn = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "release_slots_compatible"
+    )
+    fn_module = ast.Module(body=[compat_fn], type_ignores=[])
+    ast.fix_missing_locations(fn_module)
+    current_image = "sha256:" + "1" * 64
+    fake_proc = types.SimpleNamespace(returncode=0, stdout="")
+
+    class _FakeSubprocess:
+        TimeoutExpired = subprocess.TimeoutExpired
+
+        @staticmethod
+        def run(*args, **kwargs):
+            return fake_proc
+
+    ns = {
+        "subprocess": _FakeSubprocess,
+        "json": json,
+        "current": {"image_id": current_image},
+    }
+    exec(compile(fn_module, "<release-slots-compatible>", "exec"), ns, ns)  # noqa: S102
+    compat = ns["release_slots_compatible"]
+
+    # Positive case: internal-lab, integer active_slots, matching active_release.image_id
+    fake_proc.returncode = 0
+    fake_proc.stdout = json.dumps(
+        {
+            "environment": "internal-lab",
+            "active_slots": 0,
+            "active_release": {"image_id": current_image},
+            "drained": True,
+        }
+    )
+    assert compat() is True
+
+    # Negative cases: wrong environment, wrong image_id, non-int active_slots, non-dict active_release, bad exit/json
+    for bad_payload in (
+        {"environment": "prod", "active_slots": 0, "active_release": {"image_id": current_image}},
+        {"environment": "internal-lab", "active_slots": 0, "active_release": {"image_id": "sha256:" + "9" * 64}},
+        {"environment": "internal-lab", "active_slots": True, "active_release": {"image_id": current_image}},
+        {"environment": "internal-lab", "active_slots": "0", "active_release": {"image_id": current_image}},
+        {"environment": "internal-lab", "active_slots": 0, "active_release": None},
+    ):
+        fake_proc.returncode = 0
+        fake_proc.stdout = json.dumps(bad_payload)
+        assert compat() is False, bad_payload
+
+    fake_proc.stdout = "not-json"
+    assert compat() is False
+    fake_proc.returncode = 1
+    fake_proc.stdout = json.dumps(
+        {"environment": "internal-lab", "active_slots": 0, "active_release": {"image_id": current_image}}
+    )
+    assert compat() is False
 
 
 def test_run_suite_script_respects_both_pytest_and_junit_exit_codes(tmp_path):

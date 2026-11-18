@@ -1406,6 +1406,10 @@ def apply_migrations_dsn(dsn: str, migrations_dir: Path | str) -> dict[str, str]
         return apply_migrations(connection, migrations_dir)
 
 
+def _reject_symlink_ancestors(path: Path, *, label: str) -> None:
+    jsonutil.reject_symlink_ancestors(path, label=label, error_cls=ReleaseStateError)
+
+
 def _validate_evidence_bundle_path(evidence_path: Any, evidence_root: str) -> Path:
     """Validate that an archived ``evidence_path`` stays inside ``evidence_root`` without symlinks."""
     if not isinstance(evidence_path, str) or not evidence_path.strip():
@@ -1413,8 +1417,7 @@ def _validate_evidence_bundle_path(evidence_path: Any, evidence_root: str) -> Pa
     if "\\" in evidence_path:
         raise ReleaseStateError("evidence_path must use POSIX separators")
     root_path = Path(evidence_root)
-    if root_path.is_symlink():
-        raise ReleaseStateError("active release evidence_root must not be a symlink")
+    _reject_symlink_ancestors(root_path, label="active release evidence_root")
     candidate = Path(evidence_path)
     if ".." in candidate.parts:
         raise ReleaseStateError("evidence_path must not contain '..' traversal")
@@ -1898,7 +1901,8 @@ class ReleaseStore:
                     )
                 return None
             if not require_active_root:
-                _validate_evidence_path_syntax(job_rows[0]["evidence_path"])
+                for row in job_rows:
+                    _validate_evidence_path_syntax(row["evidence_path"])
                 return {
                     "path": job_rows[0]["evidence_path"],
                     "digest": job_rows[0]["evidence_digest"],
@@ -1918,8 +1922,9 @@ class ReleaseStore:
                 "active release evidence_root is missing; cannot validate evidence_path"
             )
         active_root = active["evidence_root"]
-        if Path(active_root).is_symlink():
-            raise ReleaseStateError("active release evidence_root must not be a symlink")
+        _reject_symlink_ancestors(
+            Path(active_root), label="active release evidence_root"
+        )
         historical_roots = [
             row["evidence_root"]
             for row in hist_rows
