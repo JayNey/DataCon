@@ -389,6 +389,100 @@ def test_vulnerability_scan_blocks_critical_high_and_invalid_waivers(tmp_path):
     assert summary["waived"] == 1
 
 
+def test_scan_gate_reports_every_blocked_finding_in_one_error():
+    findings = [
+        {"id": "CVE-2025-0001", "severity": "HIGH", "package": "bsdutils"},
+        {"id": "CVE-2025-0002", "severity": "CRITICAL", "package": "libssl3"},
+        {"id": "CVE-2025-0003", "severity": "LOW", "package": "ignored"},
+        {"id": "CVE-2025-0004", "severity": "HIGH", "package": "python3.12"},
+    ]
+    waivers = [
+        {
+            "id": "CVE-2025-0001",
+            "scope": "package:bsdutils",
+            "impact": "not reachable in the control-plane entrypoint",
+            "owner": "sec-team",
+            "expires_at": "2026-12-31",
+        }
+    ]
+    with pytest.raises(ci_gates.GateError) as captured:
+        ci_gates.evaluate_scan_findings(findings, waivers=waivers, today="2026-11-17")
+
+    # One error, one line per blocked finding: the waived and LOW findings must
+    # not create extra lines, and the loop must not stop at the first block.
+    lines = str(captured.value).splitlines()
+    assert lines == [
+        "unwaived CRITICAL vulnerability finding: CVE-2025-0002 (scope=libssl3)",
+        "unwaived HIGH vulnerability finding: CVE-2025-0004 (scope=python3.12)",
+    ]
+    summary = captured.value.scan_summary
+    assert summary["total"] == 4
+    assert summary["blocked"] == 2
+    assert summary["waived"] == 1
+    assert summary["blocked_findings"] == [
+        {"severity": "CRITICAL", "id": "CVE-2025-0002", "scope": "libssl3"},
+        {"severity": "HIGH", "id": "CVE-2025-0004", "scope": "python3.12"},
+    ]
+
+
+def test_scan_gate_json_output_lists_all_blocked_findings(tmp_path, capsys):
+    report = tmp_path / "trivy.json"
+    report.write_text(
+        json.dumps(
+            {
+                "SchemaVersion": 2,
+                "ArtifactName": "datacon-ci",
+                "Results": [
+                    {
+                        "Target": "datacon-ci (debian 12.11)",
+                        "Vulnerabilities": [
+                            {
+                                "VulnerabilityID": "CVE-2025-1001",
+                                "Severity": "HIGH",
+                                "PkgName": "bsdutils",
+                            },
+                            {
+                                "VulnerabilityID": "CVE-2025-1002",
+                                "Severity": "CRITICAL",
+                                "PkgName": "libssl3",
+                            },
+                            {
+                                "VulnerabilityID": "CVE-2025-1003",
+                                "Severity": "MEDIUM",
+                                "PkgName": "ignored",
+                            },
+                        ],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    waivers = tmp_path / "waivers.json"
+    waivers.write_text("[]\n", encoding="utf-8")
+
+    exit_code = ci_gates.main(
+        [
+            "--root",
+            str(REPO_ROOT),
+            "--findings",
+            str(report),
+            "--waivers",
+            str(waivers),
+            "--json",
+        ]
+    )
+    assert exit_code == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["total"] == 3
+    assert payload["blocked"] == 2
+    assert payload["waived"] == 0
+    assert payload["blocked_findings"] == [
+        {"severity": "HIGH", "id": "CVE-2025-1001", "scope": "bsdutils"},
+        {"severity": "CRITICAL", "id": "CVE-2025-1002", "scope": "libssl3"},
+    ]
+
+
 def test_trivy_report_is_parsed_and_required():
     clean = {"SchemaVersion": 2, "ArtifactName": "image", "Results": [{"Target": "image", "Vulnerabilities": []}]}
     assert ci_gates.parse_trivy_findings(clean) == []

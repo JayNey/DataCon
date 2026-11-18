@@ -333,3 +333,51 @@ jobs:
           printf '%s\n' "$output"
           test "$code" -eq 2
           grep -Fq "journal secret" <<<"$output"
+
+  # The vulnerability gate must be visible on the pull request, not only after
+  # a merge into main. This job rebuilds the image instead of downloading an
+  # image tar so the report is produced from the same Dockerfile as `image`.
+  vuln:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: image
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+      - name: Install uv and locked dependencies
+        run: |
+          python -m pip install --disable-pip-version-check --require-hashes \
+            --only-binary :all: -r requirements-ci.txt
+          uv sync --frozen
+      - name: Build the control-plane image
+        run: |
+          set -euo pipefail
+          docker build -t datacon-ci .
+      - name: Fail on unwaived HIGH/CRITICAL findings
+        shell: bash
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/trivy-report"
+          mkdir -p "$out"
+          # Same scanner image and arguments as release.yml; the digest is
+          # single-sourced in src/datacon/release.py (TRIVY_IMAGE_DIGEST) and
+          # checked by tests/contract/test_release_workflow.py.
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$out:/out" \
+            aquasec/trivy@sha256:ab70a02200597efa04748f210f793936eb647cbcdb0ea69cc30b226d6f5a22c7 \
+            image --scanners vuln --severity HIGH,CRITICAL --format json \
+            --output /out/trivy.json --exit-code 0 datacon-ci
+          test -s "$out/trivy.json"
+          uv run --frozen python -m datacon.ci_gates --root . \
+            --findings "$out/trivy.json" \
+            --waivers .github/security-waivers.json --require-scan
+      - name: Upload the Trivy report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: trivy-report
+          path: ${{ runner.temp }}/trivy-report/trivy.json
+          retention-days: 14

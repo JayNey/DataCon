@@ -16,6 +16,7 @@ from datacon import release
 REPO_ROOT = Path(__file__).resolve().parents[2]
 CI = REPO_ROOT / ".github" / "workflows" / "ci.yml"
 RELEASE = REPO_ROOT / ".github" / "workflows" / "release.yml"
+VULN_SCAN = REPO_ROOT / ".github" / "workflows" / "vuln-scan.yml"
 
 
 def _load(path: Path) -> dict:
@@ -194,6 +195,75 @@ def test_ci_has_a_real_image_build_and_smoke_job():
     assert "clang --version" in text or "--entrypoint clang" in text
 
 
+def test_ci_vuln_job_rescans_image_and_always_uploads_the_report():
+    document = _load(CI)
+    assert "vuln" in document["jobs"], "ci.yml must expose the vulnerability gate on PRs"
+    job = document["jobs"]["vuln"]
+    assert job["needs"] == "image"
+    text = _run_text(job)
+
+    assert "docker build -t datacon-ci ." in text
+    assert f"aquasec/trivy@{release.TRIVY_IMAGE_DIGEST}" in text
+    assert "-v /var/run/docker.sock:/var/run/docker.sock" in text
+    assert '--findings "$out/trivy.json"' in text
+    assert "--waivers .github/security-waivers.json --require-scan" in text
+    assert "-m datacon.ci_gates" in text
+    # The report is small; an image tar upload is forbidden.
+    assert "docker save" not in text
+
+    uploads = [
+        step
+        for step in _steps(job)
+        if str(step.get("uses", "")).startswith("actions/upload-artifact@")
+    ]
+    assert len(uploads) == 1
+    upload = uploads[0]
+    # A failing gate must still publish the report, otherwise triage degrades
+    # to a single log line, which is exactly what the incident exposed.
+    assert upload.get("if") == "always()"
+    assert upload["with"]["name"] == "trivy-report"
+    assert upload["with"]["path"].endswith("trivy-report/trivy.json")
+
+    triggers = _load(CI).get("on", _load(CI).get(True))
+    assert "schedule" not in triggers, "the weekly scan belongs in vuln-scan.yml, not ci.yml"
+
+
+def test_vuln_scan_workflow_is_weekly_dispatchable_and_runs_the_real_gate():
+    document = _load(VULN_SCAN)
+    triggers = document.get("on", document.get(True))
+    assert {"cron": "0 3 * * 1"} in triggers["schedule"]
+    assert "workflow_dispatch" in triggers
+
+    assert document["permissions"] == {"contents": "read"}
+    job = document["jobs"]["scan"]
+    text = _run_text(job)
+    assert "docker build -t datacon-ci ." in text
+    assert f"aquasec/trivy@{release.TRIVY_IMAGE_DIGEST}" in text
+    assert "-v /var/run/docker.sock:/var/run/docker.sock" in text
+    assert '--findings "$out/trivy.json"' in text
+    assert "--waivers .github/security-waivers.json --require-scan" in text
+    assert "-m datacon.ci_gates" in text
+
+    uploads = [
+        step
+        for step in _steps(job)
+        if str(step.get("uses", "")).startswith("actions/upload-artifact@")
+    ]
+    assert len(uploads) == 1
+    assert uploads[0].get("if") == "always()"
+    assert uploads[0]["with"]["name"] == "trivy-report"
+    assert uploads[0]["with"]["path"].endswith("trivy-report/trivy.json")
+
+
+def test_trivy_digest_is_single_sourced_across_workflows():
+    assert release.TRIVY_IMAGE == f"aquasec/trivy@{release.TRIVY_IMAGE_DIGEST}"
+    assert release.TRIVY_IMAGE_DIGEST.startswith("sha256:")
+    assert len(release.TRIVY_IMAGE_DIGEST) == len("sha256:") + 64
+    for path in (CI, RELEASE, VULN_SCAN):
+        text = path.read_text(encoding="utf-8")
+        assert f"aquasec/trivy@{release.TRIVY_IMAGE_DIGEST}" in text, path
+
+
 def test_ci_test_job_runs_b04_with_injected_model_and_partition_check():
     job = _load(CI)["jobs"]["test"]
     text = _run_text(job)
@@ -206,7 +276,7 @@ def test_ci_test_job_runs_b04_with_injected_model_and_partition_check():
 
 
 def test_no_continue_on_error_anywhere():
-    for path in (CI, RELEASE):
+    for path in (CI, RELEASE, VULN_SCAN):
         text = path.read_text(encoding="utf-8")
         assert "continue-on-error" not in text
 
@@ -214,11 +284,13 @@ def test_no_continue_on_error_anywhere():
 def test_workflows_use_minimal_read_only_permissions():
     ci_permissions = _load(CI)["permissions"]
     release_permissions = _load(RELEASE)["permissions"]
+    vuln_scan_permissions = _load(VULN_SCAN)["permissions"]
     # ci.yml has no cross-run artifact reads; release.yml needs actions: read
     # for actions/download-artifact with run-id + github-token.
     assert ci_permissions == {"contents": "read"}
     assert release_permissions == {"contents": "read", "actions": "read"}
-    for document in (_load(CI), _load(RELEASE)):
+    assert vuln_scan_permissions == {"contents": "read"}
+    for document in (_load(CI), _load(RELEASE), _load(VULN_SCAN)):
         for level in document["permissions"].values():
             assert level == "read"
 

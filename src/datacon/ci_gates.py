@@ -848,12 +848,17 @@ def evaluate_scan_findings(
     *,
     waivers: Sequence[dict[str, Any]] = (),
     today: str | None = None,
-) -> dict[str, int]:
+) -> dict[str, Any]:
     """Block unwaived CRITICAL/HIGH findings; validate structured waivers.
 
     A waiver is bound to ``(id, scope)``. A waiver for ``pkg-a`` therefore
     cannot silence the same CVE on ``openssl``. Duplicate ``(id, scope)``
     entries are rejected as a conflicting waiver set.
+
+    Every blocked finding is collected before one ``GateError`` is raised, so a
+    single run reveals the complete backlog instead of only the first entry.
+    The returned summary carries ``total``/``blocked``/``waived`` plus the
+    ``blocked_findings`` detail list used by ``--json``.
     """
     try:
         current_day = date.fromisoformat(today) if today else date.today()
@@ -902,7 +907,7 @@ def evaluate_scan_findings(
         seen_scopes.add(key)
         waiver_scopes.setdefault(key[0], []).append(entry)
 
-    blocked = 0
+    blocked_findings: list[dict[str, str]] = []
     waived = 0
     for finding in findings:
         severity = str(finding.get("severity", "")).upper()
@@ -917,12 +922,34 @@ def evaluate_scan_findings(
         if matching:
             waived += 1
         else:
-            blocked += 1
-            scope = str(finding.get("package") or finding.get("target") or "<unknown>")
-            raise GateError(
-                f"unwaived {severity} vulnerability finding: {fid} (scope={scope})"
+            blocked_findings.append(
+                {
+                    "severity": severity,
+                    "id": fid,
+                    "scope": str(
+                        finding.get("package") or finding.get("target") or "<unknown>"
+                    ),
+                }
             )
-    return {"total": len(findings), "blocked": blocked, "waived": waived}
+    summary: dict[str, Any] = {
+        "total": len(findings),
+        "blocked": len(blocked_findings),
+        "waived": waived,
+        "blocked_findings": blocked_findings,
+    }
+    if blocked_findings:
+        message = "\n".join(
+            f"unwaived {detail['severity']} vulnerability finding: "
+            f"{detail['id']} (scope={detail['scope']})"
+            for detail in blocked_findings
+        )
+        error = GateError(message)
+        # Keep the machine-readable summary on the exception so callers such as
+        # run_repo_static_gates and main(--json) can still print every finding
+        # after the gate fails closed.
+        error.scan_summary = summary
+        raise error
+    return summary
 
 
 def parse_trivy_findings(report: Any) -> list[dict[str, str]]:
@@ -990,7 +1017,7 @@ def evaluate_scan_report(
     *,
     waivers_path: Path | None = None,
     today: str | None = None,
-) -> dict[str, int]:
+) -> dict[str, Any]:
     """Load a real scanner JSON report and block unwaived HIGH/CRITICAL issues."""
     if not report_path.is_file():
         raise GateError(f"scanner report is missing: {report_path}")
@@ -1241,6 +1268,9 @@ def run_repo_static_gates(
         except GateError as error:
             errors.append(str(error))
             scan_summary = {"status": "failed", "error": str(error)}
+            summary = getattr(error, "scan_summary", None)
+            if isinstance(summary, Mapping):
+                scan_summary.update(summary)
     elif require_scan:
         errors.append(
             "a scanner report is required (--findings) but none was provided"
@@ -1278,6 +1308,14 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="fail closed when no scanner report is supplied",
     )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help=(
+            "print only the vulnerability scan summary (total/blocked/waived and "
+            "the blocked_findings detail list) as JSON on stdout"
+        ),
+    )
     args = parser.parse_args(argv)
     report = run_repo_static_gates(
         args.root.resolve(),
@@ -1285,7 +1323,10 @@ def main(argv: list[str] | None = None) -> int:
         waivers_path=args.waivers,
         require_scan=args.require_scan,
     )
-    print(json.dumps(report, ensure_ascii=False, indent=2))
+    if args.json:
+        print(json.dumps(report["scan"], ensure_ascii=False, indent=2))
+    else:
+        print(json.dumps(report, ensure_ascii=False, indent=2))
     return 0 if report["ok"] else 1
 
 
