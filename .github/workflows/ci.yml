@@ -331,12 +331,31 @@ jobs:
           PY
           chmod 0444 "$secret"
 
+          # The public test database still holds jobs submitted by the CLI
+          # tests. Give B01 its own schema so the first worker pass can only
+          # claim the job this step just submitted.
+          b01_dsn="$(uv run --frozen python - <<'PY'
+          import os
+
+          import psycopg
+          from psycopg.conninfo import conninfo_to_dict, make_conninfo
+
+          schema = "datacon_b01_ci"
+          with psycopg.connect(os.environ["DATACON_DATABASE_URL"], autocommit=True) as conn:
+              conn.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
+              conn.execute(f'CREATE SCHEMA "{schema}"')
+          parameters = conninfo_to_dict(os.environ["DATACON_DATABASE_URL"])
+          parameters["options"] = f"-csearch_path={schema}"
+          print(make_conninfo(**parameters))
+          PY
+          )"
+
           docker run --rm --network host \
             --group-add "$(stat -c '%g' /var/run/docker.sock)" \
             -v /var/run/docker.sock:/var/run/docker.sock \
             -v "$work:$work" \
             -v "$secret:/ci-b01-journal-secret:ro" \
-            -e DATACON_DATABASE_URL="$DATACON_DATABASE_URL" \
+            -e DATACON_DATABASE_URL="$b01_dsn" \
             -e DATACON_OPERATOR_ID=ci-b01 \
             -e DATACON_RUN_ROOT="$work/runs" \
             -e DATACON_EVIDENCE_ROOT="$work/evidence" \
