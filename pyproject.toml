@@ -17,7 +17,7 @@ dependencies = [
     "langgraph==1.2.22",
     "langgraph-checkpoint-postgres==3.2.1",
     "psycopg[binary]>=3.2,<4",
-    "tree-sitter==0.25.2",
+    "tree-sitter==0.26.1",
     "tree-sitter-c==0.24.2",
 ]
 
