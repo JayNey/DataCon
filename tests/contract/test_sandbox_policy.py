@@ -691,6 +691,46 @@ def test_log_verification_blocker_reports_precise_reasons(tmp_path):
     )
 
 
+def test_log_verification_blocker_accepts_privileged_fallback(monkeypatch):
+    # CI runners keep /var/lib/docker unreadable for the invoking user but
+    # allow passwordless sudo; verification must stay feasible there.
+    import datacon.tools.sandbox as sandbox_module
+
+    payload = {"LogPath": "/var/lib/docker/containers/datacon/x-json.log"}
+
+    def deny_lstat(path, **kwargs):
+        raise PermissionError("denied")
+
+    def sudo_verified(*args, **kwargs):
+        return SimpleNamespace(returncode=0, stdout=b"123\n", stderr=b"")
+
+    monkeypatch.setattr(sandbox_module.os, "lstat", deny_lstat)
+    monkeypatch.setattr(sandbox_module.subprocess, "run", sudo_verified)
+    from datacon.tools.sandbox import _log_verification_blocker
+
+    assert _log_verification_blocker(payload) is None
+
+
+def test_log_verification_blocker_blocks_when_fallback_also_fails(monkeypatch):
+    import datacon.tools.sandbox as sandbox_module
+
+    payload = {"LogPath": "/var/lib/docker/containers/datacon/x-json.log"}
+
+    def deny_lstat(path, **kwargs):
+        raise PermissionError("denied")
+
+    def sudo_denied(*args, **kwargs):
+        return SimpleNamespace(returncode=1, stdout=b"", stderr=b"no sudo")
+
+    monkeypatch.setattr(sandbox_module.os, "lstat", deny_lstat)
+    monkeypatch.setattr(sandbox_module.subprocess, "run", sudo_denied)
+    from datacon.tools.sandbox import _log_verification_blocker
+
+    reason = _log_verification_blocker(payload)
+    assert reason is not None
+    assert "privileged fallback" in reason
+
+
 def _probe_fake_docker(sandbox, payload):
     success = SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
     waited = SimpleNamespace(returncode=0, stdout=b"0\n", stderr=b"")

@@ -809,6 +809,20 @@ def _log_verification_blocker(
     log_path = log_path.strip()
     try:
         info = os.lstat(log_path)
+    except PermissionError:
+        # CI runners and hardened hosts keep /var/lib/docker unreadable for
+        # the invoking user. The shared run-path verifier may still confirm
+        # feasibility through its privileged fallback, so defer to it instead
+        # of blocking hosts where verification is actually possible.
+        rotated, unverified = _inspect_log_rotation(inspect_payload)
+        if unverified:
+            return (
+                f"docker LogPath {log_path!r} is not readable from this host"
+                " and the privileged fallback did not confirm it (Docker"
+                " Desktop, remote DOCKER_HOST and rootless daemons keep"
+                " container logs inside their own filesystem)"
+            )
+        return None
     except OSError:
         return (
             f"docker LogPath {log_path!r} is not accessible from this host"
