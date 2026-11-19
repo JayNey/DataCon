@@ -10,6 +10,12 @@ keep Dependabot from opening PRs this repo cannot merge:
 * `uv` / `uv-build` are pinned in three places and cross-checked by
   `ci_gates.check_dependency_lock`, so Dependabot can never produce a
   mergeable upgrade for them.
+* Root `pip` (`directory: "/"`) is removed and forbidden: `requirements-ci.txt`
+  only pins `uv` (which is upgraded manually), while a root `pip` entry still
+  scans `pyproject.toml` and opens PRs that omit `uv.lock` updates, breaking
+  `uv sync --frozen`. If CI requirements ever need automated updates, move
+  `requirements-ci.txt` into a dedicated subdirectory without `pyproject.toml`
+  before adding a `pip` entry for that subdirectory.
 """
 
 from __future__ import annotations
@@ -46,11 +52,24 @@ def _ignore_rule(entry: dict, dependency: str) -> dict:
     return rules[0]
 
 
-def test_dependabot_keeps_the_three_expected_ecosystems():
+def test_dependabot_keeps_expected_ecosystems_without_root_pip():
     document = _load()
     assert document["version"] == 2
     ecosystems = {update["package-ecosystem"] for update in document["updates"]}
-    assert {"docker", "uv", "pip"} <= ecosystems
+    assert {"docker", "uv"} <= ecosystems
+    root_pip_entries = [
+        update
+        for update in document["updates"]
+        if update.get("package-ecosystem") == "pip"
+        and (
+            update.get("directory") == "/"
+            or "/" in (update.get("directories") or ())
+        )
+    ]
+    assert not root_pip_entries, (
+        "pip ecosystem must not target '/': it also scans pyproject.toml "
+        "without updating uv.lock"
+    )
 
 
 def test_docker_allows_only_python_patch_and_digest_refreshes():
@@ -63,14 +82,12 @@ def test_docker_allows_only_python_patch_and_digest_refreshes():
     assert "version-update:semver-patch" not in update_types
 
 
-def test_uv_and_pip_ignore_uv_and_uv_build_completely():
-    document = _load()
-    for ecosystem in ("uv", "pip"):
-        entry = _entry(document, ecosystem)
-        # No `update-types` filter: the three-place pin makes even a patch bump
-        # unmergeable, so every uv/uv-build PR must be suppressed.
-        for dependency in ("uv", "uv-build"):
-            ignore = _ignore_rule(entry, dependency)
-            assert "update-types" not in ignore, (
-                f"{ecosystem} must ignore {dependency} for all update types"
-            )
+def test_uv_ignores_uv_and_uv_build_completely():
+    entry = _entry(_load(), "uv")
+    # No `update-types` filter: the three-place pin makes even a patch bump
+    # unmergeable, so every uv/uv-build PR must be suppressed.
+    for dependency in ("uv", "uv-build"):
+        ignore = _ignore_rule(entry, dependency)
+        assert "update-types" not in ignore, (
+            f"uv must ignore {dependency} for all update types"
+        )
