@@ -4,6 +4,11 @@
 # This file lives in .github/ and not in .github/workflows/ on purpose:
 # datacon.ci_gates rejects non-YAML workflow files there, and Dependabot does
 # not need a workflow file to run.
+#
+# 根目录禁止启用 `pip` 生态：Dependabot 的 pip 生态会扫描根目录的 `pyproject.toml`
+# 并生成不更新 `uv.lock` 的 PR（与 `uv` 生态重复，且必然导致 `uv sync --frozen` 失败）。
+# 将来如果确实需要对 `requirements-ci.txt` 做自动更新，应先将其移至不含
+# `pyproject.toml` 的独立子目录，再为该子目录单独配置 `pip` 生态。
 version: 2
 updates:
   # Both Dockerfile stages pin `FROM python:3.12-slim-trixie@sha256:<index>`, so
@@ -43,29 +48,6 @@ updates:
     labels:
       - "dependencies"
       - "python"
-    ignore:
-      # uv / uv-build 的版本被硬编码在三处，Dependabot 只能改一处，
-      # 因此其 PR 必然让 ci_gates 的锁门禁失败。升级必须人工按顺序完成：
-      #   1) requirements-ci.txt 的 uv==<ver> --hash=sha256:<hash>
-      #   2) pyproject.toml 的 tool.uv.required-version 与 build-system.requires
-      #   3) src/datacon/ci_gates.py 的 _UV_REQUIREMENT 正则与两处 ==<ver> 比较
-      - dependency-name: "uv"
-      - dependency-name: "uv-build"
-
-  # requirements-ci.txt is installed by pip with --require-hashes, so it is not
-  # covered by the uv ecosystem.
-  - package-ecosystem: "pip"
-    directory: "/"
-    schedule:
-      interval: "weekly"
-      day: "monday"
-      time: "04:30"
-    open-pull-requests-limit: 3
-    commit-message:
-      prefix: "chore(ci-deps)"
-    labels:
-      - "dependencies"
-      - "ci"
     ignore:
       # uv / uv-build 的版本被硬编码在三处，Dependabot 只能改一处，
       # 因此其 PR 必然让 ci_gates 的锁门禁失败。升级必须人工按顺序完成：
