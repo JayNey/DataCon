@@ -321,7 +321,16 @@ jobs:
             -c 'import os; assert os.getuid() == 65534, os.getuid(); print("uid=65534")'
           docker run --rm --entrypoint docker datacon-ci --version
           docker run --rm --entrypoint git datacon-ci --version
-          docker run --rm --entrypoint clang datacon-ci --version
+          # The runtime layer ships only the Docker client and git: clang runs
+          # inside the pinned sandbox image, and dockerd/containerd/runc are
+          # host-daemon concerns. Regressing either one must fail here.
+          docker run --rm --entrypoint /bin/sh datacon-ci -c \
+            '! command -v clang && ! command -v dockerd && ! command -v containerd && ! command -v runc'
+      - name: Record the runtime image size
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker images datacon-ci --format 'datacon-ci size={{.Size}}'
       - name: Worker without a journal secret fails closed with a readable error
         shell: bash
         run: |

@@ -1,11 +1,16 @@
 # syntax=docker/dockerfile:1
 # DataCon Control Plane Image (REQ-05, REQ-10, TC-10)
-# Base image pinned by the digest observed from the registry at build time:
-#   docker pull python:3.12-slim-bookworm
-#   docker inspect python:3.12-slim-bookworm --format '{{json .RepoDigests}}'
-# tests/contract/test_release_workflow.py asserts both stages use this exact
-# digest; PR CI builds the image so a stale or missing digest fails the build.
-FROM python:3.12-slim-bookworm@sha256:935c3c5b12357a7e10caa9c1e6ca5692344d97cf229832ef584be2cec9fc03df AS builder
+# Base image pinned by the multi-arch index digest observed from the registry at
+# build time (2026-11-18, python 3.12.16-slim-trixie):
+#   docker buildx imagetools inspect python:3.12-slim-trixie \
+#       --format '{{json .Manifest.Digest}}'
+# or, after a pull:
+#   docker pull python:3.12-slim-trixie
+#   docker inspect python:3.12-slim-trixie --format '{{json .RepoDigests}}'
+# Both stages must use the same digest; tests/contract/test_release_workflow.py
+# asserts it and PR CI builds the image so a stale or missing digest fails the
+# build.
+FROM python:3.12-slim-trixie@sha256:5e2bdb1b0d542d5039cffb8181c65930093949194a65c365dfb1b0fe13a4fa5b AS builder
 
 # The builder venv lives at /app/.venv, exactly where the runtime stage copies
 # it. uv writes absolute shebangs into console scripts, so building in /build
@@ -20,7 +25,7 @@ RUN python -m pip install --no-cache-dir --disable-pip-version-check \
     && uv sync --frozen --no-dev --no-editable \
     && uv build --wheel --out-dir /dist
 
-FROM python:3.12-slim-bookworm@sha256:935c3c5b12357a7e10caa9c1e6ca5692344d97cf229832ef584be2cec9fc03df
+FROM python:3.12-slim-trixie@sha256:5e2bdb1b0d542d5039cffb8181c65930093949194a65c365dfb1b0fe13a4fa5b
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -31,11 +36,24 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-# The authoritative worker needs the Docker CLI, git and clang at runtime. The
-# packages are installed here rather than mounted so `docker run ... worker`
-# fails with a clear message instead of a missing-binary traceback.
+# The worker only drives the host daemon over the mounted Docker socket, so the
+# runtime layer carries the Docker *client* only. Debian trixie splits it into
+# `docker-cli`; `docker.io` would also drag in dockerd, containerd, runc and
+# iptables, which are never started here and only enlarge the attack surface.
+# `docker-cli` is only a Recommends of `docker.io`, hence the explicit install:
+# without it `SandboxUnavailable("docker CLI is not executable")` breaks every
+# worker. `clang` is deliberately absent as well: it is only invoked inside the
+# pinned silkeh/clang sandbox container (src/datacon/tools/sandbox.py), never
+# on the host side of this image, and it dragged in 71 linux-libc-dev findings.
+# `git` stays: the worker clones operator-provided local bare repositories.
+#
+# `zlib1g` is requested explicitly because the pinned base digest predates the
+# 1:1.3.dfsg+really1.3.1-1+deb13u1 security update. It is already installed, so
+# this only upgrades it to the fixed copy from trixie-security instead of
+# waiving CVE-2026-85091 (gz_vacate heap overflow).
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates clang docker.io git \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates docker-cli git zlib1g \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /app/.venv /app/.venv

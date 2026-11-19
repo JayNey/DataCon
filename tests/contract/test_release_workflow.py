@@ -17,6 +17,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 CI = REPO_ROOT / ".github" / "workflows" / "ci.yml"
 RELEASE = REPO_ROOT / ".github" / "workflows" / "release.yml"
 VULN_SCAN = REPO_ROOT / ".github" / "workflows" / "vuln-scan.yml"
+DOCKERFILE = REPO_ROOT / "Dockerfile"
 
 
 def _load(path: Path) -> dict:
@@ -33,6 +34,38 @@ def _run_text(job: dict) -> str:
 
 def _steps(job: dict) -> list[dict]:
     return [step for step in job.get("steps", []) if isinstance(step, dict)]
+
+
+def _dockerfile_instructions(text: str) -> list[str]:
+    """Return logical Dockerfile instructions with continuations folded."""
+    instructions: list[str] = []
+    buffer = ""
+    for raw in text.splitlines():
+        line = raw.rstrip()
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        if line.endswith("\\"):
+            buffer += line[:-1] + " "
+            continue
+        buffer += line
+        instructions.append(" ".join(buffer.split()))
+        buffer = ""
+    if buffer.strip():
+        instructions.append(" ".join(buffer.split()))
+    return instructions
+
+
+def _runtime_apt_packages() -> set[str]:
+    text = DOCKERFILE.read_text(encoding="utf-8")
+    installs = [
+        instruction
+        for instruction in _dockerfile_instructions(text)
+        if instruction.startswith("RUN ") and "apt-get install" in instruction
+    ]
+    assert len(installs) == 1, "expected a single apt-get install layer"
+    install = installs[0]
+    tail = install.split("--no-install-recommends", 1)[1]
+    return set(tail.split("&&", 1)[0].split())
 
 
 def test_release_workflow_is_not_echo_only():
@@ -192,7 +225,20 @@ def test_ci_has_a_real_image_build_and_smoke_job():
     assert "uid=65534" in text
     assert "docker --version" in text or "--entrypoint docker" in text
     assert "git --version" in text or "--entrypoint git" in text
-    assert "clang --version" in text or "--entrypoint clang" in text
+    # clang moved out of the runtime image (it runs only inside the pinned
+    # silkeh/clang sandbox container), and dockerd/containerd/runc are host
+    # daemon concerns: the smoke step must assert all four are absent.
+    for absent_tool in ("clang", "dockerd", "containerd", "runc"):
+        assert f"! command -v {absent_tool}" in text, absent_tool
+
+
+def test_runtime_image_installs_only_the_docker_client_not_daemon_or_clang():
+    packages = _runtime_apt_packages()
+    # git is a real worker dependency (local bare repos) and ca-certificates is
+    # needed for TLS, so both stay; everything else must not creep back in.
+    assert {"ca-certificates", "docker-cli", "git"} <= packages
+    for banned in ("clang", "docker.io", "containerd", "runc", "dockerd", "iptables"):
+        assert banned not in packages, f"{banned} must stay out of the runtime image"
 
 
 def test_ci_vuln_job_rescans_image_and_always_uploads_the_report():
