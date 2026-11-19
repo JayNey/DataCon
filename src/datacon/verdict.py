@@ -117,6 +117,7 @@ class RunObservation:
     input_digest: str | None = None
     duration_seconds: float | None = None
     log_truncated: bool = False
+    log_unverified: bool = False
     capture_error: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
@@ -131,6 +132,7 @@ class RunObservation:
             "input_digest": self.input_digest,
             "duration_seconds": self.duration_seconds,
             "log_truncated": self.log_truncated,
+            "log_unverified": self.log_unverified,
             "capture_error": self.capture_error,
         }
 
@@ -175,6 +177,11 @@ def _compare_builds(builds: Mapping[str, Mapping[str, Any]] | None) -> str | Non
         if build.get("capture_error"):
             return f"{version} build log or exit capture failed"
         if build.get("log_truncated"):
+            if build.get("log_unverified"):
+                return (
+                    f"{version} build log completeness could not be verified"
+                    " (docker LogPath not accessible from the host)"
+                )
             return f"{version} build log was truncated"
     vulnerable = builds["vulnerable"]
     fixed = builds["fixed"]
@@ -279,6 +286,14 @@ def decide_verdict(
                 checks,
             )
         if run.log_truncated:
+            if run.log_unverified:
+                return _inconclusive(
+                    "EVIDENCE_INCOMPLETE",
+                    f"{run.version}/{run.phase} log completeness could not"
+                    " be verified (docker LogPath not accessible from the"
+                    " host)",
+                    checks,
+                )
             return _inconclusive(
                 "EVIDENCE_INCOMPLETE",
                 f"{run.version}/{run.phase} log was truncated",
@@ -428,6 +443,7 @@ def observation_from_run(run: Mapping[str, Any]) -> RunObservation:
         input_digest=run.get("input_digest"),
         duration_seconds=run.get("duration_seconds"),
         log_truncated=bool(run.get("log_truncated", False)),
+        log_unverified=bool(run.get("log_unverified", False)),
         capture_error=(
             str(capture_error) if capture_error is not None else None
         ),

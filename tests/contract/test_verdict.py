@@ -274,6 +274,40 @@ def test_truncated_or_missing_evidence_is_inconclusive():
     decision = decide_verdict(POLICY, runs, builds=builds())
     assert decision.verdict == "INCONCLUSIVE"
     assert decision.reason_code == "EVIDENCE_INCOMPLETE"
+    assert decision.message == "vulnerable/normal log was truncated"
+
+
+def test_truncated_build_log_reason_names_truncation():
+    drifted = builds()
+    drifted["vulnerable"] = {**drifted["vulnerable"], "log_truncated": True}
+    decision = decide_verdict(POLICY, six_runs(), builds=drifted)
+    assert decision.verdict == "INCONCLUSIVE"
+    assert decision.reason_code == "NOT_COMPARABLE"
+    assert decision.message == "vulnerable build log was truncated"
+
+
+def test_unverified_build_log_reason_names_the_real_cause():
+    drifted = builds()
+    drifted["vulnerable"] = {
+        **drifted["vulnerable"],
+        "log_truncated": True,
+        "log_unverified": True,
+    }
+    decision = decide_verdict(POLICY, six_runs(), builds=drifted)
+    assert decision.verdict == "INCONCLUSIVE"
+    assert decision.reason_code == "NOT_COMPARABLE"
+    assert "could not be verified" in decision.message
+    assert "LogPath" in decision.message
+
+
+def test_unverified_replay_log_reason_names_the_real_cause():
+    runs = six_runs()
+    runs[0] = replace(runs[0], log_truncated=True, log_unverified=True)
+    decision = decide_verdict(POLICY, runs, builds=builds())
+    assert decision.verdict == "INCONCLUSIVE"
+    assert decision.reason_code == "EVIDENCE_INCOMPLETE"
+    assert "could not be verified" in decision.message
+    assert "LogPath" in decision.message
 
 
 def test_decision_is_json_serializable_for_reports():

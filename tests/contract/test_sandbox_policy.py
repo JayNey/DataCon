@@ -676,6 +676,84 @@ def test_inspect_requires_bounded_log_rotation():
         validate_host_config(config, POLICY, LIMITS, mounts=declared_mounts())
 
 
+def test_log_verification_blocker_reports_precise_reasons(tmp_path):
+    from datacon.tools.sandbox import _log_verification_blocker
+
+    regular = tmp_path / "container-json.log"
+    regular.write_bytes(b"{}\n")
+    assert _log_verification_blocker({"LogPath": str(regular)}) is None
+    assert "did not return container metadata" in _log_verification_blocker(None)
+    assert "did not report a container LogPath" in _log_verification_blocker({})
+    missing = {"LogPath": "/var/lib/docker/containers/datacon/x-json.log"}
+    assert "not accessible from this host" in _log_verification_blocker(missing)
+    assert "not a regular file" in _log_verification_blocker(
+        {"LogPath": str(tmp_path)}
+    )
+
+
+def _probe_fake_docker(sandbox, payload):
+    success = SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+    waited = SimpleNamespace(returncode=0, stdout=b"0\n", stderr=b"")
+
+    def fake_docker(command, *, timeout=60.0):
+        sandbox.calls.append(list(command))
+        if command[0] == "image":
+            return success
+        if command[0] == "create":
+            mount = command[command.index("--mount") + 1]
+            source = next(
+                part[4:] for part in mount.split(",") if part.startswith("src=")
+            )
+            payload["Mounts"] = [
+                {
+                    "Type": "bind",
+                    "Source": source,
+                    "Destination": "/fixture",
+                    "RW": False,
+                }
+            ]
+            return SimpleNamespace(returncode=0, stdout=b"cid", stderr=b"")
+        if command[0] == "inspect":
+            return SimpleNamespace(
+                returncode=0, stdout=json.dumps([payload]).encode(), stderr=b""
+            )
+        if command[0] in ("start", "logs", "rm"):
+            return success
+        if command[0] == "wait":
+            return waited
+        raise AssertionError(f"unexpected docker command: {command}")
+
+    return fake_docker
+
+
+def test_probe_blocks_when_container_logs_are_not_host_accessible(tmp_path):
+    payload = _inspect_payload()
+    payload["LogPath"] = "/var/lib/docker/containers/datacon/missing-json.log"
+    sandbox = RecordingSandbox(tmp_path, payload)
+    sandbox._docker = _probe_fake_docker(sandbox, payload)
+
+    with pytest.raises(SandboxPolicyError, match="not accessible from this host"):
+        sandbox.probe()
+    assert sandbox.removed(), "probe container was not cleaned up"
+
+
+def test_probe_passes_log_verification_when_log_path_is_host_accessible(tmp_path):
+    log_file = tmp_path / "probe-container-json.log"
+    log_file.write_bytes(b"{}\n")
+    payload = _inspect_payload()
+    payload["LogPath"] = str(log_file)
+    sandbox = RecordingSandbox(tmp_path, payload)
+    sandbox._docker = _probe_fake_docker(sandbox, payload)
+
+    # The log-path gate passes; the probe then fails later on the empty
+    # recorded values, proving the two failure modes are distinguishable.
+    with pytest.raises(
+        SandboxPolicyError, match="did not confirm the requested policy"
+    ):
+        sandbox.probe()
+    assert sandbox.removed()
+
+
 def test_create_reports_cleanup_failure(tmp_path):
     sandbox = RecordingSandbox(tmp_path, _inspect_payload(ReadonlyRootfs=False))
 

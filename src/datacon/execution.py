@@ -3583,6 +3583,7 @@ def _to_observation(payload: Mapping[str, Any], run_root: Path) -> RunObservatio
         input_digest=payload.get("input_digest"),
         duration_seconds=payload.get("duration_seconds"),
         log_truncated=bool(payload.get("log_truncated", False)),
+        log_unverified=bool(payload.get("log_unverified", False)),
         capture_error=(
             str(capture_error) if capture_error is not None else None
         ),

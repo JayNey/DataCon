@@ -206,6 +206,7 @@ class BuildResult:
     log_truncated: bool
     artifact: bytes | None
     metadata: dict[str, Any]
+    log_unverified: bool = False
     capture_error: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
@@ -220,6 +221,7 @@ class BuildResult:
             "artifact_digest": self.artifact_digest,
             "log_digest": "sha256:" + hashlib.sha256(self.log).hexdigest(),
             "log_truncated": self.log_truncated,
+            "log_unverified": self.log_unverified,
             "capture_error": self.capture_error,
             **self.metadata,
         }
@@ -243,6 +245,7 @@ class ReplayResult:
     quota_hit: bool
     log_truncated: bool
     metadata: dict[str, Any]
+    log_unverified: bool = False
     capture_error: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
@@ -272,6 +275,7 @@ class ReplayResult:
             "timed_out": self.timed_out,
             "quota_hit": self.quota_hit,
             "log_truncated": self.log_truncated,
+            "log_unverified": self.log_unverified,
             "capture_error": self.capture_error,
             **self.metadata,
         }
@@ -782,6 +786,38 @@ def _inspect_log_rotation(
     if info.st_size >= max_size:
         return True, False
     return False, False
+
+
+def _log_verification_blocker(
+    inspect_payload: Mapping[str, Any] | None,
+) -> str | None:
+    """Return why container log completeness cannot be verified, or ``None``.
+
+    Build and replay evidence must prove the daemon did not rotate the
+    container log (``_inspect_log_rotation`` lstats the daemon-reported
+    ``LogPath`` on the host). Docker Desktop, remote ``DOCKER_HOST`` and
+    rootless daemons keep that path inside their own filesystem, so every
+    capture would be recorded as ``log_unverified`` and the verdict would
+    degrade to ``NOT_COMPARABLE`` only after all six replays. The probe uses
+    this check to fail closed before any build is attempted.
+    """
+    if not isinstance(inspect_payload, Mapping):
+        return "docker inspect did not return container metadata"
+    log_path = inspect_payload.get("LogPath")
+    if not isinstance(log_path, str) or not log_path.strip():
+        return "docker inspect did not report a container LogPath"
+    log_path = log_path.strip()
+    try:
+        info = os.lstat(log_path)
+    except OSError:
+        return (
+            f"docker LogPath {log_path!r} is not accessible from this host"
+            " (Docker Desktop, remote DOCKER_HOST and rootless daemons keep"
+            " container logs inside their own filesystem)"
+        )
+    if not stat.S_ISREG(info.st_mode):
+        return f"docker LogPath {log_path!r} is not a regular file"
+    return None
 
 
 def _read_bounded_file(
@@ -1533,6 +1569,12 @@ printf 'uid=%s\nseccomp=%s\nseccomp_filters=%s\nno_new_privs=%s\ncap_eff=%s\ncgr
             exit_code = int(wait.stdout.decode("utf-8", "replace").strip() or "1")
             inspect = self._inspect(name)
             state = inspect.get("State", {})
+            blocker = _log_verification_blocker(inspect)
+            if blocker is not None:
+                raise SandboxPolicyError(
+                    "cannot verify container log completeness from this host: "
+                    + blocker
+                )
         finally:
             ok, detail = self._remove(name)
             if not ok and detail is not None:
@@ -1677,6 +1719,7 @@ printf 'uid=%s\nseccomp=%s\nseccomp_filters=%s\nno_new_privs=%s\ncap_eff=%s\ncgr
             capture_error = state.pop("_capture_error", None)
             log, log_truncated = _truncate_log(log_bytes)
             truncated = log_truncated or bool(truncated_streams)
+            log_unverified = "log_unverified" in truncated_streams
             artifact = files.get("/work/parser")
             if artifact is not None and len(artifact) > MAX_ARTIFACT_BYTES:
                 artifact = None
@@ -1742,6 +1785,7 @@ printf 'uid=%s\nseccomp=%s\nseccomp_filters=%s\nno_new_privs=%s\ncap_eff=%s\ncgr
                 log=log,
                 log_truncated=truncated or log_truncated,
                 artifact=artifact,
+                log_unverified=log_unverified,
                 metadata=metadata,
                 capture_error=capture_error,
             )
@@ -1844,6 +1888,7 @@ printf 'uid=%s\nseccomp=%s\nseccomp_filters=%s\nno_new_privs=%s\ncap_eff=%s\ncgr
         log_truncated = (
             truncated_out or truncated_err or bool(_truncated_streams)
         )
+        log_unverified = "log_unverified" in _truncated_streams
         signature = parse_asan(stderr.decode("utf-8", "replace"))
         quota_hit = (
             bool(state.get("OOMKilled"))
@@ -1882,6 +1927,7 @@ printf 'uid=%s\nseccomp=%s\nseccomp_filters=%s\nno_new_privs=%s\ncap_eff=%s\ncgr
             quota_hit=quota_hit,
             log_truncated=log_truncated,
             metadata=metadata,
+            log_unverified=log_unverified,
             capture_error=capture_error,
         )
 
