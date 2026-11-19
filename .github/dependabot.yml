@@ -43,6 +43,9 @@ updates:
       day: "monday"
       time: "04:15"
     open-pull-requests-limit: 5
+    # 新版本落在既有区间内时仅更新 uv.lock，仅在超出区间（或针对 == 精确锁依赖）时
+    # 才同步更新 pyproject.toml，避免无实际版本升级的下界收紧噪音 PR。
+    versioning-strategy: "increase-if-necessary"
     commit-message:
       prefix: "chore(deps)"
     labels:

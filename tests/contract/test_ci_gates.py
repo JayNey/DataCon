@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import re
 import shutil
 
 import pytest
@@ -889,7 +890,9 @@ def test_dependency_lock_checks_version_constraints_not_only_names(tmp_path):
     shutil.copy2(REPO_ROOT / "uv.lock", root / "uv.lock")
     shutil.copy2(REPO_ROOT / "requirements-ci.txt", root / "requirements-ci.txt")
     pyproject = (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
-    mutated = pyproject.replace('"psycopg[binary]>=3.2,<4"', '"psycopg[binary]>=9.9"')
+    mutated = re.sub(
+        r'"psycopg\[binary\][^"]*"', '"psycopg[binary]>=9.9"', pyproject, count=1
+    )
     assert mutated != pyproject
     (root / "pyproject.toml").write_text(mutated, encoding="utf-8")
     errors = ci_gates.check_dependency_lock(root)
