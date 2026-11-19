@@ -1,0 +1,52 @@
+# Automated dependency PRs for the two things that can drift silently:
+# the Docker base-image digest and the locked Python dependency set.
+#
+# This file lives in .github/ and not in .github/workflows/ on purpose:
+# datacon.ci_gates rejects non-YAML workflow files there, and Dependabot does
+# not need a workflow file to run.
+version: 2
+updates:
+  # Both Dockerfile stages pin `FROM python:3.12-slim-trixie@sha256:<index>`, so
+  # a base-image refresh becomes a one-line reviewable PR instead of a silent
+  # rotation. The Trivy gate on that PR re-scans the rebuilt image.
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "04:00"
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: "chore(docker)"
+    labels:
+      - "dependencies"
+      - "docker"
+
+  # pyproject.toml / uv.lock, including the pinned uv build backend.
+  - package-ecosystem: "uv"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "04:15"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore(deps)"
+    labels:
+      - "dependencies"
+      - "python"
+
+  # requirements-ci.txt is installed by pip with --require-hashes, so it is not
+  # covered by the uv ecosystem.
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "04:30"
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: "chore(ci-deps)"
+    labels:
+      - "dependencies"
+      - "ci"
