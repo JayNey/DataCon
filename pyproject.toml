@@ -1,7 +1,9 @@
 [build-system]
-# uv_build ships inside uv, so `uv sync --frozen` builds the project without
-# resolving a separate, unlocked build backend from PyPI.
-requires = ["uv_build==0.12.7"]
+# uv_build ships inside uv. Pinning the same minor range (>=0.13.7,<0.14)
+# ensures both CI (uv 0.13.7) and newer same-minor patches (e.g. 0.13.8 locally
+# or in Dependabot) hit the bundled uv_build backend without falling back to
+# PyPI, while still failing closed across minor versions (0.14.0).
+requires = ["uv_build>=0.13.7,<0.14"]
 build-backend = "uv_build"
 
 [project]
@@ -26,9 +28,10 @@ datacon = "datacon.cli:main"
 dev = ["pytest>=8,<10", "pyyaml>=6,<7"]
 
 [tool.uv]
-# Keep the uv bundled with the project equal to the version pinned in
-# requirements-ci.txt, which also pins the bundled uv_build backend.
-required-version = "==0.12.7"
+# CI still pins exact uv==0.13.7 with its wheel sha256 in requirements-ci.txt;
+# this same-minor range only allows same-minor uv runners (e.g. Dependabot and
+# local environments on 0.13.x) without relaxing across minor versions.
+required-version = ">=0.13.7,<0.14"
 
 [tool.uv.build-backend]
 module-name = "datacon"

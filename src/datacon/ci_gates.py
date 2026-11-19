@@ -58,7 +58,9 @@ _UNTRUSTED_EXPR_PATTERNS: tuple[re.Pattern[str], ...] = (
 _DOCKER_DIGEST = re.compile(r"docker://[^\s@]+@sha256:[0-9a-f]{64}")
 _RUN_EXPRESSION = re.compile(r"\$\{\{(.*?)\}\}", re.S)
 _ISO_DATE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$")
-_UV_REQUIREMENT = re.compile(r"uv==0\.12\.7 --hash=sha256:[0-9a-f]{64}")
+_UV_REQUIREMENT = re.compile(r"uv==0\.13\.7 --hash=sha256:[0-9a-f]{64}")
+_UV_REQUIRED_VERSION = ">=0.13.7,<0.14"
+_UV_BUILD_REQUIREMENT = "uv_build>=0.13.7,<0.14"
 _SHA256 = re.compile(r"sha256:[0-9a-f]{64}")
 
 _ALLOWED_PERMISSIONS = {
@@ -1090,7 +1092,10 @@ def check_dependency_lock(root: Path) -> list[str]:
     """Parse pyproject.toml, requirements-ci.txt and uv.lock structurally.
 
     Comment lines never satisfy a pin: the requirement file is tokenized and
-    only a real ``uv==0.12.7 --hash=sha256:<64hex>`` line is accepted.
+    only a real ``uv==0.13.7 --hash=sha256:<64hex>`` line is accepted.
+    ``pyproject.toml`` must constrain both ``tool.uv.required-version`` and
+    ``build-system.requires`` to the matching same-minor range
+    ``>=0.13.7,<0.14`` (``uv_build>=0.13.7,<0.14``).
     """
     errors: list[str] = []
     try:
@@ -1105,11 +1110,18 @@ def check_dependency_lock(root: Path) -> list[str]:
     required_version = (
         pyproject.get("tool", {}).get("uv", {}).get("required-version")
     )
-    if required_version != "==0.12.7":
-        errors.append("pyproject.toml must pin tool.uv.required-version == 0.12.7")
+    if required_version != _UV_REQUIRED_VERSION:
+        errors.append(
+            f"pyproject.toml must pin tool.uv.required-version to {_UV_REQUIRED_VERSION!r}"
+        )
     build_requires = pyproject.get("build-system", {}).get("requires", [])
-    if "uv_build==0.12.7" not in build_requires:
-        errors.append("pyproject.toml must pin build-system uv_build==0.12.7")
+    if (
+        not isinstance(build_requires, list)
+        or _UV_BUILD_REQUIREMENT not in build_requires
+    ):
+        errors.append(
+            f"pyproject.toml must pin build-system {_UV_BUILD_REQUIREMENT}"
+        )
 
     try:
         requirement_lines = [
@@ -1125,7 +1137,7 @@ def check_dependency_lock(root: Path) -> list[str]:
     if len(non_empty_lines) != 1 or not _UV_REQUIREMENT.fullmatch(non_empty_lines[0]):
         errors.append(
             "requirements-ci.txt must contain only an uncommented "
-            "uv==0.12.7 --hash=sha256:<64hex> requirement"
+            "uv==0.13.7 --hash=sha256:<64hex> requirement"
         )
 
     project = pyproject.get("project", {})

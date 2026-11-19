@@ -577,18 +577,45 @@ def test_dependency_lock_rejects_commented_requirement_and_bad_pyproject(tmp_pat
     shutil.copy2(REPO_ROOT / "pyproject.toml", root / "pyproject.toml")
     shutil.copy2(REPO_ROOT / "uv.lock", root / "uv.lock")
     (root / "requirements-ci.txt").write_text(
-        "# uv==0.12.7 --hash=sha256:" + "a" * 64 + "\n", encoding="utf-8"
+        "# uv==0.13.7 --hash=sha256:" + "a" * 64 + "\n", encoding="utf-8"
     )
     errors = ci_gates.check_dependency_lock(root)
     assert any("requirements-ci.txt" in err for err in errors)
 
-    pyproject = (root / "pyproject.toml").read_text(encoding="utf-8")
-    (root / "pyproject.toml").write_text(
-        pyproject.replace('required-version = "==0.12.7"', 'required-version = "==9.9.9"'),
-        encoding="utf-8",
-    )
-    errors = ci_gates.check_dependency_lock(root)
-    assert any("required-version" in err for err in errors)
+    shutil.copy2(REPO_ROOT / "requirements-ci.txt", root / "requirements-ci.txt")
+    pyproject = (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    expected_required = 'required-version = ">=0.13.7,<0.14"'
+    expected_build = 'requires = ["uv_build>=0.13.7,<0.14"]'
+    assert expected_required in pyproject
+    assert expected_build in pyproject
+
+    for bad_required in (
+        "==9.9.9",
+        ">=0.13.7",
+        ">=0.13.7,<0.15",
+        ">=0.13.8,<0.14",
+        "==0.12.7",
+    ):
+        mutated = pyproject.replace(
+            expected_required, f'required-version = "{bad_required}"'
+        )
+        assert mutated != pyproject
+        (root / "pyproject.toml").write_text(mutated, encoding="utf-8")
+        errors = ci_gates.check_dependency_lock(root)
+        assert any("required-version" in err for err in errors), (bad_required, errors)
+
+    for bad_build_line in (
+        "",
+        'requires = ["uv_build==0.12.7"]',
+        'requires = ["uv_build==0.13.7"]',
+        'requires = ["uv_build>=0.13.7"]',
+        'requires = ["uv_build>=0.13.7,<0.15"]',
+    ):
+        mutated = pyproject.replace(expected_build, bad_build_line)
+        assert mutated != pyproject
+        (root / "pyproject.toml").write_text(mutated, encoding="utf-8")
+        errors = ci_gates.check_dependency_lock(root)
+        assert any("build-system" in err for err in errors), (bad_build_line, errors)
 
     # Extra unpinned/unhashed dependency line alongside valid uv pin must fail.
     extra_dep_root = tmp_path / "extra-dep"
