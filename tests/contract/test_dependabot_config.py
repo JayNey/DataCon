@@ -10,6 +10,10 @@ keep Dependabot from opening PRs this repo cannot merge:
 * `uv` / `uv-build` are pinned in three places and cross-checked by
   `ci_gates.check_dependency_lock`, so Dependabot can never produce a
   mergeable upgrade for them.
+* `uv` uses `versioning-strategy: "increase-if-necessary"` so in-range updates
+  only refresh `uv.lock` (while out-of-range or `==`-pinned updates still
+  bump `pyproject.toml`), preventing lower-bound-only noise PRs when `uv.lock`
+  is already at the target version.
 * Root `pip` (`directory: "/"`) is removed and forbidden: `requirements-ci.txt`
   only pins `uv` (which is upgraded manually), while a root `pip` entry still
   scans `pyproject.toml` and opens PRs that omit `uv.lock` updates, breaking
@@ -91,3 +95,7 @@ def test_uv_ignores_uv_and_uv_build_completely():
         assert "update-types" not in ignore, (
             f"uv must ignore {dependency} for all update types"
         )
+
+
+def test_uv_uses_increase_if_necessary_versioning_strategy():
+    assert _entry(_load(), "uv").get("versioning-strategy") == "increase-if-necessary"
