@@ -12,7 +12,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
 dependencies = [
-    "langgraph==1.2.21",
+    "langgraph==1.2.22",
     "langgraph-checkpoint-postgres==3.2.0",
     "psycopg[binary]>=3.2,<4",
     "tree-sitter==0.25.2",
