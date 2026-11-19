@@ -215,7 +215,7 @@ dev = [
 requires-dist = [
     { name = "langgraph", specifier = "==1.2.22" },
     { name = "langgraph-checkpoint-postgres", specifier = "==3.2.1" },
-    { name = "psycopg", extras = ["binary"], specifier = ">=3.2,<4" },
+    { name = "psycopg", extras = ["binary"], specifier = ">=3.3.9,<4" },
     { name = "tree-sitter", specifier = "==0.25.2" },
     { name = "tree-sitter-c", specifier = "==0.24.2" },
 ]
