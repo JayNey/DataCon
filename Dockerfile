@@ -10,7 +10,7 @@
 # Both stages must use the same digest; tests/contract/test_release_workflow.py
 # asserts it and PR CI builds the image so a stale or missing digest fails the
 # build.
-FROM python:3.12-slim-trixie@sha256:5e2bdb1b0d542d5039cffb8181c65930093949194a65c365dfb1b0fe13a4fa5b AS builder
+FROM python:3.15-slim-trixie@sha256:65a65fc7b30b06cb6df4930fd4650697cb23f4c2698ab81fc87e4b031bc36928 AS builder
 
 # The builder venv lives at /app/.venv, exactly where the runtime stage copies
 # it. uv writes absolute shebangs into console scripts, so building in /build
@@ -25,7 +25,7 @@ RUN python -m pip install --no-cache-dir --disable-pip-version-check \
     && uv sync --frozen --no-dev --no-editable \
     && uv build --wheel --out-dir /dist
 
-FROM python:3.12-slim-trixie@sha256:5e2bdb1b0d542d5039cffb8181c65930093949194a65c365dfb1b0fe13a4fa5b
+FROM python:3.15-slim-trixie@sha256:65a65fc7b30b06cb6df4930fd4650697cb23f4c2698ab81fc87e4b031bc36928
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
