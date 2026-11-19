@@ -684,7 +684,10 @@ def test_log_verification_blocker_reports_precise_reasons(tmp_path):
     assert _log_verification_blocker({"LogPath": str(regular)}) is None
     assert "did not return container metadata" in _log_verification_blocker(None)
     assert "did not report a container LogPath" in _log_verification_blocker({})
-    missing = {"LogPath": "/var/lib/docker/containers/datacon/x-json.log"}
+    # A path outside /var/lib/docker lstats to FileNotFoundError on every
+    # host; under /var/lib/docker Linux raises PermissionError and defers to
+    # the privileged fallback instead, which these unit tests must not depend on.
+    missing = {"LogPath": str(tmp_path / "missing-container-json.log")}
     assert "not accessible from this host" in _log_verification_blocker(missing)
     assert "not a regular file" in _log_verification_blocker(
         {"LogPath": str(tmp_path)}
@@ -768,7 +771,9 @@ def _probe_fake_docker(sandbox, payload):
 
 def test_probe_blocks_when_container_logs_are_not_host_accessible(tmp_path):
     payload = _inspect_payload()
-    payload["LogPath"] = "/var/lib/docker/containers/datacon/missing-json.log"
+    # Outside /var/lib/docker so the missing path raises FileNotFoundError
+    # instead of PermissionError on Linux hosts with a docker data root.
+    payload["LogPath"] = str(tmp_path / "missing-container-json.log")
     sandbox = RecordingSandbox(tmp_path, payload)
     sandbox._docker = _probe_fake_docker(sandbox, payload)
 
