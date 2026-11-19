@@ -21,6 +21,14 @@ updates:
     labels:
       - "dependencies"
       - "docker"
+    ignore:
+      # 只允许 3.12.x 的 patch 与同 tag 的 digest 刷新。
+      # minor/major 会改变运行时 Python 版本，必须人工同步
+      # requires-python、所有 workflow 的 setup-python 与 uv.lock。
+      - dependency-name: "python"
+        update-types:
+          - "version-update:semver-minor"
+          - "version-update:semver-major"
 
   # pyproject.toml / uv.lock, including the pinned uv build backend.
   - package-ecosystem: "uv"
@@ -35,6 +43,14 @@ updates:
     labels:
       - "dependencies"
       - "python"
+    ignore:
+      # uv / uv-build 的版本被硬编码在三处，Dependabot 只能改一处，
+      # 因此其 PR 必然让 ci_gates 的锁门禁失败。升级必须人工按顺序完成：
+      #   1) requirements-ci.txt 的 uv==<ver> --hash=sha256:<hash>
+      #   2) pyproject.toml 的 tool.uv.required-version 与 build-system.requires
+      #   3) src/datacon/ci_gates.py 的 _UV_REQUIREMENT 正则与两处 ==<ver> 比较
+      - dependency-name: "uv"
+      - dependency-name: "uv-build"
 
   # requirements-ci.txt is installed by pip with --require-hashes, so it is not
   # covered by the uv ecosystem.
@@ -50,3 +66,11 @@ updates:
     labels:
       - "dependencies"
       - "ci"
+    ignore:
+      # uv / uv-build 的版本被硬编码在三处，Dependabot 只能改一处，
+      # 因此其 PR 必然让 ci_gates 的锁门禁失败。升级必须人工按顺序完成：
+      #   1) requirements-ci.txt 的 uv==<ver> --hash=sha256:<hash>
+      #   2) pyproject.toml 的 tool.uv.required-version 与 build-system.requires
+      #   3) src/datacon/ci_gates.py 的 _UV_REQUIREMENT 正则与两处 ==<ver> 比较
+      - dependency-name: "uv"
+      - dependency-name: "uv-build"
