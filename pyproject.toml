@@ -14,7 +14,7 @@ license = "MIT"
 dependencies = [
     "langgraph==1.2.21",
     "langgraph-checkpoint-postgres==3.2.0",
-    "psycopg[binary]>=3.2,<4",
+    "psycopg[binary]>=3.3.9,<4",
     "tree-sitter==0.25.2",
     "tree-sitter-c==0.24.2",
 ]
