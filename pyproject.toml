@@ -23,7 +23,7 @@ dependencies = [
 datacon = "datacon.cli:main"
 
 [dependency-groups]
-dev = ["pytest>=8,<10", "pyyaml>=6,<7"]
+dev = ["pytest>=8,<10", "pyyaml>=6.0.3,<7"]
 
 [tool.uv]
 # Keep the uv bundled with the project equal to the version pinned in
