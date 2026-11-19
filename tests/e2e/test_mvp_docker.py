@@ -6,6 +6,7 @@ Docker daemon is unavailable; CI fails instead of silently skipping.
 
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 import os
 from pathlib import Path
@@ -585,48 +586,11 @@ def test_replay_exit_code_comes_from_container_not_work_file(tmp_path):
     assert b"fake clean" not in result.stdout
 
 
+def _six_runs_for_truncated_candidate(result):
+    from datacon.verdict import observation_from_run
 
-def test_s3_real_docker_40mib_stderr_rotation_marks_truncated_and_blocks_reproduced(
-    tmp_path,
-):
-    from dataclasses import replace
-    from datacon.verdict import VerdictPolicy, decide_verdict, observation_from_run
-
-    parser, input_file = _write_target(
-        tmp_path,
-        "printf '==1==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x502000000014\n"
-        "WRITE of size 1 at 0x502000000014 thread T0\n"
-        "    #0 0x55555565fadf in parse_token /fixture/vulnerable/parser.c:22:17\n"
-        "SUMMARY: AddressSanitizer: heap-buffer-overflow /fixture/vulnerable/parser.c:22:17 in parse_token\n' >&2\n"
-        "dd if=/dev/zero bs=1048576 count=40 2>/dev/null | tr '\\0' 'X' >&2\n"
-        "exit 86\n",
-    )
-    job_id = "s3-rot-" + uuid.uuid4().hex
-    sandbox = _sandbox(tmp_path, job_id)
-    result = sandbox.replay(
-        "vulnerable",
-        "candidate_1",
-        artifact_path=parser,
-        input_path=input_file,
-        asan_options="detect_leaks=0",
-        timeout_seconds=120,
-    )
-    assert result.exit_code == 86
-    assert result.log_truncated is True
-
-    policy = VerdictPolicy(
-        signature={
-            "error": "heap-buffer-overflow",
-            "operation": "WRITE",
-            "access_size": 1,
-            "function": "parse_token",
-            "source": "parser.c",
-        },
-        expected_exit={"normal": 0, "candidate_clean": 0, "candidate_asan": 86},
-        expected_stdout={"normal": "OK\n", "candidate_clean": "ABCD\n"},
-    )
     obs = observation_from_run(result.as_dict())
-    runs = [
+    return [
         obs,
         replace(obs, phase="candidate_2"),
         replace(
@@ -673,6 +637,130 @@ def test_s3_real_docker_40mib_stderr_rotation_marks_truncated_and_blocks_reprodu
             log_truncated=False,
         ),
     ]
-    decision = decide_verdict(policy, runs)
+
+
+def _reproduced_policy():
+    from datacon.verdict import VerdictPolicy
+
+    return VerdictPolicy(
+        signature={
+            "error": "heap-buffer-overflow",
+            "operation": "WRITE",
+            "access_size": 1,
+            "function": "parse_token",
+            "source": "parser.c",
+        },
+        expected_exit={"normal": 0, "candidate_clean": 0, "candidate_asan": 86},
+        expected_stdout={"normal": "OK\n", "candidate_clean": "ABCD\n"},
+    )
+
+
+def test_s3_real_docker_40mib_stderr_stream_truncation_blocks_reproduced(
+    tmp_path,
+):
+    from datacon.verdict import decide_verdict
+
+    parser, input_file = _write_target(
+        tmp_path,
+        "printf '==1==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x502000000014\n"
+        "WRITE of size 1 at 0x502000000014 thread T0\n"
+        "    #0 0x55555565fadf in parse_token /fixture/vulnerable/parser.c:22:17\n"
+        "SUMMARY: AddressSanitizer: heap-buffer-overflow /fixture/vulnerable/parser.c:22:17 in parse_token\n' >&2\n"
+        "dd if=/dev/zero bs=1048576 count=40 2>/dev/null | tr '\\0' 'X' >&2\n"
+        "exit 86\n",
+    )
+    job_id = "s3-stream-" + uuid.uuid4().hex
+    sandbox = _sandbox(tmp_path, job_id)
+    result = sandbox.replay(
+        "vulnerable",
+        "candidate_1",
+        artifact_path=parser,
+        input_path=input_file,
+        asan_options="detect_leaks=0",
+        timeout_seconds=120,
+    )
+    assert result.exit_code == 86
+    # The non-zero target status is a normal attached completion, not an
+    # attach failure; only the stream budget is truncated.
+    assert result.status == "completed"
+    assert result.capture_error is None
+    # 40 MiB on stderr exceeds the 16 MiB union budget: no rotation, just a
+    # stream-level truncation with the over-budget role recorded explicitly.
+    assert result.log_truncated is True
+    assert "stderr" in result.truncated_roles
+    assert "stdout" not in result.truncated_roles
+    assert len(result.stderr) == sandbox_module.MAX_LOG_BYTES
+
+    decision = decide_verdict(
+        _reproduced_policy(), _six_runs_for_truncated_candidate(result)
+    )
     assert decision.verdict == "INCONCLUSIVE"
     assert decision.reason_code == "EVIDENCE_INCOMPLETE"
+
+
+def test_s3_real_docker_10mib_stdout_plus_10mib_stderr_union_cap(
+    tmp_path,
+):
+    from datacon.verdict import decide_verdict
+
+    parser, input_file = _write_target(
+        tmp_path,
+        "dd if=/dev/zero bs=1048576 count=10 2>/dev/null | tr '\\0' 'O'\n"
+        # Let the stdout reader drain the first 10 MiB before stderr starts so
+        # the split is deterministic: stdout fits, stderr takes the remainder.
+        "sleep 1\n"
+        "dd if=/dev/zero bs=1048576 count=10 2>/dev/null | tr '\\0' 'E' >&2\n"
+        "exit 0\n",
+    )
+    job_id = "s3-union-" + uuid.uuid4().hex
+    sandbox = _sandbox(tmp_path, job_id)
+    result = sandbox.replay(
+        "vulnerable",
+        "candidate_1",
+        artifact_path=parser,
+        input_path=input_file,
+        asan_options="detect_leaks=0",
+        timeout_seconds=120,
+    )
+    # stdout fits in the union budget first; the later stderr bytes are capped
+    # by the remaining budget and that specific role is reported.
+    assert result.exit_code == 0
+    assert result.status == "completed"
+    assert result.capture_error is None
+    assert result.log_truncated is True
+    assert result.truncated_roles == ("stderr",)
+    assert len(result.stdout) == 10 * 1024 * 1024
+    assert len(result.stderr) == 6 * 1024 * 1024
+    assert len(result.stdout) + len(result.stderr) == sandbox_module.MAX_LOG_BYTES
+
+    decision = decide_verdict(
+        _reproduced_policy(), _six_runs_for_truncated_candidate(result)
+    )
+    assert decision.verdict == "INCONCLUSIVE"
+    assert decision.reason_code == "EVIDENCE_INCOMPLETE"
+
+
+def test_start_attach_captures_first_stdout_and_stderr_bytes(tmp_path):
+    parser, input_file = _write_target(
+        tmp_path,
+        "printf 'first-stdout\\n'\n"
+        "printf 'first-stderr\\n' >&2\n"
+        "exit 0\n",
+    )
+    job_id = "attach-first-" + uuid.uuid4().hex
+    sandbox = _sandbox(tmp_path, job_id)
+    result = sandbox.replay(
+        "fixed",
+        "normal",
+        artifact_path=parser,
+        input_path=input_file,
+        asan_options="detect_leaks=0",
+        timeout_seconds=60,
+    )
+    assert result.exit_code == 0
+    assert result.status == "completed"
+    assert result.log_truncated is False
+    assert result.truncated_roles == ()
+    assert result.capture_error is None
+    assert b"first-stdout" in result.stdout
+    assert b"first-stderr" in result.stderr

@@ -11,6 +11,7 @@ from pathlib import Path
 import stat
 import sys
 import threading
+import time
 from types import SimpleNamespace
 import unicodedata
 from uuid import uuid4
@@ -94,6 +95,8 @@ def test_container_command_enforces_every_isolation_control():
     assert command[command.index("--memory") + 1] == "2048m"
     assert command[command.index("--memory-swap") + 1] == "2048m"
     assert command[command.index("--cpus") + 1] == "2"
+    assert command[command.index("--log-driver") + 1] == "none"
+    assert "--log-opt" not in command
     assert "--platform" in command
     assert command[command.index("--platform") + 1] == "linux/amd64"
     mount = command[command.index("--mount") + 1]
@@ -173,11 +176,8 @@ def host_config(**overrides):
         "Devices": [],
         "DeviceRequests": [],
         "LogConfig": {
-            "Type": "json-file",
-            "Config": {
-                "max-size": str(32 * 1024 * 1024),
-                "max-file": "2",
-            },
+            "Type": "none",
+            "Config": {},
         },
     }
     value.update(overrides)
@@ -496,13 +496,18 @@ def test_docker_sandbox_probe_labels_the_generation(tmp_path):
                 stdout=json.dumps([payload]).encode(),
                 stderr=b"",
             )
-        if command[0] == "start":
-            return SimpleNamespace(returncode=1, stdout=b"", stderr=b"stop here")
         if command[0] == "rm":
             return success
         raise AssertionError(f"unexpected docker command: {command}")
 
     sandbox._docker = fake_docker
+
+    def unavailable(name):
+        raise SandboxUnavailable("stop here")
+
+    # The probe now starts through the live attach helper; fail there instead
+    # of invoking the real Docker CLI in a unit test.
+    sandbox._start_attached = unavailable
     with pytest.raises(SandboxUnavailable):
         sandbox.probe()
     created = next(call for call in sandbox.calls if call and call[0] == "create")
@@ -669,10 +674,25 @@ def test_inspect_rejects_non_allowlisted_security_drift(change):
         )
 
 
-def test_inspect_requires_bounded_log_rotation():
+def test_inspect_requires_attach_log_driver_none():
     config = host_config()
-    config["LogConfig"] = {"Type": "json-file", "Config": {}}
-    with pytest.raises(SandboxPolicyError, match="log rotation"):
+    config["LogConfig"] = {"Type": "none", "Config": {}}
+    validate_host_config(config, POLICY, LIMITS, mounts=declared_mounts())
+
+
+@pytest.mark.parametrize(
+    "log_config",
+    [
+        {"Type": "json-file", "Config": {}},
+        {"Type": "json-file", "Config": {"max-size": "32m", "max-file": "2"}},
+        {"Type": "local", "Config": {}},
+        {},
+    ],
+)
+def test_inspect_rejects_any_log_driver_other_than_none(log_config):
+    config = host_config()
+    config["LogConfig"] = log_config
+    with pytest.raises(SandboxPolicyError, match="log driver"):
         validate_host_config(config, POLICY, LIMITS, mounts=declared_mounts())
 
 
@@ -2566,24 +2586,60 @@ def _make_fake_cli_sandbox(
     wait_rc: int = 0,
     wait_stdout: bytes = b"0\n",
     wait_stderr: bytes = b"",
-    logs_rc: int = 0,
-    logs_stdout: bytes = b"",
-    logs_stderr: bytes = b"",
+    attach_rc: int = 0,
+    attach_stdout: bytes = b"",
+    attach_stderr: bytes = b"",
+    attach_read_error: bool = False,
+    attach_poll_after: float | None = None,
+    wait_delay: float = 0.0,
     state: dict | None = None,
-    log_path: str | None = "DEFAULT",
-    inspect_after_wait_error: bool = False,
 ):
-    default_log_file = tmp_path / "container-json.log"
-    if not default_log_file.exists():
-        default_log_file.write_bytes(b'{"log":"ok\\n","stream":"stdout"}\n')
-    effective_log_path = (
-        str(default_log_file) if log_path == "DEFAULT" else log_path
-    )
     effective_state = (
         {"Status": "exited", "Running": False, "ExitCode": 0, "OOMKilled": False}
         if state is None
         else dict(state)
     )
+
+    class FakePipe:
+        def __init__(self, data: bytes, *, fail: bool):
+            self._data = data
+            self._offset = 0
+            self._fail = fail
+
+        def fileno(self):
+            raise OSError("fake pipe has no file descriptor")
+
+        def read(self, size=-1):
+            if self._fail:
+                raise OSError("attach stream broke")
+            if self._offset >= len(self._data):
+                return b""
+            end = len(self._data) if size < 0 else self._offset + size
+            chunk = self._data[self._offset : end]
+            self._offset += len(chunk)
+            return chunk
+
+        def close(self):
+            pass
+
+    class FakeAttachProcess:
+        def __init__(self):
+            self.stdout = FakePipe(attach_stdout, fail=False)
+            self.stderr = FakePipe(attach_stderr, fail=attach_read_error)
+            self._started = time.monotonic()
+
+        def poll(self):
+            if attach_poll_after is None:
+                return None
+            if time.monotonic() - self._started < attach_poll_after:
+                return None
+            return attach_rc
+
+        def wait(self, timeout=None):
+            return attach_rc
+
+        def kill(self):
+            pass
 
     class FakeCliSandbox(DockerSandbox):
         def __init__(self):
@@ -2599,6 +2655,9 @@ def _make_fake_cli_sandbox(
             )
             self.calls: list[list[str]] = []
             self.inspect_calls = 0
+
+        def _start_attached(self, name):
+            return FakeAttachProcess()
 
         def _docker(self, command, *, timeout=60.0):
             self.calls.append(list(command))
@@ -2625,34 +2684,24 @@ def _make_fake_cli_sandbox(
                 return SimpleNamespace(returncode=0, stdout=b"cid\n", stderr=b"")
             if verb == "inspect":
                 self.inspect_calls += 1
-                if self.inspect_calls > 1 and inspect_after_wait_error:
-                    return SimpleNamespace(
-                        returncode=1, stdout=b"", stderr=b"inspect failed"
-                    )
                 payload = _inspect_payload()
                 payload["Mounts"] = getattr(self, "_mounts", payload["Mounts"])
                 payload["State"] = dict(effective_state)
-                if effective_log_path is not None:
-                    payload["LogPath"] = effective_log_path
-                else:
-                    payload.pop("LogPath", None)
                 return SimpleNamespace(
                     returncode=0,
                     stdout=json.dumps([payload]).encode("utf-8"),
                     stderr=b"",
                 )
-            if verb == "start":
-                return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
             if verb == "exec":
                 return SimpleNamespace(returncode=0, stdout=b"0\n", stderr=b"")
             if verb == "wait":
+                if wait_delay:
+                    time.sleep(wait_delay)
                 return SimpleNamespace(
                     returncode=wait_rc, stdout=wait_stdout, stderr=wait_stderr
                 )
-            if verb == "logs":
-                return SimpleNamespace(
-                    returncode=logs_rc, stdout=logs_stdout, stderr=logs_stderr
-                )
+            if verb == "kill":
+                return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
             if verb == "rm":
                 return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
             raise AssertionError(f"unexpected docker command: {command}")
@@ -2676,8 +2725,8 @@ def test_b1_replay_logs_failure_is_infra_error_and_evidence_incomplete(tmp_path)
         tmp_path,
         wait_rc=0,
         wait_stdout=b"0\n",
-        logs_rc=1,
-        logs_stderr=b"log driver read error",
+        attach_rc=1,
+        attach_stderr=b"log driver read error",
     )
     result = sandbox.replay(
         "vulnerable",
@@ -2690,7 +2739,7 @@ def test_b1_replay_logs_failure_is_infra_error_and_evidence_incomplete(tmp_path)
     assert result.status == "infra_error"
     assert result.log_truncated is True
     assert getattr(result, "capture_error", None)
-    assert "docker logs" in result.capture_error
+    assert "docker start -a" in result.capture_error
     assert result.as_dict().get("capture_error") == result.capture_error
 
     policy = VerdictPolicy(
@@ -2726,8 +2775,8 @@ def test_b1_logs_failure_with_empty_expected_stdout_is_never_not_reproduced(
         tmp_path,
         wait_rc=0,
         wait_stdout=b"0\n",
-        logs_rc=1,
-        logs_stderr=b"log driver read error",
+        attach_rc=1,
+        attach_stderr=b"log driver read error",
     )
     empty_policy = VerdictPolicy(
         signature={
@@ -2766,8 +2815,8 @@ def test_b1_logs_failure_with_non_empty_expected_stdout_is_evidence_incomplete_n
         tmp_path,
         wait_rc=0,
         wait_stdout=b"0\n",
-        logs_rc=1,
-        logs_stderr=b"log driver read error",
+        attach_rc=1,
+        attach_stderr=b"log driver read error",
     )
     non_empty_policy = VerdictPolicy(
         signature={
@@ -2801,8 +2850,8 @@ def test_b1_build_logs_failure_is_not_completed(tmp_path):
         tmp_path,
         wait_rc=0,
         wait_stdout=b"0\n",
-        logs_rc=1,
-        logs_stderr=b"build logs unavailable",
+        attach_rc=1,
+        attach_stderr=b"build logs unavailable",
     )
     result = sandbox.build(
         "vulnerable",
@@ -2910,31 +2959,85 @@ def test_s2_readme_quickstart_and_cwd_filesystem_root_guidance(
     assert "DATACON_JOURNAL_SECRET_FILE" in caught.value.message
 
 
-def test_s3_rotated_sibling_log_marks_replay_truncated_and_blocks_reproduced(
-    tmp_path,
-):
-    from datacon.verdict import VerdictPolicy, decide_verdict, observation_from_run
+def test_union_capture_keeps_first_budget_across_streams_and_marks_overflow():
+    from datacon.tools.sandbox import _UnionCapture
 
-    artifact, input_file = _prepare_replay_files(tmp_path)
-    log_file = tmp_path / "container-json.log"
-    log_file.write_bytes(b'{"log":"tail\\n","stream":"stderr"}\n')
-    rotated_file = tmp_path / "container-json.log.1"
-    rotated_file.write_bytes(b'{"log":"asan prefix\\n","stream":"stderr"}\n')
+    capture = _UnionCapture(budget=10)
+    capture.consume("stdout", b"a" * 6)
+    capture.consume("stderr", b"b" * 6)
+    stdout, stderr, roles, errors = capture.snapshot()
+    assert stdout == b"a" * 6
+    assert stderr == b"b" * 4
+    assert roles == ("stderr",)
+    assert errors == ()
 
-    asan_stderr = (
-        b"==7==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x502000000014\n"
-        b"WRITE of size 1 at 0x502000000014 thread T0\n"
-        b"    #0 0x55555565fadf in parse_token /fixture/vulnerable/parser.c:22:17\n"
-        b"SUMMARY: AddressSanitizer: heap-buffer-overflow /fixture/vulnerable/parser.c:22:17 in parse_token\n"
+
+def test_union_capture_marks_a_role_that_writes_after_the_budget():
+    from datacon.tools.sandbox import _UnionCapture
+
+    capture = _UnionCapture(budget=4)
+    capture.consume("stdout", b"1234")
+    assert capture.snapshot()[2] == ()
+    capture.consume("stderr", b"6789")
+    stdout, stderr, roles, errors = capture.snapshot()
+    assert stdout == b"1234"
+    assert stderr == b""
+    assert roles == ("stderr",)
+    assert errors == ()
+
+
+def test_result_as_dict_keeps_log_truncated_and_adds_truncated_roles():
+    build = BuildResult(
+        version="vulnerable",
+        status="infra_error",
+        exit_code=None,
+        duration_seconds=1.0,
+        container_id="cid",
+        image_digest="sha256:" + "a" * 64,
+        compile_args=(),
+        artifact_digest=None,
+        log=b"partial",
+        log_truncated=True,
+        artifact=None,
+        metadata={"truncated_roles": ["stderr"]},
+        capture_error="capture failed",
+        truncated_roles=("stderr",),
     )
+    build_payload = build.as_dict()
+    assert build_payload["log_truncated"] is True
+    assert build_payload["truncated_roles"] == ["stderr"]
+    assert build_payload["capture_error"] == "capture failed"
+
+    replay = ReplayResult(
+        version="vulnerable",
+        phase="candidate_1",
+        status="infra_error",
+        exit_code=None,
+        duration_seconds=1.0,
+        container_id="cid",
+        input_digest="sha256:" + "b" * 64,
+        stdout=b"out",
+        stderr=b"err",
+        signature=None,
+        timed_out=False,
+        quota_hit=False,
+        log_truncated=True,
+        metadata={"truncated_roles": ["stdout", "stderr"]},
+        capture_error="capture failed",
+        truncated_roles=("stdout", "stderr"),
+    )
+    replay_payload = replay.as_dict()
+    assert replay_payload["log_truncated"] is True
+    assert replay_payload["truncated_roles"] == ["stdout", "stderr"]
+    assert replay_payload["capture_error"] == "capture failed"
+
+
+def test_attach_read_failure_is_capture_error_and_infra_error(tmp_path):
+    artifact, input_file = _prepare_replay_files(tmp_path)
     sandbox = _make_fake_cli_sandbox(
         tmp_path,
-        wait_rc=0,
-        wait_stdout=b"86\n",
-        logs_rc=0,
-        logs_stderr=asan_stderr,
-        state={"ExitCode": 86, "Running": False, "Status": "exited"},
-        log_path=str(log_file),
+        attach_stdout=b"partial stdout\n",
+        attach_read_error=True,
     )
     result = sandbox.replay(
         "vulnerable",
@@ -2944,76 +3047,77 @@ def test_s3_rotated_sibling_log_marks_replay_truncated_and_blocks_reproduced(
         asan_options="detect_leaks=0",
         timeout_seconds=5.0,
     )
+    assert result.status == "infra_error"
     assert result.log_truncated is True
-
-    policy = VerdictPolicy(
-        signature={
-            "error": "heap-buffer-overflow",
-            "operation": "WRITE",
-            "access_size": 1,
-            "function": "parse_token",
-            "source": "parser.c",
-        },
-        expected_exit={"normal": 0, "candidate_clean": 0, "candidate_asan": 86},
-        expected_stdout={"normal": "OK\n", "candidate_clean": "ABCD\n"},
-    )
-    obs = observation_from_run(result.as_dict())
-    runs = [
-        obs,
-        replace(obs, phase="candidate_2"),
-        replace(obs, phase="normal", exit_code=0, stdout="OK\n", stderr="", signature=None, log_truncated=False),
-        replace(obs, version="fixed", phase="normal", exit_code=0, stdout="OK\n", stderr="", signature=None, log_truncated=False),
-        replace(obs, version="fixed", phase="candidate_1", exit_code=0, stdout="ABCD\n", stderr="", signature=None, log_truncated=False),
-        replace(obs, version="fixed", phase="candidate_2", exit_code=0, stdout="ABCD\n", stderr="", signature=None, log_truncated=False),
-    ]
-    decision = decide_verdict(policy, runs)
-    assert decision.verdict == "INCONCLUSIVE"
-    assert decision.reason_code == "EVIDENCE_INCOMPLETE"
+    assert result.capture_error is not None
+    assert "stderr capture failed" in result.capture_error
+    assert result.stdout == b"partial stdout\n"
 
 
-def test_s3_log_file_at_max_size_marks_replay_truncated(tmp_path):
-    from datacon.tools.sandbox import LOG_MAX_BYTES
-
+def test_attach_start_failure_is_capture_error_and_infra_error(tmp_path):
     artifact, input_file = _prepare_replay_files(tmp_path)
-    log_file = tmp_path / "full-json.log"
-    log_file.write_bytes(b"x")
-    os.truncate(log_file, LOG_MAX_BYTES)
     sandbox = _make_fake_cli_sandbox(
         tmp_path,
-        wait_rc=0,
-        wait_stdout=b"0\n",
-        logs_rc=0,
-        logs_stdout=b"ABCD\n",
-        log_path=str(log_file),
+        attach_rc=1,
+        attach_stdout=b"prefix\n",
     )
     result = sandbox.replay(
-        "fixed",
+        "vulnerable",
         "candidate_1",
         artifact_path=artifact,
         input_path=input_file,
         asan_options="detect_leaks=0",
         timeout_seconds=5.0,
     )
+    assert result.status == "infra_error"
     assert result.log_truncated is True
+    assert result.capture_error is not None
+    assert "docker start -a failed" in result.capture_error
 
 
-def test_s3_missing_log_path_marks_replay_truncated(tmp_path):
+def test_attach_nonzero_container_exit_is_not_a_capture_error(tmp_path):
     artifact, input_file = _prepare_replay_files(tmp_path)
     sandbox = _make_fake_cli_sandbox(
         tmp_path,
-        wait_rc=0,
-        wait_stdout=b"0\n",
-        logs_rc=0,
-        logs_stdout=b"ABCD\n",
-        log_path=None,
+        attach_rc=86,
+        attach_stderr=b"==1==ERROR: AddressSanitizer: heap-buffer-overflow\n",
+        wait_stdout=b"86\n",
+        state={"ExitCode": 86, "Running": False, "Status": "exited"},
     )
     result = sandbox.replay(
-        "fixed",
+        "vulnerable",
         "candidate_1",
         artifact_path=artifact,
         input_path=input_file,
         asan_options="detect_leaks=0",
         timeout_seconds=5.0,
     )
-    assert result.log_truncated is True
+    # ``docker start -a`` exits with the container status on a normal attached
+    # completion; that must not be mistaken for an attach failure.
+    assert result.exit_code == 86
+    assert result.status == "completed"
+    assert result.capture_error is None
+    assert result.log_truncated is False
 
+
+def test_attach_disconnect_while_container_runs_is_capture_error(tmp_path):
+    artifact, input_file = _prepare_replay_files(tmp_path)
+    sandbox = _make_fake_cli_sandbox(
+        tmp_path,
+        attach_stdout=b"before disconnect\n",
+        attach_poll_after=0.0,
+        wait_delay=0.3,
+        state={"ExitCode": 0, "Running": True, "Status": "running"},
+    )
+    result = sandbox.replay(
+        "vulnerable",
+        "candidate_1",
+        artifact_path=artifact,
+        input_path=input_file,
+        asan_options="detect_leaks=0",
+        timeout_seconds=5.0,
+    )
+    assert result.status == "infra_error"
+    assert result.capture_error is not None
+    assert "exited before the container stopped" in result.capture_error
+    assert any(call and call[0] == "kill" for call in sandbox.calls)

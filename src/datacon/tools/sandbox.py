@@ -18,6 +18,7 @@ import shlex
 import shutil
 import stat
 import subprocess
+import threading
 import time
 import uuid
 from typing import Any, Iterable, Mapping, Sequence
@@ -27,14 +28,14 @@ from datacon.asan import ASanSignature, parse_asan
 from datacon.cases import MAX_MATERIAL_BYTES
 
 MIB = 1024 * 1024
+# One union budget for stdout and stderr. Output is captured live from the
+# attached container stream (log driver "none"), so there is no on-disk Docker
+# log to rotate and no host log-directory access.
 MAX_LOG_BYTES = 16 * 1024 * 1024
+CAPTURE_CHUNK_BYTES = 64 * 1024
 MAX_ARTIFACT_BYTES = 128 * 1024 * 1024
-# Docker's json-file driver rotates at LOG_MAX_BYTES and keeps at most
-# LOG_MAX_FILES files (up to 64 MiB on disk per container). Keeping one
-# rotated sibling (.1) makes any log rotation observable via container inspect.
-LOG_MAX_BYTES = 32 * 1024 * 1024
-LOG_MAX_FILES = 2
 MAX_PREVIEW_BYTES = 512
+STREAM_ROLES = ("stdout", "stderr")
 _IMAGE_DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
 _SAFE_NAME = re.compile(r"[^a-z0-9_.-]+")
@@ -207,6 +208,7 @@ class BuildResult:
     artifact: bytes | None
     metadata: dict[str, Any]
     capture_error: str | None = None
+    truncated_roles: tuple[str, ...] = ()
 
     def as_dict(self) -> dict[str, Any]:
         payload = {
@@ -220,10 +222,12 @@ class BuildResult:
             "artifact_digest": self.artifact_digest,
             "log_digest": "sha256:" + hashlib.sha256(self.log).hexdigest(),
             "log_truncated": self.log_truncated,
+            "truncated_roles": list(self.truncated_roles),
             "capture_error": self.capture_error,
             **self.metadata,
         }
         payload["capture_error"] = self.capture_error
+        payload["truncated_roles"] = list(self.truncated_roles)
         return payload
 
 
@@ -244,6 +248,7 @@ class ReplayResult:
     log_truncated: bool
     metadata: dict[str, Any]
     capture_error: str | None = None
+    truncated_roles: tuple[str, ...] = ()
 
     def as_dict(self) -> dict[str, Any]:
         # Raw stdout/stderr are evidence files, not metadata. Keeping the full
@@ -272,10 +277,12 @@ class ReplayResult:
             "timed_out": self.timed_out,
             "quota_hit": self.quota_hit,
             "log_truncated": self.log_truncated,
+            "truncated_roles": list(self.truncated_roles),
             "capture_error": self.capture_error,
             **self.metadata,
         }
         payload["capture_error"] = self.capture_error
+        payload["truncated_roles"] = list(self.truncated_roles)
         return payload
 
 
@@ -326,7 +333,6 @@ def container_create_args(
     docker: str = "docker",
     job_id: str | None = None,
     generation: int | None = None,
-    log_max_bytes: int = LOG_MAX_BYTES,
 ) -> list[str]:
     """Return the exact ``docker create`` argument vector."""
     policy.validate()
@@ -374,12 +380,11 @@ def container_create_args(
         str(limits.cpu),
         "--ipc",
         "private",
+        # No Docker log driver. Output is captured live from an attach started
+        # before the container runs; there is no host log file to read and no
+        # rotation window that could silently drop evidence.
         "--log-driver",
-        "json-file",
-        "--log-opt",
-        f"max-size={log_max_bytes}b",
-        "--log-opt",
-        f"max-file={LOG_MAX_FILES}",
+        "none",
         "--tmpfs",
         f"/work:rw,exec,size={work_mib}m,mode=1777",
         "--tmpfs",
@@ -413,24 +418,6 @@ def container_create_args(
 
 def _close_enough(actual: Any, expected: int) -> bool:
     return type(actual) is int and actual == expected
-
-
-def _parse_log_size(value: Any) -> int:
-    """Parse Docker's ``max-size`` value (bytes with an optional unit)."""
-    text = str(value).strip().lower()
-    if not text:
-        raise ValueError("empty log size")
-    multiplier = 1
-    if text[-1] in ("b", "k", "m", "g"):
-        suffix = text[-1]
-        text = text[:-1]
-        multiplier = {
-            "b": 1,
-            "k": 1024,
-            "m": 1024 * 1024,
-            "g": 1024 * 1024 * 1024,
-        }[suffix]
-    return int(text) * multiplier
 
 
 def _validate_security_options(
@@ -565,7 +552,6 @@ def validate_host_config(
     limits: ResourceLimits,
     *,
     mounts: Sequence[tuple[str, str, bool]] = (),
-    log_max_bytes: int = LOG_MAX_BYTES,
 ) -> None:
     """Fail closed unless inspect output shows every requested control.
 
@@ -624,18 +610,15 @@ def validate_host_config(
     log_config = config.get("LogConfig") or {}
     if not isinstance(log_config, Mapping):
         raise SandboxPolicyError("container log config is invalid")
-    if log_config.get("Type") not in ("json-file", "local"):
-        raise SandboxPolicyError("container log driver is not the bounded json-file")
+    if log_config.get("Type") != "none":
+        raise SandboxPolicyError(
+            "container log driver must be none; output is captured by attach"
+        )
     log_options = log_config.get("Config") or {}
     if not isinstance(log_options, Mapping):
         raise SandboxPolicyError("container log options are invalid")
-    try:
-        configured_size = _parse_log_size(log_options.get("max-size"))
-        configured_files = int(str(log_options.get("max-file")))
-    except (TypeError, ValueError) as error:
-        raise SandboxPolicyError("container log rotation is not bounded") from error
-    if configured_size != log_max_bytes or configured_files != LOG_MAX_FILES:
-        raise SandboxPolicyError("container log rotation differs from the policy")
+    if log_options:
+        raise SandboxPolicyError("container log driver none takes no log options")
 
     _validate_mounts(config, mounts)
 
@@ -683,105 +666,82 @@ def _truncate_log(data: bytes) -> tuple[bytes, bool]:
     return data[:MAX_LOG_BYTES], True
 
 
-def _rotated_log_candidates(log_path: str) -> tuple[str, ...]:
-    candidates = [f"{log_path}.1"]
-    if log_path.endswith(".json"):
-        base = log_path[:-5]
-        candidates.extend([f"{base}.json.1", f"{base}.1.json"])
-    elif log_path.endswith(".log"):
-        base = log_path[:-4]
-        candidates.extend([f"{base}.log.1", f"{base}.1.log"])
-    return tuple(dict.fromkeys(candidates))
+class _UnionCapture:
+    """Collect stdout/stderr under one shared byte budget.
 
-
-def _inspect_log_rotation(
-    inspect_payload: Mapping[str, Any] | None,
-    *,
-    log_max_bytes: int = LOG_MAX_BYTES,
-) -> tuple[bool, bool]:
-    """Return ``(rotated, unverified)`` from container inspect metadata.
-
-    Docker's ``json-file`` driver rotates ``<LogPath>`` to ``<LogPath>.1`` at
-    ``max-size``. Even when the active log file after rotation is smaller than
-    ``MAX_LOG_BYTES``, the presence of ``.1`` (or an active file that has
-    reached ``max-size``) proves that prefix bytes were rotated out of the
-    current file. When ``inspect`` or ``.LogPath`` is unavailable, the caller
-    must not claim that a completed replay captured a full log.
+    Both streams are read concurrently by their own threads. The first
+    ``MAX_LOG_BYTES`` bytes across *both* streams are retained; a chunk that
+    does not fit is truncated record-wise and the owning role is marked in
+    ``truncated_roles``. Once the budget is exhausted the readers keep draining
+    their pipes so the target is never blocked by a full pipe, but the extra
+    bytes are discarded. Allocation and read failures are recorded instead of
+    being mistaken for a clean, complete capture.
     """
-    if not isinstance(inspect_payload, Mapping):
-        return False, True
-    max_size = log_max_bytes
-    host_config = inspect_payload.get("HostConfig")
-    if isinstance(host_config, Mapping):
-        log_config = host_config.get("LogConfig")
-        if isinstance(log_config, Mapping):
-            options = log_config.get("Config")
-            if isinstance(options, Mapping) and options.get("max-size") is not None:
-                try:
-                    max_size = _parse_log_size(options.get("max-size"))
-                except (TypeError, ValueError):
-                    max_size = log_max_bytes
-    log_path = inspect_payload.get("LogPath")
-    if not isinstance(log_path, str) or not log_path.strip():
-        return False, True
-    log_path = log_path.strip()
-    siblings = _rotated_log_candidates(log_path)
-    for sibling in siblings:
-        try:
-            os.lstat(sibling)
-            return True, False
-        except FileNotFoundError:
-            continue
-        except PermissionError:
-            break
-        except OSError:
-            return False, True
+
+    def __init__(self, budget: int = MAX_LOG_BYTES):
+        if type(budget) is not int or budget <= 0:
+            raise ValueError("capture budget must be a positive integer")
+        self._budget = budget
+        self._remaining = budget
+        self._lock = threading.Lock()
+        self._chunks: dict[str, list[bytes]] = {role: [] for role in STREAM_ROLES}
+        self.truncated_roles: set[str] = set()
+        self.errors: list[str] = []
+
+    def consume(self, role: str, chunk: bytes) -> None:
+        if role not in STREAM_ROLES:
+            raise ValueError(f"unknown capture role: {role}")
+        if not chunk:
+            return
+        with self._lock:
+            if self._remaining > 0:
+                take = min(len(chunk), self._remaining)
+                self._chunks[role].append(chunk[:take])
+                self._remaining -= take
+                if take == len(chunk):
+                    return
+            self.truncated_roles.add(role)
+
+    def record_error(self, message: str) -> None:
+        with self._lock:
+            self.errors.append(message)
+
+    def data(self, role: str) -> bytes:
+        with self._lock:
+            return b"".join(self._chunks[role])
+
+    def snapshot(self) -> tuple[bytes, bytes, tuple[str, ...], tuple[str, ...]]:
+        with self._lock:
+            stdout = b"".join(self._chunks["stdout"])
+            stderr = b"".join(self._chunks["stderr"])
+            roles = tuple(sorted(self.truncated_roles))
+            errors = tuple(self.errors)
+        return stdout, stderr, roles, errors
+
+
+def _drain_stream(role: str, stream: Any, capture: _UnionCapture) -> None:
+    """Read one attach pipe until EOF, never blocking the sibling stream."""
     try:
-        info = os.lstat(log_path)
-    except PermissionError:
-        if (
-            log_path.startswith("/var/lib/docker/")
-            and hasattr(os, "geteuid")
-            and os.geteuid() != 0
-        ):
-            try:
-                probe = subprocess.run(
-                    [
-                        "sudo",
-                        "-n",
-                        "sh",
-                        "-c",
-                        'if [ ! -f "$1" ]; then exit 2; fi; '
-                        'for s in "$1.1" "${1%.json}.json.1" "${1%.json}.1.json" '
-                        '"${1%.log}.log.1" "${1%.log}.1.log"; do '
-                        'if [ -e "$s" ]; then echo rotated; exit 0; fi; '
-                        'done; wc -c < "$1"',
-                        "sh",
-                        log_path,
-                    ],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    timeout=5,
-                    check=False,
-                )
-            except (OSError, subprocess.SubprocessError):
-                return False, True
-            if probe.returncode == 0:
-                text = probe.stdout.decode("ascii", "replace").strip()
-                if text == "rotated":
-                    return True, False
-                try:
-                    return int(text) >= max_size, False
-                except ValueError:
-                    return False, True
-        return False, True
-    except OSError:
-        return False, True
-    if not stat.S_ISREG(info.st_mode):
-        return False, True
-    if info.st_size >= max_size:
-        return True, False
-    return False, False
+        fd = stream.fileno()
+    except (AttributeError, OSError, ValueError):
+        fd = None
+    try:
+        while True:
+            if fd is not None:
+                chunk = os.read(fd, CAPTURE_CHUNK_BYTES)
+            else:
+                chunk = stream.read(CAPTURE_CHUNK_BYTES)
+            if not chunk:
+                break
+            capture.consume(role, chunk)
+    except (AttributeError, OSError, ValueError) as error:
+        capture.record_error(f"{role} capture failed: {error}")
+    finally:
+        try:
+            stream.close()
+        except (AttributeError, OSError, ValueError):
+            pass
+
 
 
 def _read_bounded_file(
@@ -1225,6 +1185,37 @@ class DockerSandbox:
         data = data_result.stdout if data_result.returncode == 0 else b""
         return data[:limit], size, size > limit or len(data) > limit
 
+    def _start_attached(self, name: str) -> subprocess.Popen:
+        """Start a container with stdout/stderr attached before it runs.
+
+        ``docker start --attach`` asks the daemon to wire the output streams
+        before starting the process, so the first byte is not lost even though
+        the container uses ``--log-driver none``. The CLI demultiplexes the two
+        streams onto its own stdout/stderr; both pipes are drained concurrently.
+        """
+        try:
+            return subprocess.Popen(
+                [self.docker, "start", "-a", name],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                close_fds=True,
+            )
+        except FileNotFoundError as error:
+            raise SandboxUnavailable("docker CLI is not available") from error
+        except PermissionError as error:
+            raise SandboxUnavailable("docker CLI is not executable") from error
+        except OSError as error:
+            raise SandboxError(
+                f"cannot attach to sandbox container: {error}"
+            ) from error
+
+    def _kill(self, name: str) -> None:
+        try:
+            self._docker(["kill", name], timeout=30)
+        except SandboxError:
+            pass
+
     def _start_and_wait(
         self,
         name: str,
@@ -1241,11 +1232,12 @@ class DockerSandbox:
         int | None,
         str | None,
     ]:
-        """Start a container and make its real exit authoritative.
+        """Start a container and capture its output from a live attach.
 
         The target never owns the completion signal: replay uses ``exec`` so
         the target is PID 1 and ``docker wait`` reports its exit code. Stdout
-        and stderr are read from the bounded json-file log, so a target that
+        and stderr come from ``docker start --attach`` (log driver ``none``),
+        read concurrently under one 16 MiB union budget, so a target that
         writes ``/work/done`` early cannot shorten the collection window.
 
         Builds also need their parser from the tmpfs before the container
@@ -1259,26 +1251,48 @@ class DockerSandbox:
         timed_out = False
         exit_code: int | None = None
         cleanup_error: str | None = None
-        stdout = b""
-        stderr = b""
         state: dict[str, Any] = {}
+        capture = _UnionCapture()
+        capture_errors: list[str] = []
         started = time.monotonic()
-        start = self._docker(["start", name], timeout=30)
-        if start.returncode != 0:
-            cleanup_error = self._cleanup_failure(name)
-            message = "cannot start sandbox container: " + start.stderr.decode(
-                "utf-8", "replace"
-            )[:500]
-            if cleanup_error is not None:
-                message += f"; cleanup also failed: {cleanup_error}"
-            raise SandboxError(message)
+        process: subprocess.Popen | None = None
+        readers: list[threading.Thread] = []
         try:
+            process = self._start_attached(name)
+            readers = [
+                threading.Thread(
+                    target=_drain_stream,
+                    args=("stdout", process.stdout, capture),
+                    daemon=True,
+                ),
+                threading.Thread(
+                    target=_drain_stream,
+                    args=("stderr", process.stderr, capture),
+                    daemon=True,
+                ),
+            ]
+            for reader in readers:
+                reader.start()
+
             if artifact:
                 while time.monotonic() - started < deadline_seconds:
                     check = self._docker(
                         ["exec", name, "test", "-e", "/work/done"], timeout=10
                     )
                     if check.returncode == 0:
+                        break
+                    if process.poll() is not None:
+                        try:
+                            running = (
+                                self._inspect(name).get("State", {}).get("Running")
+                            )
+                        except SandboxError:
+                            running = None
+                        if running is True:
+                            capture_errors.append(
+                                "docker start -a exited before the container stopped"
+                            )
+                            self._kill(name)
                         break
                     try:
                         running = (
@@ -1291,6 +1305,10 @@ class DockerSandbox:
                     time.sleep(0.1)
                 else:
                     timed_out = True
+                # The parser lives on the container tmpfs and disappears when
+                # the container is removed, so copy it while the container may
+                # still be alive. The wrapper's post-exit digest decides later
+                # whether these bytes are the completed artifact.
                 for relative, limit in (
                     ("/work/parser", MAX_ARTIFACT_BYTES),
                     ("/work/pids.events", MAX_LOG_BYTES),
@@ -1303,44 +1321,102 @@ class DockerSandbox:
                         files[relative] = data
                         if was_truncated:
                             truncated.add(relative)
-                if not timed_out:
+                if not timed_out and not capture_errors:
                     self._docker(
                         ["exec", name, "touch", "/work/release"], timeout=10
                     )
+
             if timed_out:
+                self._kill(name)
+
+            # Ask for the authoritative exit code while the two attach readers
+            # keep draining output. A monitor kills the container at the
+            # deadline (or when the attach disappears underneath it) so a
+            # container can never outlive the capture window.
+            wait_holder: dict[str, subprocess.CompletedProcess] = {}
+            wait_errors: list[str] = []
+
+            def _wait_for_exit() -> None:
                 try:
-                    self._docker(["kill", name], timeout=30)
-                except SandboxError:
-                    pass
-            remaining = max(1.0, deadline_seconds - (time.monotonic() - started))
-            wait_error: str | None = None
-            try:
-                wait = self._docker(["wait", name], timeout=remaining)
-            except SandboxError as error:
-                if error.reason_code != "TIMEOUT":
-                    raise
-                timed_out = True
-                try:
-                    self._docker(["kill", name], timeout=30)
-                except SandboxError:
-                    pass
-                wait = self._docker(["wait", name], timeout=30)
-            if wait.returncode == 0:
-                raw_wait = wait.stdout.decode("ascii", "replace").strip()
-                try:
-                    exit_code = int(raw_wait)
-                except ValueError:
-                    exit_code = None
-                    wait_error = (
-                        "docker wait returned a non-integer exit code: "
-                        f"{raw_wait[:120]!r}"
+                    wait_holder["result"] = self._docker(
+                        ["wait", name],
+                        timeout=max(
+                            1.0,
+                            deadline_seconds - (time.monotonic() - started) + 60.0,
+                        ),
                     )
-            else:
-                detail = wait.stderr.decode("utf-8", "replace").strip()
-                wait_error = (
-                    f"docker wait failed (rc={wait.returncode}): "
-                    + (detail[:300] or "no stderr")
-                )
+                except SandboxError as error:
+                    wait_errors.append(error.message)
+
+            wait_thread = threading.Thread(target=_wait_for_exit, daemon=True)
+            wait_thread.start()
+            deadline_action_done = timed_out
+            while wait_thread.is_alive():
+                if (
+                    not deadline_action_done
+                    and time.monotonic() - started >= deadline_seconds
+                ):
+                    timed_out = True
+                    deadline_action_done = True
+                    self._kill(name)
+                elif (
+                    not deadline_action_done
+                    and process.poll() is not None
+                    and wait_thread.is_alive()
+                ):
+                    # The attach CLI can exit while the container keeps
+                    # running. Re-check after a short grace to avoid racing the
+                    # normal exit path, then fail closed with a capture error.
+                    time.sleep(0.2)
+                    if process.poll() is None:
+                        continue
+                    try:
+                        running = (
+                            self._inspect(name).get("State", {}).get("Running")
+                        )
+                    except SandboxError:
+                        running = None
+                    if running is True:
+                        capture_errors.append(
+                            "docker start -a exited before the container stopped"
+                        )
+                        deadline_action_done = True
+                        self._kill(name)
+                time.sleep(0.05)
+            wait_thread.join(timeout=5)
+
+            wait = wait_holder.get("result")
+            wait_error: str | None = None
+            if wait is None:
+                # The background wait may have timed out with the daemon; one
+                # bounded retry after the kill is enough to distinguish a slow
+                # daemon from a capture that genuinely failed.
+                try:
+                    wait = self._docker(["wait", name], timeout=30)
+                except SandboxError as error:
+                    wait_error = error.message
+                else:
+                    wait_error = wait_errors[-1] if wait_errors else None
+            if wait is not None:
+                if wait.returncode == 0:
+                    raw_wait = wait.stdout.decode("ascii", "replace").strip()
+                    try:
+                        exit_code = int(raw_wait)
+                    except ValueError:
+                        exit_code = None
+                        wait_error = (
+                            "docker wait returned a non-integer exit code: "
+                            f"{raw_wait[:120]!r}"
+                        )
+                else:
+                    detail = wait.stderr.decode("utf-8", "replace").strip()
+                    wait_error = (
+                        f"docker wait failed (rc={wait.returncode}): "
+                        + (detail[:300] or "no stderr")
+                    )
+            elif wait_error is None:
+                wait_error = "docker wait did not report a result"
+
             inspect_payload: dict[str, Any] | None = None
             inspect_error: str | None = None
             try:
@@ -1350,7 +1426,6 @@ class DockerSandbox:
             except SandboxError as error:
                 state = {}
                 inspect_error = error.message
-            capture_errors: list[str] = []
             if exit_code is None:
                 candidate = state.get("ExitCode")
                 if (
@@ -1369,25 +1444,70 @@ class DockerSandbox:
                             f"Status={state.get('Status')!r}"
                         )
                     capture_errors.append(reason)
-            log_rotated, log_unverified = _inspect_log_rotation(inspect_payload)
-            if log_rotated:
-                truncated.add("log_rotated")
-            if log_unverified:
-                truncated.add("log_unverified")
-            logs = self._docker(["logs", name], timeout=60)
-            if logs.returncode == 0:
-                stdout = logs.stdout
-                stderr = logs.stderr
-            else:
-                detail = logs.stderr.decode("utf-8", "replace").strip()
+            elif inspect_payload is not None and not timed_out:
+                if (
+                    state.get("Running") is not False
+                    or state.get("Status") not in ("exited", "dead")
+                ):
+                    capture_errors.append(
+                        "container state after docker wait is not terminal: "
+                        f"Running={state.get('Running')!r} "
+                        f"Status={state.get('Status')!r}"
+                    )
+
+            # ``docker start -a`` propagates the container's exit status as the
+            # CLI status on a normal, attached completion. That is not a
+            # capture failure when it matches the authoritative ``docker wait``
+            # code. Any other non-zero CLI status (including a start/attach
+            # error) leaves the output window unproven.
+            try:
+                start_rc = process.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                start_rc = None
                 capture_errors.append(
-                    f"docker logs failed (rc={logs.returncode}): "
-                    + (detail[:300] or "no stderr")
+                    "docker start -a did not finish after the container stopped"
                 )
-                truncated.add("logs")
+                try:
+                    process.kill()
+                except OSError:
+                    pass
+                try:
+                    process.wait(timeout=5)
+                except (subprocess.TimeoutExpired, OSError):
+                    pass
+            if (
+                start_rc is not None
+                and start_rc != 0
+                and start_rc != exit_code
+            ):
+                capture_errors.append(f"docker start -a failed (rc={start_rc})")
+            for reader in readers:
+                reader.join(timeout=30)
+            if any(reader.is_alive() for reader in readers):
+                capture_errors.append("container output streams did not close")
+            stdout, stderr, truncated_roles, read_errors = capture.snapshot()
+            truncated.update(truncated_roles)
+            capture_errors.extend(read_errors)
             if capture_errors:
-                state["_capture_error"] = "; ".join(capture_errors)
+                state["_capture_error"] = "; ".join(
+                    dict.fromkeys(capture_errors)
+                )
         finally:
+            if process is not None:
+                try:
+                    process.wait(timeout=5)
+                except (subprocess.TimeoutExpired, OSError):
+                    try:
+                        process.kill()
+                    except OSError:
+                        pass
+                    try:
+                        process.wait(timeout=5)
+                    except (subprocess.TimeoutExpired, OSError):
+                        pass
+            for reader in readers:
+                if reader.ident is not None:
+                    reader.join(timeout=5)
             cleanup_error = self._cleanup_failure(name)
         return (
             stdout,
@@ -1517,22 +1637,32 @@ printf 'uid=%s\nseccomp=%s\nseccomp_filters=%s\nno_new_privs=%s\ncap_eff=%s\ncgr
                 self.limits,
                 mounts=[(str(probe_root), "/fixture", True)],
             )
-            start = self._docker(["start", name], timeout=30)
-            if start.returncode != 0:
-                raise SandboxUnavailable("cannot start isolation probe")
-            try:
-                wait = self._docker(["wait", name], timeout=deadline_seconds)
-            except SandboxError as error:
-                if error.reason_code == "TIMEOUT":
-                    raise SandboxPolicyError("isolation probe timed out") from error
-                raise
-            if wait.returncode != 0:
+            (
+                probe_stdout,
+                probe_stderr,
+                _probe_files,
+                probe_truncated,
+                state,
+                timed_out,
+                exit_code,
+                cleanup_error,
+            ) = self._start_and_wait(name, deadline_seconds=deadline_seconds)
+            if cleanup_error is not None:
+                cleanup_errors.append(cleanup_error)
+            if timed_out:
+                raise SandboxPolicyError("isolation probe timed out")
+            capture_error = state.pop("_capture_error", None)
+            if capture_error is not None:
+                raise SandboxPolicyError(
+                    "isolation probe output was not captured: " + capture_error
+                )
+            if probe_truncated:
+                raise SandboxPolicyError(
+                    "isolation probe output exceeded the capture budget"
+                )
+            if exit_code is None:
                 raise SandboxPolicyError("isolation probe did not complete")
-            logs = self._docker(["logs", name], timeout=30)
-            raw = (logs.stdout + logs.stderr).decode("utf-8", "replace")
-            exit_code = int(wait.stdout.decode("utf-8", "replace").strip() or "1")
-            inspect = self._inspect(name)
-            state = inspect.get("State", {})
+            raw = (probe_stdout + probe_stderr).decode("utf-8", "replace")
         finally:
             ok, detail = self._remove(name)
             if not ok and detail is not None:
@@ -1613,8 +1743,8 @@ printf 'uid=%s\nseccomp=%s\nseccomp_filters=%s\nno_new_privs=%s\ncap_eff=%s\ncgr
             raise SandboxError("reviewed build recipe is missing")
         work = self.run_root / "build" / version / uuid.uuid4().hex
         work.mkdir(parents=True, exist_ok=True)
-        # The build command's stdout/stderr go to the bounded container log,
-        # not to a target-writable file. The wrapper only reports the artifact
+        # The build command's stdout/stderr go to the live attach capture, not
+        # to a target-writable file. The wrapper only reports the artifact
         # size/digest after the command exits and then waits for the host to
         # acknowledge the copy; the host's exit code comes from docker wait.
         wrapper = (
@@ -1677,6 +1807,9 @@ printf 'uid=%s\nseccomp=%s\nseccomp_filters=%s\nno_new_privs=%s\ncap_eff=%s\ncgr
             capture_error = state.pop("_capture_error", None)
             log, log_truncated = _truncate_log(log_bytes)
             truncated = log_truncated or bool(truncated_streams)
+            truncated_roles = tuple(
+                role for role in STREAM_ROLES if role in truncated_streams
+            )
             artifact = files.get("/work/parser")
             if artifact is not None and len(artifact) > MAX_ARTIFACT_BYTES:
                 artifact = None
@@ -1714,10 +1847,10 @@ printf 'uid=%s\nseccomp=%s\nseccomp_filters=%s\nno_new_privs=%s\ncap_eff=%s\ncgr
             )
             if timed_out:
                 status = "timeout"
-            elif state.get("OOMKilled") or quota_hits:
-                status = "resource_limited"
             elif capture_error is not None:
                 status = "infra_error"
+            elif state.get("OOMKilled") or quota_hits:
+                status = "resource_limited"
             metadata = {
                 "build_command": ["/bin/sh", "/fixture/build.sh", version],
                 "build_recipe_digest": _digest_bytes(materials / "build.sh"),
@@ -1725,6 +1858,7 @@ printf 'uid=%s\nseccomp=%s\nseccomp_filters=%s\nno_new_privs=%s\ncap_eff=%s\ncgr
                 "timed_out": timed_out,
                 "oom_killed": bool(state.get("OOMKilled")),
                 "limits_hit": quota_hits,
+                "truncated_roles": list(truncated_roles),
             }
             if capture_error is not None:
                 metadata["capture_error"] = capture_error
@@ -1744,6 +1878,7 @@ printf 'uid=%s\nseccomp=%s\nseccomp_filters=%s\nno_new_privs=%s\ncap_eff=%s\ncgr
                 artifact=artifact,
                 metadata=metadata,
                 capture_error=capture_error,
+                truncated_roles=truncated_roles,
             )
         finally:
             # _start_and_wait already removed the container. If it could not,
@@ -1807,8 +1942,8 @@ printf 'uid=%s\nseccomp=%s\nseccomp_filters=%s\nno_new_privs=%s\ncap_eff=%s\ncgr
         artifact.chmod(0o555)
         input_file.chmod(0o444)
         # The target is PID 1. Its exit status is the container's status via
-        # docker wait, and its stdout/stderr go to the bounded Docker log; the
-        # target never writes a completion flag or an exit-code file.
+        # docker wait, and its stdout/stderr come from the live attach capture;
+        # the target never writes a completion flag or an exit-code file.
         name = None
         started = time.monotonic()
         try:
@@ -1841,8 +1976,15 @@ printf 'uid=%s\nseccomp=%s\nseccomp_filters=%s\nno_new_privs=%s\ncap_eff=%s\ncgr
         capture_error = state.pop("_capture_error", None)
         stdout, truncated_out = _truncate_log(raw_stdout)
         stderr, truncated_err = _truncate_log(raw_stderr)
+        truncated_roles = tuple(
+            role for role in STREAM_ROLES if role in _truncated_streams
+        )
         log_truncated = (
-            truncated_out or truncated_err or bool(_truncated_streams)
+            truncated_out
+            or truncated_err
+            or bool(_truncated_streams)
+            or capture_error is not None
+            or exit_code is None
         )
         signature = parse_asan(stderr.decode("utf-8", "replace"))
         quota_hit = (
@@ -1852,16 +1994,17 @@ printf 'uid=%s\nseccomp=%s\nseccomp_filters=%s\nno_new_privs=%s\ncap_eff=%s\ncgr
         status = "completed"
         if timed_out:
             status = "timeout"
-        elif quota_hit:
-            status = "resource_limited"
         elif capture_error is not None or exit_code is None:
             status = "infra_error"
+        elif quota_hit:
+            status = "resource_limited"
         metadata: dict[str, Any] = {
             "image_digest": self.image_digest,
             "asan_options": asan_options,
             "oom_killed": bool(state.get("OOMKilled")),
             "limits_hit": [],
             "timeout_seconds": timeout,
+            "truncated_roles": list(truncated_roles),
         }
         if capture_error is not None:
             metadata["capture_error"] = capture_error
@@ -1883,6 +2026,7 @@ printf 'uid=%s\nseccomp=%s\nseccomp_filters=%s\nno_new_privs=%s\ncap_eff=%s\ncgr
             log_truncated=log_truncated,
             metadata=metadata,
             capture_error=capture_error,
+            truncated_roles=truncated_roles,
         )
 
 

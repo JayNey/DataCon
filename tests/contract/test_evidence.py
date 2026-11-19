@@ -2539,7 +2539,7 @@ def test_b1_verify_bundle_rejects_completed_replay_with_capture_error(tmp_path):
         info.root,
         "vulnerable",
         "normal",
-        capture_error="docker logs failed (rc=1): daemon error",
+        capture_error="container output capture failed (rc=1): daemon error",
     )
     with pytest.raises(BundleError) as caught:
         verify_bundle(info.root)
