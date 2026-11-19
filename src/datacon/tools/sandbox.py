@@ -1329,74 +1329,98 @@ class DockerSandbox:
             if timed_out:
                 self._kill(name)
 
-            # Ask for the authoritative exit code while the two attach readers
-            # keep draining output. A monitor kills the container at the
-            # deadline (or when the attach disappears underneath it) so a
-            # container can never outlive the capture window.
-            wait_holder: dict[str, subprocess.CompletedProcess] = {}
-            wait_errors: list[str] = []
-
-            def _wait_for_exit() -> None:
-                try:
-                    wait_holder["result"] = self._docker(
-                        ["wait", name],
-                        timeout=max(
-                            1.0,
-                            deadline_seconds - (time.monotonic() - started) + 60.0,
-                        ),
-                    )
-                except SandboxError as error:
-                    wait_errors.append(error.message)
-
-            wait_thread = threading.Thread(target=_wait_for_exit, daemon=True)
-            wait_thread.start()
-            deadline_action_done = timed_out
-            while wait_thread.is_alive():
-                if (
-                    not deadline_action_done
-                    and time.monotonic() - started >= deadline_seconds
-                ):
+            # The attached CLI returns when the container stops and propagates
+            # the container status. Wait for it here while enforcing the
+            # deadline. A separate concurrent ``docker wait`` is deliberately
+            # not used: waiting on a container that has not started yet can
+            # return 0 and make a still-running capture look complete.
+            deadline_exceeded_at: float | None = None
+            while process.poll() is None:
+                now = time.monotonic()
+                if not timed_out and now - started >= deadline_seconds:
                     timed_out = True
-                    deadline_action_done = True
+                    deadline_exceeded_at = now
                     self._kill(name)
-                elif (
-                    not deadline_action_done
-                    and process.poll() is not None
-                    and wait_thread.is_alive()
+                if (
+                    deadline_exceeded_at is not None
+                    and now - deadline_exceeded_at >= 30.0
                 ):
-                    # The attach CLI can exit while the container keeps
-                    # running. Re-check after a short grace to avoid racing the
-                    # normal exit path, then fail closed with a capture error.
-                    time.sleep(0.2)
-                    if process.poll() is None:
-                        continue
+                    capture_errors.append(
+                        "docker start -a did not finish after the container "
+                        "was stopped"
+                    )
                     try:
-                        running = (
-                            self._inspect(name).get("State", {}).get("Running")
-                        )
+                        process.kill()
+                    except OSError:
+                        pass
+                    break
+                time.sleep(0.05)
+
+            try:
+                start_rc = process.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                start_rc = None
+                capture_errors.append(
+                    "docker start -a did not finish after the container stopped"
+                )
+                try:
+                    process.kill()
+                except OSError:
+                    pass
+                try:
+                    process.wait(timeout=5)
+                except (subprocess.TimeoutExpired, OSError):
+                    pass
+
+            inspect_payload: dict[str, Any] | None = None
+            inspect_error: str | None = None
+            try:
+                inspect_payload = self._inspect(name)
+                raw_state = inspect_payload.get("State")
+                state = dict(raw_state) if isinstance(raw_state, Mapping) else {}
+            except SandboxError as error:
+                state = {}
+                inspect_error = error.message
+
+            not_terminal = False
+            if not timed_out and inspect_payload is not None:
+                if state.get("Running") is True:
+                    # The attach CLI exited while the container keeps running:
+                    # the capture window is gone. Re-check after a short grace
+                    # to avoid racing the normal exit path.
+                    time.sleep(0.2)
+                    try:
+                        second_state = dict(self._inspect(name).get("State", {}))
                     except SandboxError:
-                        running = None
-                    if running is True:
+                        second_state = None
+                    if second_state is None or second_state.get("Running") is True:
                         capture_errors.append(
                             "docker start -a exited before the container stopped"
                         )
-                        deadline_action_done = True
                         self._kill(name)
-                time.sleep(0.05)
-            wait_thread.join(timeout=5)
+                    else:
+                        state = second_state
+                elif (
+                    state.get("Running") is not False
+                    or state.get("Status") not in ("exited", "dead")
+                ):
+                    not_terminal = True
+                    capture_errors.append(
+                        "container state after attach is not terminal: "
+                        f"Running={state.get('Running')!r} "
+                        f"Status={state.get('Status')!r}"
+                    )
+                    self._kill(name)
 
-            wait = wait_holder.get("result")
+            wait = None
             wait_error: str | None = None
-            if wait is None:
-                # The background wait may have timed out with the daemon; one
-                # bounded retry after the kill is enough to distinguish a slow
-                # daemon from a capture that genuinely failed.
+            if not not_terminal:
                 try:
                     wait = self._docker(["wait", name], timeout=30)
                 except SandboxError as error:
                     wait_error = error.message
-                else:
-                    wait_error = wait_errors[-1] if wait_errors else None
+            else:
+                wait_error = "container did not reach a terminal state"
             if wait is not None:
                 if wait.returncode == 0:
                     raw_wait = wait.stdout.decode("ascii", "replace").strip()
@@ -1417,15 +1441,6 @@ class DockerSandbox:
             elif wait_error is None:
                 wait_error = "docker wait did not report a result"
 
-            inspect_payload: dict[str, Any] | None = None
-            inspect_error: str | None = None
-            try:
-                inspect_payload = self._inspect(name)
-                raw_state = inspect_payload.get("State")
-                state = dict(raw_state) if isinstance(raw_state, Mapping) else {}
-            except SandboxError as error:
-                state = {}
-                inspect_error = error.message
             if exit_code is None:
                 candidate = state.get("ExitCode")
                 if (
@@ -1444,43 +1459,19 @@ class DockerSandbox:
                             f"Status={state.get('Status')!r}"
                         )
                     capture_errors.append(reason)
-            elif inspect_payload is not None and not timed_out:
-                if (
-                    state.get("Running") is not False
-                    or state.get("Status") not in ("exited", "dead")
-                ):
-                    capture_errors.append(
-                        "container state after docker wait is not terminal: "
-                        f"Running={state.get('Running')!r} "
-                        f"Status={state.get('Status')!r}"
-                    )
 
             # ``docker start -a`` propagates the container's exit status as the
             # CLI status on a normal, attached completion. That is not a
             # capture failure when it matches the authoritative ``docker wait``
             # code. Any other non-zero CLI status (including a start/attach
             # error) leaves the output window unproven.
-            try:
-                start_rc = process.wait(timeout=30)
-            except subprocess.TimeoutExpired:
-                start_rc = None
-                capture_errors.append(
-                    "docker start -a did not finish after the container stopped"
-                )
-                try:
-                    process.kill()
-                except OSError:
-                    pass
-                try:
-                    process.wait(timeout=5)
-                except (subprocess.TimeoutExpired, OSError):
-                    pass
             if (
                 start_rc is not None
                 and start_rc != 0
                 and start_rc != exit_code
             ):
                 capture_errors.append(f"docker start -a failed (rc={start_rc})")
+
             for reader in readers:
                 reader.join(timeout=30)
             if any(reader.is_alive() for reader in readers):

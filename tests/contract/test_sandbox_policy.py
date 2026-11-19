@@ -2630,7 +2630,7 @@ def _make_fake_cli_sandbox(
 
         def poll(self):
             if attach_poll_after is None:
-                return None
+                return attach_rc
             if time.monotonic() - self._started < attach_poll_after:
                 return None
             return attach_rc
@@ -3094,6 +3094,32 @@ def test_attach_nonzero_container_exit_is_not_a_capture_error(tmp_path):
     )
     # ``docker start -a`` exits with the container status on a normal attached
     # completion; that must not be mistaken for an attach failure.
+    assert result.exit_code == 86
+    assert result.status == "completed"
+    assert result.capture_error is None
+    assert result.log_truncated is False
+
+
+def test_attach_wait_happens_after_the_attach_process_exits(tmp_path):
+    artifact, input_file = _prepare_replay_files(tmp_path)
+    sandbox = _make_fake_cli_sandbox(
+        tmp_path,
+        attach_poll_after=0.1,
+        attach_rc=86,
+        wait_stdout=b"86\n",
+        state={"ExitCode": 86, "Running": False, "Status": "exited"},
+    )
+    result = sandbox.replay(
+        "vulnerable",
+        "candidate_1",
+        artifact_path=artifact,
+        input_path=input_file,
+        asan_options="detect_leaks=0",
+        timeout_seconds=5.0,
+    )
+    # The old implementation started docker wait concurrently, which can return
+    # 0 for a container that has not started yet. Waiting only after the attach
+    # process exits keeps the authoritative exit code and avoids that race.
     assert result.exit_code == 86
     assert result.status == "completed"
     assert result.capture_error is None
