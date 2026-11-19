@@ -49,10 +49,10 @@ updates:
       - "dependencies"
       - "python"
     ignore:
-      # uv / uv-build 的版本被硬编码在三处，Dependabot 只能改一处，
+      # uv / uv-build 的版本约束由三处联动并受 ci_gates 门禁校验，Dependabot 只能改一处，
       # 因此其 PR 必然让 ci_gates 的锁门禁失败。升级必须人工按顺序完成：
-      #   1) requirements-ci.txt 的 uv==<ver> --hash=sha256:<hash>
-      #   2) pyproject.toml 的 tool.uv.required-version 与 build-system.requires
-      #   3) src/datacon/ci_gates.py 的 _UV_REQUIREMENT 正则与两处 ==<ver> 比较
+      #   1) requirements-ci.txt 的 uv==<ver> --hash=sha256:<hash>（CI 精确锁定）
+      #   2) pyproject.toml 的 tool.uv.required-version 与 build-system.requires（同 minor 区间 >=<ver>,<next_minor>）
+      #   3) src/datacon/ci_gates.py 的 _UV_REQUIREMENT 正则与两处同 minor 区间校验
       - dependency-name: "uv"
       - dependency-name: "uv-build"

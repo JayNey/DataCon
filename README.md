@@ -30,7 +30,7 @@ DataCon 是面向授权实验环境的 CVE 复现平台项目。它的目标是�
 ### 依赖
 
 - Python 3.11+
-- [uv](https://docs.astral.sh/uv/) 0.12.7（仓库锁定依赖，提交了 `uv.lock`；`pyproject.toml` 的 `required-version` 与 `uv_build==0.12.7` 同 CI 固定的 uv 版本一致）
+- [uv](https://docs.astral.sh/uv/) 0.13.7（仓库锁定依赖，提交了 `uv.lock`；CI 由 `requirements-ci.txt` 精确锁定 `uv==0.13.7`，`pyproject.toml` 的 `required-version` 与 `build-system.requires` 同步约束为同 minor 区间 `>=0.13.7,<0.14` / `uv_build>=0.13.7,<0.14`，以兼容同 minor 本地环境与 Dependabot 并确保命中内置 `uv_build`）
 - PostgreSQL 17
 - Docker（T05/T06 用一次性 Linux/amd64 容器构建与回放；容器内断网，宿主只需拉取固定镜像）
 - `git`（读取固定提交与 diff）
@@ -364,7 +364,7 @@ Dockerfile              T07 控制面非 root 容器镜像构建配方
 
 ## CI
 
-`.github/workflows/ci.yml` 在 Pull Request 和 `main` 分支推送时运行：安装锁定依赖、启动固定 digest 的 PostgreSQL 17、按文件名顺序应用 `migrations/*.sql`、安装宿主 `clang` / LLVM symbolizer / patch，并在 pytest 前显式检查 `DATACON_TEST_DATABASE_URL`、这些工具、Docker 和固定 clang 镜像。独立 `image` job 在每个 PR 上真实 `docker build` 控制面镜像并 smoke 默认 / `worker` entrypoint、非 root UID 和运行时工具（`trixie` 运行层只含 `docker-cli` 客户端与 `git`）。测试 job 先用 `pytest --collect-only` 比较四组 marker 的 total 之和与全集，再逐个解析 JUnit 报告，要求每组 `total > 0` 且 `skipped=0`；四组用累计 `status` 收集结果，某一组失败不会掩盖其余组，JUnit 仍 `always()` 上传。缺少数据库、clang、llvm-symbolizer、Docker 或镜像时会在测试侧 `fail` 而不是 skip。`python -m datacon.ci_gates --root .` 在 PR 中运行显式的 secret / lock / workflow 静态子集；真实 Trivy 报告和 `evaluate_scan_findings` 在 `release.yml` 的 build-candidate 中执行，缺失报告时 release 直接失败。wheel 冒烟会把构建产物安装进临时 venv，执行 `datacon --help`，断言 `importlib.metadata` 的版本 / 依赖 / `datacon = datacon.cli:main` entry point，并从安装后的 wheel 解析和 `analyze_case` 默认案例。`uv` 按 `requirements-ci.txt` 中的 wheel hash 安装；构建后端固定为 uv 自带的 `uv_build==0.12.7`，`uv sync --frozen` 不解析或安装 setuptools，CI 还会以 verbose 重装确认实际使用的是内置后端。第三方 Action 固定到完整提交 SHA；`ci.yml` 只有 `contents: read`，`release.yml` 因跨 run 下载 artifact 只有 `contents: read` + `actions: read`，二者都没有任何 write 权限。真实 Docker 组在一次性 Linux runner 上运行固定镜像探针、双版本构建、六次回放、恢复和验包，不接触真实案例材料。本地未设置 `DATACON_TEST_DATABASE_URL`、缺少 clang 或 Docker 守护进程时仍允许显式 skip；`CI=true` 时不允许。
+`.github/workflows/ci.yml` 在 Pull Request 和 `main` 分支推送时运行：安装锁定依赖、启动固定 digest 的 PostgreSQL 17、按文件名顺序应用 `migrations/*.sql`、安装宿主 `clang` / LLVM symbolizer / patch，并在 pytest 前显式检查 `DATACON_TEST_DATABASE_URL`、这些工具、Docker 和固定 clang 镜像。独立 `image` job 在每个 PR 上真实 `docker build` 控制面镜像并 smoke 默认 / `worker` entrypoint、非 root UID 和运行时工具（`trixie` 运行层只含 `docker-cli` 客户端与 `git`）。测试 job 先用 `pytest --collect-only` 比较四组 marker 的 total 之和与全集，再逐个解析 JUnit 报告，要求每组 `total > 0` 且 `skipped=0`；四组用累计 `status` 收集结果，某一组失败不会掩盖其余组，JUnit 仍 `always()` 上传。缺少数据库、clang、llvm-symbolizer、Docker 或镜像时会在测试侧 `fail` 而不是 skip。`python -m datacon.ci_gates --root .` 在 PR 中运行显式的 secret / lock / workflow 静态子集；真实 Trivy 报告和 `evaluate_scan_findings` 在 `release.yml` 的 build-candidate 中执行，缺失报告时 release 直接失败。wheel 冒烟会把构建产物安装进临时 venv，执行 `datacon --help`，断言 `importlib.metadata` 的版本 / 依赖 / `datacon = datacon.cli:main` entry point，并从安装后的 wheel 解析和 `analyze_case` 默认案例。`uv` 在 CI 中按 `requirements-ci.txt` 中的 wheel hash 精确安装 `0.13.7`；构建后端固定为 uv 自带的 `uv_build>=0.13.7,<0.14`（同 minor 区间保证 CI 与 `0.13.x` 本地/Dependabot 均命中内置后端），`uv sync --frozen` 不解析或安装 setuptools，CI 还会以 verbose 重装确认实际使用的是内置后端。第三方 Action 固定到完整提交 SHA；`ci.yml` 只有 `contents: read`，`release.yml` 因跨 run 下载 artifact 只有 `contents: read` + `actions: read`，二者都没有任何 write 权限。真实 Docker 组在一次性 Linux runner 上运行固定镜像探针、双版本构建、六次回放、恢复和验包，不接触真实案例材料。本地未设置 `DATACON_TEST_DATABASE_URL`、缺少 clang 或 Docker 守护进程时仍允许显式 skip；`CI=true` 时不允许。
 
 ### 发布 workflow（`release.yml`）
 
