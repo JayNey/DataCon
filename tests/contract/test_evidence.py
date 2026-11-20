@@ -11,6 +11,7 @@ import stat
 from uuid import uuid4
 
 import pytest
+from test_plan import PLAN as BASE_PLAN
 
 from datacon import jsonutil
 from datacon.contracts import plan_digest
@@ -75,8 +76,6 @@ COMPILE_ARGS = [
     "-fsanitize=address",
     "-o",
 ]
-
-from test_plan import PLAN as BASE_PLAN
 
 PLAN = deepcopy(BASE_PLAN)
 PLAN["harness_digest"] = MATERIAL_DIGESTS["harness.c"]

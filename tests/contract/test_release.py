@@ -66,11 +66,17 @@ def _ledger() -> dict[str, str]:
     }
 
 
-def _backend(*, slots: int = 0, previous: dict | None = None) -> release.DictPromotionBackend:
+def _backend(
+    *,
+    slots: int = 0,
+    previous: dict | None = None,
+    b03_acceptances: dict[str, dict] | None = None,
+) -> release.DictPromotionBackend:
     return release.DictPromotionBackend(
         active_release=previous or _previous(),
         active_slots=slots,
         migrations=_ledger(),
+        b03_acceptances=b03_acceptances,
     )
 
 
@@ -97,7 +103,18 @@ def _write_evidence_artifacts(tmp_path: Path) -> Path:
         encoding="utf-8",
     )
     (artifacts / release.SBOM_REPORT_FILE).write_text(
-        '{"bomFormat":"CycloneDX"}\n', encoding="utf-8"
+        json.dumps(
+            {
+                "bomFormat": "CycloneDX",
+                "specVersion": "1.5",
+                "components": [
+                    {"type": "library", "name": "libc6", "purl": "pkg:deb/debian/libc6@2.36"},
+                    {"type": "library", "name": "psycopg", "purl": "pkg:pypi/psycopg@3.2.1"},
+                ],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
     )
     (artifacts / "datacon-0.1.0-py3-none-any.whl").write_bytes(b"wheel-bytes")
     return artifacts
@@ -194,6 +211,73 @@ def test_sbom_generation_produces_cyclonedx_and_digest(tmp_path):
     assert sbom["specVersion"] == "1.5"
     assert sbom_digest.startswith("sha256:")
     assert any(comp["name"] == "datacon" for comp in sbom["components"])
+
+
+def test_sbom_report_requires_deb_and_pypi_components(tmp_path):
+    def write_sbom(name, components):
+        path = tmp_path / name
+        path.write_text(
+            json.dumps(
+                {
+                    "bomFormat": "CycloneDX",
+                    "specVersion": "1.5",
+                    "components": components,
+                }
+            ),
+            encoding="utf-8",
+        )
+        return path
+
+    both = write_sbom(
+        "both.json",
+        [
+            {"type": "library", "name": "libc6", "purl": "pkg:deb/debian/libc6@2.36"},
+            {"type": "library", "name": "psycopg", "purl": "pkg:pypi/psycopg@3.2.1"},
+        ],
+    )
+    summary = release.verify_sbom_report(both)
+    assert summary["deb_components"] == 1
+    assert summary["pypi_components"] == 1
+
+    with pytest.raises(release.ReleaseGateError, match="pkg:deb/"):
+        release.verify_sbom_report(
+            write_sbom(
+                "pypi-only.json",
+                [{"type": "library", "name": "psycopg", "purl": "pkg:pypi/psycopg@3.2.1"}],
+            )
+        )
+    with pytest.raises(release.ReleaseGateError, match="pkg:pypi/"):
+        release.verify_sbom_report(
+            write_sbom(
+                "deb-only.json",
+                [{"type": "library", "name": "libc6", "purl": "pkg:deb/debian/libc6@2.36"}],
+            )
+        )
+    with pytest.raises(release.ReleaseGateError, match="CycloneDX"):
+        path = tmp_path / "not-cyclonedx.json"
+        path.write_text('{"components": []}\n', encoding="utf-8")
+        release.verify_sbom_report(path)
+
+
+def test_verify_manifest_evidence_keeps_sbom_digest_only(tmp_path):
+    # verify_manifest_evidence must keep binding the SBOM by file digest; the
+    # image-component check is a separate build-time gate.
+    artifacts = _write_evidence_artifacts(tmp_path / "python-only")
+    (artifacts / release.SBOM_REPORT_FILE).write_text(
+        json.dumps(
+            {
+                "bomFormat": "CycloneDX",
+                "specVersion": "1.5",
+                "components": [
+                    {"type": "library", "name": "psycopg", "purl": "pkg:pypi/psycopg@3.2.1"}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    manifest = _manifest_for_artifacts(artifacts)
+    computed = release.verify_manifest_evidence(manifest, artifacts)
+    assert computed["sbom_digest"] == manifest["sbom_digest"]
 
 
 def test_verify_manifest_evidence_accepts_real_files_and_rejects_tampering(tmp_path):
@@ -327,6 +411,112 @@ def test_promotion_switches_state_audits_once_and_is_idempotent():
     assert repeated == result
     assert len(backend.switches) == 1
     assert len(backend.audits) == 1
+
+
+def test_promotion_requires_a_passed_b03_acceptance_before_switching():
+    manifest = _sample_rc_manifest()
+    approval = _approval(manifest)
+    digest = approval["candidate_digest"]
+    previous = _previous()
+
+    missing = _backend(b03_acceptances={})
+    with pytest.raises(release.ReleaseGateError, match="B03"):
+        release.promote_and_smoke(
+            manifest=manifest,
+            expected_manifest_digest=digest,
+            approval=approval,
+            backend=missing,
+            smoke_checks={"cli_smoke": lambda: True},
+            rollback_fn=lambda prev: {"restored_image": prev["image_id"], "ok": True},
+        )
+    assert missing.switches == []
+    assert missing.audits == []
+    assert missing.active_release()["image_id"] == previous["image_id"]
+
+    failed = _backend(
+        b03_acceptances={digest: {"status": "failed", "candidate_digest": digest}}
+    )
+    with pytest.raises(release.ReleaseGateError, match="status"):
+        release.promote_and_smoke(
+            manifest=manifest,
+            expected_manifest_digest=digest,
+            approval=approval,
+            backend=failed,
+            smoke_checks={"cli_smoke": lambda: True},
+            rollback_fn=lambda prev: {"restored_image": prev["image_id"], "ok": True},
+        )
+    assert failed.switches == []
+
+    mismatched = _backend(
+        b03_acceptances={
+            digest: {
+                "status": "passed",
+                "candidate_digest": "sha256:" + "f" * 64,
+            }
+        }
+    )
+    with pytest.raises(release.ReleaseGateError, match="candidate_digest"):
+        release.promote_and_smoke(
+            manifest=manifest,
+            expected_manifest_digest=digest,
+            approval=approval,
+            backend=mismatched,
+            smoke_checks={"cli_smoke": lambda: True},
+            rollback_fn=lambda prev: {"restored_image": prev["image_id"], "ok": True},
+        )
+    assert mismatched.switches == []
+
+    wrong_environment = _backend(
+        b03_acceptances={
+            digest: {
+                "status": "passed",
+                "candidate_digest": digest,
+                "environment": "prod",
+            }
+        }
+    )
+    with pytest.raises(release.ReleaseGateError, match="environment"):
+        release.promote_and_smoke(
+            manifest=manifest,
+            expected_manifest_digest=digest,
+            approval=approval,
+            backend=wrong_environment,
+            smoke_checks={"cli_smoke": lambda: True},
+            rollback_fn=lambda prev: {"restored_image": prev["image_id"], "ok": True},
+        )
+    assert wrong_environment.switches == []
+
+    passed = _backend(
+        b03_acceptances={digest: {"status": "passed", "candidate_digest": digest}}
+    )
+    result = release.promote_and_smoke(
+        manifest=manifest,
+        expected_manifest_digest=digest,
+        approval=approval,
+        backend=passed,
+        smoke_checks={"cli_smoke": lambda: True},
+        rollback_fn=lambda prev: {"restored_image": prev["image_id"], "ok": True},
+    )
+    assert result["status"] == "promoted"
+    assert passed.active_release()["image_id"] == manifest["control_plane_image_id"]
+
+
+def test_promotion_fails_closed_when_the_backend_cannot_prove_b03():
+    manifest = _sample_rc_manifest()
+    approval = _approval(manifest)
+    backend = _backend()
+    backend.b03_acceptance_for = None  # type: ignore[method-assign]
+    with pytest.raises(release.ReleaseGateError, match="cannot prove B03"):
+        release.promote_and_smoke(
+            manifest=manifest,
+            expected_manifest_digest=approval["candidate_digest"],
+            approval=approval,
+            backend=backend,
+            smoke_checks={"cli_smoke": lambda: True},
+            rollback_fn=lambda prev: {"restored_image": prev["image_id"], "ok": True},
+        )
+    assert backend.switches == []
+    assert backend.audits == []
 
 
 def test_replayed_approval_after_a_state_change_is_rejected():
@@ -518,7 +708,6 @@ def test_noop_rollback_fn_fails_closed_after_a_real_candidate_switch():
 def test_sloppy_backend_that_only_changes_image_id_fails_closed():
     manifest = _sample_rc_manifest()
     previous = _previous()
-    backend = _backend(previous=previous)
     approval = _approval(manifest)
 
     class SloppyBackend(release.DictPromotionBackend):
@@ -2263,6 +2452,40 @@ def test_b03_pass_checks_require_nonempty_evidence():
 
     valid_checks = json.loads(B03_PATH.read_text(encoding="utf-8"))["checks"]
     release._validate_b03_checks(valid_checks)
+
+
+def test_review_bundle_readability_requires_65534_readable_files_and_dirs(tmp_path):
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    review = bundle / "review.json"
+    review.write_text('{"decision":"approve"}\n', encoding="utf-8")
+
+    bundle.chmod(0o755)
+    review.chmod(0o644)
+    digest = release.verify_review_bundle_readability(bundle)
+    assert digest == release._sha256_file(review)
+
+    review.chmod(0o444)
+    assert release.verify_review_bundle_readability(bundle) == digest
+
+    review.chmod(0o600)
+    with pytest.raises(release.ReleaseGateError, match="readable|mode"):
+        release.verify_review_bundle_readability(bundle)
+
+    review.chmod(0o644)
+    bundle.chmod(0o700)
+    with pytest.raises(release.ReleaseGateError, match="traversable|mode"):
+        release.verify_review_bundle_readability(bundle)
+
+    bundle.chmod(0o755)
+    review.unlink()
+    review.symlink_to(tmp_path / "outside-review.json")
+    with pytest.raises(release.ReleaseGateError, match="symlink"):
+        release.verify_review_bundle_readability(bundle)
+
+    review.unlink()
+    with pytest.raises(release.ReleaseGateError, match="missing review.json"):
+        release.verify_review_bundle_readability(bundle)
 
 
 def test_archived_bundle_preflight_rejects_unreadable_bundle_permissions_before_container(

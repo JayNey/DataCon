@@ -63,3 +63,78 @@ gh api repos/JayNey/DataCon/actions/runners
 ```
 
 在未确认上述 GitHub 控制面设置生效且至少一台带 `datacon-internal` 标签的 runner 在线前，不得触发 `promote-internal`、`rollback-internal` 或 `b03-internal`。
+
+## 发布 Runbook（operator 按顺序执行）
+
+> 以下命令中的 `$DATACON_DATABASE_URL`、`$DATACON_BACKUP_DIR`、`<RUN_ID>` 等全部是占位符。不要把真实 DSN、secret、B03 材料或宿主机绝对路径写入仓库、issue、PR 或日志。本 Runbook 不提供“跳过 B03 验收”或“跳过归档包检查”的开关；相关门禁只会 fail closed。
+
+### 1. 迁移前先做持久化备份
+
+在运行迁移的同一台 operator 主机上，先确认备份目录位于持久卷，再执行：
+
+```bash
+: "${DATACON_DATABASE_URL:?set DATACON_DATABASE_URL}"
+: "${DATACON_BACKUP_DIR:?set DATACON_BACKUP_DIR}"
+umask 077
+backup="$DATACON_BACKUP_DIR/datacon-$(date -u +%Y%m%dT%H%M%SZ).dump"
+pg_dump "$DATACON_DATABASE_URL" --format=custom --file "$backup"
+chmod 600 "$backup"
+test -s "$backup"
+```
+
+备份文件只允许 operator 读取（`0600`），不得随发布制品上传。
+
+### 2. 停止 worker 与部署入口，确认 drain
+
+先停止会写入 `jobs` / `attempts` / `evidence` 的 worker 和部署入口，再确认没有活跃执行槽位：
+
+```bash
+datacon release slots --environment internal-lab
+```
+
+输出中必须满足：
+
+- `"environment": "internal-lab"`
+- `"active_slots": 0`
+- `"active_release"` 指向当前线上镜像
+
+`active_slots` 不为 0 时，`promote-internal` 和 `rollback-internal` 都会 fail closed；不要绕过该检查。
+
+### 3. 应用迁移（当前 001–009）
+
+确认 `schema_migrations` 已备份后执行：
+
+```bash
+datacon migrate
+```
+
+当前迁移范围为 `001` 到 `009`。其中 `009_b03_acceptance.sql` 只新增 `b03_acceptance` 表，不修改 `release_events` 的 `action` / `status` CHECK。迁移完成后可再次执行 `datacon migrate` 验证其幂等性（已记录的迁移不会重复应用）。
+
+### 4. 再执行 promote 或 rollback
+
+迁移成功后，才允许通过受保护的 `internal-lab` environment 调度发布 workflow。promote 前必须已经存在同一 `candidate_digest` 的 `status=passed` B03 验收记录；缺失或不一致时 `promote_and_smoke` 会抛 `ReleaseGateError`，`release_state` 不会切换。
+
+```bash
+# promote：artifact_run_id 与 expected_manifest_digest 由本次构建产生
+gh workflow run release.yml --ref main \
+  -f action=promote \
+  -f artifact_run_id=<RUN_ID> \
+  -f expected_manifest_digest=sha256:<64-hex>
+
+# rollback：target_digest 为要恢复的持久化镜像 ID
+gh workflow run release.yml --ref main \
+  -f action=rollback \
+  -f target_digest=sha256:<64-hex>
+```
+
+rollback job 会在切换前对目标 release 的 `evidence_root` 执行 `archived_bundle_preflight`，检查历史 `review.json` 可被 `65534` 读取，并把结果写入 `rollback-result.json` 后上传；任一步失败都会 fail closed。
+
+### 5. 重要：promote-internal 不自动迁移
+
+`promote-internal` / `rollback-internal` **不会**执行 `datacon migrate`。迁移必须由 operator 在 drain 之后、promote/rollback 之前显式完成。若数据库仍停留在旧迁移而候选镜像需要 009，promotion 的迁移账本校验会失败；不要通过手工改 `release_state.migration_version` 或跳过门禁来“修复”。
+
+### 6. 失败后的最小处置
+
+1. 保留 `rollback-result.json`、workflow run 链接和失败步骤日志（不要上传数据库备份或 B03 原始材料）。
+2. 若迁移本身失败，先用第 1 步的备份恢复数据库，再重新 drain 和迁移。
+3. 若 B03 记录缺失，先完成 `b03-internal` 验收并确认 `record_b03_acceptance` 成功，再重新 promote；不要手工插入 `b03_acceptance` 行。

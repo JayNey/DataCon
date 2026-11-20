@@ -427,7 +427,6 @@ def test_draft_write_failure_twice_fails_closed_without_third_analysis(
             )
         return real_record(*args, **kwargs)
 
-    real_freeze = state.freeze_plan
     freeze_calls = []
 
     def flaky_freeze(*args, **kwargs):

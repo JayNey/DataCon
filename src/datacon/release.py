@@ -59,6 +59,7 @@ SBOM_REPORT_FILE = "sbom.cdx.json"
 RELEASE_MANIFEST_FILE = "release-candidate-manifest.json"
 CANDIDATE_IMAGE_TAR = "control-plane-image.tar"
 PROMOTION_RESULT_FILE = "promotion-result.json"
+ROLLBACK_RESULT_FILE = "rollback-result.json"
 
 _SHA256 = re.compile(r"sha256:[0-9a-f]{64}")
 _GIT_SHA40 = re.compile(r"[0-9a-f]{40}")
@@ -251,7 +252,14 @@ def validate_release_candidate_manifest(manifest: Mapping[str, Any]) -> None:
         _require_digest(entry.get("sha256"), "migration entry sha256")
         if set(entry.keys()) != {"file", "sha256"}:
             raise ReleaseGateError("migration entry has unknown fields")
-    numbers = [int(_MIGRATION_NUMBER.match(name).group(1)) for name in names]
+    numbers: list[int] = []
+    for name in names:
+        match = _MIGRATION_NUMBER.match(name)
+        if match is None:
+            raise ReleaseGateError(
+                f"migration entry file must start with NNN_: {name!r}"
+            )
+        numbers.append(int(match.group(1)))
     if numbers != list(range(1, len(numbers) + 1)):
         raise ReleaseGateError(
             "migrations must be numbered consecutively from 001"
@@ -386,6 +394,41 @@ def verify_manifest_evidence(
     except ci_gates.GateError as error:
         raise ReleaseGateError(str(error)) from error
     return computed
+
+
+def verify_sbom_report(path: Path) -> dict[str, Any]:
+    """Require a real image CycloneDX SBOM with OS and Python components.
+
+    The release candidate is a Debian-based image, so Trivy must report both
+    ``pkg:deb/`` and ``pkg:pypi/`` purls. A Python-only lockfile SBOM is not
+    accepted as the release SBOM because it cannot describe the base image.
+    """
+    try:
+        document = jsonutil.loads_strict(Path(path).read_bytes())
+    except (OSError, jsonutil.StrictJsonError) as error:
+        raise ReleaseGateError(f"SBOM cannot be read strictly: {error}") from error
+    if not isinstance(document, Mapping) or document.get("bomFormat") != "CycloneDX":
+        raise ReleaseGateError("SBOM must be a CycloneDX document")
+    components = document.get("components")
+    if not isinstance(components, list):
+        raise ReleaseGateError("SBOM components must be a list")
+    purls = [
+        component["purl"]
+        for component in components
+        if isinstance(component, Mapping)
+        and isinstance(component.get("purl"), str)
+    ]
+    if not any(purl.startswith("pkg:deb/") for purl in purls):
+        raise ReleaseGateError(
+            "SBOM is missing pkg:deb/ components from the base image"
+        )
+    if not any(purl.startswith("pkg:pypi/") for purl in purls):
+        raise ReleaseGateError("SBOM is missing pkg:pypi/ components")
+    return {
+        "components": len(components),
+        "deb_components": sum(purl.startswith("pkg:deb/") for purl in purls),
+        "pypi_components": sum(purl.startswith("pkg:pypi/") for purl in purls),
+    }
 
 
 def generate_sbom(
@@ -613,6 +656,11 @@ class PromotionBackend(Protocol):
     def promotion_for(self, candidate_digest: str) -> Mapping[str, Any] | None:
         ...
 
+    def b03_acceptance_for(
+        self, candidate_digest: str
+    ) -> Mapping[str, Any] | None:
+        ...
+
 
 class DictPromotionBackend:
     """In-memory backend for contract tests; it records every state change."""
@@ -624,11 +672,23 @@ class DictPromotionBackend:
         active_slots: int = 0,
         promotions: Mapping[str, Mapping[str, Any]] | None = None,
         migrations: Mapping[str, str] | None = None,
+        b03_acceptances: Mapping[str, Mapping[str, Any]] | None = None,
     ):
         self._active = validate_previous_release(active_release)
         self._slots = active_slots
         self.promotions = dict(promotions or {})
         self._migrations = dict(migrations or {})
+        # ``None`` models a store that has already accepted every candidate
+        # (the historical test default). Passing an explicit map — including
+        # ``{}`` — exercises missing, failed, or mismatched B03 records.
+        self._b03_acceptances = (
+            None
+            if b03_acceptances is None
+            else {
+                str(digest): dict(record)
+                for digest, record in b03_acceptances.items()
+            }
+        )
         self.switches: list[dict[str, Any]] = []
         self.audits: list[dict[str, Any]] = []
 
@@ -697,6 +757,19 @@ class DictPromotionBackend:
 
     def promotion_for(self, candidate_digest: str) -> Mapping[str, Any] | None:
         found = self.promotions.get(candidate_digest)
+        return dict(found) if found is not None else None
+
+    def b03_acceptance_for(
+        self, candidate_digest: str
+    ) -> Mapping[str, Any] | None:
+        explicit = getattr(self, "_b03_acceptances", None)
+        if explicit is None:
+            return {
+                "environment": RELEASE_ENVIRONMENT,
+                "candidate_digest": candidate_digest,
+                "status": "passed",
+            }
+        found = explicit.get(candidate_digest)
         return dict(found) if found is not None else None
 
 
@@ -913,6 +986,57 @@ def _existing_promotion(
     return dict(existing)
 
 
+def require_b03_acceptance(
+    backend: PromotionBackend, candidate_digest: str
+) -> dict[str, Any]:
+    """Fail closed unless the backend proves a passed B03 acceptance.
+
+    The production backend is ``state.ReleaseStore``; its lookup already scopes
+    the record to ``internal-lab`` and raises when the row is missing. A test
+    double may return ``None``. A backend that cannot expose the lookup is not
+    allowed to promote, so there is no production bypass.
+    """
+    lookup = getattr(backend, "b03_acceptance_for", None)
+    if not callable(lookup):
+        raise ReleaseGateError(
+            "promotion blocked: release backend cannot prove B03 acceptance"
+        )
+    try:
+        record = lookup(candidate_digest)
+    except Exception as error:  # noqa: BLE001 - any lookup failure blocks promotion
+        raise ReleaseGateError(
+            "promotion blocked: B03 acceptance is missing or unreadable for "
+            f"candidate {candidate_digest}: {error}"
+        ) from error
+    if record is None:
+        raise ReleaseGateError(
+            f"promotion blocked: no B03 acceptance record for candidate {candidate_digest}"
+        )
+    if not isinstance(record, Mapping):
+        raise ReleaseGateError(
+            "promotion blocked: B03 acceptance record must be an object"
+        )
+    status = record.get("status")
+    if status != "passed":
+        raise ReleaseGateError(
+            "promotion blocked: B03 acceptance status is "
+            f"{status!r}, expected 'passed'"
+        )
+    recorded_digest = record.get("candidate_digest")
+    if recorded_digest is not None and recorded_digest != candidate_digest:
+        raise ReleaseGateError(
+            "promotion blocked: B03 acceptance candidate_digest does not match "
+            "the approved manifest digest"
+        )
+    environment = record.get("environment")
+    if environment is not None and environment != RELEASE_ENVIRONMENT:
+        raise ReleaseGateError(
+            "promotion blocked: B03 acceptance environment "
+            f"{environment!r} does not match {RELEASE_ENVIRONMENT!r}"
+        )
+    return dict(record)
+
+
 def promote_and_smoke(
     *,
     manifest: Mapping[str, Any],
@@ -951,6 +1075,10 @@ def promote_and_smoke(
         require_archived_bundle=require_archived_bundle,
         skip_reason=skip_reason,
     )
+    # Every promotion attempt, including an idempotent replay, must still
+    # prove the B03 acceptance; the replay may return the persisted result but
+    # it must not become a path around the gate.
+    require_b03_acceptance(backend, candidate_digest)
     existing = backend.promotion_for(candidate_digest)
     if existing is not None:
         return _existing_promotion(backend, existing)
@@ -1003,6 +1131,7 @@ def promote_and_smoke(
         existing = backend.promotion_for(candidate_digest)
         if existing is not None:
             return _existing_promotion(backend, existing)
+        require_b03_acceptance(backend, candidate_digest)
         _require_drained(backend, action="promotion")
         current = backend.active_release()
         if current is None or not _same_release(current, previous):
@@ -1037,11 +1166,9 @@ def promote_and_smoke(
                 break
 
         if failed_check is not None:
-            before_rollback = (
-                len(backend.switches)
-                if isinstance(getattr(backend, "switches", None), list)
-                else None
-            )
+            switch_log = getattr(backend, "switches", None)
+            switch_log = switch_log if isinstance(switch_log, list) else None
+            before_rollback = len(switch_log) if switch_log is not None else None
             try:
                 rollback_outcome = rollback_fn(previous)
             except Exception as error:  # noqa: BLE001 - never swallow rollback failures
@@ -1056,8 +1183,8 @@ def promote_and_smoke(
                     "restore the previous release "
                     "(image/config/migration_version/evidence_root)"
                 )
-            if before_rollback is not None:
-                for entry in backend.switches[before_rollback:]:
+            if before_rollback is not None and switch_log is not None:
+                for entry in switch_log[before_rollback:]:
                     if entry.get("action") != "rollback":
                         continue
                     switched_release = {
@@ -1329,6 +1456,93 @@ def _verify_bundle_container_readability(bundle_path: Path) -> None:
                     raise ReleaseGateError(
                         f"refusing promotion: archived bundle contains non-regular entry: {child}"
                     )
+
+
+def verify_review_bundle_readability(bundle_path: str | Path) -> str:
+    """Require ``review.json`` to be world-readable, non-writable and non-link.
+
+    Rollback reads a historical bundle under the target release's evidence
+    root. The container runs as UID/GID 65534, so a root-only 0o600 review file
+    would make the post-rollback review unreadable. Directories must be
+    traversable (0o755-style) and regular files readable (0o644/0o444-style);
+    group/other write bits and every symlink are rejected.
+    """
+    path = Path(bundle_path)
+    _reject_symlink_ancestors(path, label="archived review bundle")
+    try:
+        root_stat = path.lstat()
+    except OSError as error:
+        raise ReleaseGateError(
+            f"rollback blocked: cannot inspect archived review bundle: {error}"
+        ) from error
+    if stat.S_ISLNK(root_stat.st_mode):
+        raise ReleaseGateError(
+            "rollback blocked: archived review bundle root is a symlink"
+        )
+    if not stat.S_ISDIR(root_stat.st_mode):
+        raise ReleaseGateError(
+            "rollback blocked: archived review bundle path is not a directory"
+        )
+    review_path = path / "review.json"
+    try:
+        review_stat = review_path.lstat()
+    except FileNotFoundError as error:
+        raise ReleaseGateError(
+            "rollback blocked: archived bundle is missing review.json"
+        ) from error
+    except OSError as error:
+        raise ReleaseGateError(
+            f"rollback blocked: cannot inspect archived review.json: {error}"
+        ) from error
+    if stat.S_ISLNK(review_stat.st_mode):
+        raise ReleaseGateError(
+            "rollback blocked: archived review.json must not be a symlink"
+        )
+    if not stat.S_ISREG(review_stat.st_mode):
+        raise ReleaseGateError(
+            "rollback blocked: archived review.json must be a regular file"
+        )
+    mode = stat.S_IMODE(review_stat.st_mode)
+    if (mode & 0o004) == 0 or (mode & 0o022) != 0:
+        raise ReleaseGateError(
+            "rollback blocked: archived review.json mode "
+            f"{oct(mode)} is not readable by UID 65534 without group/other "
+            "write (expected 0o644 or 0o444)"
+        )
+
+    # The root must be traversable by 65534 even though review.json currently
+    # sits directly under it; keep the loop so a future role move stays safe.
+    current = review_path.parent
+    while True:
+        try:
+            current_stat = current.lstat()
+        except OSError as error:
+            raise ReleaseGateError(
+                f"rollback blocked: cannot inspect archived review directory: {error}"
+            ) from error
+        if stat.S_ISLNK(current_stat.st_mode):
+            raise ReleaseGateError(
+                "rollback blocked: archived review path must not contain a symlink"
+            )
+        if not stat.S_ISDIR(current_stat.st_mode):
+            raise ReleaseGateError(
+                "rollback blocked: archived review parent is not a directory"
+            )
+        directory_mode = stat.S_IMODE(current_stat.st_mode)
+        if (directory_mode & 0o005) != 0o005 or (directory_mode & 0o022) != 0:
+            raise ReleaseGateError(
+                "rollback blocked: archived review directory mode "
+                f"{oct(directory_mode)} is not traversable by UID 65534 "
+                "(expected 0o755)"
+            )
+        if current == path:
+            break
+        if current == current.parent:
+            raise ReleaseGateError(
+                "rollback blocked: archived review.json escaped the bundle root"
+            )
+        current = current.parent
+    return _sha256_file(review_path)
 
 
 def archived_bundle_preflight(
@@ -1757,11 +1971,11 @@ def write_smoke_evidence_bundle(
         verdict=decision.verdict,
         verify=evidence.verify_bundle,
     )
-    for item in sorted(bundle_dir.rglob("*"), key=lambda p: len(p.parts)):
-        if item.is_dir():
-            item.chmod(0o755)
+    for path_entry in sorted(bundle_dir.rglob("*"), key=lambda p: len(p.parts)):
+        if path_entry.is_dir():
+            path_entry.chmod(0o755)
         else:
-            item.chmod(0o444)
+            path_entry.chmod(0o444)
     bundle_dir.chmod(0o755)
     return info.manifest_digest
 
@@ -2115,6 +2329,8 @@ def _validate_b03_admission(admission: Mapping[str, Any]) -> dict[str, Any]:
     build = admission.get("build")
     toolchain_image = _b03_string(build, "toolchain_image", "build")
     harness = admission.get("harness")
+    if not isinstance(harness, Mapping):
+        raise ReleaseGateError("B03 admission harness must be an object")
     asan_options = _b03_string(harness, "asan_options", "harness")
     expected_exit = {
         "normal": _b03_exit_code(harness, "normal_exit_code", "harness"),
@@ -2140,6 +2356,8 @@ def _validate_b03_admission(admission: Mapping[str, Any]) -> dict[str, Any]:
             )
         expected_stdout[key] = value
     repository = admission.get("repository")
+    if not isinstance(repository, Mapping):
+        raise ReleaseGateError("B03 admission repository must be an object")
     repository_url = _b03_url(repository, "url", "repository")
     source_path = repository.get("source_path", "src/regext.c")
     if (
@@ -2515,11 +2733,11 @@ def _write_readonly_staged_file(path: Path, data: bytes) -> None:
 
 
 def _chmod_tree(root: Path, *, dir_mode: int = 0o755, file_mode: int = 0o444) -> None:
-    for item in sorted(root.rglob("*"), key=lambda p: len(p.parts)):
-        if item.is_dir():
-            item.chmod(dir_mode)
+    for path_entry in sorted(root.rglob("*"), key=lambda p: len(p.parts)):
+        if path_entry.is_dir():
+            path_entry.chmod(dir_mode)
         else:
-            item.chmod(file_mode)
+            path_entry.chmod(file_mode)
     root.chmod(dir_mode)
 
 

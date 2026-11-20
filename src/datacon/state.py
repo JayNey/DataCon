@@ -1938,6 +1938,10 @@ class ReleaseStore:
 
     def record_audit(self, result: Mapping[str, Any]) -> None:
         status = result.get("status")
+        if not isinstance(status, str):
+            raise ReleaseStateError(
+                f"unknown release result status: {status!r}"
+            )
         action = {"promoted": "promote", "rolled_back": "rollback"}.get(status)
         if action is None:
             raise ReleaseStateError(f"unknown release result status: {status!r}")

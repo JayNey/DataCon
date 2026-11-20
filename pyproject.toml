@@ -25,7 +25,48 @@ dependencies = [
 datacon = "datacon.cli:main"
 
 [dependency-groups]
-dev = ["pytest>=8,<10", "pyyaml>=6,<7"]
+# Linters are pinned exactly so a local run and CI agree on rules and
+# type-checker behaviour. Bump both through a reviewed dependency update.
+dev = [
+    "pytest>=8,<10",
+    "pyyaml>=6,<7",
+    "ruff==0.17.6",
+    "mypy==2.4.1",
+]
+
+[tool.ruff]
+target-version = "py311"
+# Start from the long-standing Ruff defaults (E4/E7/E9/F). Widening the rule
+# set is a separate, reviewable change rather than an implicit CI break.
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]
+
+[tool.mypy]
+python_version = "3.11"
+# Base profile, not strict: keep the gate useful without turning every dynamic
+# boundary into a blanket failure. Missing third-party stubs are ignored.
+ignore_missing_imports = true
+warn_unused_configs = true
+files = ["src/datacon"]
+
+# Narrow per-module exceptions for legacy modules whose third-party typing or
+# dynamic dict plumbing is not part of Step 4. Each override names the exact
+# error codes; new error kinds in those modules still fail the gate.
+[[tool.mypy.overrides]]
+module = ["datacon.workflow"]
+disable_error_code = ["assignment", "call-overload"]
+
+[[tool.mypy.overrides]]
+module = ["datacon.execution"]
+disable_error_code = ["assignment", "misc", "var-annotated"]
+
+[[tool.mypy.overrides]]
+module = ["datacon.tools.sandbox"]
+disable_error_code = ["assignment", "attr-defined", "union-attr"]
+
+[[tool.mypy.overrides]]
+module = ["datacon.evidence"]
+disable_error_code = ["arg-type", "union-attr"]
 
 [tool.uv]
 # CI still pins exact uv==0.13.7 with its wheel sha256 in requirements-ci.txt;

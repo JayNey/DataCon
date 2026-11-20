@@ -884,6 +884,73 @@ def test_static_gates_scan_yaml_workflows_too(tmp_path):
     assert any("evil.yaml" in error for error in report["errors"])
 
 
+def test_markdown_file_selection_includes_docs_and_tests(tmp_path):
+    (tmp_path / "docs" / "nested").mkdir(parents=True)
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "README.md").write_text("# Fixture\n", encoding="utf-8")
+    (tmp_path / "docs" / "guide.md").write_text("# Guide\n", encoding="utf-8")
+    (tmp_path / "docs" / "nested" / "deep.md").write_text("# Deep\n", encoding="utf-8")
+    (tmp_path / "tests" / "notes.md").write_text("# Notes\n", encoding="utf-8")
+    (tmp_path / "docs" / "ignored.txt").write_text("not markdown\n", encoding="utf-8")
+
+    selected = {
+        path.relative_to(tmp_path).as_posix()
+        for path in ci_gates.repository_markdown_files(tmp_path)
+    }
+    assert selected == {
+        "README.md",
+        "docs/guide.md",
+        "docs/nested/deep.md",
+        "tests/notes.md",
+    }
+
+
+def test_static_gates_check_readme_docs_and_tests_markdown(tmp_path):
+    root = tmp_path / "repo"
+    (root / ".github" / "workflows").mkdir(parents=True)
+    (root / "docs" / "nested").mkdir(parents=True)
+    (root / "tests").mkdir()
+    (root / "examples").mkdir()
+    shutil.copy2(REPO_ROOT / "pyproject.toml", root / "pyproject.toml")
+    shutil.copy2(REPO_ROOT / "uv.lock", root / "uv.lock")
+    shutil.copy2(REPO_ROOT / "requirements-ci.txt", root / "requirements-ci.txt")
+    shutil.copy2(REPO_ROOT / "examples" / "request.json", root / "examples" / "request.json")
+    (root / "README.md").write_text("# Fixture\n", encoding="utf-8")
+    (root / "docs" / "guide.md").write_text(
+        "Broken [missing](does-not-exist.md).\n", encoding="utf-8"
+    )
+    (root / "docs" / "nested" / "deep.md").write_text(
+        "Unknown REQ-99 reference.\n", encoding="utf-8"
+    )
+    (root / "tests" / "notes.md").write_text(
+        "Valid [readme](../README.md).\n", encoding="utf-8"
+    )
+    (root / ".github" / "workflows" / "good.yml").write_text(
+        "name: Good\n"
+        "on:\n"
+        "  pull_request:\n"
+        "permissions:\n"
+        "  contents: read\n"
+        "jobs:\n"
+        "  test:\n"
+        "    steps:\n"
+        "      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262\n",
+        encoding="utf-8",
+    )
+
+    report = ci_gates.run_repo_static_gates(root)
+    assert report["checked_markdown"] == 4
+    assert any(
+        "docs/guide.md" in error and "does-not-exist.md" in error
+        for error in report["errors"]
+    ), report["errors"]
+    assert any(
+        "docs/nested/deep.md" in error and "REQ-99" in error
+        for error in report["errors"]
+    ), report["errors"]
+    assert not any("tests/notes.md" in error for error in report["errors"])
+
+
 def test_dependency_lock_checks_version_constraints_not_only_names(tmp_path):
     root = tmp_path / "repo"
     root.mkdir()

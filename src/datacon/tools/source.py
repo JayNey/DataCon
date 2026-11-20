@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import base64
 from dataclasses import dataclass
+import json
 import os
 from pathlib import Path
 import re
 import signal
 import subprocess
+import sys
 import threading
+from typing import Any, Mapping
 
 from datacon import jsonutil
 
@@ -24,6 +28,15 @@ MAX_CHANGED_PATHS = 10_000
 MAX_SYMBOLS = 10_000
 MAX_GIT_STDERR_BYTES = 64 * 1024
 GIT_TIMEOUT_SECONDS = 30
+# Tree-sitter runs in an isolated Python subprocess so a parser bug, a hostile
+# source file or an unbounded memory allocation cannot hang or exhaust the
+# worker process. The parent enforces the timeout and (on Linux) the address
+# space cap; the child only receives the pinned source bytes.
+TREE_SITTER_TIMEOUT_SECONDS = 15.0
+TREE_SITTER_MEMORY_LIMIT_BYTES = 512 * 1024 * 1024
+TREE_SITTER_WORKER_MODULE = "datacon.tools._tree_sitter_worker"
+TREE_SITTER_MAX_OUTPUT_BYTES = 8 * 1024 * 1024
+_TREE_SITTER_MAX_REQUEST_BYTES = 8 * 1024 * 1024
 _READ_CHUNK_BYTES = 64 * 1024
 _REF = re.compile(r"refs/(?:heads|tags)/[A-Za-z0-9][A-Za-z0-9._/-]*")
 _OID = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
@@ -158,6 +171,12 @@ def _bounded_run(
             f"git {operation} could not start: {type(error).__name__}",
         ) from error
 
+    stdout_pipe = process.stdout
+    stderr_pipe = process.stderr
+    if stdout_pipe is None or stderr_pipe is None:
+        _kill_process(process)
+        raise SourceToolError(tool_id, f"git {operation} pipes are unavailable")
+
     stdout = bytearray()
     stderr = bytearray()
     stdout_overflow = threading.Event()
@@ -166,7 +185,7 @@ def _bounded_run(
     def read_stdout() -> None:
         try:
             while True:
-                chunk = process.stdout.read(_READ_CHUNK_BYTES)
+                chunk = stdout_pipe.read(_READ_CHUNK_BYTES)
                 if not chunk:
                     return
                 remaining = max_stdout_bytes - len(stdout)
@@ -179,14 +198,14 @@ def _bounded_run(
                 stdout.extend(chunk)
         finally:
             try:
-                process.stdout.close()
+                stdout_pipe.close()
             except OSError:
                 pass
 
     def read_stderr() -> None:
         try:
             while True:
-                chunk = process.stderr.read(_READ_CHUNK_BYTES)
+                chunk = stderr_pipe.read(_READ_CHUNK_BYTES)
                 if not chunk:
                     return
                 remaining = max_stderr_bytes - len(stderr)
@@ -196,7 +215,7 @@ def _bounded_run(
                 # in memory. The child must not block on a full stderr pipe.
         finally:
             try:
-                process.stderr.close()
+                stderr_pipe.close()
             except OSError:
                 pass
 
@@ -586,6 +605,168 @@ def _walk(node):
         stack.extend(reversed(current.children))
 
 
+def _tree_sitter_preexec() -> None:
+    """Apply the POSIX address-space cap in the child before exec.
+
+    ``RLIMIT_AS`` is enforced on Linux. macOS rejects lowering the limit with
+    ``ValueError`` even though the hard limit is unlimited; there the timeout
+    remains the only bound and the memory-limit test is skipped.
+    """
+    if os.name != "posix":
+        return
+    try:
+        import resource
+
+        limit = TREE_SITTER_MEMORY_LIMIT_BYTES
+        resource.setrlimit(resource.RLIMIT_AS, (limit, limit))
+    except (ImportError, OSError, ValueError):
+        return
+
+
+def _tree_sitter_environment() -> dict[str, str]:
+    """Build a minimal child environment without DataCon secrets."""
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith("DATACON_")
+    }
+    environment["PYTHONHASHSEED"] = "0"
+    environment["PYTHONDONTWRITEBYTECODE"] = "1"
+    return environment
+
+
+def _run_tree_sitter_worker(payload: bytes) -> Mapping[str, Any]:
+    """Run the extraction worker with a hard timeout and no stderr passthrough.
+
+    Child stderr is discarded so a parser crash cannot print a host path into
+    the analysis error. The parent reports stable, path-free messages instead.
+    """
+    command = [sys.executable, "-B", "-m", TREE_SITTER_WORKER_MODULE]
+    preexec = _tree_sitter_preexec if os.name == "posix" else None
+    try:
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            env=_tree_sitter_environment(),
+            start_new_session=True,
+            preexec_fn=preexec,
+        )
+    except (OSError, ValueError) as error:
+        raise SourceToolError(
+            "tree_sitter.extract", "tree-sitter worker could not start"
+        ) from error
+
+    timeout = TREE_SITTER_TIMEOUT_SECONDS
+    try:
+        stdout, _ = process.communicate(payload, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _kill_process(process)
+        try:
+            process.communicate(timeout=5)
+        except (subprocess.TimeoutExpired, OSError, ValueError):
+            try:
+                process.kill()
+            except OSError:
+                pass
+        raise SourceToolError(
+            "tree_sitter.extract",
+            f"tree-sitter extraction timed out after {timeout:g} seconds",
+        ) from None
+    if len(stdout) > TREE_SITTER_MAX_OUTPUT_BYTES:
+        raise SourceToolError(
+            "tree_sitter.extract", "tree-sitter worker output exceeds the analysis cap"
+        )
+    if process.returncode != 0:
+        # A worker killed by RLIMIT_AS, a crash, or a missing parser must never
+        # look like a clean empty extraction.
+        raise SourceToolError(
+            "tree_sitter.extract",
+            "tree-sitter worker failed before returning a result "
+            "(crash, memory limit, or missing parser)",
+        )
+    try:
+        response = json.loads(stdout)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise SourceToolError(
+            "tree_sitter.extract", "tree-sitter worker returned an invalid result"
+        ) from error
+    if not isinstance(response, Mapping):
+        raise SourceToolError(
+            "tree_sitter.extract", "tree-sitter worker returned an invalid result"
+        )
+    return response
+
+
+_TREE_SITTER_ERROR_MESSAGES = {
+    "syntax_error": "cannot parse {path}: syntax error",
+    "parse_error": "cannot parse {path}: parser failure",
+    "parser_unavailable": "cannot parse {path}: parser unavailable",
+    "too_many_symbols": "too many symbols in one source file",
+    "memory": "tree-sitter extraction exceeded the memory limit",
+    "internal": "cannot parse {path}: parser failure",
+}
+
+
+def _validated_symbols(
+    response: Mapping[str, Any],
+    *,
+    safe_path: str,
+    revision: str,
+    function_name: str,
+    role: str,
+) -> list[dict]:
+    raw_symbols = response.get("symbols")
+    if not isinstance(raw_symbols, list):
+        raise SourceToolError(
+            "tree_sitter.extract", "tree-sitter worker returned an invalid result"
+        )
+    symbols: list[dict] = []
+    for entry in raw_symbols:
+        if not isinstance(entry, Mapping) or set(entry) != {
+            "name",
+            "path",
+            "role",
+            "revision",
+            "start_line",
+            "end_line",
+        }:
+            raise SourceToolError(
+                "tree_sitter.extract", "tree-sitter worker returned an invalid result"
+            )
+        start_line = entry["start_line"]
+        end_line = entry["end_line"]
+        if (
+            entry["name"] != function_name
+            or entry["path"] != safe_path
+            or entry["role"] != role
+            or entry["revision"] != revision
+            or type(start_line) is not int
+            or type(end_line) is not int
+            or start_line < 1
+            or end_line < start_line
+        ):
+            raise SourceToolError(
+                "tree_sitter.extract", "tree-sitter worker returned an invalid result"
+            )
+        symbols.append(
+            {
+                "name": function_name,
+                "path": safe_path,
+                "role": role,
+                "revision": revision,
+                "start_line": start_line,
+                "end_line": end_line,
+            }
+        )
+    if len(symbols) > MAX_SYMBOLS:
+        raise SourceToolError(
+            "tree_sitter.extract", "too many symbols in one source file"
+        )
+    return symbols
+
+
 def extract_symbols(
     source: bytes,
     *,
@@ -594,48 +775,47 @@ def extract_symbols(
     function_name: str,
     role: str,
 ) -> list[dict]:
-    """Extract a named function definition or its call sites with Tree-sitter."""
+    """Extract a named function definition or its call sites with Tree-sitter.
+
+    Parsing happens in a separate Python process. The function's return shape
+    and ``SourceToolError`` semantics are unchanged, so callers can keep
+    binding the result digest as evidence.
+    """
     if len(source) > MAX_SOURCE_BYTES:
         raise SourceToolError("tree_sitter.extract", "source file exceeds the analysis cap")
     jsonutil.require_text(function_name, "function_name")
     safe_path = jsonutil.safe_relative_path(path, "source path")
-    try:
-        tree = _parser().parse(source)
-    except Exception as error:  # tree-sitter raises a mix of parser errors
+    if role not in ("definition", "call_site"):
+        return []
+    if not isinstance(revision, str):
         raise SourceToolError(
-            "tree_sitter.extract", f"cannot parse {safe_path}: {error}"
-        ) from error
-    if tree.root_node.has_error:
-        raise SourceToolError(
-            "tree_sitter.extract", f"cannot parse {safe_path}: syntax error"
+            "tree_sitter.extract", f"cannot parse {safe_path}: invalid revision"
         )
+    request = {
+        "source": base64.b64encode(source).decode("ascii"),
+        "path": safe_path,
+        "revision": revision,
+        "function_name": function_name,
+        "role": role,
+        "max_symbols": MAX_SYMBOLS,
+    }
+    payload = json.dumps(request, separators=(",", ":")).encode("utf-8")
+    if len(payload) > _TREE_SITTER_MAX_REQUEST_BYTES:
+        raise SourceToolError("tree_sitter.extract", "source file exceeds the analysis cap")
 
-    symbols: list[dict] = []
-    for node in _walk(tree.root_node):
-        if role == "definition" and node.type == "function_definition":
-            if _function_name(node) != function_name:
-                continue
-        elif role == "call_site" and node.type == "call_expression":
-            function = node.child_by_field_name("function")
-            if function is None or function.type != "identifier":
-                continue
-            if function.text.decode("utf-8", "replace") != function_name:
-                continue
-        else:
-            continue
-        if len(symbols) >= MAX_SYMBOLS:
-            raise SourceToolError(
-                "tree_sitter.extract", "too many symbols in one source file"
-            )
-        symbols.append(
-            {
-                "name": function_name,
-                "path": safe_path,
-                "role": role,
-                "revision": revision,
-                "start_line": node.start_point.row + 1,
-                "end_line": node.end_point.row + 1,
-            }
+    response = _run_tree_sitter_worker(payload)
+    if response.get("ok") is not True:
+        code = response.get("error")
+        template = _TREE_SITTER_ERROR_MESSAGES.get(
+            code if isinstance(code, str) else "",
+            "cannot parse {path}: parser failure",
         )
-    return symbols
+        raise SourceToolError("tree_sitter.extract", template.format(path=safe_path))
+    return _validated_symbols(
+        response,
+        safe_path=safe_path,
+        revision=revision,
+        function_name=function_name,
+        role=role,
+    )
 

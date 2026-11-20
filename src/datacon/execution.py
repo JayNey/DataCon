@@ -3406,9 +3406,9 @@ def _archive_only(dsn: str, context: ExecutionContext) -> ExecutionResult:
         item = {
             key: value for key, value in row.items() if key != "attempt_token"
         }
-        for field in ("started_at", "finished_at"):
-            if item.get(field) is not None:
-                item[field] = jsonutil.timestamp(item[field])
+        for column in ("started_at", "finished_at"):
+            if item.get(column) is not None:
+                item[column] = jsonutil.timestamp(item[column])
         attempt_rows.append(item)
     artifacts = _evidence_artifacts(
         context,
@@ -3767,8 +3767,6 @@ def run_execution(
         decision = decide_verdict(
             policy, [_to_observation(run, build_root) for run in runs], builds=builds
         )
-        verdict = decision.verdict
-        verdict_reason = decision.reason_code
     except ExecutionBlocked as error:
         return _finish_blocked(
             dsn, job_id, generation, error, context=context, probe=probe_payload, builds=builds, runs=runs
@@ -3821,9 +3819,9 @@ def run_execution(
         item = {
             key: value for key, value in row.items() if key != "attempt_token"
         }
-        for field in ("started_at", "finished_at"):
-            if item.get(field) is not None:
-                item[field] = jsonutil.timestamp(item[field])
+        for column in ("started_at", "finished_at"):
+            if item.get(column) is not None:
+                item[column] = jsonutil.timestamp(item[column])
         attempt_rows.append(item)
     execution_metadata = {
         "job_id": context.job_id_text,
@@ -3873,7 +3871,7 @@ def run_execution(
         )
     except (BundleError, OSError) as error:
         archive_error = f"EVIDENCE_WRITE_FAILED: {error}"
-    except (state.StateError, state.StaleGeneration) as error:
+    except (state.StateError, state.StaleGeneration):
         return ExecutionResult("STALE")
     if archive_error is not None:
         try:

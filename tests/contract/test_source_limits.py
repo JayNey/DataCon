@@ -198,3 +198,142 @@ def test_timeout_is_still_transient_and_kills_the_process(monkeypatch):
         git._run_limited("diff", "a" * 40, max_stdout_bytes=8)
 
     assert process.killed is True
+
+
+def _fixture_source(relative: str) -> bytes:
+    return (FIXTURES / relative).read_bytes()
+
+
+def test_tree_sitter_extracts_definitions_and_call_sites_in_a_subprocess():
+    source = _fixture_source("vulnerable/parser.c")
+    definitions = source_module.extract_symbols(
+        source,
+        path="vulnerable/parser.c",
+        revision="vulnerable",
+        function_name="parse_token",
+        role="definition",
+    )
+    assert definitions == [
+        {
+            "name": "parse_token",
+            "path": "vulnerable/parser.c",
+            "role": "definition",
+            "revision": "vulnerable",
+            "start_line": 12,
+            "end_line": 24,
+        }
+    ]
+
+    call_sites = source_module.extract_symbols(
+        _fixture_source("harness.c"),
+        path="harness.c",
+        revision="harness",
+        function_name="parse_token",
+        role="call_site",
+    )
+    assert [(item["path"], item["revision"], item["start_line"]) for item in call_sites] == [
+        ("harness.c", "harness", 14)
+    ]
+
+
+def test_tree_sitter_rejects_syntax_errors_without_leaking_paths(tmp_path):
+    source = b"int main( { this is not C"
+    with pytest.raises(SourceToolError) as caught:
+        source_module.extract_symbols(
+            source,
+            path="parser.c",
+            revision="vulnerable",
+            function_name="parse_token",
+            role="definition",
+        )
+    assert caught.value.tool_id == "tree_sitter.extract"
+    assert "syntax error" in caught.value.message
+    assert str(tmp_path) not in caught.value.message
+    assert "/Users/" not in caught.value.message
+
+
+def test_tree_sitter_timeout_kills_the_worker(monkeypatch):
+    import time
+
+    monkeypatch.setattr(source_module, "TREE_SITTER_TIMEOUT_SECONDS", 0.000001)
+    started = time.monotonic()
+    with pytest.raises(SourceToolError) as caught:
+        source_module.extract_symbols(
+            _fixture_source("vulnerable/parser.c"),
+            path="vulnerable/parser.c",
+            revision="vulnerable",
+            function_name="parse_token",
+            role="definition",
+        )
+    elapsed = time.monotonic() - started
+    assert caught.value.tool_id == "tree_sitter.extract"
+    assert "timed out" in caught.value.message
+    assert elapsed < 10, f"timeout path took {elapsed:.2f}s"
+
+
+def test_tree_sitter_worker_crash_fails_closed(monkeypatch):
+    monkeypatch.setattr(
+        source_module, "TREE_SITTER_WORKER_MODULE", "datacon.tools._missing_worker"
+    )
+    with pytest.raises(SourceToolError) as caught:
+        source_module.extract_symbols(
+            _fixture_source("vulnerable/parser.c"),
+            path="vulnerable/parser.c",
+            revision="vulnerable",
+            function_name="parse_token",
+            role="definition",
+        )
+    assert caught.value.tool_id == "tree_sitter.extract"
+    assert "worker failed" in caught.value.message
+    assert "/Users/" not in caught.value.message
+
+
+@pytest.mark.skipif(
+    os.name != "posix" or not os.path.exists("/proc/self/status"),
+    reason="RLIMIT_AS memory-limit enforcement is Linux-specific",
+)
+def test_tree_sitter_memory_limit_fails_closed(monkeypatch):
+    monkeypatch.setattr(source_module, "TREE_SITTER_MEMORY_LIMIT_BYTES", 1)
+    with pytest.raises(SourceToolError) as caught:
+        source_module.extract_symbols(
+            _fixture_source("vulnerable/parser.c"),
+            path="vulnerable/parser.c",
+            revision="vulnerable",
+            function_name="parse_token",
+            role="definition",
+        )
+    assert caught.value.tool_id == "tree_sitter.extract"
+    assert any(
+        marker in caught.value.message
+        for marker in ("memory", "worker failed", "could not start")
+    ), caught.value.message
+
+
+def test_tree_sitter_rejects_a_worker_that_returns_a_host_path(monkeypatch):
+    def fake_worker(_payload):
+        return {
+            "ok": True,
+            "symbols": [
+                {
+                    "name": "parse_token",
+                    "path": "/Users/operator/secret/parser.c",
+                    "role": "definition",
+                    "revision": "vulnerable",
+                    "start_line": 1,
+                    "end_line": 2,
+                }
+            ],
+        }
+
+    monkeypatch.setattr(source_module, "_run_tree_sitter_worker", fake_worker)
+    with pytest.raises(SourceToolError) as caught:
+        source_module.extract_symbols(
+            _fixture_source("vulnerable/parser.c"),
+            path="vulnerable/parser.c",
+            revision="vulnerable",
+            function_name="parse_token",
+            role="definition",
+        )
+    assert caught.value.tool_id == "tree_sitter.extract"
+    assert "invalid result" in caught.value.message
+    assert "/Users/" not in caught.value.message

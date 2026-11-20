@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 from pathlib import Path
 import shutil
 import threading
@@ -606,7 +605,6 @@ def test_large_replay_logs_are_summarized_not_embedded(
     isolated_database, tmp_path, monkeypatch
 ):
     job, _, generation = prepare_approved_job(isolated_database, tmp_path)
-    sentinel = b"LARGE-LOG-SENTINEL"
     sandbox = FakeSandbox(large_log_bytes=200_000)
     outcome = run_with_fake(
         isolated_database, job, generation, tmp_path, sandbox, monkeypatch
@@ -930,8 +928,6 @@ class TimeoutSandbox(FakeSandbox):
 def test_sandbox_timeout_is_recorded_as_inconclusive_replay_evidence(
     isolated_database, tmp_path, monkeypatch
 ):
-    from datacon.tools.sandbox import SandboxError
-
     job, _, generation = prepare_approved_job(isolated_database, tmp_path)
     sandbox = TimeoutSandbox()
     outcome = run_with_fake(

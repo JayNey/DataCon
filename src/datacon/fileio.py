@@ -198,6 +198,7 @@ def write_regular_file(
     redirect either operation. A read-only legacy file is made writable through
     its own descriptor and the open is retried once.
     """
+    name: str | Path
     if dir_fd is not None:
         if parent_path is None:
             raise UnsafeFileError(
@@ -290,6 +291,8 @@ def write_regular_file_atomic(
     redirect the operation.
     """
     target = Path(path)
+    target_name: str | Path
+    temporary_name: str | Path
     if dir_fd is not None:
         if parent_path is None:
             raise UnsafeFileError(
@@ -297,11 +300,10 @@ def write_regular_file_atomic(
             )
         _assert_dir_fd_matches_parent(dir_fd, parent_path)
         target_name = _relative_name(target)
-        temporary_name: str | Path = Path(target_name).with_suffix(suffix).name
+        temporary_name = Path(target_name).with_suffix(suffix).name
     else:
-        temporary = target.with_suffix(suffix)
         target_name = target
-        temporary_name = temporary
+        temporary_name = target.with_suffix(suffix)
     try:
         os.unlink(temporary_name, dir_fd=dir_fd)
     except FileNotFoundError:

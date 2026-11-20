@@ -77,7 +77,12 @@ class InvalidRequest(ValueError):
     """The request does not conform to the version 1 input contract."""
 
 
-def _object(value: Any, *, required: set[str], optional: set[str] = frozenset()) -> Mapping:
+def _object(
+    value: Any,
+    *,
+    required: set[str],
+    optional: set[str] | frozenset[str] = frozenset(),
+) -> Mapping:
     if not isinstance(value, dict):
         raise ValueError("expected a JSON object")
     actual = set(value)
@@ -376,7 +381,7 @@ def _isolation(value: Any) -> dict[str, Any]:
     if network != "none":
         raise ValueError("isolation.network must be none")
     user = _isolation_user(value["user"])
-    if not value["read_only_root"] is True:
+    if value["read_only_root"] is not True:
         raise ValueError("isolation.read_only_root must be true")
     caps = value["cap_drop"]
     if (
@@ -386,7 +391,7 @@ def _isolation(value: Any) -> dict[str, Any]:
         or "ALL" not in caps
     ):
         raise ValueError("isolation.cap_drop must include ALL")
-    if not value["no_new_privileges"] is True:
+    if value["no_new_privileges"] is not True:
         raise ValueError("isolation.no_new_privileges must be true")
     seccomp = _text(value["seccomp"], label="isolation.seccomp")
     if seccomp not in _SECCOMP_PROFILES:
@@ -507,7 +512,7 @@ def _normalize_plan(plan: Mapping[str, Any]) -> tuple[dict[str, Any], dict[str, 
         required={"error", "function", "source"},
         optional={"operation", "access_size"},
     )
-    asan_signature = {
+    asan_signature: dict[str, Any] = {
         "error": _text(signature["error"], label="asan_signature.error"),
         "function": _text(signature["function"], label="asan_signature.function"),
         "source": _text(signature["source"], label="asan_signature.source"),

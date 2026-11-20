@@ -21,7 +21,7 @@ import subprocess
 import threading
 import time
 import uuid
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Mapping, Sequence
 
 from datacon import fileio
 from datacon.asan import ASanSignature, parse_asan
@@ -511,10 +511,10 @@ def _validate_mounts(
             parts = str(bind).split(":")
             if len(parts) < 3 or parts[2] not in ("ro", "readonly"):
                 raise SandboxPolicyError("a bind mount is writable")
-            source = Path(parts[0])
-            if not source.is_absolute():
+            bind_source = Path(parts[0])
+            if not bind_source.is_absolute():
                 raise SandboxPolicyError("a bind mount source is not absolute")
-            actual.append((str(source), parts[1], True))
+            actual.append((str(bind_source), parts[1], True))
 
     seen: set[str] = set()
     for source, destination, readonly in actual:
@@ -593,10 +593,10 @@ def validate_host_config(
         raise SandboxPolicyError("container has host devices")
     if config.get("IpcMode") not in (None, "private"):
         raise SandboxPolicyError("container IPC namespace is not private")
-    for field in ("PidMode", "UTSMode", "UsernsMode"):
-        if config.get(field) not in (None, "", "private"):
+    for namespace in ("PidMode", "UTSMode", "UsernsMode"):
+        if config.get(namespace) not in (None, "", "private"):
             raise SandboxPolicyError(
-                f"container {field} must be private, not {config.get(field)!r}"
+                f"container {namespace} must be private, not {config.get(namespace)!r}"
             )
     if config.get("CgroupnsMode") not in (None, "", "private"):
         raise SandboxPolicyError(
@@ -1820,6 +1820,7 @@ printf 'uid=%s\nseccomp=%s\nseccomp_filters=%s\nno_new_privs=%s\ncap_eff=%s\ncgr
                 if (
                     reported_digest == "missing"
                     or reported_size != len(artifact)
+                    or artifact_digest is None
                     or reported_digest != artifact_digest.split(":", 1)[1]
                     or reported_code != exit_code
                 ):

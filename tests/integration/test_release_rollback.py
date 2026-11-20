@@ -41,6 +41,18 @@ def _approval(manifest: dict) -> dict:
     }
 
 
+def _accept_b03(store_handle, manifest: dict) -> dict:
+    """Record the passed B03 acceptance that promotion now requires."""
+    return store_handle.record_b03_acceptance(
+        candidate_digest=release.canonical_manifest_digest(manifest),
+        control_plane_image_id=manifest["control_plane_image_id"],
+        b03_bundle_manifest_digest="sha256:" + "7" * 64,
+        storage_ref="vault://datacon/integration-test",
+        run_id="integration-test",
+        payload={"benchmark_id": "B03"},
+    )
+
+
 def _manifest() -> dict:
     return release.build_release_candidate_manifest(
         source_commit="b" * 40,
@@ -128,6 +140,7 @@ def test_promotion_and_rollback_change_the_persisted_active_release(
     )
     manifest = _manifest()
     approval = _approval(manifest)
+    _accept_b03(store_handle, manifest)
 
     def rollback_fn(prev):
         store_handle.switch(
@@ -265,6 +278,8 @@ def test_multiple_rollbacks_and_repeated_smoke_failures_preserve_all_audit_event
     m1 = _manifest_with(m1_image, "b" * 40)
     m2 = _manifest_with(m2_image, "c" * 40)
     m3 = _manifest_with(m3_image, "d" * 40)
+    for candidate_manifest in (m1, m2, m3):
+        _accept_b03(store_handle, candidate_manifest)
 
     def make_rollback(candidate_digest: str):
         def _rb(prev):
@@ -394,6 +409,7 @@ def test_release_store_transaction_rolls_back_switch_when_audit_fails(
     )
     manifest = _manifest()
     approval = _approval(manifest)
+    _accept_b03(store_handle, manifest)
 
     def broken_audit(_result):
         raise RuntimeError("simulated audit write failure")
@@ -492,6 +508,7 @@ def test_migration_008_is_idempotent_with_existing_release_events(isolated_datab
     store_handle.bootstrap_release(**baseline)
     manifest = _manifest_with(CANDIDATE_IMAGE, "b" * 40)
     approval = _approval(manifest)
+    _accept_b03(store_handle, manifest)
     promoted = release.promote_and_smoke(
         manifest=manifest,
         expected_manifest_digest=approval["candidate_digest"],
@@ -607,6 +624,7 @@ def test_replaying_promoted_manifest_after_rollback_fails_closed(isolated_databa
     )
     m1 = _manifest_with(CANDIDATE_IMAGE, "b" * 40)
     a1 = _approval(m1)
+    _accept_b03(store_handle, m1)
     promoted = release.promote_and_smoke(
         manifest=m1,
         expected_manifest_digest=a1["candidate_digest"],
@@ -785,6 +803,7 @@ def test_promote_and_smoke_on_release_store_rejects_noop_rollback_fn(
     )
     manifest = _manifest()
     approval = _approval(manifest)
+    _accept_b03(store_handle, manifest)
     with pytest.raises(release.ReleaseGateError, match="did not restore|state transition"):
         release.promote_and_smoke(
             manifest=manifest,
@@ -957,6 +976,8 @@ def test_smoke_failure_auto_rollback_does_not_pollute_release_for_image_provenan
     m2 = _manifest_with(m2_image, "c" * 40)
     a1 = _approval(m1)
     a2 = _approval(m2)
+    _accept_b03(store_handle, m1)
+    _accept_b03(store_handle, m2)
 
     def make_rollback(candidate_digest: str):
         def _rb(prev):
@@ -1022,6 +1043,7 @@ def test_release_store_transaction_sets_timeouts_and_rejects_fake_promote_rollba
 
     manifest = _manifest()
     approval = _approval(manifest)
+    _accept_b03(store_handle, manifest)
 
     def fake_promote_rollback(prev):
         store_handle.switch(
@@ -1198,6 +1220,7 @@ def test_rollback_rejects_tampered_compatible_migration_digest_and_same_ordinal_
     )
     m1 = _manifest()
     a1 = _approval(m1)
+    _accept_b03(store_handle, m1)
     assert (
         release.promote_and_smoke(
             manifest=m1,

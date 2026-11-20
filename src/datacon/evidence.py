@@ -11,9 +11,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
-import json
 import os
 from pathlib import Path, PurePosixPath
+import re
 import shutil
 import stat
 import uuid
@@ -44,7 +44,6 @@ MAX_FILES = 4096
 MAX_DIRECTORIES = 1024
 MAX_BUNDLE_ENTRIES = MAX_FILES + MAX_DIRECTORIES + 1  # + manifest.json
 MAX_ROLE_LENGTH = 64
-import re
 
 _SHA256_HEX = re.compile(r"[0-9a-f]{64}")
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}")

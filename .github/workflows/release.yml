@@ -204,28 +204,27 @@ jobs:
         with:
           name: release-junit
           path: ${{ runner.temp }}/release-artifacts
-      - name: Build wheel, SBOM, image tar and real Trivy report
+      - name: Build wheel, image tar and real Trivy reports
         shell: bash
         run: |
           set -euo pipefail
           out="$RUNNER_TEMP/release-artifacts"
           mkdir -p "$out"
           uv build --wheel --out-dir "$out"
-          uv run --frozen python - "$out" <<'PY'
-          import pathlib
-          import sys
-
-          from datacon import release
-
-          out = pathlib.Path(sys.argv[1])
-          release.generate_sbom(
-              pyproject_path=pathlib.Path("pyproject.toml"),
-              uv_lock_path=pathlib.Path("uv.lock"),
-              out_path=out / release.SBOM_REPORT_FILE,
-          )
-          PY
           docker build -t datacon-control-plane:candidate .
           docker save -o "$out/control-plane-image.tar" datacon-control-plane:candidate
+          # The release SBOM must describe the built image, not just the Python
+          # lockfile: Trivy emits CycloneDX components for both Debian packages
+          # (pkg:deb/) and Python packages (pkg:pypi/). The old Python-only
+          # lockfile generator remains available for compatibility, but it is
+          # not the release SBOM.
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$out:/out" \
+            aquasec/trivy@sha256:ab70a02200597efa04748f210f793936eb647cbcdb0ea69cc30b226d6f5a22c7 \
+            image --format cyclonedx --output /out/sbom.cdx.json \
+            --exit-code 0 datacon-control-plane:candidate
+          test -s "$out/sbom.cdx.json"
           docker run --rm \
             -v /var/run/docker.sock:/var/run/docker.sock \
             -v "$out:/out" \
@@ -233,6 +232,23 @@ jobs:
             image --scanners vuln --severity HIGH,CRITICAL --format json \
             --output /out/trivy.json --exit-code 0 datacon-control-plane:candidate
           test -s "$out/trivy.json"
+      - name: Validate the release SBOM is an image CycloneDX document
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv run --frozen python - "$RUNNER_TEMP/release-artifacts/sbom.cdx.json" <<'PY'
+          import pathlib
+          import sys
+
+          from datacon import release
+
+          summary = release.verify_sbom_report(pathlib.Path(sys.argv[1]))
+          print(
+              "sbom components="
+              f"{summary['components']} deb={summary['deb_components']} "
+              f"pypi={summary['pypi_components']}"
+          )
+          PY
       - name: Fail on unwaived HIGH/CRITICAL findings and run the static gates
         shell: bash
         run: |
@@ -1049,7 +1065,9 @@ jobs:
           set -euo pipefail
           out="$RUNNER_TEMP/release-artifacts"
           mkdir -p "$out"
-          uv run --frozen python - "$out" <<'PY'
+          rm -f "$out/rollback-result.json"
+          status=0
+          uv run --frozen python - "$out" <<'PY' || status=$?
           import json
           import os
           import pathlib
@@ -1103,6 +1121,72 @@ jobs:
                   os.environ["DATACON_DATABASE_URL"], connect_timeout=5
               ) as conn:
                   return conn.execute("SELECT 1").fetchone() == (1,)
+
+          def db_reviews_readable():
+              import psycopg
+
+              with psycopg.connect(
+                  os.environ["DATACON_DATABASE_URL"], connect_timeout=5
+              ) as conn:
+                  # A read-only SELECT proves the historical review table is
+                  # present and readable without exposing review rows.
+                  conn.execute("SELECT review_id FROM reviews LIMIT 1").fetchone()
+                  return True
+
+          def verify_bundle_in_container(bundle_path, expected_digest):
+              proc = subprocess.run(
+                  [
+                      "docker",
+                      "run",
+                      "--rm",
+                      "-v",
+                      f"{bundle_path}:/bundle:ro",
+                      target_image,
+                      "verify-bundle",
+                      "/bundle",
+                      "--expected-digest",
+                      expected_digest,
+                  ],
+                  capture_output=True,
+                  text=True,
+                  timeout=60,
+              )
+              if proc.returncode != 0:
+                  if proc.stderr:
+                      sys.stderr.write(proc.stderr)
+                  return False
+              try:
+                  parsed = json.loads(proc.stdout)
+              except json.JSONDecodeError:
+                  return False
+              return (
+                  parsed.get("status") == "valid"
+                  and parsed.get("manifest_digest") == expected_digest
+              )
+
+          def review_bundle_readable_65534(bundle_path):
+              # Prove the historical review file is readable by the runtime
+              # user, not merely by the CI runner.
+              proc = subprocess.run(
+                  [
+                      "docker",
+                      "run",
+                      "--rm",
+                      "--user",
+                      "65534:65534",
+                      "-v",
+                      f"{bundle_path}:/bundle:ro",
+                      "--entrypoint",
+                      "/bin/sh",
+                      target_image,
+                      "-c",
+                      "test -r /bundle/review.json && test ! -L /bundle/review.json",
+                  ],
+                  capture_output=True,
+                  text=True,
+                  timeout=60,
+              )
+              return proc.returncode == 0
 
           def archived_bundle_smoke():
               proc = subprocess.run(
@@ -1173,6 +1257,24 @@ jobs:
               active = store.active_release()
               return active is not None and active.get("image_id") == target["image_id"]
 
+          # Rollback must prove the target release's historical evidence is
+          # still usable: an archived bundle under its evidence_root, a
+          # review.json readable by UID 65534, and a readable reviews table.
+          archived_preflight = release.archived_bundle_preflight(
+              evidence_root=target["evidence_root"],
+              store=store,
+              verify_fn=verify_bundle_in_container,
+          )
+          if archived_preflight["status"] != "required":
+              raise SystemExit(
+                  "rollback requires a real archived evidence bundle under the "
+                  "target release evidence_root"
+              )
+          archived_bundle_path = archived_preflight["bundle_path"]
+          review_digest = release.verify_review_bundle_readability(
+              archived_bundle_path
+          )
+
           approved_by = os.environ.get("APPROVED_BY", "").strip()
           if not approved_by:
               raise SystemExit("approved_by must identify the dispatching operator")
@@ -1183,7 +1285,12 @@ jobs:
                   smoke_checks={
                       "cli_smoke": image_help,
                       "db_readability": db_readable,
+                      "db_reviews_readable": db_reviews_readable,
                       "archived_bundle": archived_bundle_smoke,
+                      "archived_real_bundle": archived_preflight["check_fn"],
+                      "review_bundle_readable": lambda: review_bundle_readable_65534(
+                          archived_bundle_path
+                      ),
                       "release_slots": release_slots_compatible,
                   },
                   post_switch_checks={
@@ -1195,8 +1302,66 @@ jobs:
               )
           finally:
               shutil.rmtree(smoke_bundle, ignore_errors=True)
+          # Persist only digests/status; never the evidence_root or bundle path.
+          result_doc = {
+              "schema_version": release.SCHEMA_VERSION,
+              "status": result["status"],
+              "target_digest": target_image,
+              "active_image_id": result["active_image_id"],
+              "previous_image_id": result["previous_image_id"],
+              "candidate_digest": result["candidate_digest"],
+              "approved_by": result["approved_by"],
+              "archived_bundle_digest": archived_preflight["bundle_digest"],
+              "review_digest": review_digest,
+              "reviews_readable": True,
+              "recorded_at": result["recorded_at"],
+          }
+          (out / release.ROLLBACK_RESULT_FILE).write_text(
+              json.dumps(result_doc, indent=2) + "\n", encoding="utf-8"
+          )
           print(json.dumps(result, indent=2))
           PY
+          if [ "$status" -ne 0 ]; then
+            python3 - "$out" "$status" <<'PY'
+          import json
+          import os
+          import pathlib
+          import sys
+
+          payload = {
+              "schema_version": 1,
+              "status": "failed",
+              "target_digest": os.environ.get("TARGET_DIGEST"),
+              "approved_by": os.environ.get("APPROVED_BY"),
+              "exit_code": int(sys.argv[2]),
+              "error": "rollback failed; inspect the failing workflow step log",
+          }
+          pathlib.Path(sys.argv[1], "rollback-result.json").write_text(
+              json.dumps(payload, indent=2) + "\n", encoding="utf-8"
+          )
+          PY
+            exit "$status"
+          fi
+
+      - name: Ensure a rollback result exists for upload
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/release-artifacts"
+          mkdir -p "$out"
+          if [ ! -s "$out/rollback-result.json" ]; then
+            printf '%s\n' '{"schema_version":1,"status":"failed","error":"rollback did not produce a result; inspect the failing step log"}' \
+              > "$out/rollback-result.json"
+          fi
+
+      - name: Upload the rollback result
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-rollback-result
+          path: ${{ runner.temp }}/release-artifacts/rollback-result.json
+          retention-days: 30
 
   b03-internal:
     if: >-
