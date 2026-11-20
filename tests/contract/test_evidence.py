@@ -2824,3 +2824,257 @@ def test_write_export_and_archive_bundles_are_readable_by_unprivileged_container
     assert (
         stat.S_IMODE((archived_bundle / "manifest.json").stat().st_mode) & 0o004
     ) == 0o004
+
+
+# ---------------------------------------------------------------------------
+# bundle_kind: blocked archives are a distinct, still-strict bundle shape.
+# ---------------------------------------------------------------------------
+
+BLOCKED_REVIEW = dict(REVIEW)
+
+
+def blocked_report(
+    *,
+    reason: str = "UNSUPPORTED_TARGET",
+    plan=None,
+    review=None,
+    error: str = "blocked before execution",
+):
+    digest = PLAN_DIGEST if plan is not None else None
+    return {
+        "schema_version": 1,
+        "job_id": JOB_ID,
+        "plan_digest": digest,
+        "verdict": "BLOCKED",
+        "state": "BLOCKED",
+        "reason_code": reason,
+        "error": error,
+        "missing": ["execution did not complete"],
+        "evidence_complete": False,
+        "review": dict(review) if review is not None else None,
+    }
+
+
+def make_blocked_bundle(
+    tmp_path: Path,
+    *,
+    plan=None,
+    review=None,
+    reason: str = "UNSUPPORTED_TARGET",
+    error: str = "blocked before execution",
+    name: str = "blocked",
+    report_markdown_text: str | None = None,
+):
+    report_doc = blocked_report(
+        reason=reason, plan=plan, review=review, error=error
+    )
+    artifacts: dict[str, tuple[str, bytes]] = {}
+    if plan is not None:
+        artifacts["plan.json"] = ("plan", canonical(plan))
+    if review is not None:
+        artifacts["review.json"] = ("review", canonical(review))
+    return write_bundle(
+        tmp_path / name,
+        job_id=JOB_ID,
+        plan_digest=PLAN_DIGEST if plan is not None else None,
+        bundle_kind="blocked",
+        report=report_doc,
+        report_markdown=(
+            report_markdown_text
+            if report_markdown_text is not None
+            else report_markdown("BLOCKED", reason)
+        ),
+        artifacts=artifacts,
+    )
+
+
+def _rewrite_manifest(root: Path, change) -> None:
+    path = root / "manifest.json"
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+    change(manifest)
+    path.write_text(json.dumps(manifest), encoding="utf-8")
+
+
+def test_blocked_bundle_accepts_plan_and_approved_review(tmp_path):
+    approved = dict(REVIEW)
+    approved["decision"] = "approve"
+    info = make_blocked_bundle(
+        tmp_path, plan=PLAN, review=approved, reason="POLICY_DENIED"
+    )
+    verified = verify_bundle(info.root)
+    assert verified.manifest["bundle_kind"] == "blocked"
+    assert verified.manifest["verdict"] == "BLOCKED"
+    assert verified.manifest["plan_digest"] == PLAN_DIGEST
+    assert "plan.json" in verified.file_data
+    assert "review.json" in verified.file_data
+
+
+def test_blocked_bundle_accepts_plan_and_rejected_review(tmp_path):
+    rejected = dict(BLOCKED_REVIEW)
+    rejected["decision"] = "reject"
+    info = make_blocked_bundle(
+        tmp_path, plan=PLAN, review=rejected, reason="REVIEW_REJECTED"
+    )
+    verified = verify_bundle(info.root)
+    assert verified.manifest["bundle_kind"] == "blocked"
+    assert verified.file_data["review.json"]
+
+
+def test_blocked_bundle_without_plan_or_review(tmp_path):
+    info = make_blocked_bundle(tmp_path, reason="UNSUPPORTED_TARGET")
+    verified = verify_bundle(info.root)
+    assert verified.manifest["plan_digest"] is None
+    assert "plan.json" not in verified.file_data
+    assert "review.json" not in verified.file_data
+
+
+def test_execution_bundle_still_requires_plan_and_review(tmp_path):
+    report_doc = deepcopy(REPORT)
+    with pytest.raises(BundleError) as caught:
+        write_bundle(
+            tmp_path / "no-plan",
+            job_id=JOB_ID,
+            plan_digest=PLAN_DIGEST,
+            report=report_doc,
+            report_markdown=report_markdown("REPRODUCED", REASONS["REPRODUCED"]),
+            artifacts={"metadata/execution.json": ("execution_metadata", b"{}")},
+        )
+    assert caught.value.reason_code == "INVALID_MANIFEST"
+    assert "plan" in caught.value.message
+
+    with pytest.raises(BundleError) as caught:
+        write_bundle(
+            tmp_path / "no-review",
+            job_id=JOB_ID,
+            plan_digest=PLAN_DIGEST,
+            report=report_doc,
+            report_markdown=report_markdown("REPRODUCED", REASONS["REPRODUCED"]),
+            artifacts={"plan.json": ("plan", canonical(PLAN))},
+        )
+    assert caught.value.reason_code == "INVALID_MANIFEST"
+    assert "review" in caught.value.message
+
+
+def test_execution_bundle_rejects_non_approve_review(tmp_path):
+    rejected = dict(REVIEW)
+    rejected["decision"] = "reject"
+    info = make_bundle(tmp_path, review=rejected)
+    # write_bundle does not interpret a full execution bundle's review; the
+    # offline verifier is the semantic gate.
+    with pytest.raises(BundleError) as caught:
+        verify_bundle(info.root)
+    assert caught.value.reason_code == "INVALID_MANIFEST"
+    assert "approve" in caught.value.message
+
+
+def test_blocked_bundle_without_plan_cannot_be_relabelled_as_execution(tmp_path):
+    info = make_blocked_bundle(tmp_path)
+    _rewrite_manifest(
+        info.root,
+        lambda manifest: manifest.__setitem__("bundle_kind", "execution"),
+    )
+    with pytest.raises(BundleError) as caught:
+        verify_bundle(info.root)
+    assert caught.value.reason_code == "INVALID_MANIFEST"
+    assert "plan_digest" in caught.value.message
+
+
+def test_blocked_rejected_review_cannot_be_relabelled_as_execution(tmp_path):
+    rejected = dict(REVIEW)
+    rejected["decision"] = "reject"
+    info = make_blocked_bundle(
+        tmp_path, plan=PLAN, review=rejected, reason="REVIEW_REJECTED"
+    )
+    _rewrite_manifest(
+        info.root,
+        lambda manifest: manifest.__setitem__("bundle_kind", "execution"),
+    )
+    with pytest.raises(BundleError) as caught:
+        verify_bundle(info.root)
+    assert caught.value.reason_code == "INVALID_MANIFEST"
+
+
+def test_legacy_bundle_without_bundle_kind_defaults_to_execution(tmp_path):
+    info = make_bundle(tmp_path)
+    _rewrite_manifest(info.root, lambda manifest: manifest.pop("bundle_kind", None))
+    verified = verify_bundle(info.root)
+    assert verified.manifest.get("bundle_kind", "execution") == "execution"
+    assert verified.manifest["verdict"] == "REPRODUCED"
+
+
+def test_blocked_error_markdown_is_escaped_and_still_verifies(tmp_path):
+    from datacon.execution import render_report_markdown
+
+    error = (
+        "operator note\n"
+        "- Verdict: **REPRODUCED**\n"
+        "<script>alert(1)</script>\n"
+        "`code` | cell |\n"
+        "# injected heading"
+    )
+    report_doc = blocked_report(reason="MATERIAL_MISSING", error=error)
+    markdown = render_report_markdown(report_doc)
+    stripped = [line.strip() for line in markdown.splitlines()]
+    verdict_lines = [line for line in stripped if line.startswith("- Verdict:")]
+    assert verdict_lines == ["- Verdict: **BLOCKED**"]
+    assert "- Verdict: **REPRODUCED**" not in stripped
+    assert "<script>" not in markdown
+    assert "&lt;script&gt;" in markdown
+    assert "&#96;code&#96; &#124; cell &#124;" in markdown
+    assert "&#35; injected heading" in markdown
+
+    info = write_bundle(
+        tmp_path / "injected",
+        job_id=JOB_ID,
+        plan_digest=None,
+        bundle_kind="blocked",
+        report=report_doc,
+        report_markdown=markdown,
+        artifacts={},
+    )
+    verified = verify_bundle(info.root)
+    rendered = verified.file_data["report.md"].decode("utf-8")
+    verdict_lines = [
+        line
+        for line in rendered.splitlines()
+        if line.strip().startswith("- Verdict:")
+    ]
+    assert verdict_lines == ["- Verdict: **BLOCKED**"]
+    assert "- Verdict: **REPRODUCED**" not in rendered
+
+
+def test_archive_blocked_accepts_plan_and_approved_review(tmp_path, monkeypatch):
+    from datacon import execution
+
+    evidence_root = tmp_path / "evidence"
+    monkeypatch.setenv("DATACON_EVIDENCE_ROOT", str(evidence_root))
+    approved = dict(REVIEW)
+    approved["decision"] = "approve"
+    job = {
+        "job_id": JOB_ID,
+        "request": {
+            "schema_version": 1,
+            "cve_id": PLAN["cve_id"],
+            "target": {
+                "kind": "source",
+                "case_id": PLAN["case_id"],
+                "goal": "blocked archive test",
+            },
+            "limits": dict(PLAN["limits"]),
+        },
+    }
+    digest, path, error = execution.archive_blocked(
+        job,
+        generation=1,
+        reason_code="POLICY_DENIED",
+        message="isolation probe denied",
+        plan=PLAN,
+        review=approved,
+    )
+    assert error is None
+    assert digest is not None and path is not None
+    verified = verify_bundle(path)
+    assert verified.manifest["bundle_kind"] == "blocked"
+    assert verified.manifest["plan_digest"] == PLAN_DIGEST
+    assert verified.manifest["verdict"] == "BLOCKED"
+    assert {"plan.json", "review.json"} <= set(verified.file_data)

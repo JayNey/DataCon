@@ -52,6 +52,7 @@ from datacon.verdict import (
     VerdictDecision,
     VerdictPolicy,
     decide_verdict,
+    reason_allowed,
 )
 
 ARCHIVE_RESERVE_MAX = 60
@@ -2434,37 +2435,151 @@ def _build_report(
         "cleanup_errors": list(getattr(context, "cleanup_errors", [])),
         "created_at": _utc_now(),
     }
+    return report, render_report_markdown(report)
+
+
+_REPORT_VERDICTS = frozenset(
+    {"REPRODUCED", "NOT_REPRODUCED", "INCONCLUSIVE", "BLOCKED", "FAILED"}
+)
+_REPORT_REASON_TEXT = re.compile(r"[A-Z0-9_]*")
+# report.md is a rendering of report.json. Every dynamic value is replaced by
+# an HTML entity before it reaches the document, so a value can never open a
+# heading, a code span, a table cell or another "- Verdict:" line. Entities are
+# valid inside inline code and table cells and render as the original
+# character.
+_MARKDOWN_ENTITIES = {
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    '"': "&quot;",
+    "`": "&#96;",
+    "|": "&#124;",
+    "\\": "&#92;",
+    "*": "&#42;",
+    "_": "&#95;",
+    "[": "&#91;",
+    "]": "&#93;",
+    "#": "&#35;",
+}
+
+
+def _markdown_escape(value: Any) -> str:
+    """Render one dynamic value as a single inert Markdown line."""
+    text = "" if value is None else str(value)
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    escaped: list[str] = []
+    for character in text:
+        if character == "\n":
+            # Keep the value on one source line. A real newline here could
+            # promote injected text to an independent Markdown block.
+            escaped.append("&#10;")
+        else:
+            escaped.append(_MARKDOWN_ENTITIES.get(character, character))
+    return "".join(escaped)
+
+
+def _markdown_code(value: Any) -> str:
+    return f"`{_markdown_escape(value)}`"
+
+
+def _markdown_block(value: Any) -> str:
+    """Render untrusted prose as a block that cannot become Markdown syntax.
+
+    Prefixing every physical line with ``> `` means ``line.strip()`` never
+    starts with ``- Verdict:`` even when the error text contains an injected
+    conclusion line.
+    """
+    text = "" if value is None else str(value)
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    return "\n".join(
+        "> " + _markdown_escape(line) for line in text.split("\n")
+    )
+
+
+def render_report_markdown(report: Mapping[str, Any]) -> str:
+    """Render report.md solely from report.json.
+
+    There is exactly one producer for the human-readable report: this
+    function. Its only conclusion lines are generated from the validated
+    ``verdict`` and ``reason_code`` values; all other report fields are
+    escaped before rendering.
+    """
+    verdict = report.get("verdict")
+    verdict_text = (
+        verdict
+        if isinstance(verdict, str) and verdict in _REPORT_VERDICTS
+        else "PENDING"
+    )
+    reason = report.get("reason_code")
+    reason_text = (
+        reason
+        if isinstance(reason, str) and _REPORT_REASON_TEXT.fullmatch(reason)
+        else ""
+    )
+    environment = report.get("environment")
+    if not isinstance(environment, Mapping):
+        environment = {}
+    versions = report.get("versions")
+    if not isinstance(versions, Mapping):
+        versions = {}
+    builds = report.get("builds")
+    if not isinstance(builds, list):
+        builds = []
+    replays = report.get("replays")
+    if not isinstance(replays, list):
+        replays = []
+    compile_args = environment.get("compile_args")
+    if not isinstance(compile_args, (list, tuple)):
+        compile_args = []
+    evidence_refs = report.get("evidence_refs")
+    if not isinstance(evidence_refs, list):
+        evidence_refs = []
+    missing = report.get("missing")
+    if not isinstance(missing, list):
+        missing = []
+    cleanup_errors = report.get("cleanup_errors")
+    if not isinstance(cleanup_errors, list):
+        cleanup_errors = []
+
     lines = [
         "# DataCon evidence report",
         "",
-        f"- Job: `{context.job_id_text}`",
-        f"- Plan: `{context.plan_digest}`",
-        f"- Case: `{context.plan['case_id']}` / `{context.plan['cve_id']}`",
-        f"- Verdict: **{verdict or 'PENDING'}**",
-        f"- Reason: `{verdict_reason or ''}`",
-        f"- Image: `{context.image}`",
-        f"- Platform: `{context.plan['platform']}`",
-        f"- ASan options: `{context.plan['asan_options']}`",
-        f"- Compile args: `{' '.join(context.compile_args)}`",
+        f"- Job: {_markdown_code(report.get('job_id'))}",
+        f"- Plan: {_markdown_code(report.get('plan_digest'))}",
+        f"- Case: {_markdown_code(report.get('case_id'))} / "
+        f"{_markdown_code(report.get('cve_id'))}",
+        f"- Verdict: **{verdict_text}**",
+        f"- Reason: `{reason_text}`",
+        f"- Image: {_markdown_code(environment.get('image') or environment.get('image_digest'))}",
+        f"- Platform: {_markdown_code(environment.get('platform'))}",
+        f"- ASan options: {_markdown_code(environment.get('asan_options'))}",
+        f"- Compile args: {_markdown_code(' '.join(str(item) for item in compile_args))}",
         "",
         "## Revisions",
         "",
-        f"- vulnerable: `{context.plan['revisions']['vulnerable']}`",
-        f"- fixed: `{context.plan['revisions']['fixed']}`",
+        f"- vulnerable: {_markdown_code(versions.get('vulnerable'))}",
+        f"- fixed: {_markdown_code(versions.get('fixed'))}",
         "",
         "## Builds",
         "",
         "| Version | Status | Exit | Artifact |",
         "| --- | --- | ---: | --- |",
     ]
+    by_version = {
+        item.get("version"): item
+        for item in builds
+        if isinstance(item, Mapping)
+    }
     for version in ("vulnerable", "fixed"):
-        build = builds.get(version, {})
+        build = by_version.get(version, {})
+        if not isinstance(build, Mapping):
+            build = {}
         lines.append(
-            "| {version} | {status} | {exit} | `{artifact}` |".format(
-                version=version,
-                status=build.get("status", "missing"),
-                exit=build.get("exit_code", ""),
-                artifact=build.get("artifact_digest") or "",
+            "| {version} | {status} | {exit} | {artifact} |".format(
+                version=_markdown_escape(version),
+                status=_markdown_escape(build.get("status", "missing")),
+                exit=_markdown_escape(build.get("exit_code", "")),
+                artifact=_markdown_code(build.get("artifact_digest") or ""),
             )
         )
     lines.extend(
@@ -2476,43 +2591,45 @@ def _build_report(
             "| --- | --- | --- | ---: | --- |",
         ]
     )
-    for run in runs:
-        signature = run.get("signature") or {}
+    for run in replays:
+        if not isinstance(run, Mapping):
+            continue
+        signature = run.get("signature")
+        if not isinstance(signature, Mapping):
+            signature = {}
         lines.append(
             "| {version} | {phase} | {status} | {exit} | {asan} |".format(
-                version=run.get("version", ""),
-                phase=run.get("phase", ""),
-                status=run.get("status", ""),
-                exit=run.get("exit_code", ""),
-                asan=signature.get("error", ""),
+                version=_markdown_escape(run.get("version", "")),
+                phase=_markdown_escape(run.get("phase", "")),
+                status=_markdown_escape(run.get("status", "")),
+                exit=_markdown_escape(run.get("exit_code", "")),
+                asan=_markdown_escape(signature.get("error", "")),
             )
         )
-    lines.extend(
-        [
-            "",
-            "## Rule trace",
-            "",
-            "```json",
-            json.dumps(decision.as_dict() if decision else {}, indent=2, sort_keys=True),
-            "```",
-            "",
-            "## Evidence",
-            "",
-        ]
-    )
+    lines.extend(["", "## Rule trace", ""])
+    rule = report.get("rule")
+    if rule is None:
+        lines.append("> (no rule trace)")
+    else:
+        try:
+            rule_text = json.dumps(rule, indent=2, sort_keys=True)
+        except (TypeError, ValueError):
+            rule_text = str(rule)
+        lines.extend(_markdown_block(rule_text).splitlines())
+    lines.extend(["", "## Evidence", ""])
     for reference in evidence_refs:
-        lines.append(f"- `{reference}`")
+        lines.append(f"- {_markdown_code(reference)}")
     if missing:
         lines.extend(["", "## Missing", ""])
         for item in missing:
-            lines.append(f"- `{item}`")
-    if error:
-        lines.extend(["", "## Error", "", error])
-    cleanup_errors = list(getattr(context, "cleanup_errors", []))
+            lines.append(f"- {_markdown_code(item)}")
+    if report.get("error"):
+        lines.extend(["", "## Error", ""])
+        lines.extend(_markdown_block(report.get("error")).splitlines())
     if cleanup_errors:
         lines.extend(["", "## Cleanup", ""])
         for item in cleanup_errors:
-            lines.append(f"- `{item}`")
+            lines.append(f"- {_markdown_code(item)}")
     lines.extend(
         [
             "",
@@ -2521,7 +2638,7 @@ def _build_report(
             "",
         ]
     )
-    return report, "\n".join(lines)
+    return "\n".join(lines)
 
 
 def _run_root_path(
@@ -2737,6 +2854,290 @@ def _discard_published_bundle(path: str | None) -> None:
         shutil.rmtree(target, ignore_errors=True)
     except OSError:
         pass
+
+
+def _discard_blocked_bundle(path: str | None) -> None:
+    """Best-effort removal of a just-published blocked bundle.
+
+    Only a ``blocked-generation-*`` directory below the evidence root is
+    removed. The shared job directory and other evidence are untouched.
+    """
+    if not path:
+        return
+    try:
+        target = Path(path)
+        if not target.name.startswith("blocked-generation-"):
+            return
+        shutil.rmtree(target, ignore_errors=True)
+    except OSError:
+        pass
+
+
+def _blocked_evidence_root(run_root: Path | str | None) -> Path:
+    """Resolve the evidence root for a path that has no execution context."""
+    raw = Path(os.getenv("DATACON_EVIDENCE_ROOT", ".datacon/evidence")).expanduser()
+    if run_root is not None:
+        return _outside_run_root(
+            raw, Path(run_root), "DATACON_EVIDENCE_ROOT"
+        )
+    return raw.resolve()
+
+
+def _blocked_report(
+    job: Mapping[str, Any],
+    *,
+    reason_code: str,
+    message: str,
+    plan: Mapping[str, Any] | None,
+    review: Mapping[str, Any] | None,
+    expected_plan_digest: str | None = None,
+) -> tuple[dict[str, Any], str | None, dict[str, Any] | None, dict[str, Any] | None]:
+    """Build a report for a terminal block that did not reach execution.
+
+    The plan and review are optional. A plan/review pair is included only when
+    the plan digest can be re-derived, matches the frozen digest (when the
+    caller has one), and the review is bound to that plan. Otherwise the
+    bundle records the block without pretending a complete plan existed (an
+    expiry can leave only a plan, and submit-time rejection has neither).
+    """
+    plan_doc: dict[str, Any] | None = dict(plan) if isinstance(plan, Mapping) else None
+    plan_digest: str | None = None
+    if plan_doc is not None:
+        try:
+            plan_digest = contracts.plan_digest(plan_doc)
+        except (KeyError, TypeError, ValueError, UnicodeError):
+            # A legacy/partial plan row cannot be bound to a manifest digest.
+            plan_doc = None
+            plan_digest = None
+        else:
+            if (
+                expected_plan_digest is not None
+                and expected_plan_digest != plan_digest
+            ):
+                plan_doc = None
+                plan_digest = None
+    review_doc: dict[str, Any] | None = None
+    if plan_doc is not None and isinstance(review, Mapping):
+        if (
+            review.get("decision") in ("approve", "reject")
+            and review.get("plan_digest") == plan_digest
+        ):
+            review_doc = {
+                "reviewer_id": review.get("reviewer_id"),
+                "decision": review.get("decision"),
+                "plan_digest": review.get("plan_digest"),
+                "decided_at": (
+                    jsonutil.timestamp(review["decided_at"])
+                    if review.get("decided_at") is not None
+                    and not isinstance(review.get("decided_at"), str)
+                    else review.get("decided_at")
+                ),
+            }
+    request = job.get("request")
+    if not isinstance(request, Mapping):
+        request = {}
+    target = request.get("target")
+    if not isinstance(target, Mapping):
+        target = {}
+    plan_map = plan_doc or {}
+    environment = {
+        "image": None,
+        "image_digest": plan_map.get("image_digest"),
+        "platform": plan_map.get("platform"),
+        "toolchain": plan_map.get("toolchain"),
+        "asan_options": plan_map.get("asan_options"),
+        "compile_args": [],
+        "isolation": plan_map.get("isolation"),
+        "probe": None,
+    }
+    evidence_refs = ["report.json", "report.md"]
+    if plan_doc is not None:
+        evidence_refs.append("plan.json")
+    if review_doc is not None:
+        evidence_refs.append("review.json")
+    report: dict[str, Any] = {
+        "schema_version": 1,
+        "job_id": str(job["job_id"]),
+        "plan_digest": plan_digest,
+        "cve_id": plan_map.get("cve_id") or request.get("cve_id"),
+        "case_id": plan_map.get("case_id") or target.get("case_id"),
+        "state": "BLOCKED",
+        "verdict": "BLOCKED",
+        "reason_code": reason_code,
+        "target": dict(target),
+        "versions": plan_map.get("revisions"),
+        "repository": plan_map.get("repository"),
+        "environment": environment,
+        "budget": plan_map.get("limits") or request.get("limits"),
+        "inputs": plan_map.get("inputs"),
+        "review": review_doc,
+        "signature": plan_map.get("asan_signature"),
+        "builds": [],
+        "replays": [],
+        "rule": None,
+        "evidence_refs": evidence_refs,
+        "missing": ["execution did not complete"],
+        "error": f"{reason_code}: {message}",
+        "evidence_complete": False,
+        "cleanup_errors": [],
+        "created_at": _utc_now(),
+    }
+    return report, plan_digest, plan_doc, review_doc
+
+
+def archive_blocked(
+    job: Mapping[str, Any],
+    *,
+    generation: int,
+    reason_code: str,
+    message: str,
+    plan: Mapping[str, Any] | None = None,
+    review: Mapping[str, Any] | None = None,
+    expected_plan_digest: str | None = None,
+    run_root: Path | str | None = None,
+) -> tuple[str | None, str | None, str | None]:
+    """Archive a terminal block without a lease or execution context.
+
+    This deliberately does not reuse ``_archive``: that helper requires the
+    job to be RUNNING/ARCHIVING and fences the write with a live lease. Submit,
+    review and analysis blocks have no such lease. The bundle still goes
+    through ``write_bundle(verify=verify_bundle)`` so hashes, paths, manifest
+    digest and report.md binding are enforced exactly like an execution
+    bundle.
+    """
+    temporary: Path | None = None
+    try:
+        job_id = str(uuid.UUID(str(job["job_id"])))
+        if not isinstance(reason_code, str) or not reason_allowed(
+            "BLOCKED", reason_code
+        ):
+            raise BundleError(
+                "INVALID_MANIFEST", f"reason_code {reason_code!r} is not a BLOCKED code"
+            )
+        evidence_root = _blocked_evidence_root(run_root)
+        evidence_root.mkdir(mode=0o755, parents=True, exist_ok=True)
+        if evidence_root.is_symlink() or not evidence_root.is_dir():
+            raise BundleError("SYMLINK", "evidence root must be a real directory")
+        evidence_root.chmod(0o755)
+        job_root = evidence_root / job_id
+        if job_root.is_symlink():
+            raise BundleError("SYMLINK", "evidence job directory is a symlink")
+        job_root.mkdir(mode=0o755, parents=True, exist_ok=True)
+        if job_root.is_symlink() or not job_root.is_dir():
+            raise BundleError(
+                "SYMLINK", "evidence job directory must be a real directory"
+            )
+        job_root.chmod(0o755)
+        bundle = job_root / (
+            f"blocked-generation-{int(generation)}-{uuid.uuid4().hex}"
+        )
+        temporary = evidence_root / (
+            f".{job_id}.blocked-{uuid.uuid4().hex}"
+        )
+        report, plan_digest, plan_doc, review_doc = _blocked_report(
+            job,
+            reason_code=reason_code,
+            message=message,
+            plan=plan,
+            review=review,
+            expected_plan_digest=expected_plan_digest,
+        )
+        artifacts: dict[str, tuple[str, bytes]] = {}
+        if plan_doc is not None:
+            artifacts["plan.json"] = (
+                "plan",
+                jsonutil.canonical_bytes(plan_doc) + b"\n",
+            )
+        if review_doc is not None:
+            artifacts["review.json"] = (
+                "review",
+                jsonutil.canonical_bytes(review_doc) + b"\n",
+            )
+        info = write_bundle(
+            temporary,
+            job_id=job_id,
+            plan_digest=plan_digest,
+            bundle_kind="blocked",
+            report=report,
+            report_markdown=render_report_markdown(report),
+            artifacts=artifacts,
+            verdict="BLOCKED",
+            verify=verify_bundle,
+            dir_mode=0o755,
+            file_mode=0o444,
+        )
+        temporary.rename(bundle)
+        return info.manifest_digest, str(bundle.resolve()), None
+    except (
+        BundleError,
+        OSError,
+        ValueError,
+        KeyError,
+        TypeError,
+        ExecutionFailed,
+    ) as error:
+        if temporary is not None:
+            shutil.rmtree(temporary, ignore_errors=True)
+        detail = getattr(error, "message", None) or str(error)
+        return None, None, f"EVIDENCE_WRITE_FAILED: {detail}"
+
+
+def record_blocked(
+    dsn: str,
+    job_id: UUID,
+    *,
+    reason_code: str,
+    message: str,
+    plan: Mapping[str, Any] | None = None,
+    review: Mapping[str, Any] | None = None,
+    generation: int | None = None,
+    run_root: Path | str | None = None,
+) -> bool:
+    """Archive a blocked bundle and record it on the job.
+
+    The row must still be BLOCKED at the expected generation. A filesystem or
+    verification failure is stamped as FAILED/EVIDENCE_WRITE_FAILED by
+    ``state.record_blocked_evidence``, so a blocked job can never be left with
+    ``evidence_status='failed'``.
+    """
+    job = state.load_job(dsn, job_id)
+    if job is None or job.get("state") != "BLOCKED":
+        return False
+    expected_generation = job["generation"] if generation is None else generation
+    if job["generation"] != expected_generation:
+        return False
+    expected_plan_digest = None
+    if plan is None:
+        plan_row = state.get_plan(dsn, job_id)
+        if plan_row is not None:
+            plan = plan_row["plan"]
+            expected_plan_digest = plan_row["plan_digest"]
+    if review is None:
+        review = state.get_review(dsn, job_id)
+    digest, path, error = archive_blocked(
+        job,
+        generation=expected_generation,
+        reason_code=reason_code,
+        message=message,
+        plan=plan,
+        review=review,
+        expected_plan_digest=expected_plan_digest,
+        run_root=run_root,
+    )
+    recorded = state.record_blocked_evidence(
+        dsn,
+        job_id,
+        generation=expected_generation,
+        evidence_digest=digest,
+        evidence_path=path,
+        evidence_error=error,
+        reason_code=reason_code,
+    )
+    if not recorded:
+        # The row changed between the read and the terminal write. Do not
+        # leave a bundle that no task record references.
+        _discard_blocked_bundle(path)
+    return recorded
 
 
 def _archive(
@@ -3477,8 +3878,9 @@ def run_execution(
     if archive_error is not None:
         try:
             # The computed decision is not published as authoritative until a
-            # verifiable bundle exists. COALESCE in finish_execution therefore
-            # only preserves a verdict from an earlier successful archive.
+            # verifiable bundle exists. finish_execution clears any prior
+            # verdict and evidence pointer on this FAILED terminal; the error
+            # is preserved in evidence_error/last_error.
             finished = state.finish_execution(
                 dsn,
                 job_id,

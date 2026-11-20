@@ -57,8 +57,14 @@ def cli(*args, database_url=None, env_extra=None):
     )
 
 
-def submit(database_url, request_path):
-    result = cli("submit", "--request", str(request_path), database_url=database_url)
+def submit(database_url, request_path, *, env_extra=None):
+    result = cli(
+        "submit",
+        "--request",
+        str(request_path),
+        database_url=database_url,
+        env_extra=env_extra,
+    )
     assert result.returncode == 0, result.stderr
     return json.loads(result.stdout)
 
@@ -104,18 +110,24 @@ def test_submit_and_status_in_separate_processes(database, postgres_dsn, tmp_pat
 def test_binary_submit_is_archived_as_blocked(database, postgres_dsn, tmp_path):
     request = tmp_path / "binary.json"
     request.write_text(BINARY_REQUEST, encoding="utf-8")
+    evidence_root = tmp_path / "evidence"
+    env = {"DATACON_EVIDENCE_ROOT": str(evidence_root)}
 
-    first = submit(postgres_dsn, request)
-    second = submit(postgres_dsn, request)
+    first = submit(postgres_dsn, request, env_extra=env)
+    second = submit(postgres_dsn, request, env_extra=env)
 
     assert first["state"] == "BLOCKED", first
     assert second["state"] == "BLOCKED", second
     assert str(UUID(first["job_id"])) == first["job_id"]
     assert first["job_id"] != second["job_id"]
 
-    result = cli("status", first["job_id"], database_url=postgres_dsn)
+    result = cli(
+        "status", first["job_id"], database_url=postgres_dsn, env_extra=env
+    )
     assert result.returncode == 0, result.stderr
-    assert json.loads(result.stdout) == {
+    status_payload = json.loads(result.stdout)
+    evidence = status_payload.pop("evidence")
+    assert status_payload == {
         "job_id": first["job_id"],
         "state": "BLOCKED",
         "stage": None,
@@ -127,20 +139,96 @@ def test_binary_submit_is_archived_as_blocked(database, postgres_dsn, tmp_path):
         "verdict": None,
         "verdict_reason": None,
         "verdict_current": False,
-        "evidence": None,
     }
+    assert evidence["available"] is True
+    assert evidence["status"] == "archived"
+    assert evidence["digest"].startswith("sha256:")
+    assert Path(evidence["path"]).is_relative_to(evidence_root)
+
+    exported = cli(
+        "export",
+        first["job_id"],
+        "--out",
+        str(tmp_path / "exported"),
+        database_url=postgres_dsn,
+        env_extra=env,
+    )
+    assert exported.returncode == 0, exported.stderr
+    assert json.loads(exported.stdout)["verdict"] == "BLOCKED"
+    verified = cli(
+        "verify-bundle",
+        str(tmp_path / "exported"),
+        env_extra=env,
+    )
+    assert verified.returncode == 0, verified.stderr
+    assert json.loads(verified.stdout)["status"] == "valid"
 
     row = database.execute(
-        "SELECT state, reason_code FROM jobs WHERE job_id = %s",
+        "SELECT state, reason_code, verdict, evidence_status, evidence_path, "
+        "evidence_digest FROM jobs WHERE job_id = %s",
         (UUID(first["job_id"]),),
     ).fetchone()
-    assert row == ("BLOCKED", "UNSUPPORTED_TARGET"), row
+    assert row[0:3] == ("BLOCKED", "UNSUPPORTED_TARGET", None), row
+    assert row[3] == "archived", row
+    assert row[4] == evidence["path"] and row[5] == evidence["digest"], row
 
     queued_binary = database.execute(
         "SELECT count(*) FROM jobs "
         "WHERE request->'target'->>'kind' = 'binary' AND state = 'QUEUED'"
     ).fetchone()[0]
     assert queued_binary == 0, "binary requests must never remain queued"
+
+
+def test_binary_submit_evidence_failure_is_failed_not_blocked(
+    database, postgres_dsn, tmp_path
+):
+    request = tmp_path / "binary.json"
+    request.write_text(BINARY_REQUEST, encoding="utf-8")
+    evidence_file = tmp_path / "not-a-directory"
+    evidence_file.write_text("occupied", encoding="utf-8")
+
+    submitted = cli(
+        "submit",
+        "--request",
+        str(request),
+        database_url=postgres_dsn,
+        env_extra={"DATACON_EVIDENCE_ROOT": str(evidence_file)},
+    )
+    assert submitted.returncode == 0, submitted.stderr
+    payload = json.loads(submitted.stdout)
+    assert payload["state"] == "FAILED"
+
+    result = cli("status", payload["job_id"], database_url=postgres_dsn)
+    assert result.returncode == 0, result.stderr
+    current = json.loads(result.stdout)
+    assert current["state"] == "FAILED"
+    assert current["reason_code"] == "EVIDENCE_WRITE_FAILED"
+    assert current["verdict"] is None
+    assert current["verdict_reason"] is None
+    assert current["evidence"]["available"] is False
+    assert current["evidence"]["status"] == "failed"
+    assert current["evidence"]["path"] is None
+    assert current["evidence"]["digest"] is None
+    assert current["evidence"]["error"]
+
+    row = database.execute(
+        "SELECT state, reason_code, verdict, verdict_reason, evidence_status, "
+        "evidence_path, evidence_digest FROM jobs WHERE job_id = %s",
+        (UUID(payload["job_id"]),),
+    ).fetchone()
+    assert row == (
+        "FAILED",
+        "EVIDENCE_WRITE_FAILED",
+        None,
+        None,
+        "failed",
+        None,
+        None,
+    ), row
+    assert database.execute(
+        "SELECT count(*) FROM jobs WHERE state = 'BLOCKED' "
+        "AND evidence_status = 'failed'"
+    ).fetchone()[0] == 0
 
 
 @pytest.mark.parametrize(

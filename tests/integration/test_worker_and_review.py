@@ -1,9 +1,12 @@
 import json
+from pathlib import Path
 import shutil
 from uuid import UUID, uuid4
 
 import pytest
 from psycopg.types.json import Jsonb
+
+from datacon import execution, state
 
 from support import (
     cli,
@@ -988,3 +991,254 @@ def test_worker_requires_database_configuration():
     result = cli("worker", "--once")
     assert result.returncode == 1
     assert json.loads(result.stderr)["reason_code"] == "DATABASE_NOT_CONFIGURED"
+
+
+# ---------------------------------------------------------------------------
+# Step 2: non-execution terminal blocks also archive an exportable bundle.
+# ---------------------------------------------------------------------------
+
+
+def export_and_verify_blocked(database, tmp_path, job_id, evidence_root, name):
+    current = status(database.dsn, job_id)
+    assert current["evidence"]["available"] is True, current
+    assert current["evidence"]["status"] == "archived"
+    assert current["verdict"] is None
+    assert current["verdict_current"] is False
+    assert Path(current["evidence"]["path"]).is_relative_to(evidence_root)
+
+    out = tmp_path / name
+    env = {"DATACON_EVIDENCE_ROOT": str(evidence_root)}
+    exported = cli(
+        "export", job_id, "--out", str(out), database_url=database.dsn, env_extra=env
+    )
+    assert exported.returncode == 0, exported.stderr
+    verified = cli("verify-bundle", str(out), env_extra=env)
+    assert verified.returncode == 0, verified.stderr
+    assert json.loads(verified.stdout)["status"] == "valid"
+    manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["bundle_kind"] == "blocked"
+    return current, manifest
+
+
+def test_analysis_material_missing_archives_exportable_blocked_bundle(
+    isolated_database, tmp_path
+):
+    case_root = copy_cases(tmp_path)
+    (case_root / "harness.c").unlink()
+    evidence_root = tmp_path / "evidence"
+    env = {
+        "DATACON_CASE_ROOT": str(case_root),
+        "DATACON_EVIDENCE_ROOT": str(evidence_root),
+    }
+    job = submit(isolated_database.dsn, write_request(tmp_path))
+
+    result = worker(isolated_database.dsn, env_extra=env)
+    assert result["state"] == "BLOCKED", result
+    current, manifest = export_and_verify_blocked(
+        isolated_database, tmp_path, job["job_id"], evidence_root, "exported"
+    )
+    assert current["reason_code"] == "MATERIAL_MISSING"
+    assert manifest["plan_digest"] is None
+    assert {entry["path"] for entry in manifest["files"]} >= {
+        "report.json",
+        "report.md",
+    }
+
+
+def test_review_rejection_archives_exportable_blocked_bundle(
+    isolated_database, tmp_path
+):
+    evidence_root = tmp_path / "evidence"
+    env = {"DATACON_EVIDENCE_ROOT": str(evidence_root)}
+    job = submit(isolated_database.dsn, write_request(tmp_path))
+    worker(isolated_database.dsn)
+    digest = status(isolated_database.dsn, job["job_id"])["pending_plan"][
+        "plan_digest"
+    ]
+
+    rejected = review(
+        isolated_database.dsn,
+        job["job_id"],
+        digest,
+        "reject",
+        env_extra=env,
+    )
+    assert rejected.returncode == 0, rejected.stderr
+
+    current, manifest = export_and_verify_blocked(
+        isolated_database, tmp_path, job["job_id"], evidence_root, "exported"
+    )
+    assert current["reason_code"] == "REVIEW_REJECTED"
+    assert manifest["plan_digest"] == digest
+    paths = {entry["path"] for entry in manifest["files"]}
+    assert {"plan.json", "review.json"} <= paths
+    review_doc = json.loads(
+        (tmp_path / "exported" / "review.json").read_text(encoding="utf-8")
+    )
+    assert review_doc["decision"] == "reject"
+
+
+def test_review_expiry_archives_exportable_blocked_bundle(
+    isolated_database, tmp_path
+):
+    evidence_root = tmp_path / "evidence"
+    env = {"DATACON_EVIDENCE_ROOT": str(evidence_root)}
+    job = submit(isolated_database.dsn, write_request(tmp_path))
+    worker(isolated_database.dsn)
+    digest = status(isolated_database.dsn, job["job_id"])["pending_plan"][
+        "plan_digest"
+    ]
+    isolated_database.connection.execute(
+        "UPDATE jobs SET review_deadline_at = now() - interval '1 second' "
+        "WHERE job_id = %s",
+        (UUID(job["job_id"]),),
+    )
+
+    expired = worker(isolated_database.dsn, env_extra=env)
+    assert expired["state"] == "BLOCKED", expired
+
+    current, manifest = export_and_verify_blocked(
+        isolated_database, tmp_path, job["job_id"], evidence_root, "exported"
+    )
+    assert current["reason_code"] == "REVIEW_EXPIRED"
+    assert manifest["plan_digest"] == digest
+    paths = {entry["path"] for entry in manifest["files"]}
+    assert "plan.json" in paths
+    assert "review.json" not in paths
+
+
+def test_review_rejection_archive_failure_marks_failed(
+    isolated_database, tmp_path, monkeypatch
+):
+    evidence_root = tmp_path / "evidence"
+    monkeypatch.setenv("DATACON_EVIDENCE_ROOT", str(evidence_root))
+    job = submit(isolated_database.dsn, write_request(tmp_path))
+    worker(isolated_database.dsn)
+    digest = status(isolated_database.dsn, job["job_id"])["pending_plan"][
+        "plan_digest"
+    ]
+    job_uuid = UUID(job["job_id"])
+
+    monkeypatch.setattr(
+        execution,
+        "archive_blocked",
+        lambda *args, **kwargs: (
+            None,
+            None,
+            "EVIDENCE_WRITE_FAILED: injected archive failure",
+        ),
+    )
+    outcome = state.record_review(
+        isolated_database.dsn,
+        job_uuid,
+        plan_digest=digest,
+        decision="reject",
+        reviewer_id="reviewer-archive-failure",
+    )
+    assert outcome.status == "applied"
+
+    current = status(isolated_database.dsn, job["job_id"])
+    assert current["state"] == "FAILED"
+    assert current["reason_code"] == "EVIDENCE_WRITE_FAILED"
+    assert current["verdict"] is None
+    assert current["verdict_reason"] is None
+    assert current["evidence"]["available"] is False
+    assert current["evidence"]["status"] == "failed"
+    assert current["evidence"]["path"] is None
+    assert current["evidence"]["digest"] is None
+    assert current["evidence"]["error"]
+    row = isolated_database.connection.execute(
+        "SELECT state, reason_code, verdict, verdict_reason, evidence_status, "
+        "evidence_path, evidence_digest FROM jobs WHERE job_id = %s",
+        (job_uuid,),
+    ).fetchone()
+    assert row == (
+        "FAILED",
+        "EVIDENCE_WRITE_FAILED",
+        None,
+        None,
+        "failed",
+        None,
+        None,
+    ), row
+
+
+def test_review_expiry_archive_failure_marks_failed(
+    isolated_database, tmp_path, monkeypatch
+):
+    evidence_root = tmp_path / "evidence"
+    monkeypatch.setenv("DATACON_EVIDENCE_ROOT", str(evidence_root))
+    job = submit(isolated_database.dsn, write_request(tmp_path))
+    worker(isolated_database.dsn)
+    job_uuid = UUID(job["job_id"])
+    isolated_database.connection.execute(
+        "UPDATE jobs SET review_deadline_at = now() - interval '1 second' "
+        "WHERE job_id = %s",
+        (job_uuid,),
+    )
+    claimed = state.claim_next(isolated_database.dsn, "expiry-archive-failure")
+    assert claimed is not None
+
+    monkeypatch.setattr(
+        execution,
+        "archive_blocked",
+        lambda *args, **kwargs: (
+            None,
+            None,
+            "EVIDENCE_WRITE_FAILED: injected archive failure",
+        ),
+    )
+    assert (
+        state.expire_review(
+            isolated_database.dsn, job_uuid, claimed["generation"]
+        )
+        is True
+    )
+
+    current = status(isolated_database.dsn, job["job_id"])
+    assert current["state"] == "FAILED"
+    assert current["reason_code"] == "EVIDENCE_WRITE_FAILED"
+    assert current["verdict"] is None
+    assert current["verdict_reason"] is None
+    assert current["evidence"]["available"] is False
+    assert current["evidence"]["status"] == "failed"
+    row = isolated_database.connection.execute(
+        "SELECT state, reason_code, verdict, verdict_reason, evidence_status, "
+        "evidence_path, evidence_digest FROM jobs WHERE job_id = %s",
+        (job_uuid,),
+    ).fetchone()
+    assert row == (
+        "FAILED",
+        "EVIDENCE_WRITE_FAILED",
+        None,
+        None,
+        "failed",
+        None,
+        None,
+    ), row
+
+
+def test_blocked_bundle_is_removed_when_record_rejects_the_write(
+    isolated_database, tmp_path, monkeypatch
+):
+    evidence_root = tmp_path / "evidence"
+    monkeypatch.setenv("DATACON_EVIDENCE_ROOT", str(evidence_root))
+    job = submit(isolated_database.dsn, write_request(tmp_path))
+    worker(isolated_database.dsn)
+    digest = status(isolated_database.dsn, job["job_id"])["pending_plan"][
+        "plan_digest"
+    ]
+    job_uuid = UUID(job["job_id"])
+
+    monkeypatch.setattr(
+        state, "record_blocked_evidence", lambda *args, **kwargs: False
+    )
+    outcome = state.record_review(
+        isolated_database.dsn,
+        job_uuid,
+        plan_digest=digest,
+        decision="reject",
+        reviewer_id="reviewer-orphan",
+    )
+    assert outcome.status == "applied"
+    assert not list(evidence_root.glob(f"*/blocked-generation-*"))

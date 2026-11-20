@@ -73,6 +73,45 @@ def _claimed_generation(graph_state: SupervisorState) -> int:
     return graph_state["generation"]
 
 
+# Analysis-period blocks that are terminal before execution. They get a
+# blocked evidence bundle (no plan/review is available yet). PLAN_MISMATCH and
+# ANALYSIS_ERROR are deliberately excluded: the former is not the execution
+# terminal and the latter is an internal failure, not a business block.
+_BLOCKED_EVIDENCE_REASONS = frozenset(
+    {"MATERIAL_MISSING", "SOURCE_CONFLICT", "DEADLINE_EXCEEDED"}
+)
+
+
+def _block_job(
+    dsn: str,
+    job_id: UUID,
+    *,
+    generation: int,
+    reason_code: str,
+    message: str,
+    state: str = "BLOCKED",
+    event_type: str = "blocked",
+) -> None:
+    """Commit a block and, when it is a terminal business block, archive it."""
+    state_store.block_job(
+        dsn,
+        job_id,
+        generation=generation,
+        reason_code=reason_code,
+        message=message,
+        state=state,
+        event_type=event_type,
+    )
+    if state == "BLOCKED" and reason_code in _BLOCKED_EVIDENCE_REASONS:
+        execution.record_blocked(
+            dsn,
+            job_id,
+            generation=generation,
+            reason_code=reason_code,
+            message=message,
+        )
+
+
 def _reusable_analysis(result: dict[str, Any] | None) -> AnalyzedCase | None:
     """Return a plan draft persisted before a workflow-level retry.
 
@@ -137,7 +176,7 @@ def build_graph(
         if state_store.prepare_deadline_passed(
             dsn, job_id, generation=job["generation"]
         ):
-            state_store.block_job(
+            _block_job(
                 dsn,
                 job_id,
                 generation=job["generation"],
@@ -162,7 +201,7 @@ def build_graph(
             last_error: BaseException | None = None
             for _ in range(2):
                 try:
-                    state_store.block_job(
+                    _block_job(
                         dsn,
                         job_id,
                         generation=job["generation"],
@@ -378,7 +417,7 @@ def build_graph(
                 if state_store.prepare_deadline_passed(
                     dsn, job_id, generation=job["generation"]
                 ):
-                    state_store.block_job(
+                    _block_job(
                         dsn,
                         job_id,
                         generation=job["generation"],
@@ -407,7 +446,7 @@ def build_graph(
                 except state_store.StaleGeneration:
                     raise
                 except AnalysisBlocked as error:
-                    state_store.block_job(
+                    _block_job(
                         dsn,
                         job_id,
                         generation=job["generation"],
@@ -436,7 +475,7 @@ def build_graph(
                     attempt_no += 1
                     continue
                 except Exception as error:  # noqa: BLE001 - sanitized below
-                    state_store.block_job(
+                    _block_job(
                         dsn,
                         job_id,
                         generation=job["generation"],
@@ -462,7 +501,7 @@ def build_graph(
                 summary=analyzed.summary,
             )
         except state_store.PlanConflict:
-            state_store.block_job(
+            _block_job(
                 dsn,
                 job_id,
                 generation=job["generation"],
@@ -557,7 +596,7 @@ def build_graph(
                 and review is not None
                 and review["plan_digest"] != plan["plan_digest"]
             ):
-                state_store.block_job(
+                _block_job(
                     dsn,
                     job_id,
                     generation=claimed_generation,
@@ -795,7 +834,7 @@ def _process_claim(
                     break
                 if expired:
                     try:
-                        state_store.block_job(
+                        _block_job(
                             dsn,
                             job_id,
                             generation=generation,

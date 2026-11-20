@@ -454,6 +454,17 @@ def test_archive_failure_keeps_verdict_unset(
     assert current["verdict_reason"] is None
     assert current["evidence"]["available"] is False
     assert current["evidence"]["error"]
+    row = isolated_database.connection.execute(
+        "SELECT verdict, verdict_reason, evidence_status, evidence_path, "
+        "evidence_digest FROM jobs WHERE job_id = %s",
+        (UUID(job["job_id"]),),
+    ).fetchone()
+    assert row == (None, None, "failed", None, None)
+    archived_without_pointer = isolated_database.connection.execute(
+        "SELECT count(*) FROM jobs WHERE evidence_status = 'archived' "
+        "AND (evidence_path IS NULL OR evidence_digest IS NULL)"
+    ).fetchone()[0]
+    assert archived_without_pointer == 0
 
 
 def test_completed_journals_are_reused_after_generation_takeover(
@@ -2025,3 +2036,44 @@ def test_s1_finish_failed_timeout_and_run_incomplete_archive_partial_inconclusiv
     assert report["rule"] is None
     assert report["missing"]
     assert report["evidence_complete"] is False
+
+
+def test_execution_material_missing_archives_exportable_execution_bundle(
+    isolated_database, tmp_path, monkeypatch
+):
+    job, _, generation = prepare_approved_job(isolated_database, tmp_path)
+
+    def missing_material(context, run_root, **kwargs):
+        raise execution.ExecutionBlocked(
+            "MATERIAL_MISSING", "material harness.c is missing"
+        )
+
+    monkeypatch.setattr(execution, "_materialize", missing_material)
+    outcome = run_with_fake(
+        isolated_database, job, generation, tmp_path, FakeSandbox(), monkeypatch
+    )
+    assert outcome.state == "BLOCKED", outcome
+    assert outcome.reason_code == "MATERIAL_MISSING"
+
+    current = status(isolated_database.dsn, job["job_id"])
+    assert current["state"] == "BLOCKED"
+    assert current["reason_code"] == "MATERIAL_MISSING"
+    assert current["verdict"] is None
+    assert current["evidence"]["available"] is True
+    verified = verify_bundle(current["evidence"]["path"])
+    assert verified.manifest["bundle_kind"] == "execution"
+    assert verified.manifest["verdict"] == "BLOCKED"
+    assert {"plan.json", "review.json"} <= set(verified.file_data)
+
+    out = tmp_path / "exported"
+    exported = cli(
+        "export",
+        job["job_id"],
+        "--out",
+        str(out),
+        database_url=isolated_database.dsn,
+    )
+    assert exported.returncode == 0, exported.stderr
+    offline = cli("verify-bundle", str(out))
+    assert offline.returncode == 0, offline.stderr
+    assert json.loads(offline.stdout)["verdict"] == "BLOCKED"

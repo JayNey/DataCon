@@ -26,10 +26,10 @@ def submit(dsn: str, request: dict, *, operator_id: str | None = None) -> dict:
     job_id = uuid4()
     job_state, reason_code = initial_state(request)
     with psycopg.connect(dsn, connect_timeout=5) as connection:
-        row = connection.execute(
+        connection.execute(
             "INSERT INTO jobs "
             "(job_id, request, state, reason_code, operator_id, workflow_synced) "
-            "VALUES (%s, %s, %s, %s, %s, %s) RETURNING state",
+            "VALUES (%s, %s, %s, %s, %s, %s)",
             (
                 job_id,
                 Jsonb(request),
@@ -38,8 +38,30 @@ def submit(dsn: str, request: dict, *, operator_id: str | None = None) -> dict:
                 operator_id,
                 job_state == "BLOCKED",
             ),
-        ).fetchone()
-    return {"job_id": str(job_id), "state": row[0]}
+        )
+    if job_state == "BLOCKED":
+        # Submit-time rejection never enters a worker claim, so it has no lease
+        # and cannot use the execution archive path. Archive the standalone
+        # blocked evidence bundle and record it directly.
+        from datacon import execution
+
+        execution.record_blocked(
+            dsn,
+            job_id,
+            generation=0,
+            reason_code=reason_code or "UNSUPPORTED_TARGET",
+            message=(
+                "binary targets are not supported; only source targets can be "
+                "analyzed"
+            ),
+        )
+        with psycopg.connect(dsn, connect_timeout=5) as connection:
+            current = connection.execute(
+                "SELECT state FROM jobs WHERE job_id = %s", (job_id,)
+            ).fetchone()
+        if current is not None:
+            job_state = current[0]
+    return {"job_id": str(job_id), "state": job_state}
 
 
 def status(dsn: str, job_id: UUID) -> dict | None:
