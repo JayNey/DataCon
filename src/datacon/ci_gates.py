@@ -1246,7 +1246,11 @@ def run_repo_static_gates(
     """Run all T07 repository static merge gates and return a structured report."""
     md_files = [
         path
-        for path in [root / "README.md", *sorted((root / "tests").rglob("*.md"))]
+        for path in [
+            root / "README.md",
+            *sorted((root / "docs").rglob("*.md")),
+            *sorted((root / "tests").rglob("*.md")),
+        ]
         if path.is_file()
     ]
     workflow_dir = root / ".github" / "workflows"
