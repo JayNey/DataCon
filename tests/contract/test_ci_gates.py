@@ -1182,8 +1182,13 @@ def test_codeowners_protects_ci_trusted_root():
         "/.github/",
         "/src/datacon/ci_gates.py",
         "/scripts/run_suite.sh",
+        "/scripts/calibrate_b03.py",
+        "/scripts/freeze_b03_admission.py",
         "/tests/contract/test_ci_gates.py",
         "/tests/contract/test_release_workflow.py",
+        "/tests/contract/test_b03_calibration.py",
+        "/tests/contract/test_b03_migration.py",
+        "/migrations/009_b03_acceptance.sql",
     ):
         assert required in text, f"{required} missing from .github/CODEOWNERS"
 

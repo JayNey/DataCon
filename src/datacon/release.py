@@ -89,6 +89,11 @@ ROLLBACK_COMPATIBLE_MIGRATIONS: Mapping[str, str] = MappingProxyType(
         "008_release_events.sql": (
             "sha256:c117f26d16f8f956032018bedb22304ea53704b6ed2032d43c01a4ff3d98ba09"
         ),
+        # 009 only adds the dedicated b03_acceptance table, so an image built
+        # before 009 keeps working across it.
+        "009_b03_acceptance.sql": (
+            "sha256:f5905caf9ab61702c32297c519ca711d4e21c810a55c668543e811939ed7f235"
+        ),
     }
 )
 _CVE_ID = re.compile(r"CVE-[0-9]{4}-[0-9]{4,}")

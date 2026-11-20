@@ -44,18 +44,25 @@
   "harness": {
     "language": "C",
     "entrypoint": "onig_new_deluxe",
-    "pattern_encoding": "ONIG_ENCODING_UTF8",
-    "target_encoding": "ONIG_ENCODING_EUC_JP",
+    "pattern_encoding": "ONIG_ENCODING_UTF8 (normal) / ONIG_ENCODING_ASCII (candidate)",
+    "target_encoding": "ONIG_ENCODING_UTF8 (normal) / ONIG_ENCODING_UTF16_BE (candidate)",
     "same_harness_for_both_versions": true,
     "normal_exit_code": 0,
     "candidate_asan_exit_code": 86,
-    "asan_options": "detect_leaks=0:halt_on_error=1:abort_on_error=0:exitcode=86"
+    "asan_options": "detect_leaks=0:halt_on_error=1:abort_on_error=0:exitcode=86",
+    "candidate_clean_exit_code": 0,
+    "expected_stdout": {
+      "normal": "OK\n",
+      "candidate_clean": "MISMATCH_REJECTED\n"
+    }
   },
   "asan_signature": {
     "error": "heap-use-after-free",
-    "function": "onig_new_deluxe",
-    "source": "src/regext.c",
-    "status": "expected_pending_t05_replay"
+    "function": "utf16be_mbc_to_code",
+    "source": "/fixture/vulnerable/src/utf16_be.c",
+    "status": "frozen",
+    "operation": "READ",
+    "access_size": 1
   },
   "checks": [
     {
@@ -90,10 +97,9 @@
     },
     {
       "id": "asan_replay",
-      "status": "deferred",
-      "owner_task": "T05",
-      "evidence": "Execute the pinned case only in the authorized isolated environment; pin the exact ASan frame and input digest after replay. T01/T02 do not execute real cases.",
-      "verification": "execution_deferred"
+      "status": "pass",
+      "evidence": "ASan heap-use-after-free READ of size 1 in utf16be_mbc_to_code at /fixture/vulnerable/src/utf16_be.c; vulnerable/candidate exited 86 with the real diagnostic, both normal controls exited 0 with identical stdout, and fixed/candidate exited 0 cleanly.",
+      "verification": "calibrated_replay"
     }
   ],
   "acceptance_workflow": {
@@ -107,11 +113,11 @@
     "offline_verifier": "datacon.evidence.verify_bundle",
     "private_storage_contract": "Only sanitized summary, storage_ref, and manifest_digest may be recorded in repository metadata; raw candidate inputs, build logs, full ASan diagnostics, and evidence bundles stay in authorized storage."
   },
-  "usage_boundary": "Public metadata only. No real-case input, build log, diagnostic, credential or evidence bundle is committed. Execution and release acceptance stay in the authorized Linux environment and are deferred to T05/T08.",
+  "usage_boundary": "Public metadata only. No real-case input, build log, diagnostic, credential or evidence bundle is committed. Execution and release acceptance run only in the authorized Linux environment; the frozen ASan signature and expected outputs below come from that environment.",
   "notes": [
-    "This admission record selects B03 for planning; it does not claim a completed reproduction.",
-    "The expected ASan signature must be frozen from an actual T05 replay before T08 release acceptance."
+    "This admission record was frozen from a real authorized-lab calibration; release acceptance is recorded separately in the b03_acceptance ledger.",
+    "The frozen ASan signature and expected exits/stdout were produced by scripts/calibrate_b03.py and scripts/freeze_b03_admission.py; they are not hand-written placeholders."
   ],
   "expected_verdict": "REPRODUCED",
-  "expected_verdict_status": "pending_t05_replay"
+  "expected_verdict_status": "frozen"
 }

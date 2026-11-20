@@ -134,7 +134,7 @@ def test_missing_and_tampered_material_is_detected(tmp_path):
         verify_material(copy, expected)
 
 
-def test_b03_admission_record_is_traceable_and_defers_real_execution():
+def test_b03_admission_record_is_traceable_and_pending_or_frozen():
     record = load("B03-admission.json")
     assert record["schema_version"] == 1
     assert record["benchmark_id"] == "B03"
@@ -160,14 +160,34 @@ def test_b03_admission_record_is_traceable_and_defers_real_execution():
         "asan_replay",
     }
     assert all(checks[name]["status"] == "pass" for name in checks if name != "asan_replay")
-    assert checks["asan_replay"]["status"] == "deferred"
-    assert checks["asan_replay"]["owner_task"] == "T05"
-    assert checks["asan_replay"]["verification"] == "execution_deferred"
+    asan_replay = checks["asan_replay"]
+    if asan_replay["status"] == "deferred":
+        # The public fixture stays pending until the authorized lab freezes it.
+        assert asan_replay["owner_task"] == "T05"
+        assert asan_replay["verification"] == "execution_deferred"
+        assert record["asan_signature"]["status"] == "expected_pending_t05_replay"
+        assert record["expected_verdict_status"] == "pending_t05_replay"
+    else:
+        # The same fixture must remain valid after freeze_b03_admission.py
+        # replaces the pending placeholders with real lab values.
+        assert asan_replay["status"] == "pass"
+        assert isinstance(asan_replay.get("evidence"), str)
+        assert asan_replay["evidence"].strip()
+        assert record["asan_signature"]["status"] in {"frozen", "verified"}
+        assert record["expected_verdict_status"] in {"frozen", "verified"}
+        for field in ("error", "operation", "access_size", "function", "source"):
+            assert field in record["asan_signature"], field
+        assert record["asan_signature"]["operation"] in {"READ", "WRITE"}
+        assert type(record["asan_signature"]["access_size"]) is int
+        assert record["asan_signature"]["access_size"] > 0
+        assert type(record["harness"]["candidate_clean_exit_code"]) is int
+        expected_stdout = record["harness"]["expected_stdout"]
+        assert isinstance(expected_stdout, dict)
+        assert isinstance(expected_stdout.get("normal"), str)
+        assert isinstance(expected_stdout.get("candidate_clean"), str)
     assert checks["offline_build"]["verification"] == "design"
     assert checks["public_advisory"]["verification"] == "public_metadata"
-    assert record["asan_signature"]["status"] == "expected_pending_t05_replay"
     assert record["expected_verdict"] == "REPRODUCED"
-    assert record["expected_verdict_status"] == "pending_t05_replay"
     assert "No real-case input" in record["usage_boundary"]
 
     markdown = (CASES / "B03-admission.md").read_text(encoding="utf-8")

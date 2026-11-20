@@ -123,7 +123,7 @@ def test_release_candidate_manifest_rejects_unknown_missing_and_bad_digests():
     manifest = _sample_rc_manifest()
     assert manifest["schema_version"] == 1
     assert manifest["contract_version"] == 1
-    assert manifest["migration_version"] == "008_release_events.sql"
+    assert manifest["migration_version"] == "009_b03_acceptance.sql"
     assert len(manifest["migrations"]) >= 8
     release.validate_release_candidate_manifest(manifest)
 
@@ -858,7 +858,15 @@ def _b03_case_root(tmp_path: Path) -> Path:
 
 def _frozen_admission() -> dict:
     admission = json.loads(B03_PATH.read_text(encoding="utf-8"))
-    admission["asan_signature"]["status"] = "frozen"
+    # The checked-in fixture is the real frozen lab record. These contract
+    # tests use a synthetic fake sandbox, so pin the signature they exercise
+    # instead of depending on the fixture's real ASan frame.
+    admission["asan_signature"] = {
+        "error": "heap-use-after-free",
+        "function": "onig_new_deluxe",
+        "source": "src/regext.c",
+        "status": "frozen",
+    }
     admission["expected_verdict_status"] = "frozen"
     admission["repository"]["source_path"] = "parser.c"
     admission["harness"]["candidate_clean_exit_code"] = 0
@@ -1008,10 +1016,13 @@ def _run_b03(tmp_path, admission, sandbox, review):
     )
 
 
-def test_b03_repo_pending_admission_is_rejected(tmp_path):
+def test_b03_pending_admission_is_rejected(tmp_path):
+    # Build an explicit pending copy so this regression test does not depend on
+    # whether the checked-in fixture has already been frozen by the lab.
     root = _b03_case_root(tmp_path)
-    admission = json.loads(B03_PATH.read_text(encoding="utf-8"))
-    assert admission["expected_verdict_status"] == "pending_t05_replay"
+    admission = _frozen_admission()
+    admission["asan_signature"]["status"] = "expected_pending_t05_replay"
+    admission["expected_verdict_status"] = "pending_t05_replay"
     review = _review_for(_frozen_admission(), root)
     sandbox = FakeB03Sandbox(toolchain=admission["build"]["toolchain_image"])
     with pytest.raises(release.ReleaseGateError, match="asan_signature.status"):
