@@ -67,6 +67,25 @@ def _case_root(tmp_path: Path) -> Path:
 def _admission() -> dict:
     admission = json.loads(ADMISSION_PATH.read_text(encoding="utf-8"))
     admission["repository"]["source_path"] = "parser.c"
+    # The checked-in fixture is a frozen real lab record. These unit tests
+    # exercise the pending -> frozen transition with a synthetic calibration,
+    # so reset only the state the freeze script is expected to replace.
+    admission["asan_signature"]["status"] = "expected_pending_t05_replay"
+    admission["expected_verdict_status"] = "pending_t05_replay"
+    admission["harness"].pop("candidate_clean_exit_code", None)
+    admission["harness"].pop("expected_stdout", None)
+    for entry in admission["checks"]:
+        if entry.get("id") == "asan_replay":
+            entry.clear()
+            entry.update(
+                {
+                    "id": "asan_replay",
+                    "status": "deferred",
+                    "owner_task": "T05",
+                    "evidence": "pending lab calibration",
+                    "verification": "execution_deferred",
+                }
+            )
     return admission
 
 

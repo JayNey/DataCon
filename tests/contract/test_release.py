@@ -858,7 +858,15 @@ def _b03_case_root(tmp_path: Path) -> Path:
 
 def _frozen_admission() -> dict:
     admission = json.loads(B03_PATH.read_text(encoding="utf-8"))
-    admission["asan_signature"]["status"] = "frozen"
+    # The checked-in fixture is the real frozen lab record. These contract
+    # tests use a synthetic fake sandbox, so pin the signature they exercise
+    # instead of depending on the fixture's real ASan frame.
+    admission["asan_signature"] = {
+        "error": "heap-use-after-free",
+        "function": "onig_new_deluxe",
+        "source": "src/regext.c",
+        "status": "frozen",
+    }
     admission["expected_verdict_status"] = "frozen"
     admission["repository"]["source_path"] = "parser.c"
     admission["harness"]["candidate_clean_exit_code"] = 0

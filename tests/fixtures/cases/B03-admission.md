@@ -2,7 +2,7 @@
 
 **结论** 选定 `CVE-2019-13224` 作为 B03 候选，准入状态为 `conditional_admission`。Step 3 固定走 **路线 B**：在授权 lab 上用真实材料完成 4 次回放标定，冻结 ASan 签名与控制输出，再在候选控制面镜像内执行 6 次回放验收并将结果写入 `b03_acceptance` 专用表。路线 A（扩展主流程的多文件构建）**延后**，不作为本次验收的前置条件，见文末。
 
-机器可读记录见 `B03-admission.json`。仓库内该记录在授权 lab 完成 T05 标定前保持 `pending`；真实签名只能来自 lab calibration，不得手写或推断。
+机器可读记录见 `B03-admission.json`。该记录已由授权 lab 的 T05 calibration 冻结；真实签名来自 4 次真实回放，不是手写值。正式 6 次回放验收仍由 operator 在 `datacon-internal` 执行，并写入 `b03_acceptance`。
 
 | 条件 | 结果 | 依据 |
 | --- | --- | --- |
@@ -13,7 +13,15 @@
 | 材料许可 | 通过 | 仓库 `COPYING` 为 BSD-2-Clause |
 | 两版同一 harness | 通过（设计核对） | 同一 C harness 调用 `onig_new_deluxe()`，仅源码提交不同 |
 | ASan 工具链 | 通过（计划） | 固定 clang 19.1.7 镜像 + AddressSanitizer |
-| ASan 实际回放 | 待授权 lab 标定 | 由 `scripts/calibrate_b03.py` 真实回放后经 `scripts/freeze_b03_admission.py` 冻结 |
+| ASan 实际回放 | 通过（lab calibration） | `scripts/calibrate_b03.py` 4 次真实回放后经 `scripts/freeze_b03_admission.py` 冻结；error=`heap-use-after-free`、operation=`READ`、access_size=1 |
+
+## 当前冻结状态
+
+- Case root：授权 lab 上的 `/srv/datacon/b03-case`（真实材料，不提交仓库）。
+- Real ASan signature：`heap-use-after-free` / `READ` / size `1` / `utf16be_mbc_to_code` / `/fixture/vulnerable/src/utf16_be.c`。
+- Expected exit：normal `0`、candidate_clean `0`、candidate_asan `86`。
+- Expected stdout：normal `OK\n`、candidate_clean `MISMATCH_REJECTED\n`。
+- `plan_digest`（最终 frozen admission）：`sha256:a18aef14dc37c088fbc37ea9cb3ba431e15fac91c78ebceb19eb9d44941e964a`。
 
 ## Step 3 路线 B 操作顺序（固定）
 
@@ -27,7 +35,7 @@
 
 不要调换 4/5/6/7 的顺序；review 过期、candidate 不一致或 009 未应用都会 fail closed。
 
-### 1. 标定（授权 lab，仅此环境）
+### 1. 标定（授权 lab，已完成）
 
 ```bash
 uv run --frozen python scripts/calibrate_b03.py \
@@ -44,7 +52,7 @@ uv run --frozen python scripts/calibrate_b03.py \
 - 只写 `--out`；不写数据库、不写 evidence bundle、不打印宿主路径或原始日志。
 - 任一回放失败/超时/截断、固定版本出现 ASan、vulnerable candidate 没有完整真实签名，或与 admission 里已写死的 exit/stdout/签名冲突时，直接失败且不产出文件。
 
-### 2. 冻结 admission
+### 2. 冻结 admission（已完成）
 
 ```bash
 uv run --frozen python scripts/freeze_b03_admission.py \
@@ -65,7 +73,7 @@ uv run --frozen python scripts/freeze_b03_admission.py \
 
 ### 3. 更新 repo fixture 与 secret
 
-- 用 `<frozen-admission.json>` 替换 `tests/fixtures/cases/B03-admission.json`（仅在 lab 真实值就绪后；仓库当前保持 `pending`）。
+- `tests/fixtures/cases/B03-admission.json` 已替换为 lab 产出的 frozen JSON；仓库只保留脱敏签名、summary 与公开元数据。
 - 把**同一份 JSON 文本**写入 `internal-lab` environment secret `DATACON_B03_ADMISSION`。Step 3 的 workflow 直接 `json.loads` 该 secret，不再把 secret 当文件路径。
 - `DATACON_B03_CASE_ROOT` 仍是授权 lab 上的真实材料目录（绝对路径），不提交仓库。
 
@@ -154,6 +162,7 @@ gh workflow run release.yml --ref main \
 
 ## 使用边界
 
-- 仓库只提交公开元数据、准入记录与脱敏摘要契约；不提交真实输入、构建日志、完整 ASan 诊断、凭证或证据包实体。
+- 仓库只提交公开元数据、准入记录、脱敏 ASan 签名与公开源码摘要契约；不提交真实材料树、构建日志、完整 ASan 诊断、凭证或证据包实体。
+- 真实材料树只存在于授权 lab 的 `/srv/datacon/b03-case`，不随仓库分发。
 - `scripts/calibrate_b03.py` 与 `scripts/freeze_b03_admission.py` 不写数据库、不写 evidence bundle；真实 6 回放只由 operator 在 `datacon-internal` 上执行，Agent 不得伪造。
 - `run_b03_acceptance` 会硬拒绝未冻结的 admission、过期/不匹配的 review、失败 probe/build、缺失材料和不一致输入。
