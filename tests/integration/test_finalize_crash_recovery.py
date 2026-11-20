@@ -182,7 +182,6 @@ def test_crash_before_finalize_then_review_expiry_converges(
     job, job_uuid = crash_after_interrupt_before_finalize(
         isolated_database, tmp_path, monkeypatch
     )
-    digest = pending_digest(isolated_database, job_uuid)
 
     isolated_database.connection.execute(
         "UPDATE jobs SET review_deadline_at = now() - interval '1 second' "

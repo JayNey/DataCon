@@ -185,7 +185,9 @@ def _load_workflow(path: Path) -> Any:
 
 def _workflow_trigger(document: Mapping[str, Any]) -> Any:
     # PyYAML resolves the unquoted key ``on`` as the boolean True (YAML 1.1).
-    return document.get("on", document.get(True))
+    if "on" in document:
+        return document["on"]
+    return document.get(True)  # type: ignore[call-overload]
 
 
 def _check_permissions(
@@ -945,12 +947,12 @@ def evaluate_scan_findings(
             f"{detail['id']} (scope={detail['scope']})"
             for detail in blocked_findings
         )
-        error = GateError(message)
+        gate_error = GateError(message)
         # Keep the machine-readable summary on the exception so callers such as
         # run_repo_static_gates and main(--json) can still print every finding
         # after the gate fails closed.
-        error.scan_summary = summary
-        raise error
+        setattr(gate_error, "scan_summary", summary)
+        raise gate_error
     return summary
 
 
@@ -1236,6 +1238,22 @@ def check_test_partition_counts(
     return errors
 
 
+def repository_markdown_files(root: Path) -> list[Path]:
+    """Return README plus every Markdown file under ``docs/`` and ``tests/``.
+
+    The Markdown link and REQ/TC checks must cover the operator documentation
+    (including nested ``docs/spec/`` pages) and test notes, not only the root
+    README. Non-existent paths are ignored so a repository without tests/docs
+    still yields a useful partial report.
+    """
+    candidates = [
+        root / "README.md",
+        *sorted((root / "docs").rglob("*.md")),
+        *sorted((root / "tests").rglob("*.md")),
+    ]
+    return [path for path in candidates if path.is_file()]
+
+
 def run_repo_static_gates(
     root: Path,
     *,
@@ -1244,15 +1262,7 @@ def run_repo_static_gates(
     require_scan: bool = False,
 ) -> dict[str, Any]:
     """Run all T07 repository static merge gates and return a structured report."""
-    md_files = [
-        path
-        for path in [
-            root / "README.md",
-            *sorted((root / "docs").rglob("*.md")),
-            *sorted((root / "tests").rglob("*.md")),
-        ]
-        if path.is_file()
-    ]
+    md_files = repository_markdown_files(root)
     workflow_dir = root / ".github" / "workflows"
     workflow_files = sorted(
         [*workflow_dir.glob("*.yml"), *workflow_dir.glob("*.yaml")]

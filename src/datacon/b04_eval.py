@@ -14,7 +14,7 @@ import json
 from pathlib import Path
 import shutil
 import tempfile
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, cast
 
 from datacon import jsonutil
 from datacon.agent_contracts import AnalysisModel, AgentOutput, ModelContext, ModelSuggestion
@@ -255,7 +255,7 @@ def evaluate_single_round(
                 analyzed = analyze_case(
                     req,
                     case_root=str(case_root),
-                    model=harness,
+                    model=cast(AnalysisModel, harness),
                     recorder=recorder,
                 )
                 findings_raw = analyzed.plan["analysis"]["findings"]

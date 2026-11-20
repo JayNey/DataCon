@@ -103,7 +103,11 @@ def require_int(value: Any, label: str, *, minimum: int, maximum: int) -> int:
 
 
 def require_object(
-    value: Any, *, required: set[str], optional: set[str] = frozenset(), label: str = "value"
+    value: Any,
+    *,
+    required: set[str],
+    optional: set[str] | frozenset[str] = frozenset(),
+    label: str = "value",
 ) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError(f"{label} must be a JSON object")

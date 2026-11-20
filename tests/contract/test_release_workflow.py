@@ -8,6 +8,7 @@ still calls the production promotion/rollback paths.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import yaml
 
@@ -93,6 +94,18 @@ def test_build_candidate_saves_image_and_real_test_scan_evidence():
     )
 
 
+def test_build_candidate_release_sbom_is_trivy_cyclonedx():
+    job = _load(RELEASE)["jobs"]["build-candidate"]
+    text = _run_text(job)
+    assert "generate_sbom(" not in text
+    assert "--format cyclonedx" in text
+    assert f"/out/{release.SBOM_REPORT_FILE}" in text
+    assert "test -s \"$out/sbom.cdx.json\"" in text
+    assert f"aquasec/trivy@{release.TRIVY_IMAGE_DIGEST}" in text
+    assert "verify_sbom_report" in text
+    assert "sbom.cdx.json" in text
+
+
 def test_promote_job_requires_test_report_and_build_candidate_without_always():
     job = _load(RELEASE)["jobs"]["promote-internal"]
     needs = job.get("needs")
@@ -155,6 +168,45 @@ def test_rollback_job_validates_input_via_env_and_uses_real_rollback():
     assert "db_readability" in text
 
 
+def test_rollback_preflights_archived_bundle_reviews_and_uploads_result():
+    job = _load(RELEASE)["jobs"]["rollback-internal"]
+    text = _run_text(job)
+    assert "archived_bundle_preflight" in text
+    assert "verify_review_bundle_readability" in text
+    assert "SELECT review_id FROM reviews LIMIT 1" in text
+    assert '"--user"' in text and "65534:65534" in text
+    assert "/bundle/review.json" in text
+    assert release.ROLLBACK_RESULT_FILE in text
+    assert "rollback-result.json" in text
+
+    restore = next(
+        step for step in _steps(job) if "rollback_release" in step.get("run", "")
+    )
+    script = restore["run"]
+    assert script.index("archived_bundle_preflight") < script.index(
+        "rollback_release"
+    )
+    assert script.index("verify_review_bundle_readability") < script.index(
+        "rollback_release"
+    )
+    assert script.index("db_reviews_readable") < script.index("rollback_release")
+
+    uploads = [
+        step
+        for step in _steps(job)
+        if step.get("uses", "").startswith("actions/upload-artifact@")
+    ]
+    result_upload = next(
+        step
+        for step in uploads
+        if str(step.get("with", {}).get("path", "")).endswith(
+            release.ROLLBACK_RESULT_FILE
+        )
+    )
+    assert result_upload.get("if") == "always()"
+    assert result_upload["with"]["name"] == "release-rollback-result"
+
+
 def test_release_workflow_passes_untrusted_inputs_through_env():
     document = _load(RELEASE)
     for job in document["jobs"].values():
@@ -167,7 +219,7 @@ def test_test_report_job_produces_four_junit_reports():
     job = _load(RELEASE)["jobs"]["test-report"]
     text = _run_text(job)
     for label in ("postgres", "docker", "asan", "contract"):
-        assert f"--junitxml=\"$RUNNER_TEMP/release-junit/${{label}}.xml\"" in text or label in text
+        assert f"$RUNNER_TEMP/release-junit/junit-{label}.xml" in text
     run_suite_script = REPO_ROOT / "scripts" / "run_suite.sh"
     assert run_suite_script.is_file()
     assert "scripts/run_suite.sh" in text
@@ -531,7 +583,6 @@ def test_s1_s4_s5_s8_promote_and_rollback_safety_contracts():
     document = _load(RELEASE)
     jobs = document["jobs"]
 
-    promote_steps = _steps(jobs["promote-internal"])
     promote_text = _run_text(jobs["promote-internal"])
     assert "worker --once" not in promote_text
     assert "release slots --environment internal-lab" in promote_text

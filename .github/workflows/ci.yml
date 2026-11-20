@@ -58,6 +58,10 @@ jobs:
             echo "setuptools must not be resolved as the build backend" >&2
             exit 1
           fi
+      - name: Run Ruff
+        run: uv run --frozen ruff check src tests
+      - name: Run mypy (base profile)
+        run: uv run --frozen mypy src/datacon
       - name: Run T07 static, link, REQ/TC, workflow YAML, secret and lock gates
         run: |
           # This PR job runs the explicit static subset. The real Trivy report

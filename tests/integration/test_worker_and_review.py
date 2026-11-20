@@ -1241,4 +1241,4 @@ def test_blocked_bundle_is_removed_when_record_rejects_the_write(
         reviewer_id="reviewer-orphan",
     )
     assert outcome.status == "applied"
-    assert not list(evidence_root.glob(f"*/blocked-generation-*"))
+    assert not list(evidence_root.glob("*/blocked-generation-*"))
