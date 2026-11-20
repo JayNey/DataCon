@@ -314,8 +314,12 @@ jobs:
           # /tmp definitely exists inside the control container, so the mount
           # point needs no extra parent directories.
           work="$(mktemp -d /tmp/datacon-ci-b01.XXXXXX)"
-          mkdir -p "$work/runs" "$work/evidence" "$work/export"
-          chmod 0777 "$work" "$work/runs" "$work/evidence" "$work/export"
+          mkdir -p "$work/runs"
+          chmod 0777 "$work" "$work/runs"
+          # evidence / staging / export are created by the 65534 process
+          # inside the container. Pre-creating them as the runner would make
+          # the archive's chmod(0o755) fail with EPERM because 65534 does not
+          # own the directory.
 
           # The host file is world-readable so the 65534 runtime user can copy
           # it. The journal check requires a private, same-owner inode, so the
