@@ -15,7 +15,7 @@ concurrency:
 jobs:
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 35
     services:
       postgres:
         image: postgres:17-bookworm@sha256:665dc7b37ac52a17e298511414c21d23ffa4e6a6ef6225b3e5d59c7afb35e994
@@ -301,6 +301,101 @@ jobs:
           name: ci-junit-reports
           path: ${{ runner.temp }}/ci-reports/*.xml
           retention-days: 14
+      - name: Run B01 end-to-end inside the control-plane container
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker build -t datacon-ci .
+
+          # The sibling sandbox containers are created by the host daemon, so
+          # every path the control container asks it to mount must exist at the
+          # *same absolute path* on the host. Bind-mount the whole temporary
+          # tree at that path instead of giving the container a different view.
+          # /tmp definitely exists inside the control container, so the mount
+          # point needs no extra parent directories.
+          work="$(mktemp -d /tmp/datacon-ci-b01.XXXXXX)"
+          mkdir -p "$work/runs"
+          chmod 0777 "$work" "$work/runs"
+          # evidence / staging / export are created by the 65534 process
+          # inside the container. Pre-creating them as the runner would make
+          # the archive's chmod(0o755) fail with EPERM because 65534 does not
+          # own the directory.
+
+          # The host file is world-readable so the 65534 runtime user can copy
+          # it. The journal check requires a private, same-owner inode, so the
+          # container copies it to /tmp and chmods the copy to 0400 before any
+          # worker starts.
+          secret="$RUNNER_TEMP/datacon-ci-journal-secret"
+          python - "$secret" <<'PY'
+          import secrets
+          import sys
+          from pathlib import Path
+
+          Path(sys.argv[1]).write_text(secrets.token_hex(32) + "\n", encoding="ascii")
+          PY
+          chmod 0444 "$secret"
+
+          # The public test database still holds jobs submitted by the CLI
+          # tests. Give B01 its own schema so the first worker pass can only
+          # claim the job this step just submitted.
+          b01_dsn="$(uv run --frozen python - <<'PY'
+          import os
+
+          import psycopg
+          from psycopg.conninfo import conninfo_to_dict, make_conninfo
+
+          schema = "datacon_b01_ci"
+          with psycopg.connect(os.environ["DATACON_DATABASE_URL"], autocommit=True) as conn:
+              conn.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
+              conn.execute(f'CREATE SCHEMA "{schema}"')
+          parameters = conninfo_to_dict(os.environ["DATACON_DATABASE_URL"])
+          parameters["options"] = f"-csearch_path={schema}"
+          print(make_conninfo(**parameters))
+          PY
+          )"
+
+          docker run --rm --network host \
+            --group-add "$(stat -c '%g' /var/run/docker.sock)" \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$work:$work" \
+            -v "$secret:/ci-b01-journal-secret:ro" \
+            -e DATACON_DATABASE_URL="$b01_dsn" \
+            -e DATACON_OPERATOR_ID=ci-b01 \
+            -e DATACON_RUN_ROOT="$work/runs" \
+            -e DATACON_EVIDENCE_ROOT="$work/evidence" \
+            -e DATACON_STAGING_ROOT="$work/staging" \
+            -e DATACON_CI_EXPORT_DIR="$work/export" \
+            -e DATACON_JOURNAL_SECRET_FILE=/tmp/datacon-journal-secret \
+            -e HOME=/tmp \
+            --entrypoint /bin/sh datacon-ci -c '
+              # /bin/sh is dash in the Debian runtime: keep to POSIX sh (no
+              # pipefail) and avoid pipelines for the JSON assertions.
+              set -eu
+              cp /ci-b01-journal-secret /tmp/datacon-journal-secret
+              chmod 0400 /tmp/datacon-journal-secret
+
+              datacon migrate --migrations-dir /app/migrations
+
+              datacon submit --request /app/examples/request.json > /tmp/submit.json
+              job=$(python -c "import json; print(json.load(open(\"/tmp/submit.json\"))[\"job_id\"])")
+
+              datacon worker --once > /tmp/worker1.json
+              python -c "import json; d=json.load(open(\"/tmp/worker1.json\")); assert d[\"processed\"] == 1, d"
+
+              datacon status "$job" > /tmp/status1.json
+              digest=$(python -c "import json; print(json.load(open(\"/tmp/status1.json\"))[\"pending_plan\"][\"plan_digest\"])")
+
+              datacon review "$job" --plan-digest "$digest" --decision approve
+
+              datacon worker --once > /tmp/worker2.json
+              python -c "import json; d=json.load(open(\"/tmp/worker2.json\")); assert d[\"processed\"] == 1, d"
+
+              datacon status "$job" > /tmp/status2.json
+              python -c "import json; d=json.load(open(\"/tmp/status2.json\")); assert d[\"state\"] == \"REPRODUCED\", d; assert d[\"verdict\"] == \"REPRODUCED\", d"
+
+              datacon export "$job" --out "$DATACON_CI_EXPORT_DIR"
+              datacon verify-bundle "$DATACON_CI_EXPORT_DIR"
+            '
 
   image:
     runs-on: ubuntu-latest
