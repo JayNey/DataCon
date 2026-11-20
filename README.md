@@ -4,6 +4,8 @@ DataCon 是面向授权实验环境的 CVE 复现平台项目。它的目标是�
 
 **项目状态**：MVP 第一批 T01–T02、第二批 T03–T04 已合入 `main`；第三批 T05–T06 在 `feat/mvp-sandbox-evidence` 分支实现，并以 PR 审阅；T07–T08 在本 PR 实现。当前提供本地 CLI 的任务提交、查询、Supervisor 计划生成、人工审核与恢复，PostgreSQL 业务记录与 LangGraph 持久化检查点，离线情报 / Git / Tree-sitter 分析，一次性 Linux Docker 隔离构建与 ASan 回放，六次回放判定、可离线校验的证据包、合成案例端到端 CI、PR 镜像构建门禁以及候选发布清单 / 推广 / 回滚状态机。B03 公开案例仍停在准入阶段：仓库内的 `B03-admission.json` 是 `pending_t05_replay`，`run_b03_acceptance` 会拒绝它；只有在授权 runner 上用冻结签名和真实 case 材料才能执行 B03 验收。
 
+项目规范文档集（项目章程、PRD、SRS、系统设计、多 Agent 协作、接口契约、安全设计、MVP 规格、测试计划、任务清单、CI/CD 规范与 Agent 开发规则）随代码版本化于 [docs/spec/](docs/spec/)。
+
 ## 首版范围
 
 1. 通过本地 CLI 提交已登记的 C/C++ 案例，查询任务状态。
@@ -337,6 +339,7 @@ src/datacon/
   data/seccomp/         固定 seccomp profile（计划记录其 canonical 摘要）
 migrations/             001 任务表、002 工作流增量、003 attempts 代次键升级、004 旧 binary 回填、005 判定 / 证据、006 journal provenance token、007 归档证据不变量修复与 CHECK、008 发布状态 / 审计事件 / 迁移账本
 examples/               示例请求
+docs/spec/              项目规范文档集（章程 / PRD / SRS / 架构 / 多 Agent / 接口 / 安全 / MVP / 测试 / 任务 / CI/CD / Agent 规则）
 tests/contract/         请求、计划、Agent、分析、判定、证据、沙箱策略、wheel、CI 门禁、B04、发布与 B03
 tests/integration/      真实 PostgreSQL CLI / 审核 / 恢复 / 重试 / 迁移 / 执行 / 回滚 / ASan 回放
 tests/e2e/              真实 Docker 的 MVP-01 至 MVP-04
