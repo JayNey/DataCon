@@ -44,7 +44,10 @@ BLOCKED_REASONS = frozenset(
         "MATERIAL_MISSING",
         "PLAN_MISMATCH",
         "POLICY_DENIED",
+        "REVIEW_EXPIRED",
+        "REVIEW_REJECTED",
         "SOURCE_CONFLICT",
+        "UNSUPPORTED_TARGET",
     }
 )
 FAILED_REASONS = frozenset({"BUILD_FAILED", "EVIDENCE_WRITE_FAILED"})

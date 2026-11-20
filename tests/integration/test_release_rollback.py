@@ -16,6 +16,9 @@ pytestmark = pytest.mark.postgres
 
 PREVIOUS_IMAGE = "sha256:" + "8" * 64
 CANDIDATE_IMAGE = "sha256:" + "1" * 64
+LATEST_MIGRATION = sorted(
+    (Path(__file__).resolve().parents[2] / "migrations").glob("*.sql")
+)[-1].name
 
 
 def _now() -> str:
@@ -114,7 +117,7 @@ def test_promotion_and_rollback_change_the_persisted_active_release(
     previous = {
         "image_id": PREVIOUS_IMAGE,
         "config": {"policy_version": "1"},
-        "migration_version": "008_release_events.sql",
+        "migration_version": LATEST_MIGRATION,
         "evidence_root": str(evidence_root),
     }
     store_handle.bootstrap_release(
@@ -251,7 +254,7 @@ def test_multiple_rollbacks_and_repeated_smoke_failures_preserve_all_audit_event
     baseline = {
         "image_id": PREVIOUS_IMAGE,
         "config": {"policy_version": "1"},
-        "migration_version": "008_release_events.sql",
+        "migration_version": LATEST_MIGRATION,
         "evidence_root": "/var/lib/datacon/evidence",
     }
     store_handle.bootstrap_release(**baseline)
@@ -386,7 +389,7 @@ def test_release_store_transaction_rolls_back_switch_when_audit_fails(
     store_handle.bootstrap_release(
         image_id=PREVIOUS_IMAGE,
         config={"policy_version": "1"},
-        migration_version="008_release_events.sql",
+        migration_version=LATEST_MIGRATION,
         evidence_root="/var/lib/datacon/evidence",
     )
     manifest = _manifest()
@@ -451,7 +454,7 @@ def test_release_for_image_skips_a_malformed_but_valid_looking_event(
     baseline = {
         "image_id": PREVIOUS_IMAGE,
         "config": {"policy_version": "1"},
-        "migration_version": "008_release_events.sql",
+        "migration_version": LATEST_MIGRATION,
         "evidence_root": "/var/lib/datacon/evidence",
     }
     store_handle.bootstrap_release(**baseline)
@@ -483,7 +486,7 @@ def test_migration_008_is_idempotent_with_existing_release_events(isolated_datab
     baseline = {
         "image_id": PREVIOUS_IMAGE,
         "config": {"policy_version": "1"},
-        "migration_version": "008_release_events.sql",
+        "migration_version": LATEST_MIGRATION,
         "evidence_root": "/var/lib/datacon/evidence",
     }
     store_handle.bootstrap_release(**baseline)
@@ -535,7 +538,7 @@ def test_bootstrap_is_idempotent_and_rejects_a_conflicting_baseline(
     baseline = {
         "image_id": PREVIOUS_IMAGE,
         "config": {"policy_version": "1"},
-        "migration_version": "008_release_events.sql",
+        "migration_version": LATEST_MIGRATION,
         "evidence_root": "/var/lib/datacon/evidence",
     }
     store_handle.bootstrap_release(**baseline)
@@ -546,7 +549,7 @@ def test_bootstrap_is_idempotent_and_rejects_a_conflicting_baseline(
         store_handle.bootstrap_release(
             image_id="sha256:" + "1" * 64,
             config={"policy_version": "1"},
-            migration_version="008_release_events.sql",
+            migration_version=LATEST_MIGRATION,
             evidence_root="/var/lib/datacon/evidence",
         )
 
@@ -582,7 +585,7 @@ def test_bootstrap_rejects_migration_not_in_schema_migrations(
             no_ledger_store.bootstrap_release(
                 image_id=PREVIOUS_IMAGE,
                 config={"policy_version": "1"},
-                migration_version="008_release_events.sql",
+                migration_version=LATEST_MIGRATION,
                 evidence_root="/var/lib/datacon/evidence",
             )
     finally:
@@ -599,7 +602,7 @@ def test_replaying_promoted_manifest_after_rollback_fails_closed(isolated_databa
     store_handle.bootstrap_release(
         image_id=PREVIOUS_IMAGE,
         config={"policy_version": "1"},
-        migration_version="008_release_events.sql",
+        migration_version=LATEST_MIGRATION,
         evidence_root="/var/lib/datacon/evidence",
     )
     m1 = _manifest_with(CANDIDATE_IMAGE, "b" * 40)
@@ -664,7 +667,7 @@ def test_cli_migrate_and_release_bootstrap_end_to_end(postgres_dsn):
         )
         assert mig.returncode == 0, mig.stderr
         mig_out = json.loads(mig.stdout)
-        assert "008_release_events.sql" in mig_out["applied"]
+        assert LATEST_MIGRATION in mig_out["applied"]
 
         boot = cli(
             "release",
@@ -672,7 +675,7 @@ def test_cli_migrate_and_release_bootstrap_end_to_end(postgres_dsn):
             "--image-id",
             PREVIOUS_IMAGE,
             "--migration-version",
-            "008_release_events.sql",
+            LATEST_MIGRATION,
             "--evidence-root",
             "/var/lib/datacon/evidence",
             "--config",
@@ -692,7 +695,7 @@ def test_cli_migrate_and_release_bootstrap_end_to_end(postgres_dsn):
             "--image-id",
             PREVIOUS_IMAGE,
             "--migration-version",
-            "008_release_events.sql",
+            LATEST_MIGRATION,
             "--evidence-root",
             "/var/lib/datacon/evidence",
             database_url=schema_dsn,
@@ -729,7 +732,7 @@ def test_latest_evidence_bundle_validates_containment_and_rejects_symlinks(
     store_handle.bootstrap_release(
         image_id=PREVIOUS_IMAGE,
         config={"policy_version": "1"},
-        migration_version="008_release_events.sql",
+        migration_version=LATEST_MIGRATION,
         evidence_root=str(evidence_root),
     )
 
@@ -777,7 +780,7 @@ def test_promote_and_smoke_on_release_store_rejects_noop_rollback_fn(
     store_handle.bootstrap_release(
         image_id=PREVIOUS_IMAGE,
         config={"policy_version": "1"},
-        migration_version="008_release_events.sql",
+        migration_version=LATEST_MIGRATION,
         evidence_root="/var/lib/datacon/evidence",
     )
     manifest = _manifest()
@@ -832,7 +835,7 @@ def test_bootstrap_cli_on_unmigrated_schema_exits_2_and_rejects_stale_migration(
             "--image-id",
             PREVIOUS_IMAGE,
             "--migration-version",
-            "008_release_events.sql",
+            LATEST_MIGRATION,
             "--evidence-root",
             "/var/lib/datacon/evidence",
             database_url=empty_dsn,
@@ -871,7 +874,7 @@ def test_latest_evidence_bundle_handles_cross_generation_roots_and_rejects_relat
     store_handle.bootstrap_release(
         image_id=PREVIOUS_IMAGE,
         config={"policy_version": "1"},
-        migration_version="008_release_events.sql",
+        migration_version=LATEST_MIGRATION,
         evidence_root=str(root_v1),
     )
 
@@ -894,7 +897,7 @@ def test_latest_evidence_bundle_handles_cross_generation_roots_and_rejects_relat
         store_handle.switch(
             image_id=CANDIDATE_IMAGE,
             config={"policy_version": "2"},
-            migration_version="008_release_events.sql",
+            migration_version=LATEST_MIGRATION,
             evidence_root=str(root_v2),
             action="promote",
             candidate_digest="sha256:" + "c" * 64,
@@ -907,7 +910,7 @@ def test_latest_evidence_bundle_handles_cross_generation_roots_and_rejects_relat
                 "active_image_id": CANDIDATE_IMAGE,
                 "previous_image_id": PREVIOUS_IMAGE,
                 "config": {"policy_version": "2"},
-                "migration_version": "008_release_events.sql",
+                "migration_version": LATEST_MIGRATION,
                 "evidence_root": str(root_v2),
             }
         )
@@ -945,7 +948,7 @@ def test_smoke_failure_auto_rollback_does_not_pollute_release_for_image_provenan
     store_handle.bootstrap_release(
         image_id=PREVIOUS_IMAGE,
         config={"policy_version": "1"},
-        migration_version="008_release_events.sql",
+        migration_version=LATEST_MIGRATION,
         evidence_root="/var/lib/datacon/evidence",
     )
     m1_image = "sha256:" + "1" * 64
@@ -1007,7 +1010,7 @@ def test_release_store_transaction_sets_timeouts_and_rejects_fake_promote_rollba
     store_handle.bootstrap_release(
         image_id=PREVIOUS_IMAGE,
         config={"policy_version": "1"},
-        migration_version="008_release_events.sql",
+        migration_version=LATEST_MIGRATION,
         evidence_root="/var/lib/datacon/evidence",
     )
 
@@ -1053,7 +1056,7 @@ def test_rollback_release_rejects_target_equal_to_active_in_postgres(
     baseline = {
         "image_id": PREVIOUS_IMAGE,
         "config": {"policy_version": "1"},
-        "migration_version": "008_release_events.sql",
+        "migration_version": LATEST_MIGRATION,
         "evidence_root": "/var/lib/datacon/evidence",
     }
     store_handle.bootstrap_release(**baseline)
@@ -1090,7 +1093,7 @@ def test_latest_evidence_bundle_strict_requires_active_root_bundle(
     store_handle.bootstrap_release(
         image_id=PREVIOUS_IMAGE,
         config={"policy_version": "1"},
-        migration_version="008_release_events.sql",
+        migration_version=LATEST_MIGRATION,
         evidence_root=str(evidence_root),
     )
 
@@ -1177,7 +1180,7 @@ def test_bootstrap_rejects_non_consecutive_schema_migrations_in_postgres(
         store_handle.bootstrap_release(
             image_id=PREVIOUS_IMAGE,
             config={"policy_version": "1"},
-            migration_version="008_release_events.sql",
+            migration_version=LATEST_MIGRATION,
             evidence_root="/var/lib/datacon/evidence",
         )
     assert store_handle.active_release() is None
@@ -1190,7 +1193,7 @@ def test_rollback_rejects_tampered_compatible_migration_digest_and_same_ordinal_
     store_handle.bootstrap_release(
         image_id=PREVIOUS_IMAGE,
         config={"policy_version": "1"},
-        migration_version="008_release_events.sql",
+        migration_version=LATEST_MIGRATION,
         evidence_root="/var/lib/datacon/evidence",
     )
     m1 = _manifest()

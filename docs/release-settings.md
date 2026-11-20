@@ -15,11 +15,13 @@ GitHub Actions 在触发 `push`（含 `refs/tags/v*`）或 `workflow_dispatch` �
 3. **Environment secrets**：
    - `DATACON_DATABASE_URL`
    - `DATACON_RELEASE_APPROVAL`
-   - `DATACON_B03_CASE_ROOT`
-   - `DATACON_B03_ADMISSION`
-   - `DATACON_B03_REVIEW`
+   - `DATACON_B03_CASE_ROOT`：授权 lab 上的真实材料目录（绝对路径）
+   - `DATACON_B03_ADMISSION`：**冻结后的 admission JSON 文本**（由 `scripts/freeze_b03_admission.py --out` 产生；不是文件路径）
+   - `DATACON_B03_REVIEW`：**review JSON 文本**（绑定 `plan_digest`，24 小时内有效）
 4. **Environment / Repository variables（非 secret）**：
-   - `DATACON_B03_EVIDENCE_DIR`：授权 `datacon-internal` runner 上的持久化绝对目录路径（B03 在清理临时目录前会把 bundle 复制到 `<DATACON_B03_EVIDENCE_DIR>/<job_id>/` 并用 `evidence.verify_bundle` 复验；未设置时 `b03-internal` fail closed）。
+   - `DATACON_B03_EVIDENCE_DIR`：授权 `datacon-internal` runner 上的持久化绝对目录路径。候选控制面容器以 `65534:65534` 在其中创建 `<job_id>/` 证据包；该目录必须由 `65534` 拥有且可写（例如 `chown 65534:65534`、`chmod 0755`），且不得含 symlink。未设置或 65534 不可写时 `b03-internal` fail closed。
+   - `DATACON_B03_STORAGE_REF`（可选）：验收证据的存储引用；未设置时使用 `vault://datacon/b03`。
+5. **数据库迁移**：`b03-internal` 的 `ReleaseStore.record_b03_acceptance` 需要先应用 `009_b03_acceptance.sql`；缺表时 fail closed。009 只新增 `b03_acceptance` 专用表，不改 `release_events` 的 action/status CHECK。
 
 ### 2. 分支与 Tag 保护（Settings → Rules → Rulesets）
 
@@ -37,7 +39,7 @@ GitHub Actions 在触发 `push`（含 `refs/tags/v*`）或 `workflow_dispatch` �
 1. **Docker daemon 可用**：runner 服务进程所属用户可直接执行 `docker load`、`docker image inspect` 与 `docker run`（包括 `--network host` 访问内网 PostgreSQL）。
 2. **宿主机 `evidence_root` 路径与 DB 一致**：宿主机挂载的证据根目录必须为绝对路径，且与数据库 `release_state.evidence_root` 完全一致（若运行 `b03-internal`，`DATACON_B03_EVIDENCE_DIR` 也须为同一套宿主机持久绝对路径）；`archived_bundle_preflight` 与 `ReleaseStore.latest_evidence_bundle` 会按此路径直接校验并挂载到候选容器。
 3. **所有路径段禁止 symlink**：`evidence_root` 本身、其所有祖先父目录（例如挂载点父目录），以及归档的 `<job_id>/<generation>` bundle 目录均不得包含任何 symlink；否则 `archived_bundle_preflight`、`persist_b03_evidence_bundle` 与 `latest_evidence_bundle` 会 fail closed 拒绝执行。
-4. **容器非 root 用户 `65534:65534` 只读遍历/读取权限**：[控制面 Dockerfile](../Dockerfile) 以 `USER 65534:65534` 运行容器；`promote-internal` 会将归档 bundle 以 `-v <bundle_path>:/bundle:ro` 挂载进容器内执行 `verify-bundle`。`evidence.write_bundle` / `export_bundle` / `execution._archive` / `persist_b03_evidence_bundle` 默认以 `0o755` 目录、`0o644`（或 `0o444`）文件生成共享只读权限；若存在历史 `0o700`/`0o600` 遗留归档包，`archived_bundle_preflight` 会在进容器前直接报错并提示修复权限。
+4. **容器非 root 用户 `65534:65534` 只读遍历/读取权限，B03 evidence dir 可写**：`b03-internal` 会把 case root 以只读、`DATACON_B03_EVIDENCE_DIR` 以可写同路径挂载进候选镜像，并在启动前用 `65534` 探针验证可读/可写；evidence dir 应 `chown 65534:65534` 且 `chmod 0755`，case root 至少 `a+rX`。[控制面 Dockerfile](../Dockerfile) 以 `USER 65534:65534` 运行容器；`promote-internal` 会将归档 bundle 以 `-v <bundle_path>:/bundle:ro` 挂载进容器内执行 `verify-bundle`。`evidence.write_bundle` / `export_bundle` / `execution._archive` / `persist_b03_evidence_bundle` 默认以 `0o755` 目录、`0o644`（或 `0o444`）文件生成共享只读权限；若存在历史 `0o700`/`0o600` 遗留归档包，`archived_bundle_preflight` 会在进容器前直接报错并提示修复权限。
 5. **Baseline 与 >30 天历史镜像持久化（可选但强烈建议）**：GitHub Actions `release-candidate-artifacts` 仅保留 30 天，且 `datacon release bootstrap` 初始化的 baseline 镜像可能没有对应的 Actions run。为保障“bootstrap → promote → rollback to baseline”与 >30 天历史版本回滚闭环，请配置 repository/environment variable `DATACON_IMAGE_ARCHIVE_DIR`（runner 上的持久绝对路径，禁止 symlink），并在 bootstrap 时执行：
    ```bash
    docker save -o "$DATACON_IMAGE_ARCHIVE_DIR/${BASELINE_ID#sha256:}.tar" "$BASELINE_IMAGE"

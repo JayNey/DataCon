@@ -178,28 +178,68 @@ def test_test_report_job_produces_four_junit_reports():
     )
 
 
-def test_b03_job_requires_authorized_runner_and_upload_only_summary():
+def test_b03_job_requires_authorized_runner_and_candidate_artifact():
     job = _load(RELEASE)["jobs"]["b03-internal"]
     assert job["environment"] == "internal-lab"
     assert job["runs-on"] == ["self-hosted", "linux", "x64", "datacon-internal"]
     condition = job["if"]
     assert "run_b03" in condition
+    assert "artifact_run_id" in condition
+    assert job["env"]["ARTIFACT_RUN_ID"] == "${{ github.event.inputs.artifact_run_id }}"
+    assert "DATACON_B03_CASE_ROOT" not in job.get("env", {})
+    assert "DATACON_DATABASE_URL" not in job.get("env", {})
+
+    steps = _steps(job)
+    download = next(
+        step
+        for step in steps
+        if step.get("uses", "").startswith("actions/download-artifact@")
+    )
+    assert download["with"]["name"] == "release-candidate-artifacts"
+    assert download["with"]["run-id"] == "${{ env.ARTIFACT_RUN_ID }}"
+
     text = _run_text(job)
-    assert "run_b03_acceptance" in text
-    assert "B03CaseMaterials" in text
+    for required in (
+        "control-plane-image.tar",
+        "release-candidate-manifest.json",
+        "release-manifest.json",
+        "canonical_manifest_digest",
+        "validate_release_candidate_manifest",
+        "docker load",
+        "docker image inspect",
+        "control_plane_image_id",
+        "--network host",
+        "--group-add",
+        "/var/run/docker.sock",
+        "--user 65534:65534",
+        "/app/.venv/bin/python",
+        "B03CaseMaterials",
+        "prepare_b03_plan",
+        "run_b03_acceptance",
+        "persist_b03_evidence_bundle",
+        "record_b03_acceptance",
+        "ReleaseStore",
+        "b03-acceptance-summary.json",
+        "DATACON_DATABASE_URL",
+    ):
+        assert required in text, required
     assert "materials.normal_input" in text
     assert "materials.candidate_input" in text
     assert 'normal.txt").read_bytes()' not in text
-    assert "b03-acceptance-summary.json" in text
-    assert "REPRODUCED" in text
+    assert "bundle_path" not in text
     assert "ASAN_SIGNATURE_MATCHED" in text
-    assert 'acceptance["replay_count"] != 6' in text or 'acceptance["replay_count"] == 6' in text
+    assert 'acceptance["replay_count"] != 6' in text
     assert 'acceptance["bundle_verified"]' in text
-    assert "GITHUB_RUN_ATTEMPT" in text
-    assert "job_id=job_id" in text
+    assert "GITHUB_RUN_ID" in text
+
+    record_step = next(
+        step for step in steps if "record_b03_acceptance" in step.get("run", "")
+    )
+    assert record_step["env"]["DATACON_DATABASE_URL"] == "${{ secrets.DATACON_DATABASE_URL }}"
+
     upload = [
         step
-        for step in _steps(job)
+        for step in steps
         if step.get("uses", "").startswith("actions/upload-artifact@")
     ]
     assert len(upload) == 1
@@ -517,6 +557,7 @@ def _eval_gha_condition(
     ref: str,
     action: str = "build",
     run_b03: bool = False,
+    artifact_run_id: str = "12345",
     test_report_result: str = "success",
     build_candidate_result: str = "skipped",
     cancelled: bool = False,
@@ -530,6 +571,7 @@ def _eval_gha_condition(
         "github.ref": repr(ref),
         "github.event.inputs.action": repr(action),
         "github.event.inputs.run_b03": repr("true" if run_b03 else "false"),
+        "github.event.inputs.artifact_run_id": repr(artifact_run_id),
         "needs.test-report.result": repr(test_report_result),
         "needs.build-candidate.result": repr(build_candidate_result),
     }
@@ -549,7 +591,9 @@ def _extract_python_heredocs(script: str) -> list[str]:
     import re
     import textwrap
 
-    blocks = re.findall(r"<<'?PY'?\n(.*?)\n[ \t]*PY(?:\n|$)", script, flags=re.S)
+    blocks = re.findall(
+        r"<<'?PY'?[^\n]*\n(.*?)\n[ \t]*PY(?:\n|$)", script, flags=re.S
+    )
     return [textwrap.dedent(block) for block in blocks]
 
 
@@ -824,6 +868,13 @@ def test_secret_jobs_only_run_on_main_workflow_dispatch_never_tags():
         ref="refs/heads/main",
         run_b03=True,
     ) is True
+    assert _eval_gha_condition(
+        b03_if,
+        event_name="workflow_dispatch",
+        ref="refs/heads/main",
+        run_b03=True,
+        artifact_run_id="",
+    ) is False
 
     # Promote must not carry dead push/build-candidate fallback expressions.
     promote = jobs["promote-internal"]
@@ -1050,7 +1101,7 @@ def test_timeout_helper_rejects_commented_or_removed_timeout():
         _assert_smoke_timeouts(mutated_sh)
 
 
-def test_b03_persists_bundle_before_cleanup_and_fails_closed_without_dir(tmp_path):
+def test_b03_persists_bundle_before_cleanup_and_uploads_only_a_sanitized_summary(tmp_path):
     import ast
     import os
     import subprocess
@@ -1083,7 +1134,10 @@ def test_b03_persists_bundle_before_cleanup_and_fails_closed_without_dir(tmp_pat
 
     blocks = _extract_python_heredocs(run_text)
     assert blocks
-    tree = ast.parse(blocks[0])
+    acceptance_block = next(
+        block for block in blocks if "run_b03_acceptance" in block
+    )
+    tree = ast.parse(acceptance_block)
     try_nodes = [node for node in ast.walk(tree) if isinstance(node, ast.Try)]
     assert try_nodes
     persist_in_try = any(
@@ -1093,10 +1147,18 @@ def test_b03_persists_bundle_before_cleanup_and_fails_closed_without_dir(tmp_pat
         for node in ast.walk(stmt)
     )
     assert persist_in_try, "persist_b03_evidence_bundle must run inside try before finally cleanup"
+    assert "shutil.rmtree(bundle_out" in acceptance_block
+    assert "DATACON_B03_RECORD=" in acceptance_block
 
+    summary_step = next(
+        step for step in b03_steps if "b03-acceptance-summary.json" in step.get("run", "")
+    )
+    summary_blocks = _extract_python_heredocs(summary_step["run"])
+    assert summary_blocks
+    summary_tree = ast.parse(summary_blocks[0])
     summary_assign = next(
         node
-        for node in ast.walk(tree)
+        for node in ast.walk(summary_tree)
         if isinstance(node, ast.Assign)
         and any(isinstance(t, ast.Name) and t.id == "summary" for t in node.targets)
         and isinstance(node.value, ast.Dict)
@@ -1106,12 +1168,16 @@ def test_b03_persists_bundle_before_cleanup_and_fails_closed_without_dir(tmp_pat
         for k, v in zip(summary_assign.value.keys, summary_assign.value.values)
         if isinstance(k, ast.Constant) and isinstance(k.value, str)
     }
-    for key in ("bundle_verified", "bundle_path", "bundle_manifest_digest"):
+    for key in (
+        "candidate_digest",
+        "b03_manifest_digest",
+        "storage_ref",
+        "run_id",
+    ):
         assert key in summary_map, f"summary missing {key}"
-        val = summary_map[key]
-        assert isinstance(val, ast.Subscript)
-        assert isinstance(val.value, ast.Name) and val.value.id == "persisted"
-        assert isinstance(val.slice, ast.Constant) and val.slice.value == key
+    assert "bundle_path" not in summary_map
+    assert "bundle_path" not in summary_blocks[0]
+    assert "DATACON_B03_CASE_ROOT" not in summary_step["run"]
 
 
 def test_rollback_runs_release_slots_compatibility_in_pre_switch_smoke_not_post_commit():

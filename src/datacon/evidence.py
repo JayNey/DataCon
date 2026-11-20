@@ -60,6 +60,17 @@ _REQUIRED_PATHS = {
     "plan.json": "plan",
     "review.json": "review",
 }
+# A blocked bundle is produced before an execution plan exists (submit-time
+# rejection, analysis failure) or before execution starts (review rejection or
+# expiry). It still carries the two report documents, but plan.json and
+# review.json are stage-dependent: the review window may close without a
+# decision, and preparation may block before a plan is frozen.
+_BLOCKED_REQUIRED_ROLES = frozenset({"report_json", "report_markdown"})
+_BLOCKED_REQUIRED_PATHS = {
+    "report.json": "report_json",
+    "report.md": "report_markdown",
+}
+_BUNDLE_KINDS = frozenset({"execution", "blocked"})
 _ROLE_NAMES = frozenset(
     {
         "report_json",
@@ -280,12 +291,13 @@ def write_bundle(
     root: Path | str,
     *,
     job_id: str | uuid.UUID,
-    plan_digest: str,
+    plan_digest: str | None,
     report: Mapping[str, Any],
     report_markdown: str,
     artifacts: Mapping[str, tuple[str, bytes | bytearray | memoryview | Path | str]] | None = None,
     verdict: str | None = None,
     created_at: str | None = None,
+    bundle_kind: str = "execution",
     verify: Callable[[Path], object] | None = None,
     dir_mode: int = 0o755,
     file_mode: int = 0o644,
@@ -294,10 +306,24 @@ def write_bundle(
 
     The caller supplies role-labelled artifacts. report.json and report.md are
     added by this function. The directory must not already exist.
+
+    ``bundle_kind`` is ``execution`` for the full evidence tree produced by an
+    execution attempt and ``blocked`` for a terminal non-execution block. An
+    execution bundle keeps every historical invariant (plan, approved review,
+    full file hashes). A blocked bundle may omit the plan and review, but it
+    must still bind the report, every file hash and a safe path.
     """
     job_text = str(uuid.UUID(str(job_id)))
-    if not isinstance(plan_digest, str) or not _DIGEST.fullmatch(plan_digest):
+    if not isinstance(bundle_kind, str) or bundle_kind not in _BUNDLE_KINDS:
+        raise BundleError("INVALID_MANIFEST", "bundle_kind is invalid")
+    if plan_digest is not None and (
+        not isinstance(plan_digest, str) or not _DIGEST.fullmatch(plan_digest)
+    ):
         raise BundleError("INVALID_MANIFEST", "plan digest is invalid")
+    if bundle_kind == "execution" and plan_digest is None:
+        raise BundleError(
+            "INVALID_MANIFEST", "an execution bundle requires a plan digest"
+        )
     if not isinstance(report, Mapping):
         raise BundleError("INVALID_MANIFEST", "report must be an object")
     if not isinstance(report_markdown, str):
@@ -337,6 +363,24 @@ def write_bundle(
         raise BundleError(
             "INVALID_MANIFEST", "report evidence_complete must be a boolean"
         )
+    if bundle_kind == "blocked":
+        # A blocked bundle is a terminal non-execution record. It must not be
+        # able to claim an outcome verdict, and a plan digest without the plan
+        # document (or vice versa) is an inconsistent bundle.
+        if report_verdict != "BLOCKED":
+            raise BundleError(
+                "INVALID_MANIFEST", "a blocked bundle must record verdict BLOCKED"
+            )
+        if report_reason is None or not reason_allowed("BLOCKED", report_reason):
+            raise BundleError(
+                "INVALID_MANIFEST",
+                "a blocked bundle requires an allowed BLOCKED reason_code",
+            )
+        if plan_digest is None and report.get("review") is not None:
+            raise BundleError(
+                "INVALID_MANIFEST",
+                "a review requires a plan digest in a blocked bundle",
+            )
     if report_verdict in ("REPRODUCED", "NOT_REPRODUCED"):
         if evidence_complete is False:
             raise BundleError(
@@ -421,16 +465,27 @@ def write_bundle(
         entries.sort(key=lambda item: item["path"])
 
         roles = {entry["role"] for entry in entries}
-        if not _REQUIRED_ROLES <= roles:
-            missing = sorted(_REQUIRED_ROLES - roles)
+        required_roles = (
+            _REQUIRED_ROLES if bundle_kind == "execution" else _BLOCKED_REQUIRED_ROLES
+        )
+        if not required_roles <= roles:
+            missing = sorted(required_roles - roles)
             raise BundleError(
                 "INVALID_MANIFEST",
                 "bundle is missing required roles: " + ", ".join(missing),
             )
-        _require_required_paths({entry["path"]: entry for entry in entries})
+        listed = {entry["path"]: entry for entry in entries}
+        if bundle_kind == "execution":
+            _require_required_paths(listed, _REQUIRED_PATHS)
+        else:
+            _require_blocked_paths(listed)
+            _validate_blocked_artifacts(
+                payloads, plan_digest=plan_digest, report=report
+            )
 
         manifest = {
             "schema_version": SCHEMA_VERSION,
+            "bundle_kind": bundle_kind,
             "job_id": job_text,
             "plan_digest": plan_digest,
             "verdict": verdict if isinstance(verdict, str) else report_verdict,
@@ -486,18 +541,29 @@ def _load_manifest(root: Path) -> tuple[dict[str, Any], bytes]:
 
 def _validate_manifest_header(
     manifest: Mapping[str, Any],
-) -> tuple[str, str, list[dict[str, Any]], str, str | None]:
+) -> tuple[str, str, str | None, list[dict[str, Any]], str, str | None]:
     if (
         type(manifest.get("schema_version")) is not int
         or manifest.get("schema_version") != SCHEMA_VERSION
     ):
         raise BundleError("INVALID_MANIFEST", "manifest schema_version must be 1")
+    # Old bundles predate bundle_kind. They were all produced by execution, so
+    # a missing field keeps the historical (strict) meaning. A present field
+    # must be one of the two supported kinds.
+    bundle_kind = manifest.get("bundle_kind", "execution")
+    if not isinstance(bundle_kind, str) or bundle_kind not in _BUNDLE_KINDS:
+        raise BundleError("INVALID_MANIFEST", "manifest bundle_kind is invalid")
     try:
         job_id = str(uuid.UUID(str(manifest.get("job_id"))))
     except (TypeError, ValueError, AttributeError) as error:
         raise BundleError("INVALID_MANIFEST", "manifest job_id must be a UUID") from error
     plan_digest = manifest.get("plan_digest")
-    if not isinstance(plan_digest, str) or not _DIGEST.fullmatch(plan_digest):
+    if bundle_kind == "execution":
+        if not isinstance(plan_digest, str) or not _DIGEST.fullmatch(plan_digest):
+            raise BundleError("INVALID_MANIFEST", "manifest plan_digest is invalid")
+    elif plan_digest is not None and (
+        not isinstance(plan_digest, str) or not _DIGEST.fullmatch(plan_digest)
+    ):
         raise BundleError("INVALID_MANIFEST", "manifest plan_digest is invalid")
     verdict = manifest.get("verdict")
     if not isinstance(verdict, str) or verdict not in _VERDICTS:
@@ -513,7 +579,7 @@ def _validate_manifest_header(
         raise BundleError("INVALID_MANIFEST", "manifest files must be a list")
     if len(files) > MAX_FILES:
         raise BundleError("INVALID_MANIFEST", "manifest lists too many files")
-    return job_id, plan_digest, files, verdict, reason_code
+    return job_id, bundle_kind, plan_digest, files, verdict, reason_code
 
 
 def _validate_entry(entry: Any, seen: set[str]) -> dict[str, Any]:
@@ -642,15 +708,16 @@ def _require_evidence_roles(
 
 def _require_required_paths(
     listed: Mapping[str, Mapping[str, Any]],
+    required_paths: Mapping[str, str] | None = None,
 ) -> None:
-    """Require the four base evidence files at their fixed paths.
+    """Require each base evidence file at its fixed path.
 
     ``_REQUIRED_ROLES`` only proves that some file carries each role. A
     ``report_markdown`` role on ``notes.md``, or a rewritten ``report.md`` with
     another role, must not satisfy the contract: the path and the role are both
     part of the evidence identity.
     """
-    for path, role in _REQUIRED_PATHS.items():
+    for path, role in (required_paths or _REQUIRED_PATHS).items():
         entry = listed.get(path)
         if entry is None:
             raise BundleError(
@@ -663,6 +730,98 @@ def _require_required_paths(
                 f"evidence {path} must carry the {role} role, "
                 f"not {entry.get('role')!r}",
             )
+
+
+def _require_blocked_paths(
+    listed: Mapping[str, Mapping[str, Any]],
+) -> None:
+    """Require the report files and, when present, bind optional plan/review."""
+    _require_required_paths(listed, _BLOCKED_REQUIRED_PATHS)
+    for path, role in (("plan.json", "plan"), ("review.json", "review")):
+        entry = listed.get(path)
+        if entry is not None and entry.get("role") != role:
+            raise BundleError(
+                "INVALID_MANIFEST",
+                f"evidence {path} must carry the {role} role, "
+                f"not {entry.get('role')!r}",
+            )
+    for entry in listed.values():
+        if entry.get("role") in ("plan", "review") and entry.get("path") not in (
+            "plan.json",
+            "review.json",
+        ):
+            raise BundleError(
+                "INVALID_MANIFEST",
+                "a blocked plan/review must live at its fixed evidence path",
+            )
+
+
+def _validate_blocked_artifacts(
+    payloads: Mapping[str, bytes],
+    *,
+    plan_digest: str | None,
+    report: Mapping[str, Any],
+) -> None:
+    """Check the optional plan/review documents of a blocked bundle.
+
+    A blocked bundle may omit both, carry only a frozen plan (review expiry),
+    or carry a plan plus a review (approve or reject). The bundle kind, not
+    the review decision, is what separates a blocked archive from an execution
+    archive.
+    """
+    has_plan = "plan.json" in payloads
+    has_review = "review.json" in payloads
+    if plan_digest is None:
+        if has_plan or has_review:
+            raise BundleError(
+                "INVALID_MANIFEST",
+                "a blocked bundle without a plan digest must not ship plan/review",
+            )
+        return
+    if not has_plan:
+        raise BundleError(
+            "INVALID_MANIFEST",
+            "a blocked bundle with a plan digest must ship plan.json",
+        )
+    plan = _parse_json_file(payloads, "plan.json")
+    try:
+        computed = contracts.plan_digest(plan)
+    except (KeyError, TypeError, ValueError, UnicodeError) as error:
+        raise BundleError(
+            "INVALID_MANIFEST", f"plan.json cannot be validated: {error}"
+        ) from error
+    if computed != plan_digest:
+        raise BundleError(
+            "INVALID_MANIFEST",
+            "plan.json content does not match the manifest plan_digest",
+        )
+    if not has_review:
+        if report.get("review") is not None:
+            raise BundleError(
+                "INVALID_MANIFEST",
+                "report review must be null when review.json is absent",
+            )
+        return
+    review = _parse_json_file(payloads, "review.json")
+    if review.get("decision") not in ("approve", "reject"):
+        raise BundleError(
+            "INVALID_MANIFEST",
+            "a blocked review.json must record approve or reject",
+        )
+    if review.get("plan_digest") != plan_digest:
+        raise BundleError(
+            "INVALID_MANIFEST", "review.json is bound to a different plan"
+        )
+    expected_review = {
+        "reviewer_id": review.get("reviewer_id"),
+        "decision": review.get("decision"),
+        "plan_digest": review.get("plan_digest"),
+        "decided_at": review.get("decided_at"),
+    }
+    if dict(report.get("review") or {}) != expected_review:
+        raise BundleError(
+            "INVALID_MANIFEST", "report review does not match review.json"
+        )
 
 
 def _mapping(value: Any, label: str) -> Mapping[str, Any]:
@@ -1909,7 +2068,8 @@ def _verify_partial_inconclusive(
 def _verify_semantics(
     *,
     job_id: str,
-    plan_digest: str,
+    bundle_kind: str,
+    plan_digest: str | None,
     verdict: str,
     manifest_reason: str | None,
     listed: Mapping[str, Mapping[str, Any]],
@@ -1917,9 +2077,12 @@ def _verify_semantics(
 ) -> None:
     """Cross-check the manifest against the plan, review and report content.
 
-    The manifest digest only proves internal byte consistency. This step
-    re-derives the plan digest and requires an approved review, a consistent
-    report and (for outcome verdicts) the complete execution evidence tree.
+    The manifest digest only proves internal byte consistency. For an
+    execution bundle this step re-derives the plan digest and requires an
+    approved review, a consistent report and (for outcome verdicts) the
+    complete execution evidence tree. A blocked bundle keeps the report,
+    markdown and reason checks but only validates the plan/review documents it
+    actually carries.
     """
     report = _parse_json_file(data, "report.json")
     if (
@@ -2031,6 +2194,82 @@ def _verify_semantics(
             "INVALID_MANIFEST",
             f"reason_code {report_reason!r} is not allowed for {verdict}",
         )
+
+    if bundle_kind == "blocked":
+        if report_verdict != "BLOCKED":
+            raise BundleError(
+                "INVALID_MANIFEST", "a blocked bundle must record verdict BLOCKED"
+            )
+        if report_reason is None or not reason_allowed("BLOCKED", report_reason):
+            raise BundleError(
+                "INVALID_MANIFEST",
+                "a blocked bundle requires an allowed BLOCKED reason_code",
+            )
+        has_plan = "plan.json" in listed
+        has_review = "review.json" in listed
+        if plan_digest is None:
+            if has_plan or has_review:
+                raise BundleError(
+                    "INVALID_MANIFEST",
+                    "a blocked bundle without a plan digest must not ship "
+                    "plan/review",
+                )
+            if report.get("review") is not None:
+                raise BundleError(
+                    "INVALID_MANIFEST",
+                    "report review must be null when review.json is absent",
+                )
+            return
+        if not has_plan:
+            raise BundleError(
+                "INVALID_MANIFEST",
+                "a blocked bundle with a plan digest must ship plan.json",
+            )
+        plan = _parse_json_file(data, "plan.json")
+        try:
+            computed_plan_digest = contracts.plan_digest(plan)
+        except (KeyError, TypeError, ValueError, UnicodeError) as error:
+            raise BundleError(
+                "INVALID_MANIFEST", f"plan.json cannot be validated: {error}"
+            ) from error
+        if computed_plan_digest != plan_digest:
+            raise BundleError(
+                "INVALID_MANIFEST",
+                "plan.json content does not match the manifest plan_digest",
+            )
+        for field in ("case_id", "cve_id"):
+            if report.get(field) is not None and report.get(field) != plan.get(field):
+                raise BundleError(
+                    "INVALID_MANIFEST", f"report {field} does not match the plan"
+                )
+        if not has_review:
+            if report.get("review") is not None:
+                raise BundleError(
+                    "INVALID_MANIFEST",
+                    "report review must be null when review.json is absent",
+                )
+            return
+        review = _parse_json_file(data, "review.json")
+        if review.get("decision") not in ("approve", "reject"):
+            raise BundleError(
+                "INVALID_MANIFEST",
+                "a blocked review.json must record approve or reject",
+            )
+        if review.get("plan_digest") != plan_digest:
+            raise BundleError(
+                "INVALID_MANIFEST", "review.json is bound to a different plan"
+            )
+        expected_review = {
+            "reviewer_id": review.get("reviewer_id"),
+            "decision": review.get("decision"),
+            "plan_digest": review.get("plan_digest"),
+            "decided_at": review.get("decided_at"),
+        }
+        if dict(report.get("review") or {}) != expected_review:
+            raise BundleError(
+                "INVALID_MANIFEST", "report review does not match review.json"
+            )
+        return
 
     plan = _parse_json_file(data, "plan.json")
     try:
@@ -2359,23 +2598,34 @@ def verify_bundle(root: Path | str) -> BundleVerification:
         raise BundleError("INVALID_MANIFEST", "bundle root must be a directory")
 
     manifest, manifest_bytes = _load_manifest(root_path)
-    job_id, plan_digest, files, verdict, manifest_reason = _validate_manifest_header(
-        manifest
-    )
+    (
+        job_id,
+        bundle_kind,
+        plan_digest,
+        files,
+        verdict,
+        manifest_reason,
+    ) = _validate_manifest_header(manifest)
     entries = []
     seen: set[str] = set()
     for entry in files:
         entries.append(_validate_entry(entry, seen))
     roles = {entry["role"] for entry in entries}
-    if not _REQUIRED_ROLES <= roles:
-        missing = sorted(_REQUIRED_ROLES - roles)
+    required_roles = (
+        _REQUIRED_ROLES if bundle_kind == "execution" else _BLOCKED_REQUIRED_ROLES
+    )
+    if not required_roles <= roles:
+        missing = sorted(required_roles - roles)
         raise BundleError(
             "INVALID_MANIFEST",
             "manifest is missing required roles: " + ", ".join(missing),
         )
 
     listed = {entry["path"]: entry for entry in entries}
-    _require_required_paths(listed)
+    if bundle_kind == "execution":
+        _require_required_paths(listed)
+    else:
+        _require_blocked_paths(listed)
     actual: dict[str, Path] = {}
     entries_seen = 0
     files_seen = 0
@@ -2488,6 +2738,7 @@ def verify_bundle(root: Path | str) -> BundleVerification:
 
     _verify_semantics(
         job_id=job_id,
+        bundle_kind=bundle_kind,
         plan_digest=plan_digest,
         verdict=verdict,
         manifest_reason=manifest_reason,
