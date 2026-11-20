@@ -26,7 +26,7 @@ on:
         default: ""
         type: string
       artifact_run_id:
-        description: "Workflow run id holding the candidate artifact (promote/rollback)"
+        description: "Workflow run id holding the candidate artifact (promote/rollback/B03)"
         required: false
         default: ""
         type: string
@@ -1203,12 +1203,16 @@ jobs:
       github.event_name == 'workflow_dispatch'
       && github.ref == 'refs/heads/main'
       && github.event.inputs.run_b03 == 'true'
+      && github.event.inputs.artifact_run_id != ''
     environment: internal-lab
-    # This label is intentionally not a GitHub-hosted runner. The B03 replay
-    # must execute on the authorized internal Linux runner; a missing runner
-    # leaves the job failing/queued instead of skipping the acceptance.
+    # This label is intentionally not a GitHub-hosted runner. B03 replays must
+    # execute on the authorized internal Linux runner; a missing runner leaves
+    # the job failing/queued instead of silently skipping the acceptance.
     runs-on: [self-hosted, linux, x64, datacon-internal]
     timeout-minutes: 120
+    env:
+      ARTIFACT_RUN_ID: ${{ github.event.inputs.artifact_run_id }}
+      CURRENT_SHA: ${{ github.sha }}
     steps:
       - name: Verify protected ref
         shell: bash
@@ -1229,8 +1233,12 @@ jobs:
           python3 - <<'PY'
           import json
           import os
+          import re
           import urllib.request
 
+          run_id = os.environ.get("ARTIFACT_RUN_ID", "").strip()
+          if not re.fullmatch(r"[0-9]+", run_id):
+              raise SystemExit("artifact_run_id must be a numeric run id")
           url = (
               "https://api.github.com/repos/"
               + os.environ["REPOSITORY"]
@@ -1256,8 +1264,13 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
-      - name: Verify checked-out commit ancestry
+      - name: Verify checked-out commit ancestry and candidate artifact provenance
         shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ARTIFACT_RUN_ID: ${{ github.event.inputs.artifact_run_id }}
+          REPOSITORY: ${{ github.repository }}
+          CURRENT_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
           git fetch --no-tags origin main:refs/remotes/origin/main
@@ -1265,6 +1278,71 @@ jobs:
             echo "ref commit ${GITHUB_SHA} is not an ancestor of origin/main" >&2
             exit 1
           fi
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          import subprocess
+          import urllib.request
+
+          def fail(message):
+              raise SystemExit(message)
+
+          current = os.environ.get("CURRENT_SHA", "").strip()
+          if not re.fullmatch(r"[0-9a-f]{40}", current):
+              fail("GITHUB_SHA is not a 40-char commit")
+          run_id = os.environ.get("ARTIFACT_RUN_ID", "").strip()
+          if not re.fullmatch(r"[0-9]+", run_id):
+              fail("artifact_run_id must be a numeric run id to verify B03 provenance")
+          token = os.environ.get("GITHUB_TOKEN", "").strip()
+          if not token:
+              fail("GITHUB_TOKEN is required to verify the artifact run")
+          url = (
+              "https://api.github.com/repos/"
+              + os.environ["REPOSITORY"]
+              + "/actions/runs/"
+              + run_id
+          )
+          request = urllib.request.Request(
+              url,
+              headers={
+                  "Authorization": "Bearer " + token,
+                  "Accept": "application/vnd.github+json",
+                  "X-GitHub-Api-Version": "2022-11-28",
+              },
+          )
+          try:
+              with urllib.request.urlopen(request, timeout=20) as response:
+                  run = json.load(response)
+          except Exception as error:
+              fail("cannot read artifact run metadata: " + repr(error))
+          path = str(run.get("path", ""))
+          if not path.endswith(".github/workflows/release.yml"):
+              fail("artifact run was not produced by release.yml")
+          if run.get("status") != "completed" or run.get("conclusion") != "success":
+              fail("artifact run did not complete successfully")
+          head_sha = run.get("head_sha")
+          if not isinstance(head_sha, str) or not re.fullmatch(r"[0-9a-f]{40}", head_sha):
+              fail("artifact run has no valid head_sha")
+          head_branch = run.get("head_branch")
+          if head_branch != "main":
+              fail("artifact run did not come from main")
+          if subprocess.run(
+              ["git", "merge-base", "--is-ancestor", head_sha, "refs/remotes/origin/main"],
+              timeout=30,
+          ).returncode != 0:
+              fail("artifact run head_sha is not in origin/main history")
+          if subprocess.run(
+              ["git", "merge-base", "--is-ancestor", head_sha, current],
+              timeout=30,
+          ).returncode != 0:
+              fail("artifact run head_sha is not in the protected ref history")
+          env_file = os.environ.get("GITHUB_ENV")
+          if env_file:
+              with open(env_file, "a", encoding="utf-8") as handle:
+                  handle.write("VERIFIED_RUN_HEAD_SHA=" + head_sha + "\n")
+          print("protected ref and candidate artifact provenance verified")
+          PY
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.12"
@@ -1273,112 +1351,342 @@ jobs:
           python -m pip install --disable-pip-version-check --require-hashes \
             --only-binary :all: -r requirements-ci.txt
           uv sync --frozen
-      - name: Run B03 acceptance and upload only a sanitized summary
+      - name: Download the candidate image and manifest from the verified run
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-candidate-artifacts
+          path: ${{ runner.temp }}/b03-artifacts
+          run-id: ${{ env.ARTIFACT_RUN_ID }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Verify the manifest and load the candidate image
+        id: candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/b03-artifacts"
+          test -s "$out/control-plane-image.tar" || {
+            echo "control-plane-image.tar is missing from the artifact run" >&2
+            exit 1
+          }
+          # The canonical artifact name is release.RELEASE_MANIFEST_FILE.
+          # Accept release-manifest.json as an alias so an artifact produced by
+          # a future manifest rename is still rejected or accepted explicitly.
+          manifest="$out/release-candidate-manifest.json"
+          if [ ! -s "$manifest" ] && [ -s "$out/release-manifest.json" ]; then
+            manifest="$out/release-manifest.json"
+          fi
+          test -s "$manifest" || {
+            echo "release candidate manifest is missing from the artifact run" >&2
+            exit 1
+          }
+          candidate_digest="$(uv run --frozen python - "$manifest" "$VERIFIED_RUN_HEAD_SHA" <<'PY'
+          import json
+          import pathlib
+          import subprocess
+          import sys
+
+          from datacon import release
+
+          manifest = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+          expected_head = sys.argv[2]
+          release.validate_release_candidate_manifest(manifest)
+          if manifest["source_commit"] != expected_head:
+              raise SystemExit(
+                  "manifest source_commit does not match the verified artifact run head"
+              )
+          for revision in ("refs/remotes/origin/main", "HEAD"):
+              if subprocess.run(
+                  ["git", "merge-base", "--is-ancestor", manifest["source_commit"], revision],
+                  timeout=30,
+              ).returncode != 0:
+                  raise SystemExit(
+                      f"manifest source_commit is not in {revision} history"
+                  )
+          print(release.canonical_manifest_digest(manifest))
+          PY
+          )"
+          docker load -i "$out/control-plane-image.tar"
+          image_id="$(docker image inspect datacon-control-plane:candidate --format '{{.Id}}')"
+          uv run --frozen python - "$manifest" "$image_id" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          from datacon import release
+
+          manifest = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+          if manifest["control_plane_image_id"] != sys.argv[2]:
+              raise SystemExit(
+                  "loaded image id does not match manifest.control_plane_image_id"
+              )
+          print("candidate manifest digest and loaded image id verified")
+          PY
+          echo "candidate_digest=$candidate_digest" >> "$GITHUB_OUTPUT"
+          echo "image_id=$image_id" >> "$GITHUB_OUTPUT"
+      - name: Run B03 acceptance inside the candidate control-plane image
         shell: bash
         env:
           DATACON_B03_CASE_ROOT: ${{ secrets.DATACON_B03_CASE_ROOT }}
           DATACON_B03_ADMISSION: ${{ secrets.DATACON_B03_ADMISSION }}
           DATACON_B03_REVIEW: ${{ secrets.DATACON_B03_REVIEW }}
           DATACON_B03_EVIDENCE_DIR: ${{ vars.DATACON_B03_EVIDENCE_DIR }}
+          DATACON_B03_STORAGE_REF: ${{ vars.DATACON_B03_STORAGE_REF }}
+          DATACON_B03_CANDIDATE_DIGEST: ${{ steps.candidate.outputs.candidate_digest }}
+          DATACON_B03_CANDIDATE_IMAGE_ID: ${{ steps.candidate.outputs.image_id }}
         run: |
           set -euo pipefail
-          if [ -z "${DATACON_B03_CASE_ROOT}" ] || [ -z "${DATACON_B03_ADMISSION}" ] || [ -z "${DATACON_B03_REVIEW}" ] || [ -z "${DATACON_B03_EVIDENCE_DIR:-}" ]; then
-            echo "B03 requires DATACON_B03_CASE_ROOT, DATACON_B03_ADMISSION, DATACON_B03_REVIEW and DATACON_B03_EVIDENCE_DIR" >&2
+          : "${DATACON_B03_CASE_ROOT:?DATACON_B03_CASE_ROOT must be set}"
+          : "${DATACON_B03_ADMISSION:?DATACON_B03_ADMISSION must be set}"
+          : "${DATACON_B03_REVIEW:?DATACON_B03_REVIEW must be set}"
+          : "${DATACON_B03_EVIDENCE_DIR:?DATACON_B03_EVIDENCE_DIR must be set}"
+          case_root="$DATACON_B03_CASE_ROOT"
+          evidence_dir="$DATACON_B03_EVIDENCE_DIR"
+          candidate_image="$DATACON_B03_CANDIDATE_IMAGE_ID"
+          uv run --frozen python - "$case_root" "$evidence_dir" <<'PY'
+          import pathlib
+          import sys
+
+          from datacon import jsonutil
+
+          for label, raw in (("case root", sys.argv[1]), ("evidence dir", sys.argv[2])):
+              path = pathlib.Path(raw)
+              if not path.is_absolute():
+                  raise SystemExit(f"{label} must be an absolute path")
+              if ".." in path.parts:
+                  raise SystemExit(f"{label} must not contain '..'")
+              jsonutil.reject_symlink_ancestors(path, label=label)
+          case_root = pathlib.Path(sys.argv[1])
+          evidence_dir = pathlib.Path(sys.argv[2])
+          if not case_root.is_dir():
+              raise SystemExit("DATACON_B03_CASE_ROOT must be an existing directory")
+          if not evidence_dir.is_dir():
+              raise SystemExit("DATACON_B03_EVIDENCE_DIR must be an existing directory")
+          PY
+          job_id="$(python3 -c 'import uuid; print(uuid.uuid4())')"
+          export DATACON_B03_JOB_ID="$job_id"
+          docker run --rm --network none --user 65534:65534 \
+            -v "$case_root:$case_root:ro" \
+            -v "$evidence_dir:$evidence_dir" \
+            --entrypoint /bin/sh \
+            "$candidate_image" -c \
+            'set -eu; test -r "$1/harness.c"; test -r "$1/inputs/normal.txt"; test -r "$1/inputs/candidate.txt"; mkdir -p "$2/.b03-access-probe"; rmdir "$2/.b03-access-probe"' \
+            sh "$case_root" "$evidence_dir"
+          docker_socket=/var/run/docker.sock
+          test -S "$docker_socket" || {
+            echo "the host Docker socket is missing" >&2
             exit 1
-          fi
-          uv run --frozen python - <<'PY'
+          }
+          docker_gid="$(stat -c '%g' "$docker_socket")"
+          docker run --rm -i --network host \
+            --user 65534:65534 \
+            --group-add "$docker_gid" \
+            -v "$docker_socket:/var/run/docker.sock" \
+            -v "$case_root:$case_root:ro" \
+            -v "$evidence_dir:$evidence_dir" \
+            -e DATACON_B03_CASE_ROOT \
+            -e DATACON_B03_ADMISSION \
+            -e DATACON_B03_REVIEW \
+            -e DATACON_B03_EVIDENCE_DIR \
+            -e DATACON_B03_JOB_ID \
+            -e DATACON_B03_STORAGE_REF \
+            -e DATACON_B03_CANDIDATE_DIGEST \
+            -e DATACON_B03_CANDIDATE_IMAGE_ID \
+            -e GITHUB_RUN_ID \
+            -e HOME=/tmp \
+            -e DOCKER_CONFIG=/tmp/.docker \
+            --entrypoint /app/.venv/bin/python \
+            "$candidate_image" - <<'PY' | tee "$RUNNER_TEMP/b03-acceptance.out"
           import json
           import os
           import pathlib
           import shutil
-          import uuid
 
           from datacon import release
 
           case_root = pathlib.Path(os.environ["DATACON_B03_CASE_ROOT"])
-          admission = json.loads(
-              pathlib.Path(os.environ["DATACON_B03_ADMISSION"]).read_text(encoding="utf-8")
-          )
+          evidence_dir = pathlib.Path(os.environ["DATACON_B03_EVIDENCE_DIR"])
+          admission = json.loads(os.environ["DATACON_B03_ADMISSION"])
           review = json.loads(os.environ["DATACON_B03_REVIEW"])
+          job_id = os.environ["DATACON_B03_JOB_ID"]
+          storage_ref = (
+              os.environ.get("DATACON_B03_STORAGE_REF") or "vault://datacon/b03"
+          )
           materials = release.B03CaseMaterials.load(case_root)
-          normal_input = materials.normal_input
-          candidate_input = materials.candidate_input
           prepared = release.prepare_b03_plan(
               admission=admission,
               materials=materials,
-              normal_input=normal_input,
-              candidate_input=candidate_input,
+              normal_input=materials.normal_input,
+              candidate_input=materials.candidate_input,
           )
-          job_id = str(uuid.uuid4())
+          run_root = evidence_dir / (".b03-runs-" + job_id)
+          bundle_out = evidence_dir / (".b03-bundle-" + job_id)
+          shutil.rmtree(bundle_out, ignore_errors=True)
+          shutil.rmtree(run_root, ignore_errors=True)
           sandbox = release.build_b03_sandbox(
               prepared["plan"],
               image=prepared["toolchain_image"],
               job_id=job_id,
-              run_root=pathlib.Path(os.environ.get("RUNNER_TEMP", "/tmp")) / "b03-runs",
+              run_root=run_root,
           )
-          run_id = os.environ.get("GITHUB_RUN_ID", "local")
-          run_attempt = os.environ.get("GITHUB_RUN_ATTEMPT", "1")
-          bundle_out = (
-              pathlib.Path(os.environ.get("RUNNER_TEMP", "/tmp"))
-              / f"b03-bundle-{run_id}-{run_attempt}-{job_id}"
-          )
-          shutil.rmtree(bundle_out, ignore_errors=True)
           try:
               acceptance = release.run_b03_acceptance(
                   admission=admission,
                   sandbox=sandbox,
-                  normal_input=normal_input,
-                  candidate_input=candidate_input,
+                  normal_input=materials.normal_input,
+                  candidate_input=materials.candidate_input,
                   bundle_out=bundle_out,
-                  storage_ref=os.environ.get("DATACON_B03_STORAGE_REF", "vault://datacon/b03"),
+                  storage_ref=storage_ref,
                   review=review,
                   case_root=case_root,
                   job_id=job_id,
               )
               persisted = release.persist_b03_evidence_bundle(
                   bundle_out,
-                  persist_root=os.environ["DATACON_B03_EVIDENCE_DIR"],
+                  persist_root=evidence_dir,
                   job_id=job_id,
                   expected_manifest_digest=acceptance["manifest_digest"],
               )
           finally:
               shutil.rmtree(bundle_out, ignore_errors=True)
-          summary = {
-              "benchmark_id": acceptance["benchmark_id"],
-              "cve_id": acceptance["cve_id"],
-              "verdict": acceptance["verdict"],
-              "reason_code": acceptance["reason_code"],
-              "replay_count": acceptance["replay_count"],
-              "bundle_verified": persisted["bundle_verified"],
-              "manifest_digest": acceptance["manifest_digest"],
-              "bundle_manifest_digest": persisted["bundle_manifest_digest"],
-              "bundle_path": persisted["bundle_path"],
-              "storage_ref": acceptance["storage_ref"],
-              "versions": acceptance["versions"],
-          }
-          pathlib.Path("b03-acceptance-summary.json").write_text(
-              json.dumps(summary, indent=2) + "\n", encoding="utf-8"
-          )
-          print(json.dumps(summary, indent=2))
+              shutil.rmtree(run_root, ignore_errors=True)
           expected_verdict = admission.get("expected_verdict", "REPRODUCED")
           if expected_verdict != "REPRODUCED":
               raise SystemExit(
-                  f"unexpected B03 expected_verdict: {expected_verdict!r}"
+                  "unexpected B03 expected_verdict; acceptance requires REPRODUCED"
               )
           if acceptance["verdict"] != expected_verdict:
               raise SystemExit(
-                  f"B03 acceptance verdict mismatch: {acceptance['verdict']!r} != {expected_verdict!r}"
+                  "B03 acceptance verdict does not match the admission"
               )
           if acceptance["reason_code"] != "ASAN_SIGNATURE_MATCHED":
               raise SystemExit(
-                  f"B03 acceptance reason_code mismatch: {acceptance['reason_code']!r}"
+                  "B03 acceptance reason_code is not ASAN_SIGNATURE_MATCHED"
               )
           if acceptance["replay_count"] != 6:
-              raise SystemExit(
-                  f"B03 acceptance replay_count mismatch: {acceptance['replay_count']!r}"
-              )
+              raise SystemExit("B03 acceptance replay_count is not 6")
           if acceptance["bundle_verified"] is not True or persisted["bundle_verified"] is not True:
               raise SystemExit("B03 acceptance bundle_verified must be True")
+          record = {
+              "schema_version": 1,
+              "benchmark_id": "B03",
+              "cve_id": acceptance["cve_id"],
+              "candidate_digest": os.environ["DATACON_B03_CANDIDATE_DIGEST"],
+              "control_plane_image_id": os.environ["DATACON_B03_CANDIDATE_IMAGE_ID"],
+              "b03_bundle_manifest_digest": persisted["bundle_manifest_digest"],
+              "storage_ref": acceptance["storage_ref"],
+              "run_id": os.environ["GITHUB_RUN_ID"],
+              "status": "passed",
+              "verdict": acceptance["verdict"],
+              "replay_count": acceptance["replay_count"],
+              "bundle_verified": True,
+          }
+          print(
+              "DATACON_B03_RECORD="
+              + json.dumps(record, sort_keys=True, separators=(",", ":"))
+          )
+          PY
+      - name: Build the sanitized B03 summary
+        shell: bash
+        run: |
+          set -euo pipefail
+          record_line="$(grep -h '^DATACON_B03_RECORD=' "$RUNNER_TEMP/b03-acceptance.out" | tail -n 1 || true)"
+          test -n "$record_line" || {
+            echo "B03 acceptance did not emit a sanitized record" >&2
+            exit 1
+          }
+          printf '%s\n' "${record_line#DATACON_B03_RECORD=}" > "$RUNNER_TEMP/b03-record.json"
+          uv run --frozen python - "$RUNNER_TEMP/b03-record.json" "b03-acceptance-summary.json" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          record = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+          required = (
+              "candidate_digest",
+              "control_plane_image_id",
+              "b03_bundle_manifest_digest",
+              "storage_ref",
+              "run_id",
+              "status",
+              "verdict",
+          )
+          for field in required:
+              value = record.get(field)
+              if not isinstance(value, str) or not value.strip():
+                  raise SystemExit("B03 record is missing " + field)
+          if type(record.get("replay_count")) is not int:
+              raise SystemExit("B03 record is missing replay_count")
+          summary = {
+              "schema_version": 1,
+              "benchmark_id": "B03",
+              "cve_id": record["cve_id"],
+              "candidate_digest": record["candidate_digest"],
+              "b03_manifest_digest": record["b03_bundle_manifest_digest"],
+              "storage_ref": record["storage_ref"],
+              "run_id": record["run_id"],
+              "environment": "internal-lab",
+              "status": "passed",
+              "verdict": record["verdict"],
+              "replay_count": record["replay_count"],
+              "bundle_verified": True,
+          }
+          pathlib.Path(sys.argv[2]).write_text(
+              json.dumps(summary, indent=2) + "\n", encoding="utf-8"
+          )
+          PY
+      - name: Record B03 acceptance in release state
+        shell: bash
+        env:
+          DATACON_DATABASE_URL: ${{ secrets.DATACON_DATABASE_URL }}
+          CANDIDATE_IMAGE_ID: ${{ steps.candidate.outputs.image_id }}
+          ARTIFACT_RUN_ID: ${{ env.ARTIFACT_RUN_ID }}
+        run: |
+          set -euo pipefail
+          uv run --frozen python - "b03-acceptance-summary.json" <<'PY'
+          import json
+          import os
+          import pathlib
+          import sys
+
+          from datacon import state
+
+          summary = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+          if summary["run_id"] != os.environ.get("GITHUB_RUN_ID"):
+              raise SystemExit("B03 summary run_id does not match this workflow run")
+          if not os.environ.get("DATACON_DATABASE_URL"):
+              raise SystemExit("DATACON_DATABASE_URL is required to record B03 acceptance")
+          store = state.ReleaseStore(
+              os.environ["DATACON_DATABASE_URL"], environment="internal-lab"
+          )
+          recorded = store.record_b03_acceptance(
+              candidate_digest=summary["candidate_digest"],
+              control_plane_image_id=os.environ["CANDIDATE_IMAGE_ID"],
+              b03_bundle_manifest_digest=summary["b03_manifest_digest"],
+              storage_ref=summary["storage_ref"],
+              run_id=summary["run_id"],
+              status="passed",
+              payload={
+                  "benchmark_id": "B03",
+                  "cve_id": summary.get("cve_id"),
+                  "verdict": summary["verdict"],
+                  "replay_count": summary["replay_count"],
+                  "b03_bundle_manifest_digest": summary["b03_manifest_digest"],
+                  "bundle_verified": True,
+                  "artifact_run_id": os.environ.get("ARTIFACT_RUN_ID"),
+              },
+          )
+          print(
+              json.dumps(
+                  {
+                      "candidate_digest": recorded["candidate_digest"],
+                      "b03_manifest_digest": recorded["b03_bundle_manifest_digest"],
+                      "storage_ref": recorded["storage_ref"],
+                      "run_id": recorded["run_id"],
+                      "status": recorded["status"],
+                  },
+                  indent=2,
+              )
+          )
           PY
       - name: Upload only the sanitized B03 summary
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

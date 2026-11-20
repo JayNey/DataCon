@@ -2,5 +2,10 @@
 /.github/ @JayNey
 /src/datacon/ci_gates.py @JayNey
 /scripts/run_suite.sh @JayNey
+/scripts/calibrate_b03.py @JayNey
+/scripts/freeze_b03_admission.py @JayNey
 /tests/contract/test_ci_gates.py @JayNey
 /tests/contract/test_release_workflow.py @JayNey
+/tests/contract/test_b03_calibration.py @JayNey
+/tests/contract/test_b03_migration.py @JayNey
+/migrations/009_b03_acceptance.sql @JayNey

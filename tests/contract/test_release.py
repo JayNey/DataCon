@@ -123,7 +123,7 @@ def test_release_candidate_manifest_rejects_unknown_missing_and_bad_digests():
     manifest = _sample_rc_manifest()
     assert manifest["schema_version"] == 1
     assert manifest["contract_version"] == 1
-    assert manifest["migration_version"] == "008_release_events.sql"
+    assert manifest["migration_version"] == "009_b03_acceptance.sql"
     assert len(manifest["migrations"]) >= 8
     release.validate_release_candidate_manifest(manifest)
 

@@ -1476,6 +1476,26 @@ def _release_digest(value: Any, label: str) -> str:
     return value
 
 
+def _b03_acceptance_record(row: Mapping[str, Any]) -> dict[str, Any]:
+    status = row["status"]
+    if status != "passed":
+        raise ReleaseStateError(
+            f"persisted B03 acceptance has status {status!r}; only 'passed' is valid"
+        )
+    payload = row["payload"]
+    return {
+        "environment": row["environment"],
+        "candidate_digest": row["candidate_digest"],
+        "control_plane_image_id": row["control_plane_image_id"],
+        "b03_bundle_manifest_digest": row["b03_bundle_manifest_digest"],
+        "storage_ref": row["storage_ref"],
+        "run_id": row["run_id"],
+        "status": status,
+        "accepted_at": row["accepted_at"].isoformat(),
+        "payload": dict(payload) if isinstance(payload, Mapping) else {},
+    }
+
+
 def _migration_sha256(path: Path) -> str:
     return "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
 
@@ -1642,6 +1662,24 @@ class ReleaseStore:
                 "schema_migrations ledger is missing; run `datacon migrate` "
                 "against the target database before bootstrapping, promoting, "
                 "rolling back, or querying release state"
+            )
+
+    def _ensure_b03_acceptance_table(self, connection) -> None:
+        """Fail closed when migration 009 has not been applied.
+
+        The B03 ledger is intentionally checked per call rather than in
+        ``_ensure_release_tables`` so promotion/rollback on a database migrated
+        only through 008 keep their existing behaviour; the B03 entrypoints
+        themselves never write to a schema they cannot prove.
+        """
+        reg = connection.execute(
+            "SELECT to_regclass('b03_acceptance') AS b03_tbl"
+        ).fetchone()
+        if reg is None or reg["b03_tbl"] is None:
+            raise ReleaseStateError(
+                "b03_acceptance table is missing; run `datacon migrate` "
+                "against the target database before recording or reading B03 "
+                "acceptance"
             )
 
     @contextmanager
@@ -1961,6 +1999,123 @@ class ReleaseStore:
                 (self.environment, candidate_digest),
             ).fetchone()
         return dict(row["payload"]) if row is not None else None
+
+    def record_b03_acceptance(
+        self,
+        *,
+        candidate_digest: str,
+        control_plane_image_id: str,
+        b03_bundle_manifest_digest: str,
+        storage_ref: str,
+        run_id: str,
+        status: str = "passed",
+        payload: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Persist one accepted B03 result, idempotently and without overwrites.
+
+        ``candidate_digest`` is the release candidate manifest digest, never an
+        image id. Repeating the exact same acceptance is a no-op; a conflicting
+        record for the same ``(environment, candidate_digest)`` fails closed so
+        a later run cannot silently replace a reviewed acceptance.
+        """
+        _release_digest(candidate_digest, "B03 candidate_digest")
+        _release_digest(control_plane_image_id, "B03 control_plane_image_id")
+        _release_digest(
+            b03_bundle_manifest_digest, "B03 b03_bundle_manifest_digest"
+        )
+        if not isinstance(storage_ref, str) or not storage_ref.strip():
+            raise ReleaseStateError("B03 storage_ref must be a non-empty string")
+        if len(storage_ref) > 2048 or any(
+            ord(character) < 0x20 for character in storage_ref
+        ):
+            raise ReleaseStateError("B03 storage_ref must be a bounded single-line string")
+        if (
+            not isinstance(run_id, str)
+            or not re.fullmatch(r"[A-Za-z0-9._:-]{1,200}", run_id)
+        ):
+            raise ReleaseStateError("B03 run_id must be a short single-line identifier")
+        if status != "passed":
+            raise ReleaseStateError(
+                f"B03 acceptance status must be 'passed'; got {status!r}"
+            )
+        if payload is None:
+            payload = {}
+        if not isinstance(payload, Mapping):
+            raise ReleaseStateError("B03 acceptance payload must be an object")
+        payload_doc = dict(payload)
+        desired = {
+            "environment": self.environment,
+            "candidate_digest": candidate_digest,
+            "control_plane_image_id": control_plane_image_id,
+            "b03_bundle_manifest_digest": b03_bundle_manifest_digest,
+            "storage_ref": storage_ref,
+            "run_id": run_id,
+            "status": status,
+            "payload": payload_doc,
+        }
+        with self.transaction() as connection:
+            self._ensure_b03_acceptance_table(connection)
+            row = connection.execute(
+                "SELECT environment, candidate_digest, control_plane_image_id, "
+                "b03_bundle_manifest_digest, storage_ref, run_id, status, "
+                "accepted_at, payload FROM b03_acceptance "
+                "WHERE environment = %s AND candidate_digest = %s",
+                (self.environment, candidate_digest),
+            ).fetchone()
+            if row is not None:
+                existing = _b03_acceptance_record(row)
+                for field, value in desired.items():
+                    if existing[field] != value:
+                        raise ReleaseStateError(
+                            "B03 acceptance conflicts with the persisted record "
+                            f"for {candidate_digest}: {field}"
+                        )
+                return existing
+            connection.execute(
+                "INSERT INTO b03_acceptance "
+                "(environment, candidate_digest, control_plane_image_id, "
+                "b03_bundle_manifest_digest, storage_ref, run_id, status, payload) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+                (
+                    self.environment,
+                    candidate_digest,
+                    control_plane_image_id,
+                    b03_bundle_manifest_digest,
+                    storage_ref,
+                    run_id,
+                    status,
+                    Jsonb(payload_doc),
+                ),
+            )
+            row = connection.execute(
+                "SELECT environment, candidate_digest, control_plane_image_id, "
+                "b03_bundle_manifest_digest, storage_ref, run_id, status, "
+                "accepted_at, payload FROM b03_acceptance "
+                "WHERE environment = %s AND candidate_digest = %s",
+                (self.environment, candidate_digest),
+            ).fetchone()
+        if row is None:
+            raise ReleaseStateError("B03 acceptance was not persisted")
+        return _b03_acceptance_record(row)
+
+    def b03_acceptance_for(self, candidate_digest: str) -> dict[str, Any]:
+        """Return the accepted B03 record for a candidate, or fail closed."""
+        _release_digest(candidate_digest, "B03 candidate_digest")
+        with self._connection() as connection:
+            self._ensure_b03_acceptance_table(connection)
+            row = connection.execute(
+                "SELECT environment, candidate_digest, control_plane_image_id, "
+                "b03_bundle_manifest_digest, storage_ref, run_id, status, "
+                "accepted_at, payload FROM b03_acceptance "
+                "WHERE environment = %s AND candidate_digest = %s",
+                (self.environment, candidate_digest),
+            ).fetchone()
+        if row is None:
+            raise ReleaseStateError(
+                "no B03 acceptance record exists for candidate "
+                f"{candidate_digest}"
+            )
+        return _b03_acceptance_record(row)
 
     def applied_migrations(self) -> dict[str, str]:
         """Return the verifiable migration ledger as ``{file: sha256}``.

@@ -16,6 +16,7 @@ MIGRATION_004 = ROOT / "migrations" / "004_legacy_binary_sync.sql"
 MIGRATION_005 = ROOT / "migrations" / "005_execution_evidence.sql"
 MIGRATION_006 = ROOT / "migrations" / "006_attempt_journal_provenance.sql"
 MIGRATION_007 = ROOT / "migrations" / "007_execution_evidence_invariant.sql"
+MIGRATION_009 = ROOT / "migrations" / "009_b03_acceptance.sql"
 
 
 def _relation_kind(connection, schema_name, relation_name):
@@ -678,7 +679,16 @@ def test_007_repairs_legacy_evidence_rows_and_enforces_invariants(postgres_dsn):
 
 
 def test_incremental_migrations_take_the_advisory_lock():
-    for migration in (MIGRATION_005, MIGRATION_006, MIGRATION_007):
+    for migration in (MIGRATION_005, MIGRATION_006, MIGRATION_007, MIGRATION_009):
         text = migration.read_text(encoding="utf-8")
-        assert "pg_advisory_xact_lock" in text, migration.name
-        assert text.index("pg_advisory_xact_lock") < text.index("ALTER TABLE")
+        executable = "\n".join(
+            line.split("--", 1)[0] for line in text.splitlines()
+        )
+        assert "pg_advisory_xact_lock" in executable, migration.name
+        ddl = [
+            executable.index(token)
+            for token in ("ALTER TABLE", "CREATE TABLE")
+            if token in executable
+        ]
+        assert ddl
+        assert executable.index("pg_advisory_xact_lock") < min(ddl), migration.name
