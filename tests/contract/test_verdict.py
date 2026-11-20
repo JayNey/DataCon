@@ -400,3 +400,16 @@ def test_forged_asan_source_prefix_is_rejected():
     real = replace(forged, source="/fixture/vulnerable/parser.c")
     assert signature_matches(real, SIGNATURE)
     assert signature_matches(replace(forged, source="parser.c"), SIGNATURE)
+
+
+def test_blocked_reasons_cover_non_execution_terminals():
+    from datacon.verdict import reason_allowed
+
+    for code in ("UNSUPPORTED_TARGET", "REVIEW_REJECTED", "REVIEW_EXPIRED"):
+        assert reason_allowed("BLOCKED", code)
+    # These codes still belong to the non-execution block set; they must not
+    # become a FAILED reason just because the evidence write failed.
+    for code in ("MATERIAL_MISSING", "SOURCE_CONFLICT", "DEADLINE_EXCEEDED"):
+        assert reason_allowed("BLOCKED", code)
+    for code in ("REVIEW_REJECTED", "REVIEW_EXPIRED", "UNSUPPORTED_TARGET"):
+        assert not reason_allowed("FAILED", code)

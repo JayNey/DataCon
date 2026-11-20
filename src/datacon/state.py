@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 import hashlib
 from pathlib import Path
@@ -484,6 +484,124 @@ def block_job(
         )
 
 
+def _archive_pending_blocked(
+    dsn: str, job_id: UUID, pending: list[tuple[str, str]]
+) -> None:
+    """Archive a just-committed BLOCKED transition (best effort).
+
+    The callback runs from ``ExitStack`` after the database context manager has
+    committed. Filesystem/verification errors are turned into
+    FAILED/EVIDENCE_WRITE_FAILED by ``record_blocked``; a control-plane
+    database error is propagated rather than hidden behind a successful review
+    response.
+    """
+    if not pending:
+        return
+    reason_code, message = pending[-1]
+    # Imported lazily: execution imports state at module load time, so a
+    # module-level import here would be circular.
+    from datacon import execution
+
+    execution.record_blocked(
+        dsn,
+        job_id,
+        reason_code=reason_code,
+        message=message,
+    )
+
+
+def record_blocked_evidence(
+    dsn: str,
+    job_id: UUID,
+    *,
+    generation: int | None = None,
+    evidence_digest: str | None = None,
+    evidence_path: str | None = None,
+    evidence_error: str | None = None,
+    reason_code: str | None = None,
+) -> bool:
+    """Attach a blocked bundle to a job without requiring a worker lease.
+
+    The row must still be BLOCKED at ``generation``. A successful archive
+    records both pointer columns and leaves the verdict columns NULL (a
+    blocked job has no output verdict). An archive failure moves the row to
+    FAILED/EVIDENCE_WRITE_FAILED and clears every current evidence pointer, so
+    the 007 invariant (``archived`` iff path+digest, no verdict for a failed
+    terminal) is never violated.
+    """
+    with _connect(dsn) as connection:
+        job = connection.execute(
+            "SELECT state, reason_code, generation FROM jobs "
+            "WHERE job_id = %s FOR UPDATE",
+            (job_id,),
+        ).fetchone()
+        if job is None:
+            return False
+        if generation is None:
+            generation = job["generation"]
+        if job["generation"] != generation or job["state"] != "BLOCKED":
+            return False
+        archived = bool(evidence_digest and evidence_path)
+        if evidence_error is None and not archived:
+            evidence_error = "blocked evidence bundle was not produced"
+        if evidence_error is None and archived:
+            connection.execute(
+                "UPDATE jobs SET evidence_status = 'archived', "
+                "evidence_path = %s, evidence_digest = %s, "
+                "evidence_error = NULL, verdict = NULL, verdict_reason = NULL, "
+                "state_version = state_version + 1, "
+                "updated_at = clock_timestamp() "
+                "WHERE job_id = %s AND generation = %s AND state = 'BLOCKED'",
+                (evidence_path, evidence_digest, job_id, generation),
+            )
+            _audit(
+                connection,
+                job_id,
+                "blocked_evidence_archived",
+                stage="blocked",
+                reason_code=reason_code or job["reason_code"],
+                detail={
+                    "generation": generation,
+                    "evidence_digest": evidence_digest,
+                    "evidence_path": evidence_path,
+                },
+            )
+            return True
+        # Do not leave a BLOCKED row with evidence_status='failed'. The
+        # terminal state is FAILED, the current verdict/pointers are cleared,
+        # and the original block reason stays in the audit detail.
+        connection.execute(
+            "UPDATE jobs SET state = 'FAILED', stage = 'failed', "
+            "reason_code = 'EVIDENCE_WRITE_FAILED', last_error = %s, "
+            "verdict = NULL, verdict_reason = NULL, evidence_path = NULL, "
+            "evidence_digest = NULL, evidence_status = 'failed', "
+            "evidence_error = %s, state_version = state_version + 1, "
+            "updated_at = clock_timestamp() "
+            "WHERE job_id = %s AND generation = %s AND state = 'BLOCKED'",
+            (
+                _truncate(evidence_error or "blocked evidence write failed"),
+                _truncate(evidence_error or "blocked evidence write failed"),
+                job_id,
+                generation,
+            ),
+        )
+        _audit(
+            connection,
+            job_id,
+            "failed",
+            stage="failed",
+            reason_code="EVIDENCE_WRITE_FAILED",
+            detail={
+                "generation": generation,
+                "blocked_reason": reason_code or job["reason_code"],
+                "evidence_error": _truncate(
+                    evidence_error or "blocked evidence write failed"
+                ),
+            },
+        )
+        return True
+
+
 def record_attempt(
     dsn: str,
     job_id: UUID,
@@ -725,11 +843,11 @@ def finish_execution(
     """Atomically commit a terminal execution state and fence older writers.
 
     The generation is advanced so a worker that lost the lease can never write
-    again. A failed archive keeps the previously recorded verdict in the row
-    for history while the job itself becomes ``FAILED`` with
-    ``EVIDENCE_WRITE_FAILED``; ``status`` only exposes a verdict while
-    ``evidence_status == "archived"`` so consumers cannot mistake that old
-    value for the current result.
+    again. A terminal that did not archive a bundle becomes FAILED and clears
+    the current verdict and evidence pointer; the failure text stays in
+    ``evidence_error``/``last_error``. ``status`` only exposes a verdict while
+    ``evidence_status == "archived"``, so a stale value cannot be mistaken for
+    the current result.
     """
     if state not in ("REPRODUCED", "NOT_REPRODUCED", "INCONCLUSIVE", "BLOCKED", "FAILED"):
         raise StateError("execution terminal state is invalid")
@@ -940,7 +1058,14 @@ def record_review(
     if len(reviewer_id) > 128:
         raise StateError("reviewer_id is too long")
 
-    with _connect(dsn) as connection:
+    pending_blocked: list[tuple[str, str]] = []
+    with ExitStack() as stack:
+        # Registered before the connection so it runs after the transaction
+        # commits (ExitStack unwinds in reverse order). record_review has no
+        # worker lease; record_blocked_evidence intentionally does not require
+        # one.
+        stack.callback(_archive_pending_blocked, dsn, job_id, pending_blocked)
+        connection = stack.enter_context(_connect(dsn))
         job = connection.execute(
             "SELECT state, reason_code, review_deadline_at, generation "
             "FROM jobs WHERE job_id = %s FOR UPDATE",
@@ -1065,6 +1190,12 @@ def record_review(
                     ),
                 },
             )
+            pending_blocked.append(
+                (
+                    "REVIEW_EXPIRED",
+                    "review deadline passed before a decision was recorded",
+                )
+            )
             return ReviewOutcome(
                 "expired",
                 state="BLOCKED",
@@ -1164,6 +1295,10 @@ def record_review(
                 "plan_digest": plan_digest,
             },
         )
+        if decision == "reject":
+            pending_blocked.append(
+                ("REVIEW_REJECTED", "review rejected by the operator")
+            )
         return ReviewOutcome(
             "applied",
             state=state,
@@ -1177,7 +1312,10 @@ def record_review(
 
 
 def expire_review(dsn: str, job_id: UUID, generation: int) -> bool:
-    with _connect(dsn) as connection:
+    pending_blocked: list[tuple[str, str]] = []
+    with ExitStack() as stack:
+        stack.callback(_archive_pending_blocked, dsn, job_id, pending_blocked)
+        connection = stack.enter_context(_connect(dsn))
         job = connection.execute(
             "SELECT state, generation, review_deadline_at, lease_owner, "
             "lease_expires_at, "
@@ -1221,6 +1359,12 @@ def expire_review(dsn: str, job_id: UUID, generation: int) -> bool:
                 "generation": generation,
                 "plan_digest": job["plan_digest"],
             },
+        )
+        pending_blocked.append(
+            (
+                "REVIEW_EXPIRED",
+                "review deadline passed before a decision was recorded",
+            )
         )
         return True
 
@@ -1286,11 +1430,11 @@ def status(dsn: str, job_id: UUID) -> dict[str, Any] | None:
             "path": row["evidence_path"],
             "error": row["evidence_error"],
         }
-    # A verdict is authoritative only for an archived bundle. ``finish_execution``
-    # keeps a previously archived verdict in the row so history is not lost,
-    # but a later failed archive advances the job to FAILED. Returning the old
-    # value here would let a consumer mistake it for the current result, so the
-    # public status only exposes a verdict while the evidence is archived.
+    # A verdict is authoritative only for an archived bundle. A terminal that
+    # did not archive evidence is already FAILED with a NULL verdict and
+    # evidence pointer (finish_execution/record_blocked_evidence clear them),
+    # so status returns a verdict only while the archived+path+digest
+    # invariant holds. The old value is never retained for history.
     verdict_current = (
         row["evidence_status"] == "archived"
         and row["verdict"] is not None
