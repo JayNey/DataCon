@@ -1008,10 +1008,13 @@ def _run_b03(tmp_path, admission, sandbox, review):
     )
 
 
-def test_b03_repo_pending_admission_is_rejected(tmp_path):
+def test_b03_pending_admission_is_rejected(tmp_path):
+    # Build an explicit pending copy so this regression test does not depend on
+    # whether the checked-in fixture has already been frozen by the lab.
     root = _b03_case_root(tmp_path)
-    admission = json.loads(B03_PATH.read_text(encoding="utf-8"))
-    assert admission["expected_verdict_status"] == "pending_t05_replay"
+    admission = _frozen_admission()
+    admission["asan_signature"]["status"] = "expected_pending_t05_replay"
+    admission["expected_verdict_status"] = "pending_t05_replay"
     review = _review_for(_frozen_admission(), root)
     sandbox = FakeB03Sandbox(toolchain=admission["build"]["toolchain_image"])
     with pytest.raises(release.ReleaseGateError, match="asan_signature.status"):
