@@ -1111,6 +1111,406 @@ def finalize_workflow(dsn: str, job_id: UUID, generation: int) -> bool:
         return True
 
 
+# A fixed-mode envelope is the degenerate authorization: it can never widen
+# into guided and its mutation surface is empty. The envelope body is closed:
+# every field documented in interface-contract-delta §2 is required and any
+# other field is rejected, because envelope_digest commits to these exact bytes.
+_ENVELOPE_FIELDS = frozenset(
+    {
+        "mode",
+        "allowed_mutation_families",
+        "mutation_limits",
+        "seed_corpus_digest",
+        "fuzz_image_digest",
+        "harness_digest",
+        "max_rounds",
+        "max_total_seconds",
+        "max_fuzz_seconds",
+        "accepted_signature_set",
+        "admission_predicate_version",
+    }
+)
+_MUTATION_LIMIT_FIELDS = frozenset({"allowed_ops", "max_input_bytes"})
+_ENVELOPE_SIGNATURE_FIELDS = frozenset({"error", "function", "source"})
+_ENVELOPE_SIGNATURE_OPTIONAL = frozenset({"operation", "access_size"})
+_ENVELOPE_MODES = frozenset({"fixed", "guided"})
+_ENVELOPE_MAX_ACCESS_SIZE = 2**31 - 1
+
+
+def _envelope_text(value: Any, label: str) -> str:
+    """Require a non-empty string envelope identifier without whitespace."""
+    text = jsonutil.require_text(value, label)
+    if any(character.isspace() for character in text):
+        raise ValueError(f"{label} must not contain whitespace")
+    return text
+
+
+def _envelope_string_list(value: Any, label: str) -> list[str]:
+    if not isinstance(value, list):
+        raise ValueError(f"{label} must be a JSON array")
+    result: list[str] = []
+    seen: set[str] = set()
+    for index, item in enumerate(value):
+        text = _envelope_text(item, f"{label}[{index}]")
+        if text in seen:
+            raise ValueError(f"{label} must not contain duplicates")
+        seen.add(text)
+        result.append(text)
+    return result
+
+
+def _envelope_digest_or_null(value: Any, label: str) -> str | None:
+    if value is None:
+        return None
+    return jsonutil.require_digest(value, label)
+
+
+def _envelope_signature_set(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        raise ValueError("envelope.accepted_signature_set must be a JSON array")
+    normalized: list[dict[str, Any]] = []
+    for index, item in enumerate(value):
+        label = f"accepted_signature_set[{index}]"
+        signature = jsonutil.require_object(
+            item,
+            required=set(_ENVELOPE_SIGNATURE_FIELDS),
+            optional=_ENVELOPE_SIGNATURE_OPTIONAL,
+            label=label,
+        )
+        entry: dict[str, Any] = {
+            field: jsonutil.require_text(signature[field], f"{label}.{field}")
+            for field in sorted(_ENVELOPE_SIGNATURE_FIELDS)
+        }
+        if "operation" in signature:
+            operation = jsonutil.require_text(
+                signature["operation"], f"{label}.operation"
+            )
+            if operation not in ("READ", "WRITE"):
+                raise ValueError(f"{label}.operation must be READ or WRITE")
+            entry["operation"] = operation
+        if "access_size" in signature:
+            access_size = signature["access_size"]
+            if (
+                type(access_size) is not int
+                or not 1 <= access_size <= _ENVELOPE_MAX_ACCESS_SIZE
+            ):
+                raise ValueError(
+                    f"{label}.access_size must be an integer between 1 and "
+                    f"{_ENVELOPE_MAX_ACCESS_SIZE}"
+                )
+            entry["access_size"] = access_size
+        normalized.append(entry)
+    return normalized
+
+
+def _validate_envelope(envelope: Any) -> dict[str, Any]:
+    """Validate and normalize one proposed exploration envelope.
+
+    The body is closed and every documented field is required. Fixed mode is
+    kept at its degenerate values so a fixed envelope can never carry a
+    mutation surface; guided mode requires the seed/fuzz digests that make the
+    admitted rounds reproducible. Values are otherwise preserved byte-for-byte
+    (apart from the deterministic ordering of accepted_signature_set fields) so
+    the persisted body and envelope_digest describe the approval.
+    """
+    jsonutil.require_object(
+        envelope,
+        required=set(_ENVELOPE_FIELDS),
+        label="envelope",
+    )
+    mode = envelope["mode"]
+    if not isinstance(mode, str) or mode not in _ENVELOPE_MODES:
+        raise ValueError("envelope.mode must be fixed or guided")
+
+    families = _envelope_string_list(
+        envelope["allowed_mutation_families"],
+        "envelope.allowed_mutation_families",
+    )
+    limits = jsonutil.require_object(
+        envelope["mutation_limits"],
+        required=set(_MUTATION_LIMIT_FIELDS),
+        label="envelope.mutation_limits",
+    )
+    allowed_ops = _envelope_string_list(
+        limits["allowed_ops"], "envelope.mutation_limits.allowed_ops"
+    )
+    max_input_bytes = limits["max_input_bytes"]
+    if type(max_input_bytes) is not int or max_input_bytes < 0:
+        raise ValueError(
+            "envelope.mutation_limits.max_input_bytes must be a non-negative integer"
+        )
+
+    seed_corpus_digest = _envelope_digest_or_null(
+        envelope["seed_corpus_digest"], "envelope.seed_corpus_digest"
+    )
+    fuzz_image_digest = _envelope_digest_or_null(
+        envelope["fuzz_image_digest"], "envelope.fuzz_image_digest"
+    )
+    harness_digest = jsonutil.require_digest(
+        envelope["harness_digest"], "envelope.harness_digest"
+    )
+    max_rounds = envelope["max_rounds"]
+    if type(max_rounds) is not int or max_rounds < 1:
+        raise ValueError("envelope.max_rounds must be a positive integer")
+    max_total_seconds = envelope["max_total_seconds"]
+    if type(max_total_seconds) is not int or max_total_seconds < 1:
+        raise ValueError("envelope.max_total_seconds must be a positive integer")
+    max_fuzz_seconds = envelope["max_fuzz_seconds"]
+    if (
+        type(max_fuzz_seconds) is not int
+        or not 0 <= max_fuzz_seconds <= max_total_seconds
+    ):
+        raise ValueError(
+            "envelope.max_fuzz_seconds must be an integer between 0 and "
+            "max_total_seconds"
+        )
+    accepted_signature_set = _envelope_signature_set(
+        envelope["accepted_signature_set"]
+    )
+    admission_predicate_version = jsonutil.require_text(
+        envelope["admission_predicate_version"],
+        "envelope.admission_predicate_version",
+    )
+
+    if mode == "fixed":
+        if families:
+            raise ValueError("fixed envelope requires allowed_mutation_families=[]")
+        if allowed_ops:
+            raise ValueError("fixed envelope requires mutation_limits.allowed_ops=[]")
+        if max_input_bytes != 0:
+            raise ValueError(
+                "fixed envelope requires mutation_limits.max_input_bytes=0"
+            )
+        if seed_corpus_digest is not None:
+            raise ValueError("fixed envelope requires seed_corpus_digest=null")
+        if fuzz_image_digest is not None:
+            raise ValueError("fixed envelope requires fuzz_image_digest=null")
+        if max_rounds != 1:
+            raise ValueError("fixed envelope requires max_rounds=1")
+        if max_fuzz_seconds != 0:
+            raise ValueError("fixed envelope requires max_fuzz_seconds=0")
+    else:
+        if not families:
+            raise ValueError(
+                "guided envelope requires a non-empty allowed_mutation_families"
+            )
+        if seed_corpus_digest is None:
+            raise ValueError("guided envelope requires seed_corpus_digest")
+        if fuzz_image_digest is None:
+            raise ValueError("guided envelope requires fuzz_image_digest")
+
+    return {
+        "mode": mode,
+        "allowed_mutation_families": families,
+        "mutation_limits": {
+            "allowed_ops": allowed_ops,
+            "max_input_bytes": max_input_bytes,
+        },
+        "seed_corpus_digest": seed_corpus_digest,
+        "fuzz_image_digest": fuzz_image_digest,
+        "harness_digest": harness_digest,
+        "max_rounds": max_rounds,
+        "max_total_seconds": max_total_seconds,
+        "max_fuzz_seconds": max_fuzz_seconds,
+        "accepted_signature_set": accepted_signature_set,
+        "admission_predicate_version": admission_predicate_version,
+    }
+
+
+def _request_exploration(request: Any) -> dict[str, Any] | None:
+    if not isinstance(request, dict):
+        return None
+    exploration = request.get("exploration")
+    if not isinstance(exploration, dict):
+        return None
+    return exploration
+
+
+def _original_allowed_ops(
+    request: Any, exploration: dict[str, Any]
+) -> set[str] | None:
+    """Return the request's allowed mutation ops when it declares any.
+
+    Request v2 does not expose mutation_limits publicly, but a persisted row may
+    carry one from an earlier gate. Both the documented exploration nesting and
+    a top-level block are honored so a ceiling can never be silently bypassed.
+    """
+    candidates: list[Any] = []
+    nested = exploration.get("mutation_limits")
+    if isinstance(nested, dict):
+        candidates.append(nested)
+    if isinstance(request, dict):
+        top_level = request.get("mutation_limits")
+        if isinstance(top_level, dict):
+            candidates.append(top_level)
+    declared: list[set[str]] = []
+    for candidate in candidates:
+        ops = candidate.get("allowed_ops")
+        if isinstance(ops, list):
+            declared.append({op for op in ops if isinstance(op, str)})
+    if not declared:
+        return None
+    # Intersect independent declarations: a new envelope may not escape either.
+    floor = declared[0]
+    for ops in declared[1:]:
+        floor &= ops
+    return floor
+
+
+def _assert_envelope_not_expanded(
+    envelope: dict[str, Any], request: Any
+) -> None:
+    """Reject a proposed envelope that widens the family's request ceilings.
+
+    A request without exploration is a fixed family: only a fixed envelope is
+    acceptable. A guided request may tighten any budget, family or op set, but
+    never widen one, and a fixed request can never be re-opened as guided.
+    Case-registry ceilings are a separate T11 gate; this check only covers the
+    persisted request, which is the evidence available to T10.
+    """
+    exploration = _request_exploration(request)
+    if exploration is None:
+        if envelope["mode"] != "fixed":
+            raise StateError(
+                "a request without exploration only accepts a fixed envelope"
+            )
+        return
+
+    original_mode = exploration.get("mode", "fixed")
+    if original_mode == "fixed" and envelope["mode"] == "guided":
+        raise StateError("a fixed family cannot be re-opened as a guided envelope")
+
+    # Missing request ceilings are treated conservatively as their fixed
+    # defaults rather than as "unlimited": an absent ceiling cannot be widened.
+    ceiling_defaults = {"max_rounds": 1, "max_total_seconds": 0, "max_fuzz_seconds": 0}
+    for field, default in ceiling_defaults.items():
+        original = exploration.get(field, default)
+        if type(original) is not int:
+            original = default
+        if envelope[field] > original:
+            raise StateError(
+                f"envelope.{field} {envelope[field]} exceeds the request "
+                f"ceiling {original}"
+            )
+
+    families = exploration.get("allowed_mutation_families")
+    original_families = (
+        {family for family in families if isinstance(family, str)}
+        if isinstance(families, list)
+        else set()
+    )
+    widened_families = sorted(
+        set(envelope["allowed_mutation_families"]) - original_families
+    )
+    if widened_families:
+        raise StateError(
+            "envelope adds mutation families outside the request: "
+            + ", ".join(widened_families)
+        )
+
+    original_ops = _original_allowed_ops(request, exploration)
+    if original_ops is not None:
+        widened_ops = sorted(
+            set(envelope["mutation_limits"]["allowed_ops"]) - original_ops
+        )
+        if widened_ops:
+            raise StateError(
+                "envelope adds mutation ops outside the request: "
+                + ", ".join(widened_ops)
+            )
+
+
+def propose_envelope(
+    dsn: str,
+    family_id: UUID,
+    envelope: Any,
+    *,
+    operator_id: str | None = None,
+) -> dict[str, Any]:
+    """Create one pending family envelope for a changed-envelope re-approval.
+
+    The family row lock serializes proposals against reviews: a pending row can
+    never be superseded concurrently, and the partial unique index is the
+    database backstop for "one pending envelope per family". The digest is the
+    canonical SHA-256 of the exact validated body, so re-proposing the same body
+    is rejected by ``family_envelopes_digest_unique``.
+    """
+    try:
+        normalized = _validate_envelope(envelope)
+    except ValueError as error:
+        raise StateError(str(error)) from error
+
+    if operator_id is not None:
+        try:
+            operator_id = jsonutil.require_text(operator_id, "operator_id")
+        except ValueError as error:
+            raise StateError(str(error)) from error
+        if len(operator_id) > 128:
+            raise StateError("operator_id is too long")
+
+    digest = jsonutil.digest_json(normalized)
+
+    with _connect(dsn) as connection:
+        job = connection.execute(
+            "SELECT state, job_kind, job_contract_version, request "
+            "FROM jobs WHERE job_id = %s FOR UPDATE",
+            (family_id,),
+        ).fetchone()
+        if job is None:
+            raise StateError("family does not exist")
+        if job["job_kind"] != "family":
+            raise StateError("target job is not a family")
+        if job["job_contract_version"] != 2:
+            raise StateError("target family is not on the v2 job contract")
+        if job["state"] != "AGGREGATING":
+            raise StateError(
+                f"family is {job['state']}, not AGGREGATING"
+            )
+
+        _assert_envelope_not_expanded(normalized, job["request"])
+
+        try:
+            inserted = connection.execute(
+                "INSERT INTO family_envelopes "
+                "(envelope_id, family_id, envelope_digest, envelope_json, "
+                "status, review_deadline_at) "
+                "VALUES (%s, %s, %s, %s, 'pending', "
+                f"clock_timestamp() + interval '{REVIEW_WINDOW_HOURS} hours') "
+                "RETURNING review_deadline_at",
+                (uuid.uuid4(), family_id, digest, Jsonb(normalized)),
+            ).fetchone()
+        except psycopg.errors.UniqueViolation as error:
+            constraint = getattr(error.diag, "constraint_name", None)
+            if constraint == "family_envelopes_one_pending":
+                raise StateError("a pending envelope already exists") from error
+            if constraint == "family_envelopes_digest_unique":
+                raise StateError("this envelope was already proposed") from error
+            raise
+
+        _audit(
+            connection,
+            family_id,
+            "envelope_proposed",
+            stage="review",
+            detail={
+                "operator_id": operator_id,
+                "envelope_digest": digest,
+                "mode": normalized["mode"],
+                "max_rounds": normalized["max_rounds"],
+                "max_total_seconds": normalized["max_total_seconds"],
+                "max_fuzz_seconds": normalized["max_fuzz_seconds"],
+            },
+        )
+        review_deadline_at = jsonutil.timestamp(inserted["review_deadline_at"])
+
+    return {
+        "family_id": str(family_id),
+        "envelope_digest": digest,
+        "status": "pending",
+        "review_deadline_at": review_deadline_at,
+    }
+
+
 # A decided family envelope maps back to the review decision it recorded. The
 # idempotency key is (family_id, first_plan_digest, envelope_digest, decision,
 # reviewer_id); the first_plan_digest is validated before the lookup, so the

@@ -54,6 +54,13 @@ def _parser() -> argparse.ArgumentParser:
     status = commands.add_parser("status", help="look up one job")
     status.add_argument("job_id")
 
+    propose = commands.add_parser(
+        "propose-envelope",
+        help="propose a changed family envelope for human re-approval",
+    )
+    propose.add_argument("family_id")
+    propose.add_argument("--request", required=True, type=Path)
+
     review = commands.add_parser("review", help="record an operator review decision")
     review.add_argument("job_id")
     review.add_argument("--plan-digest", required=True)
@@ -189,6 +196,35 @@ def _status(args) -> int:
         return _error(1, "DATABASE_ERROR", _database_error_message(error))
     if result is None:
         return _error(3, "JOB_NOT_FOUND", "job does not exist")
+    print(json.dumps(result, ensure_ascii=False))
+    return 0
+
+
+def _propose_envelope(args) -> int:
+    family_id = _parse_job_id(args.family_id)
+    if family_id is None:
+        return _error(2, "INVALID_REQUEST", "family_id must be a UUID")
+    try:
+        size = args.request.stat().st_size
+        if size > MAX_REQUEST_BYTES:
+            raise ValueError(f"envelope payload exceeds {MAX_REQUEST_BYTES} bytes")
+        envelope = jsonutil.loads_strict(
+            args.request.read_text(encoding="utf-8")
+        )
+        operator = _operator_id()
+    except (jsonutil.StrictJsonError, UnicodeError, OSError, ValueError) as error:
+        return _error(2, "INVALID_REQUEST", f"cannot read envelope: {error}")
+    dsn = _database_url()
+    if not dsn:
+        return _error(1, "DATABASE_NOT_CONFIGURED", "set DATACON_DATABASE_URL")
+    try:
+        result = state.propose_envelope(
+            dsn, family_id, envelope, operator_id=operator
+        )
+    except psycopg.Error as error:
+        return _error(1, "DATABASE_ERROR", _database_error_message(error))
+    except state.StateError as error:
+        return _error(3, "STATE_ERROR", str(error))
     print(json.dumps(result, ensure_ascii=False))
     return 0
 
@@ -470,6 +506,8 @@ def main(argv: list[str] | None = None) -> int:
         return _submit(args)
     if args.command == "status":
         return _status(args)
+    if args.command == "propose-envelope":
+        return _propose_envelope(args)
     if args.command == "review":
         return _review(args)
     if args.command == "worker":
