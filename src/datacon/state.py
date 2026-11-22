@@ -2255,6 +2255,97 @@ def expire_review(dsn: str, job_id: UUID, generation: int) -> bool:
         return True
 
 
+def expire_pending_envelopes(dsn: str) -> int:
+    """Expire changed-envelope re-approvals whose review window has closed.
+
+    This is the periodic sweep from §9.1: it scans ``family_envelopes`` rows
+    (not child ``review_deadline_at`` values), so a family parked in
+    ``AGGREGATING`` on a re-approval converges to
+    ``BLOCKED(REVIEW_EXPIRED)`` even though no child is ``AWAITING_REVIEW``.
+    Each candidate is re-checked while holding the family row lock, which is
+    the same lock ``record_review`` and ``propose_envelope`` take first; a
+    review that raced the scan therefore wins instead of being overwritten.
+    Only the family job row is locked; no child row is locked or changed.
+    Existing ``reviews`` and every child (``READY``, ``AWAITING_REVIEW`` or
+    finished) are left untouched. The sweep is idempotent because every write
+    is conditional on ``status = 'pending'`` and ``state = 'AGGREGATING'``.
+    """
+    expired = 0
+    with _connect(dsn) as connection:
+        candidates = connection.execute(
+            "SELECT fe.envelope_id, fe.family_id, fe.envelope_digest "
+            "FROM family_envelopes AS fe "
+            "JOIN jobs AS j ON j.job_id = fe.family_id "
+            "WHERE fe.status = 'pending' "
+            "AND fe.review_deadline_at <= clock_timestamp() "
+            "AND j.state = 'AGGREGATING' "
+            "AND j.job_kind = 'family' "
+            "AND j.job_contract_version = 2 "
+            "ORDER BY fe.review_deadline_at, fe.envelope_id"
+        ).fetchall()
+        for candidate in candidates:
+            # The family lock is the serialization point. SKIP LOCKED lets a
+            # concurrent review finish without making the sweep wait; that
+            # row is simply reconsidered on the next poll.
+            family = connection.execute(
+                "SELECT state, generation FROM jobs "
+                "WHERE job_id = %s FOR UPDATE SKIP LOCKED",
+                (candidate["family_id"],),
+            ).fetchone()
+            if family is None or family["state"] != "AGGREGATING":
+                continue
+            # Read the clock only after the lock is held so a wait across the
+            # deadline cannot leave a closed window looking open.
+            db_now = connection.execute(
+                "SELECT clock_timestamp() AS db_now"
+            ).fetchone()["db_now"]
+            envelope = connection.execute(
+                "SELECT status, review_deadline_at FROM family_envelopes "
+                "WHERE envelope_id = %s",
+                (candidate["envelope_id"],),
+            ).fetchone()
+            if (
+                envelope is None
+                or envelope["status"] != "pending"
+                or not _review_window_closed(
+                    envelope["review_deadline_at"], db_now
+                )
+            ):
+                continue
+            connection.execute(
+                "UPDATE family_envelopes SET status = 'expired' "
+                "WHERE envelope_id = %s AND status = 'pending'",
+                (candidate["envelope_id"],),
+            )
+            connection.execute(
+                "UPDATE jobs SET state = 'BLOCKED', stage = 'blocked', "
+                "reason_code = 'REVIEW_EXPIRED', last_error = %s, "
+                "state_version = state_version + 1, "
+                "generation = generation + 1, workflow_synced = false, "
+                "lease_owner = NULL, lease_expires_at = NULL, "
+                "updated_at = clock_timestamp() "
+                "WHERE job_id = %s AND state = 'AGGREGATING'",
+                (
+                    "review deadline passed before a decision was recorded",
+                    candidate["family_id"],
+                ),
+            )
+            _audit(
+                connection,
+                candidate["family_id"],
+                "review_expired",
+                stage="blocked",
+                reason_code="REVIEW_EXPIRED",
+                detail={
+                    "generation": family["generation"],
+                    "envelope_digest": candidate["envelope_digest"],
+                    "source": "pending_envelope_sweep",
+                },
+            )
+            expired += 1
+    return expired
+
+
 def status(dsn: str, job_id: UUID) -> dict[str, Any] | None:
     with _connect(dsn) as connection:
         row = connection.execute(

@@ -642,12 +642,21 @@ def run_worker(
         checkpointer.setup()
         graph = build_graph(dsn, checkpointer, case_root=case_root)
         while True:
+            # A changed-envelope re-approval parks on the family, not on a
+            # child, so the claim path alone would never observe its deadline.
+            # Sweep before claiming on every poll; a database error propagates
+            # with the existing worker error semantics instead of being
+            # swallowed.
+            expired_envelopes = state_store.expire_pending_envelopes(dsn)
             claimed = state_store.claim_next(
                 dsn, worker, lease_seconds=lease_seconds, execute=execute
             )
             if claimed is None:
                 if once:
-                    return {"processed": 0}
+                    return {
+                        "processed": 0,
+                        "expired_envelopes": expired_envelopes,
+                    }
                 time.sleep(poll_seconds)
                 continue
             result = _process_claim(
@@ -658,6 +667,7 @@ def run_worker(
                 execute=execute,
                 run_root=run_root,
             )
+            result["expired_envelopes"] = expired_envelopes
             if once:
                 return result
 
