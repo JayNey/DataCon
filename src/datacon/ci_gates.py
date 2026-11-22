@@ -23,8 +23,13 @@ import yaml
 from datacon import jsonutil
 from datacon.contracts import InvalidRequest, parse_request
 
-VALID_REQS = frozenset(f"REQ-{i:02d}" for i in range(1, 11))
-VALID_TCS = frozenset(f"TC-{i:02d}" for i in range(1, 11))
+_V01_REQS = frozenset(f"REQ-{i:02d}" for i in range(1, 11))
+_V01_TCS = frozenset(f"TC-{i:02d}" for i in range(1, 11))
+_V02_REQS = frozenset(f"REQ-{i:02d}" for i in range(1, 17))
+_V02_TCS = frozenset(f"TC-{i:02d}" for i in range(1, 17))
+# Backwards-compatible aliases for the historical, unscoped v0.1 gate scope.
+VALID_REQS = _V01_REQS
+VALID_TCS = _V01_TCS
 
 _MD_LINK = re.compile(r"\[[^\]]*\]\(([^)]+)\)")
 _REQ_REF = re.compile(r"\bREQ-[0-9]{2}\b")
@@ -159,16 +164,49 @@ def check_markdown_links(files: Iterable[Path], *, root: Path) -> list[str]:
     return errors
 
 
-def check_req_tc_consistency(files: Iterable[Path]) -> list[str]:
-    """Verify all REQ-XX and TC-XX references belong to REQ-01..10 / TC-01..10."""
+def _reference_scope(
+    path: Path, root: Path | None
+) -> tuple[frozenset[str], frozenset[str]]:
+    """Return the allowed REQ/TC sets for a Markdown file.
+
+    With no ``root`` the checker keeps the historical v0.1 scope (01..10).
+    With a ``root`` the scope follows the file's location so the frozen v0.1
+    spec cannot cite v0.2 requirements while the v0.2 delta and the wider
+    repository notes can. Unknown or out-of-root files use the union scope.
+    """
+    if root is None:
+        return VALID_REQS, VALID_TCS
+    try:
+        relative = path.resolve().relative_to(root.resolve())
+    except ValueError:
+        return _V02_REQS, _V02_TCS
+    parts = relative.parts
+    if parts[:3] == ("docs", "spec", "v0.2"):
+        return _V02_REQS, _V02_TCS
+    if len(parts) == 3 and parts[:2] == ("docs", "spec"):
+        return _V01_REQS, _V01_TCS
+    return _V02_REQS, _V02_TCS
+
+
+def check_req_tc_consistency(
+    files: Iterable[Path], *, root: Path | None = None
+) -> list[str]:
+    """Verify REQ-XX and TC-XX references stay inside the file's scope.
+
+    ``docs/spec/v0.2/`` may cite REQ/TC 01..16, the frozen v0.1 files at the
+    root of ``docs/spec/`` may cite only 01..10, and every other Markdown file
+    (root README, test notes, other docs) may cite the union 01..16. Callers
+    without a repository root retain the historical 01..10 behaviour.
+    """
     errors: list[str] = []
     for path in files:
+        valid_reqs, valid_tcs = _reference_scope(path, root)
         text = path.read_text(encoding="utf-8")
         for req in sorted(set(_REQ_REF.findall(text))):
-            if req not in VALID_REQS:
+            if req not in valid_reqs:
                 errors.append(f"{path}: unknown requirement reference {req}")
         for tc in sorted(set(_TC_REF.findall(text))):
-            if tc not in VALID_TCS:
+            if tc not in valid_tcs:
                 errors.append(f"{path}: unknown test-case reference {tc}")
     return errors
 
@@ -1275,7 +1313,7 @@ def run_repo_static_gates(
                     f"{path}: unexpected non-YAML file in .github/workflows"
                 )
     errors.extend(check_markdown_links(md_files, root=root))
-    errors.extend(check_req_tc_consistency(md_files))
+    errors.extend(check_req_tc_consistency(md_files, root=root))
     errors.extend(check_workflow_security(workflow_files, root=root))
     errors.extend(check_dependency_lock(root))
     errors.extend(check_contract_examples(root))
