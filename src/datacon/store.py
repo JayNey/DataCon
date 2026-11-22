@@ -21,8 +21,75 @@ def initial_state(request: dict) -> tuple[str, str | None]:
     return "QUEUED", None
 
 
+def _submit_v2(dsn: str, request: dict, *, operator_id: str | None = None) -> dict:
+    """Insert the v2 family row and return its identity and initial state.
+
+    A v2 submit creates exactly one family job. The first child/plan is created
+    later (T11), so this path must not depend on ``initial_state`` nor write a
+    plan. Binary targets remain structurally valid but outside the MVP scope;
+    they get the same family identity, archived as BLOCKED like a v1 submit.
+    """
+    family_id = uuid4()
+    binary = request["target"]["kind"] == "binary"
+    job_state = "BLOCKED" if binary else "AGGREGATING"
+    reason_code = "UNSUPPORTED_TARGET" if binary else None
+    with psycopg.connect(dsn, connect_timeout=5) as connection:
+        # Same transaction-scoped release lock as the v1 path and claim_next.
+        connection.execute(
+            "SELECT pg_advisory_xact_lock_shared(hashtext(%s))",
+            (state.RELEASE_LOCK_PREFIX + state.RELEASE_ENVIRONMENT,),
+        )
+        connection.execute(
+            "INSERT INTO jobs "
+            "(job_id, request, state, stage, reason_code, operator_id, "
+            "workflow_synced, job_contract_version, family_id, job_kind, "
+            "parent_job_id, round_no) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+            (
+                family_id,
+                Jsonb(request),
+                job_state,
+                "family",
+                reason_code,
+                operator_id,
+                True,
+                2,
+                family_id,
+                "family",
+                None,
+                None,
+            ),
+        )
+    if binary:
+        # A submit-time rejection never enters a worker claim, so it has no
+        # lease and must use the same direct blocked-evidence path as v1. A
+        # family row has no plan yet; record_blocked tolerates that and archives
+        # the block without inventing one.
+        from datacon import execution
+
+        execution.record_blocked(
+            dsn,
+            family_id,
+            generation=0,
+            reason_code="UNSUPPORTED_TARGET",
+            message=(
+                "binary targets are not supported; only source targets can be "
+                "analyzed"
+            ),
+        )
+        with psycopg.connect(dsn, connect_timeout=5) as connection:
+            current = connection.execute(
+                "SELECT state FROM jobs WHERE job_id = %s", (family_id,)
+            ).fetchone()
+        if current is not None:
+            job_state = current[0]
+    return {"job_id": str(family_id), "state": job_state}
+
+
 def submit(dsn: str, request: dict, *, operator_id: str | None = None) -> dict:
     """Insert one job and return its identity and initial state."""
+    if request.get("schema_version") == 2:
+        return _submit_v2(dsn, request, operator_id=operator_id)
     job_id = uuid4()
     job_state, reason_code = initial_state(request)
     with psycopg.connect(dsn, connect_timeout=5) as connection:
