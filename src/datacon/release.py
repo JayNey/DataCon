@@ -23,7 +23,7 @@ from datacon.tools.sandbox import _extract_compile_args
 from datacon.verdict import RunObservation, VerdictPolicy, decide_verdict
 
 SCHEMA_VERSION = 1
-CONTRACT_VERSION = contracts.SCHEMA_VERSION
+CONTRACT_VERSION = 1
 # One source of truth for the pinned analysis toolchain. ci.yml and release.yml
 # are checked against this constant by tests/contract/test_release_workflow.py;
 # duplicating the literal in a second module is a release-blocking drift.
@@ -94,6 +94,11 @@ ROLLBACK_COMPATIBLE_MIGRATIONS: Mapping[str, str] = MappingProxyType(
         # before 009 keeps working across it.
         "009_b03_acceptance.sql": (
             "sha256:f5905caf9ab61702c32297c519ca711d4e21c810a55c668543e811939ed7f235"
+        ),
+        # 010 only adds v2 identity/review/budget tables and additive jobs
+        # columns, so an image built before 010 keeps working across it.
+        "010_v2_identity_review.sql": (
+            "sha256:7f91a291653e409e77a318ea01d8755e2f1ee59ba97e4bde9a002feeca1d9deb"
         ),
     }
 )
