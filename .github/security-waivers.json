@@ -838,5 +838,26 @@
     "impact": "util-linux ships nsenter, dmesg, lsblk/findmnt and the mount.* helpers. CVE-2026-78408 is reached only through `nsenter --join-cgroup`, CVE-2026-76642 through a privileged external mount helper's post-hook, and CVE-2026-78409/78410 through X-mount.subdir and restricted bind mounting; every trigger needs CAP_SYS_ADMIN and a privileged mount or namespace syscall the worker never issues (uid 65534, cap-drop ALL, no --privileged, no host PID/namespace). This waiver is removed once the upstream Debian package carries the fix.",
     "owner": "platform-security",
     "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-124709",
+    "scope": "package:libssl3t64",
+    "impact": "CVE-2026-124709 is a memory leak in openssl's QUIC stream handling that a peer triggers by sending crafted QUIC streams. In this image the only consumer of libssl3t64 is Python's TLS client stack for outbound HTTPS; neither the control plane nor the worker terminates or opens QUIC connections, so the trigger path is unreachable here. No Debian 13 package carries a fix yet: the pinned base digest ships 3.5.7-1~deb13u3 and even the newest trixie/main build, 3.5.9-1~deb13u1, is still reported affected. This waiver is removed once Debian publishes a fixed openssl, and the base digest is refreshed at that point.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-124709",
+    "scope": "package:openssl",
+    "impact": "CVE-2026-124709 is a memory leak in openssl's QUIC stream handling. The openssl CLI is installed by the base image but nothing in this repository invokes it, and the image never speaks QUIC, so the CLI cannot be driven into the vulnerable code path. No Debian 13 package carries a fix yet (3.5.7-1~deb13u3 installed, newest trixie/main 3.5.9-1~deb13u1 still affected). This waiver is removed once Debian publishes a fixed openssl, and the base digest is refreshed at that point.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-124709",
+    "scope": "package:openssl-provider-legacy",
+    "impact": "CVE-2026-124709 is a memory leak in openssl's QUIC stream handling. The legacy provider is loaded only when a caller explicitly requests it through an openssl configuration, which nothing in this repository does, and the image never speaks QUIC. No Debian 13 package carries a fix yet (3.5.7-1~deb13u3 installed, newest trixie/main 3.5.9-1~deb13u1 still affected). This waiver is removed once Debian publishes a fixed openssl, and the base digest is refreshed at that point.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
   }
 ]
