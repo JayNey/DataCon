@@ -40,6 +40,47 @@ def test_req_and_tc_reference_consistency(tmp_path):
     assert any("TC-42" in err for err in errors)
 
 
+def test_req_scope_rejects_v2_reference_in_v01_spec_root(tmp_path):
+    spec_root = tmp_path / "docs" / "spec"
+    spec_root.mkdir(parents=True)
+    doc = spec_root / "srs.md"
+    doc.write_text("Covers REQ-11.\n", encoding="utf-8")
+
+    errors = ci_gates.check_req_tc_consistency([doc], root=tmp_path)
+
+    assert any("REQ-11" in error for error in errors)
+
+
+def test_req_scope_accepts_v2_reference_under_v02_spec(tmp_path):
+    spec_v02 = tmp_path / "docs" / "spec" / "v0.2"
+    spec_v02.mkdir(parents=True)
+    doc = spec_v02 / "srs-delta.md"
+    doc.write_text("Covers REQ-11 and TC-16.\n", encoding="utf-8")
+
+    assert ci_gates.check_req_tc_consistency([doc], root=tmp_path) == []
+
+
+def test_req_scope_rejects_unknown_reference_under_v02_spec(tmp_path):
+    spec_v02 = tmp_path / "docs" / "spec" / "v0.2"
+    spec_v02.mkdir(parents=True)
+    doc = spec_v02 / "srs-delta.md"
+    doc.write_text("Unknown REQ-99 and TC-42.\n", encoding="utf-8")
+
+    errors = ci_gates.check_req_tc_consistency([doc], root=tmp_path)
+
+    assert any("REQ-99" in error for error in errors)
+    assert any("TC-42" in error for error in errors)
+
+
+def test_req_scope_accepts_v2_reference_in_tests_notes(tmp_path):
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    note = tests_dir / "notes.md"
+    note.write_text("Plans REQ-16 coverage.\n", encoding="utf-8")
+
+    assert ci_gates.check_req_tc_consistency([note], root=tmp_path) == []
+
+
 def _workflow(tmp_path: Path, body: str) -> Path:
     path = tmp_path / "workflow.yml"
     path.write_text(body, encoding="utf-8")
