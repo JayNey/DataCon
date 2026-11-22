@@ -26,6 +26,16 @@ def submit(dsn: str, request: dict, *, operator_id: str | None = None) -> dict:
     job_id = uuid4()
     job_state, reason_code = initial_state(request)
     with psycopg.connect(dsn, connect_timeout=5) as connection:
+        # A submit may run while a release is being promoted. Take the shared
+        # side of the same release lock that claim_next takes so a promotion
+        # holding the exclusive side cannot interleave with a new job going
+        # in; submit waits for the promotion and then targets the new release.
+        # The lock is transaction-scoped and released when the with block
+        # commits, after the INSERT.
+        connection.execute(
+            "SELECT pg_advisory_xact_lock_shared(hashtext(%s))",
+            (state.RELEASE_LOCK_PREFIX + state.RELEASE_ENVIRONMENT,),
+        )
         connection.execute(
             "INSERT INTO jobs "
             "(job_id, request, state, reason_code, operator_id, workflow_synced) "
