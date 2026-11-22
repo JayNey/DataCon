@@ -1272,3 +1272,144 @@ def test_rollback_rejects_tampered_compatible_migration_digest_and_same_ordinal_
             approved_by="reviewer-1",
             candidate_digest=a1["candidate_digest"],
         )
+
+
+# --- T10/D38: v2 rollback drain gate runs before and after smoke ---
+
+def _insert_v2_family(database, *, state_name="AGGREGATING", workflow_synced=True):
+    from uuid import uuid4
+
+    from psycopg.types.json import Jsonb
+
+    family_id = uuid4()
+    database.connection.execute(
+        "INSERT INTO jobs (job_id, request, state, stage, submitted_at, "
+        "job_contract_version, family_id, job_kind, parent_job_id, round_no, "
+        "workflow_synced) VALUES (%s, %s, %s, 'family', clock_timestamp(), 2, "
+        "%s, 'family', NULL, NULL, %s)",
+        (family_id, Jsonb({"schema_version": 2}), state_name, family_id, workflow_synced),
+    )
+    return family_id
+
+
+def _insert_v2_child(
+    database,
+    family_id,
+    *,
+    state_name,
+    round_no=1,
+    workflow_synced=True,
+):
+    from uuid import uuid4
+
+    from psycopg.types.json import Jsonb
+
+    child_id = uuid4()
+    database.connection.execute(
+        "INSERT INTO jobs (job_id, request, state, stage, submitted_at, "
+        "job_contract_version, family_id, job_kind, parent_job_id, round_no, "
+        "workflow_synced) VALUES (%s, %s, %s, 'execute', clock_timestamp(), 2, "
+        "%s, 'round', %s, %s, %s)",
+        (
+            child_id,
+            Jsonb({"schema_version": 2}),
+            state_name,
+            family_id,
+            family_id,
+            round_no,
+            workflow_synced,
+        ),
+    )
+    return child_id
+
+
+def _store_with_candidate_active(isolated_database):
+    store_handle = state.ReleaseStore(isolated_database.dsn)
+    store_handle.bootstrap_release(
+        image_id=PREVIOUS_IMAGE,
+        config={"policy_version": "1"},
+        migration_version=LATEST_MIGRATION,
+        evidence_root="/var/lib/datacon/evidence",
+    )
+    store_handle.switch(
+        image_id=CANDIDATE_IMAGE,
+        config={"policy_version": "1"},
+        migration_version=LATEST_MIGRATION,
+        evidence_root="/var/lib/datacon/evidence",
+        action="promote",
+        candidate_digest="sha256:" + "6" * 64,
+    )
+    target = store_handle.release_for_image(PREVIOUS_IMAGE)
+    assert target is not None
+    return store_handle, target
+
+
+def _rollback(store_handle, target, smoke_checks):
+    return release.rollback_release(
+        target_release=target,
+        backend=store_handle,
+        smoke_checks=smoke_checks,
+        approved_by="reviewer-p1",
+        candidate_digest=target.get("candidate_digest") or target["manifest_digest"],
+        manifest_digest=target["manifest_digest"],
+    )
+
+
+def test_rollback_drain_gate_runs_before_and_after_smoke(isolated_database):
+    store_handle, target = _store_with_candidate_active(isolated_database)
+
+    def smoke_that_creates_a_v2_residual():
+        family_id = _insert_v2_family(isolated_database)
+        _insert_v2_child(
+            isolated_database,
+            family_id,
+            state_name="QUEUED",
+            workflow_synced=False,
+        )
+        return True
+
+    with pytest.raises(release.ReleaseGateError, match="drained|not drained"):
+        _rollback(
+            store_handle,
+            target,
+            {"cli_smoke": smoke_that_creates_a_v2_residual},
+        )
+
+    rollbacks = [
+        event for event in store_handle.events() if event["action"] == "rollback"
+    ]
+    assert rollbacks == [], "rollback switch skipped the post-smoke drain gate"
+    active = store_handle.active_release()
+    assert active is not None
+    assert active["image_id"] == CANDIDATE_IMAGE
+
+
+def test_rollback_drains_all_v2_non_terminal_jobs(isolated_database):
+    store_handle, target = _store_with_candidate_active(isolated_database)
+    family_id = _insert_v2_family(isolated_database, state_name="AGGREGATING")
+    _insert_v2_child(
+        isolated_database,
+        family_id,
+        state_name="AWAITING_REVIEW",
+        round_no=1,
+        workflow_synced=False,
+    )
+    _insert_v2_child(
+        isolated_database,
+        family_id,
+        state_name="BLOCKED",
+        round_no=2,
+        workflow_synced=False,
+    )
+
+    assert store_handle.active_slots() >= 2
+    with pytest.raises(release.ReleaseGateError, match="drained|not drained"):
+        _rollback(store_handle, target, {"cli_smoke": lambda: True})
+
+    rollbacks = [
+        event for event in store_handle.events() if event["action"] == "rollback"
+    ]
+    assert rollbacks == [], "rollback promoted with a v2 job left"
+    active = store_handle.active_release()
+    assert active is not None
+    assert active["image_id"] == CANDIDATE_IMAGE

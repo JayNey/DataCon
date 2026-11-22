@@ -2742,3 +2742,32 @@ def test_bootstrap_release_rejects_non_consecutive_schema_migrations(monkeypatch
             migration_version="008_release_events.sql",
             evidence_root="/var/lib/datacon/evidence",
         )
+
+
+def test_release_contract_version_is_not_derived_from_contracts_schema():
+    import importlib
+
+    from datacon import contracts
+
+    original = contracts.SCHEMA_VERSION
+    contracts.SCHEMA_VERSION = 2
+    try:
+        importlib.reload(release)
+        assert release.CONTRACT_VERSION == 1, (
+            "release contract version tracked contracts.SCHEMA_VERSION"
+        )
+        manifest = release.build_release_candidate_manifest(
+            source_commit="b" * 40,
+            control_plane_image_id="sha256:" + "1" * 64,
+            wheel_digest="sha256:" + "2" * 64,
+            migrations_dir=REPO_ROOT / "migrations",
+            sbom_digest="sha256:" + "3" * 64,
+            test_report_digest="sha256:" + "4" * 64,
+            scan_report_digest="sha256:" + "5" * 64,
+        )
+        assert manifest["contract_version"] == 1, (
+            "v2 contract constant changed the release manifest contract_version"
+        )
+    finally:
+        contracts.SCHEMA_VERSION = original
+        importlib.reload(release)
