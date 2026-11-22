@@ -70,6 +70,9 @@ _BLOCKED_REQUIRED_PATHS = {
     "report.md": "report_markdown",
 }
 _BUNDLE_KINDS = frozenset({"execution", "blocked"})
+# v2 adds campaign as a third archive shape. ``family`` is deliberately absent:
+# a family index is not a bundle and must never be accepted by verify_bundle.
+_V2_BUNDLE_KINDS = frozenset({"execution", "blocked", "campaign"})
 _ROLE_NAMES = frozenset(
     {
         "report_json",
@@ -101,6 +104,96 @@ _ROLE_NAMES = frozenset(
         "symbolizer_log",
     }
 )
+# The v2 verifier accepts the frozen v0.1 role set plus the roles archived by
+# the v0.2 execution, campaign and policy paths. The table is additive: every
+# v1 bundle keeps verifying with the v1 branch, and a v2 bundle may carry any
+# role from either generation.
+_V2_ROLE_NAMES = _ROLE_NAMES | frozenset(
+    {
+        "envelope",
+        "budget_snapshot",
+        "build_provenance",
+        "admission",
+        "budget_ledger",
+        "budget_charge",
+        "experiment_spec",
+        "model_audit",
+        "fuzz_log",
+        "crash_seed",
+        "fuzz_provenance",
+        "intel_snapshot",
+        "license_record",
+    }
+)
+# Public alias used by contract tests and later v2 producers. Keep the private
+# name as well so existing internal imports do not change.
+V2_ROLE_NAMES = _V2_ROLE_NAMES
+# Roles a v2 bundle must carry today. Roles introduced for T13/T14/T15
+# (build_provenance, model_audit, intel_snapshot, license_record) are accepted
+# by _V2_ROLE_NAMES but are not required yet, so T12/T13 work is not blocked.
+# crash_seed is conditionally required only when a campaign records at least
+# one candidate seed; a zero-crash campaign legitimately has none.
+_V2_EXECUTION_REQUIRED_ROLES = frozenset(
+    {
+        "report_json",
+        "report_markdown",
+        "plan",
+        "envelope",
+        "budget_snapshot",
+        "execution_metadata",
+        "probe",
+        "case_config",
+        "build_metadata",
+        "build_log",
+        "build_artifact",
+        "normal_output",
+        "normal_error",
+        "asan_log",
+        "replay_stdout",
+        "replay_stderr",
+        "replay_metadata",
+    }
+)
+_V2_CAMPAIGN_REQUIRED_ROLES = frozenset(
+    {
+        "report_json",
+        "report_markdown",
+        "plan",
+        "review",
+        "envelope",
+        "budget_snapshot",
+        "execution_metadata",
+        "probe",
+        "case_config",
+        "build_metadata",
+        "build_log",
+        "build_artifact",
+        "fuzz_log",
+        "fuzz_provenance",
+    }
+)
+_V2_REQUIRED_ROLES = {
+    "execution": _V2_EXECUTION_REQUIRED_ROLES,
+    "blocked": _BLOCKED_REQUIRED_ROLES,
+    "campaign": _V2_CAMPAIGN_REQUIRED_ROLES,
+}
+_V2_REQUIRED_PATHS = {
+    "execution": {
+        "report.json": "report_json",
+        "report.md": "report_markdown",
+        "plan.json": "plan",
+        "envelope.json": "envelope",
+        "budget/snapshot.json": "budget_snapshot",
+    },
+    "campaign": {
+        "report.json": "report_json",
+        "report.md": "report_markdown",
+        "plan.json": "plan",
+        "review.json": "review",
+        "envelope.json": "envelope",
+        "budget/snapshot.json": "budget_snapshot",
+    },
+}
 _ENTRY_FIELDS = frozenset({"path", "role", "size_bytes", "sha256"})
 _VERDICTS = frozenset(
     {"REPRODUCED", "NOT_REPRODUCED", "INCONCLUSIVE", "BLOCKED", "FAILED"}
@@ -581,7 +674,77 @@ def _validate_manifest_header(
     return job_id, bundle_kind, plan_digest, files, verdict, reason_code
 
 
-def _validate_entry(entry: Any, seen: set[str]) -> dict[str, Any]:
+def _validate_v2_manifest_header(
+    manifest: Mapping[str, Any],
+) -> tuple[str, str, str | None, list[dict[str, Any]], str | None, str | None]:
+    """Validate the v2 manifest header without falling into v1 semantics.
+
+    This is the T10 dispatch skeleton: it pins the version, the closed v2 bundle
+    kind set, the campaign's null verdict/reason_code and the shared manifest
+    fields. Later v2 tasks extend the bundle-kind specific semantics; the v1
+    branch stays frozen and never sees a schema_version=2 document.
+    """
+    if (
+        type(manifest.get("schema_version")) is not int
+        or manifest.get("schema_version") != contracts.SCHEMA_VERSION_V2
+    ):
+        raise BundleError("INVALID_MANIFEST", "manifest schema_version must be 2")
+    # v2 requires bundle_kind explicitly. ``family`` (the family index) is not
+    # a bundle kind, so it is rejected here with a bundle_kind error.
+    bundle_kind = manifest.get("bundle_kind")
+    if not isinstance(bundle_kind, str) or bundle_kind not in _V2_BUNDLE_KINDS:
+        raise BundleError("INVALID_MANIFEST", "manifest bundle_kind is invalid")
+    try:
+        job_id = str(uuid.UUID(str(manifest.get("job_id"))))
+    except (TypeError, ValueError, AttributeError) as error:
+        raise BundleError("INVALID_MANIFEST", "manifest job_id must be a UUID") from error
+    plan_digest = manifest.get("plan_digest")
+    if bundle_kind == "execution":
+        if not isinstance(plan_digest, str) or not _DIGEST.fullmatch(plan_digest):
+            raise BundleError("INVALID_MANIFEST", "manifest plan_digest is invalid")
+    elif plan_digest is not None and (
+        not isinstance(plan_digest, str) or not _DIGEST.fullmatch(plan_digest)
+    ):
+        # Campaign and blocked bundles may be archived before a plan is
+        # frozen (campaign is a search record, not a verdict round).
+        raise BundleError("INVALID_MANIFEST", "manifest plan_digest is invalid")
+    verdict = manifest.get("verdict")
+    if bundle_kind == "campaign":
+        # Campaign proves search observations, never a reproduction verdict.
+        if verdict is not None:
+            raise BundleError(
+                "INVALID_MANIFEST", "campaign bundle must not carry a verdict"
+            )
+    elif not isinstance(verdict, str) or verdict not in _VERDICTS:
+        raise BundleError("INVALID_MANIFEST", "manifest verdict is invalid")
+    elif bundle_kind == "blocked" and verdict != "BLOCKED":
+        raise BundleError(
+            "INVALID_MANIFEST", "blocked bundle verdict must be BLOCKED"
+        )
+    reason_code = manifest.get("reason_code")
+    if bundle_kind == "campaign":
+        if reason_code is not None:
+            raise BundleError(
+                "INVALID_MANIFEST", "campaign bundle must not carry a reason_code"
+            )
+    elif reason_code is not None and (
+        not isinstance(reason_code, str)
+        or not _REASON_CODE.fullmatch(reason_code)
+    ):
+        raise BundleError("INVALID_MANIFEST", "manifest reason_code is invalid")
+    files = manifest.get("files")
+    if not isinstance(files, list):
+        raise BundleError("INVALID_MANIFEST", "manifest files must be a list")
+    if len(files) > MAX_FILES:
+        raise BundleError("INVALID_MANIFEST", "manifest lists too many files")
+    return job_id, bundle_kind, plan_digest, files, verdict, reason_code
+
+
+def _validate_entry(
+    entry: Any,
+    seen: set[str],
+    role_names: frozenset[str] = _ROLE_NAMES,
+) -> dict[str, Any]:
     if not isinstance(entry, dict):
         raise BundleError("INVALID_MANIFEST", "manifest entry must be an object")
     if set(entry) != _ENTRY_FIELDS:
@@ -597,7 +760,7 @@ def _validate_entry(entry: Any, seen: set[str]) -> dict[str, Any]:
     role = entry["role"]
     if not isinstance(role, str) or not role or len(role) > MAX_ROLE_LENGTH:
         raise BundleError("INVALID_MANIFEST", f"invalid role for {path}")
-    if role not in _ROLE_NAMES:
+    if role not in role_names:
         raise BundleError("INVALID_MANIFEST", f"unknown evidence role: {role}")
     size = entry["size_bytes"]
     if type(size) is not int or not 0 <= size <= MAX_FILE_BYTES:
@@ -2584,8 +2747,7 @@ def _verify_semantics(
     _verify_outcome(plan, verdict, report, observations, expected_stdout)
 
 
-def verify_bundle(root: Path | str) -> BundleVerification:
-    """Verify a bundle without database or network access."""
+def _resolve_bundle_root(root: Path | str) -> Path:
     path = Path(root)
     if path.is_symlink():
         raise BundleError("SYMLINK", "bundle root must not be a symlink")
@@ -2595,8 +2757,33 @@ def verify_bundle(root: Path | str) -> BundleVerification:
         raise BundleError("MISSING_FILE", f"bundle root is not readable: {error}") from error
     if not root_path.is_dir():
         raise BundleError("INVALID_MANIFEST", "bundle root must be a directory")
+    return root_path
 
+
+def verify_bundle(root: Path | str) -> BundleVerification:
+    """Verify a bundle without database or network access.
+
+    The manifest's ``schema_version`` selects the verifier before any other
+    field is interpreted: v1 bundles keep the frozen v1 validator, v2 bundles
+    use the versioned validator. A manifest with an absent or non-integer
+    version still follows the historical v1 error surface.
+    """
+    root_path = _resolve_bundle_root(root)
     manifest, manifest_bytes = _load_manifest(root_path)
+    schema_version = manifest.get("schema_version")
+    if (
+        type(schema_version) is int
+        and schema_version == contracts.SCHEMA_VERSION_V2
+    ):
+        return _verify_bundle_v2(root_path, manifest, manifest_bytes)
+    return _verify_bundle_v1(root_path, manifest, manifest_bytes)
+
+
+def _verify_bundle_v1(
+    root_path: Path,
+    manifest: dict[str, Any],
+    manifest_bytes: bytes,
+) -> BundleVerification:
     (
         job_id,
         bundle_kind,
@@ -2625,6 +2812,31 @@ def verify_bundle(root: Path | str) -> BundleVerification:
         _require_required_paths(listed)
     else:
         _require_blocked_paths(listed)
+    data = _read_listed_files(root_path, listed)
+
+    _verify_semantics(
+        job_id=job_id,
+        bundle_kind=bundle_kind,
+        plan_digest=plan_digest,
+        verdict=verdict,
+        manifest_reason=manifest_reason,
+        listed=listed,
+        data=data,
+    )
+
+    return BundleVerification(
+        root=root_path,
+        manifest=manifest,
+        manifest_digest=canonical_manifest_digest(manifest),
+        manifest_bytes=manifest_bytes,
+        file_data=data,
+    )
+
+
+def _read_listed_files(
+    root_path: Path,
+    listed: Mapping[str, Mapping[str, Any]],
+) -> dict[str, bytes]:
     actual: dict[str, Path] = {}
     entries_seen = 0
     files_seen = 0
@@ -2734,16 +2946,49 @@ def verify_bundle(root: Path | str) -> BundleVerification:
         if _sha256(content) != entry["sha256"]:
             raise BundleError("DIGEST_MISMATCH", f"sha256 mismatch for {relative}")
         data[relative] = content
+    return data
 
-    _verify_semantics(
-        job_id=job_id,
-        bundle_kind=bundle_kind,
-        plan_digest=plan_digest,
-        verdict=verdict,
-        manifest_reason=manifest_reason,
-        listed=listed,
-        data=data,
-    )
+
+def _verify_bundle_v2(
+    root_path: Path,
+    manifest: dict[str, Any],
+    manifest_bytes: bytes,
+) -> BundleVerification:
+    """Verify the v2 manifest skeleton and its role/path surface.
+
+    T10 only owns dispatch and the campaign error surface: the header and role
+    checks are version-specific, while the v2 report/plan semantic replay is
+    filled in by the later evidence-v2 tasks. The generic inventory walk and
+    digest checks are shared with v1 so path traversal, symlinks, extra/missing
+    files and digest tampering keep the same guarantees.
+    """
+    (
+        _job_id,
+        bundle_kind,
+        _plan_digest,
+        files,
+        _verdict,
+        _manifest_reason,
+    ) = _validate_v2_manifest_header(manifest)
+    entries = []
+    seen: set[str] = set()
+    for entry in files:
+        entries.append(_validate_entry(entry, seen, _V2_ROLE_NAMES))
+    roles = {entry["role"] for entry in entries}
+    required_roles = _V2_REQUIRED_ROLES[bundle_kind]
+    if not required_roles <= roles:
+        missing = sorted(required_roles - roles)
+        raise BundleError(
+            "INVALID_MANIFEST",
+            "manifest is missing required roles: " + ", ".join(missing),
+        )
+
+    listed = {entry["path"]: entry for entry in entries}
+    if bundle_kind == "blocked":
+        _require_blocked_paths(listed)
+    else:
+        _require_required_paths(listed, _V2_REQUIRED_PATHS[bundle_kind])
+    data = _read_listed_files(root_path, listed)
 
     return BundleVerification(
         root=root_path,
