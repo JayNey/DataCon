@@ -57,6 +57,11 @@ def _parser() -> argparse.ArgumentParser:
     review = commands.add_parser("review", help="record an operator review decision")
     review.add_argument("job_id")
     review.add_argument("--plan-digest", required=True)
+    review.add_argument(
+        "--envelope-digest",
+        default=None,
+        help="v2 family envelope digest (sha256)",
+    )
     review.add_argument("--decision", required=True, choices=("approve", "reject"))
 
     worker = commands.add_parser("worker", help="claim and advance queued jobs")
@@ -194,6 +199,10 @@ def _review(args) -> int:
         return _error(2, "INVALID_REQUEST", "job_id must be a UUID")
     if not _DIGEST.fullmatch(args.plan_digest):
         return _error(2, "INVALID_REQUEST", "plan_digest must be a sha256 digest")
+    if args.envelope_digest is not None and not _DIGEST.fullmatch(
+        args.envelope_digest
+    ):
+        return _error(2, "INVALID_REQUEST", "envelope_digest must be a sha256 digest")
     try:
         operator = _operator_id()
     except ValueError as error:
@@ -208,6 +217,7 @@ def _review(args) -> int:
             plan_digest=args.plan_digest,
             decision=args.decision,
             reviewer_id=operator,
+            envelope_digest=args.envelope_digest,
         )
     except psycopg.Error as error:
         return _error(1, "DATABASE_ERROR", _database_error_message(error))

@@ -61,6 +61,7 @@ class ReviewOutcome:
             "conflict": "REVIEW_CONFLICT",
             "expired": "REVIEW_EXPIRED",
             "invalid_state": "INVALID_STATE",
+            "envelope_mismatch": "REVIEW_ENVELOPE_MISMATCH",
             "job_not_found": "JOB_NOT_FOUND",
         }.get(self.status, "REVIEW_ERROR")
 
@@ -93,7 +94,7 @@ def _locked_job(
     """
     job = connection.execute(
         "SELECT state, generation, lease_owner, lease_expires_at, "
-        "prepare_deadline_at, state_version "
+        "prepare_deadline_at, state_version, job_contract_version "
         "FROM jobs WHERE job_id = %s FOR UPDATE",
         (job_id,),
     ).fetchone()
@@ -848,8 +849,19 @@ def finish_execution(
     ``evidence_error``/``last_error``. ``status`` only exposes a verdict while
     ``evidence_status == "archived"``, so a stale value cannot be mistaken for
     the current result.
+
+    ``COMPLETED`` is the v2 child terminal (the family converges through
+    ``complete_family``): a v1 row must never be written into it because the v1
+    state machine has no such state.
     """
-    if state not in ("REPRODUCED", "NOT_REPRODUCED", "INCONCLUSIVE", "BLOCKED", "FAILED"):
+    if state not in (
+        "REPRODUCED",
+        "NOT_REPRODUCED",
+        "INCONCLUSIVE",
+        "BLOCKED",
+        "FAILED",
+        "COMPLETED",
+    ):
         raise StateError("execution terminal state is invalid")
     if verdict is not None and verdict not in (
         "REPRODUCED",
@@ -876,6 +888,11 @@ def finish_execution(
         evidence_digest = None
     with _connect(dsn) as connection:
         job = _locked_job(connection, job_id, generation=generation)
+        # COMPLETED exists only in the v2 contract. Checking the version on the
+        # locked row (not on caller input) keeps a v1 worker from writing a
+        # state its own control plane cannot read.
+        if state == "COMPLETED" and job["job_contract_version"] != 2:
+            raise StateError("COMPLETED is only valid for a v2 job")
         if job["state"] not in ("RUNNING", "ARCHIVING"):
             raise StateError(f"cannot finish execution while the job is {job['state']}")
         updated = connection.execute(
@@ -924,6 +941,57 @@ def finish_execution(
                 "evidence_status": evidence_status,
             },
         )
+        return True
+
+
+def complete_family(
+    dsn: str,
+    family_id: UUID,
+    evidence_path: str,
+    evidence_digest: str,
+) -> bool:
+    """Converge an AGGREGATING v2 family job to COMPLETED.
+
+    The family is the aggregate, not a claimed child: no execution lease is
+    required here. The only accepted source state is ``AGGREGATING`` and the
+    only accepted identity is a ``job_kind = 'family'`` row on contract v2.
+    Replaying the identical archived evidence pointer is idempotent; every
+    other repeat or state is refused.
+    """
+    if not isinstance(evidence_path, str) or not evidence_path.strip():
+        raise StateError("completing a family requires evidence_path")
+    if not isinstance(evidence_digest, str) or not evidence_digest.strip():
+        raise StateError("completing a family requires evidence_digest")
+    with _connect(dsn) as connection:
+        job = connection.execute(
+            "SELECT state, job_kind, job_contract_version, evidence_path, "
+            "evidence_digest FROM jobs WHERE job_id = %s FOR UPDATE",
+            (family_id,),
+        ).fetchone()
+        if job is None:
+            raise StateError("family job does not exist")
+        if job["job_kind"] != "family" or job["job_contract_version"] != 2:
+            raise StateError("job is not a v2 family")
+        if job["state"] == "COMPLETED":
+            if (
+                job["evidence_path"] == evidence_path
+                and job["evidence_digest"] == evidence_digest
+            ):
+                return True
+            raise StateError("family is already COMPLETED with different evidence")
+        if job["state"] != "AGGREGATING":
+            raise StateError(f"cannot complete a family while it is {job['state']}")
+        updated = connection.execute(
+            "UPDATE jobs SET state = 'COMPLETED', stage = 'done', "
+            "evidence_status = 'archived', evidence_path = %s, "
+            "evidence_digest = %s, verdict = NULL, verdict_reason = NULL, "
+            "reason_code = NULL, state_version = state_version + 1, "
+            "updated_at = clock_timestamp() "
+            "WHERE job_id = %s AND state = 'AGGREGATING' RETURNING job_id",
+            (evidence_path, evidence_digest, family_id),
+        ).fetchone()
+        if updated is None:
+            raise StateError("family state changed while completing it")
         return True
 
 
@@ -1050,7 +1118,11 @@ def record_review(
     plan_digest: str,
     decision: str,
     reviewer_id: str,
+    envelope_digest: str | None = None,
 ) -> ReviewOutcome:
+    # envelope_digest belongs to the v2 family envelope path. It is accepted
+    # here so the CLI can forward it without a second entrypoint; the v1 review
+    # path below intentionally does not read it.
     if decision not in ("approve", "reject"):
         raise StateError("decision must be approve or reject")
     if not isinstance(reviewer_id, str) or not reviewer_id.strip():
@@ -1067,12 +1139,17 @@ def record_review(
         stack.callback(_archive_pending_blocked, dsn, job_id, pending_blocked)
         connection = stack.enter_context(_connect(dsn))
         job = connection.execute(
-            "SELECT state, reason_code, review_deadline_at, generation "
-            "FROM jobs WHERE job_id = %s FOR UPDATE",
+            "SELECT state, reason_code, review_deadline_at, generation, "
+            "job_contract_version FROM jobs WHERE job_id = %s FOR UPDATE",
             (job_id,),
         ).fetchone()
         if job is None:
             return ReviewOutcome("job_not_found", message="job does not exist")
+        # The v2 family review path (family_envelopes / family_approvals)
+        # lands in step 5b. Until then the v1 path must fail closed instead of
+        # writing a v1 review row against a v2 identity.
+        if job["job_contract_version"] != 1:
+            raise StateError("v2 family review is not implemented")
         plan = connection.execute(
             "SELECT plan_digest FROM plans WHERE job_id = %s", (job_id,)
         ).fetchone()
@@ -1728,9 +1805,25 @@ class ReleaseStore:
                 self._tx_local.switches = None
 
     def active_slots(self) -> int:
+        # v1 counts its three in-flight states. v2 adds the six child states
+        # plus an unsynced BLOCKED child. AGGREGATING is special: a family
+        # that already owns child rows is represented by those rows (counting
+        # the aggregate as well would double its drain units), while a
+        # childless AGGREGATING family is a residual in its own right. One
+        # OR'd predicate over one row also keeps a v2 job that matches the v1
+        # list from counting twice.
         with self._connection() as connection:
             row = connection.execute(
-                "SELECT COUNT(*) AS active FROM jobs WHERE state = ANY(%s)",
+                "SELECT COUNT(*) AS active FROM jobs "
+                "WHERE state = ANY(%s) "
+                "OR (job_contract_version = 2 AND ("
+                "state IN ('QUEUED', 'PREPARING', 'AWAITING_REVIEW', "
+                "'READY', 'RUNNING', 'ARCHIVING') "
+                "OR (state = 'BLOCKED' AND workflow_synced = false) "
+                "OR (state = 'AGGREGATING' AND ("
+                "job_kind IS DISTINCT FROM 'family' "
+                "OR NOT EXISTS (SELECT 1 FROM jobs child "
+                "WHERE child.parent_job_id = jobs.job_id)))))",
                 (list(RELEASE_ACTIVE_STATES),),
             ).fetchone()
         return int(row["active"])
@@ -2205,6 +2298,7 @@ class ReleaseStore:
             job_rows = connection.execute(
                 "SELECT evidence_path, evidence_digest FROM jobs "
                 "WHERE evidence_status = 'archived' "
+                "AND job_contract_version = 1 "
                 "AND evidence_path IS NOT NULL AND evidence_digest IS NOT NULL "
                 "ORDER BY submitted_at DESC"
             ).fetchall()

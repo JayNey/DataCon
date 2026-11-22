@@ -46,7 +46,6 @@ SECCOMP_PROFILE_DIGEST = (
 )
 APPROVAL_MAX_AGE = timedelta(hours=24)
 APPROVAL_FUTURE_SKEW = timedelta(minutes=5)
-ACTIVE_JOB_STATES = ("PREPARING", "RUNNING", "ARCHIVING")
 RELEASE_ENVIRONMENT = "internal-lab"
 TEST_REPORT_FILES = (
     "junit-asan.xml",
