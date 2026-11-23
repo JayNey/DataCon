@@ -155,6 +155,7 @@ def _seed_family(
     first_approval=False,
     pending_envelope=ENVELOPE_1,
     child_state=None,
+    request=None,
 ):
     family_id = uuid4()
     child_id = uuid4()
@@ -163,6 +164,7 @@ def _seed_family(
     deadline = review_deadline_at or (_now() + timedelta(hours=24))
     if child_state is None:
         child_state = "READY" if first_approval else "AWAITING_REVIEW"
+    request_document = request if request is not None else _family_request(mode)
 
     _insert_job(
         database,
@@ -174,7 +176,7 @@ def _seed_family(
         parent_job_id=None,
         round_no=None,
         workflow_synced=True,
-        request=_family_request(mode),
+        request=request_document,
     )
     _insert_job(
         database,
@@ -886,6 +888,53 @@ def test_expire_pending_envelopes_still_expires_reapproval(
     ) == ("BLOCKED", "REVIEW_EXPIRED")
 
 
+FIXED_ENVELOPE_BODY = {
+    "mode": "fixed",
+    "allowed_mutation_families": [],
+    "mutation_limits": {"allowed_ops": [], "max_input_bytes": 0},
+    "seed_corpus_digest": None,
+    "fuzz_image_digest": None,
+    "harness_digest": "sha256:" + "c" * 64,
+    "max_rounds": 1,
+    "max_total_seconds": 100,
+    "max_fuzz_seconds": 0,
+    "accepted_signature_set": [
+        {
+            "error": "heap-buffer-overflow",
+            "function": "parse_token",
+            "source": "parser.c",
+            "operation": "WRITE",
+            "access_size": 1,
+        }
+    ],
+    "admission_predicate_version": "admission-v1",
+}
+
+
+def _fixed_request_without_exploration(*, execute_seconds=600):
+    request = _family_request("fixed")
+    request.pop("exploration")
+    limits = dict(contracts.DEFAULT_LIMITS)
+    limits["execute_seconds"] = execute_seconds
+    request["limits"] = limits
+    return request
+
+
+def _fixed_envelope_body(*, max_total_seconds):
+    body = deepcopy(FIXED_ENVELOPE_BODY)
+    body["max_total_seconds"] = max_total_seconds
+    return body
+
+
+def _guided_request_with_mutation_limits(*, max_input_bytes, allowed_ops=("append",)):
+    request = _family_request("guided")
+    request["exploration"]["mutation_limits"] = {
+        "allowed_ops": list(allowed_ops),
+        "max_input_bytes": max_input_bytes,
+    }
+    return request
+
+
 GUIDED_ENVELOPE_BODY = {
     "mode": "guided",
     "allowed_mutation_families": ["byte_flip"],
@@ -1422,6 +1471,14 @@ def test_expire_review_does_not_revert_completed_family(
             seed["child_id"],
         ),
     )
+    # S-1 refuses to complete a family with a pending envelope. Seed the legal
+    # approved state instead; expire_review must still not touch it.
+    isolated_database.connection.execute(
+        "UPDATE family_envelopes SET status = 'approved', "
+        "reviewer_id = 'reviewer-first', decided_at = clock_timestamp() "
+        "WHERE family_id = %s AND status = 'pending'",
+        (seed["family_id"],),
+    )
     family_path = tmp_path / "family.json"
     family_path.write_text('{"kind":"family_index","rounds":[]}', encoding="utf-8")
     family_digest = "sha256:" + "d" * 64
@@ -1470,7 +1527,7 @@ def test_expire_review_does_not_revert_completed_family(
         isolated_database,
         "SELECT status FROM family_envelopes WHERE family_id = %s",
         (seed["family_id"],),
-    )[0] == "pending", "expire_review expired the envelope of a COMPLETED family"
+    )[0] == "approved", "expire_review changed the envelope of a COMPLETED family"
 
 
 # Complete Plan v2 fixture. ``contracts.plan_digest`` validates the full v1
@@ -1865,6 +1922,178 @@ def test_first_envelope_and_propose_reject_the_same_expansion(isolated_database)
             approved["family_id"],
             body,
         )
+
+
+def test_fixed_envelope_without_exploration_cannot_exceed_execute_seconds(
+    isolated_database,
+):
+    request = _fixed_request_without_exploration(execute_seconds=600)
+    family_id, child_id = _freeze_seed(isolated_database, request)
+
+    def freeze(body):
+        digest = jsonutil.digest_json(body)
+        plan = _v2_plan(family_id, round_no=None, envelope_digest=digest)
+        return state.freeze_plan(
+            isolated_database.dsn,
+            child_id,
+            generation=1,
+            plan=plan,
+            plan_digest=contracts.plan_digest(plan),
+            summary={},
+            envelope=body,
+        )
+
+    with pytest.raises(state.StateError, match="max_total_seconds"):
+        freeze(_fixed_envelope_body(max_total_seconds=900))
+    _assert_no_freeze_rows(isolated_database, family_id, child_id)
+
+    assert freeze(_fixed_envelope_body(max_total_seconds=600)) is True
+    assert _row(
+        isolated_database,
+        "SELECT count(*) FROM plans WHERE job_id = %s",
+        (child_id,),
+    )[0] == 1
+    assert _row(
+        isolated_database,
+        "SELECT count(*) FROM family_envelopes WHERE family_id = %s",
+        (family_id,),
+    )[0] == 1
+
+
+def test_propose_envelope_without_exploration_cannot_exceed_execute_seconds(
+    isolated_database,
+):
+    request = _fixed_request_without_exploration(execute_seconds=600)
+    seed = _seed_family(
+        isolated_database,
+        mode="fixed",
+        first_approval=True,
+        pending_envelope=None,
+        request=request,
+    )
+    with pytest.raises(state.StateError, match="max_total_seconds"):
+        state.propose_envelope(
+            isolated_database.dsn,
+            seed["family_id"],
+            _fixed_envelope_body(max_total_seconds=900),
+        )
+    result = state.propose_envelope(
+        isolated_database.dsn,
+        seed["family_id"],
+        _fixed_envelope_body(max_total_seconds=600),
+    )
+    assert result["status"] == "pending"
+
+
+def test_guided_envelope_without_exploration_request_is_rejected(
+    isolated_database,
+):
+    request = _fixed_request_without_exploration(execute_seconds=600)
+    family_id, child_id = _freeze_seed(isolated_database, request)
+    body = deepcopy(GUIDED_ENVELOPE_BODY)
+    digest = jsonutil.digest_json(body)
+    plan = _v2_plan(family_id, round_no=None, envelope_digest=digest)
+
+    with pytest.raises(state.StateError, match="fixed envelope"):
+        state.freeze_plan(
+            isolated_database.dsn,
+            child_id,
+            generation=1,
+            plan=plan,
+            plan_digest=contracts.plan_digest(plan),
+            summary={},
+            envelope=body,
+        )
+    _assert_no_freeze_rows(isolated_database, family_id, child_id)
+
+
+def test_envelope_max_input_bytes_cannot_expand_the_request(isolated_database):
+    request = _guided_request_with_mutation_limits(max_input_bytes=64)
+    family_id, child_id = _freeze_seed(isolated_database, request)
+
+    def freeze(max_input_bytes):
+        body = deepcopy(GUIDED_ENVELOPE_BODY)
+        body["mutation_limits"] = {
+            "allowed_ops": ["append"],
+            "max_input_bytes": max_input_bytes,
+        }
+        digest = jsonutil.digest_json(body)
+        plan = _v2_plan(family_id, round_no=None, envelope_digest=digest)
+        return state.freeze_plan(
+            isolated_database.dsn,
+            child_id,
+            generation=1,
+            plan=plan,
+            plan_digest=contracts.plan_digest(plan),
+            summary={},
+            envelope=body,
+        )
+
+    with pytest.raises(state.StateError, match="max_input_bytes"):
+        freeze(4096)
+    _assert_no_freeze_rows(isolated_database, family_id, child_id)
+
+    assert freeze(64) is True
+
+
+def test_propose_envelope_max_input_bytes_cannot_expand_the_request(
+    isolated_database,
+):
+    request = _guided_request_with_mutation_limits(max_input_bytes=64)
+    seed = _seed_family(
+        isolated_database,
+        first_approval=True,
+        pending_envelope=None,
+        request=request,
+    )
+    expanded = deepcopy(GUIDED_ENVELOPE_BODY)
+    expanded["mutation_limits"] = {
+        "allowed_ops": ["append"],
+        "max_input_bytes": 4096,
+    }
+    with pytest.raises(state.StateError, match="max_input_bytes"):
+        state.propose_envelope(
+            isolated_database.dsn, seed["family_id"], expanded
+        )
+
+    tightened = deepcopy(GUIDED_ENVELOPE_BODY)
+    tightened["mutation_limits"] = {
+        "allowed_ops": ["append"],
+        "max_input_bytes": 64,
+    }
+    result = state.propose_envelope(
+        isolated_database.dsn, seed["family_id"], tightened
+    )
+    assert result["status"] == "pending"
+
+
+def test_request_mutation_limits_take_the_intersection_and_minimum(
+    isolated_database,
+):
+    request = _guided_request_with_mutation_limits(max_input_bytes=64)
+    request["mutation_limits"] = {
+        "allowed_ops": ["append"],
+        "max_input_bytes": 32,
+    }
+    family_id, child_id = _freeze_seed(isolated_database, request)
+    body = deepcopy(GUIDED_ENVELOPE_BODY)
+    body["mutation_limits"] = {
+        "allowed_ops": ["append"],
+        "max_input_bytes": 64,
+    }
+    digest = jsonutil.digest_json(body)
+    plan = _v2_plan(family_id, round_no=None, envelope_digest=digest)
+    with pytest.raises(state.StateError, match="max_input_bytes"):
+        state.freeze_plan(
+            isolated_database.dsn,
+            child_id,
+            generation=1,
+            plan=plan,
+            plan_digest=contracts.plan_digest(plan),
+            summary={},
+            envelope=body,
+        )
+    _assert_no_freeze_rows(isolated_database, family_id, child_id)
 
 
 def test_first_approve_retry_without_digest_is_idempotent(isolated_database):

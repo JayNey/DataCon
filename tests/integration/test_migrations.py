@@ -565,3 +565,92 @@ def test_family_parent_can_be_demoted_without_children(isolated_database):
         "round_no FROM jobs WHERE job_id = %s",
         (family_id,),
     ).fetchone() == (1, None, None, None, None)
+
+
+# --- 013: a child may only be inserted under an AGGREGATING family ---------
+
+
+MIGRATION_013 = ROOT / "migrations" / "013_v2_child_insert_parent_state_guard.sql"
+
+
+def test_013_parent_state_guard_is_reentrant_and_registered(isolated_database):
+    sql = MIGRATION_013.read_text(encoding="utf-8")
+    isolated_database.connection.execute(sql)
+    isolated_database.connection.execute(sql)
+
+    expected = "sha256:" + sha256(MIGRATION_013.read_bytes()).hexdigest()
+    assert release.ROLLBACK_COMPATIBLE_MIGRATIONS[MIGRATION_013.name] == expected
+
+    family_id = _insert_family(isolated_database)
+    first_child = uuid4()
+    _insert_identity_job(
+        isolated_database,
+        first_child,
+        job_kind="round",
+        family_id=family_id,
+        parent_job_id=family_id,
+        round_no=1,
+    )
+    isolated_database.connection.execute(
+        "UPDATE jobs SET state = 'COMPLETED', stage = 'done' WHERE job_id = %s",
+        (family_id,),
+    )
+
+    with pytest.raises(psycopg.errors.CheckViolation, match="aggregating_family"):
+        _insert_identity_job(
+            isolated_database,
+            uuid4(),
+            job_kind="round",
+            family_id=family_id,
+            parent_job_id=family_id,
+            round_no=2,
+        )
+
+    other_family = _insert_family(isolated_database)
+    other_child = uuid4()
+    _insert_identity_job(
+        isolated_database,
+        other_child,
+        job_kind="round",
+        family_id=other_family,
+        parent_job_id=other_family,
+        round_no=1,
+    )
+    with pytest.raises(psycopg.errors.CheckViolation, match="aggregating_family"):
+        isolated_database.connection.execute(
+            "UPDATE jobs SET parent_job_id = %s, family_id = %s WHERE job_id = %s",
+            (family_id, family_id, other_child),
+        )
+
+
+def test_rollback_gate_fails_closed_when_013_is_not_registered(
+    isolated_database, monkeypatch
+):
+    from types import MappingProxyType
+
+    import datacon.release as release_module
+
+    migrations = sorted((ROOT / "migrations").glob("*.sql"))
+    applied = {
+        migration.name: "sha256:" + sha256(migration.read_bytes()).hexdigest()
+        for migration in migrations
+    }
+    registry = {
+        name: digest
+        for name, digest in release_module.ROLLBACK_COMPATIBLE_MIGRATIONS.items()
+        if not name.startswith("013_")
+    }
+    monkeypatch.setattr(
+        release_module,
+        "ROLLBACK_COMPATIBLE_MIGRATIONS",
+        MappingProxyType(registry),
+    )
+    with pytest.raises(
+        release.ReleaseGateError,
+        match="without a declared.*013_v2_child_insert_parent_state_guard",
+    ):
+        release_module._verify_rollback_migrations(
+            target_version="009_b03_acceptance.sql",
+            current_version=migrations[-1].name,
+            applied=applied,
+        )

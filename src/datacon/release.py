@@ -109,6 +109,12 @@ ROLLBACK_COMPATIBLE_MIGRATIONS: Mapping[str, str] = MappingProxyType(
         "012_v2_parent_demotion_guard.sql": (
             "sha256:74f6189ca191be47fcd68b40a21c80dbc5850f4170bbf48db2356019de3959cd"
         ),
+        # 013 tightens 011's parent guard to require an AGGREGATING family. It
+        # only rejects new v2 child inserts/rebinds, so a v1 image that never
+        # writes v2 children is unaffected.
+        "013_v2_child_insert_parent_state_guard.sql": (
+            "sha256:cb8319f42175bc3150b62a3902e10cbebd26b58987180978286c26a34b62c637"
+        ),
     }
 )
 _CVE_ID = re.compile(r"CVE-[0-9]{4}-[0-9]{4,}")

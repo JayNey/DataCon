@@ -17,18 +17,55 @@ from test_evidence import make_bundle
 from datacon import contracts, evidence
 from datacon.evidence import BundleError, export_bundle, verify_bundle
 
-V2_ROLES = {
-    # v0.1 roles the v2 table must keep.
+# The complete frozen v0.1 role table. It is listed explicitly rather than
+# reflected from ``evidence._ROLE_NAMES`` so deleting a production role makes
+# this contract test fail instead of shrinking its own expectation.
+V1_ROLES = {
+    "report_json",
+    "report_markdown",
+    "plan",
+    "review",
+    "execution_metadata",
+    "probe",
+    "build_log",
+    "build_metadata",
+    "build_artifact",
     "normal_output",
     "normal_error",
     "asan_log",
+    "replay_stdout",
+    "replay_stderr",
+    "replay_metadata",
+    "material_harness",
+    "material_build_recipe",
+    "material_dependencies",
+    "material_input_normal",
+    "material_input_candidate",
+    "material_source_vulnerable",
+    "material_source_fixed",
+    "material_patch",
+    "material_repository_bundle",
+    "material_advisory",
     "case_config",
     "symbolizer_log",
-    # v0.2 roles required by T12/T13/T14/T15.
+}
+# The thirteen additive v0.2 roles accepted by the v2 verifier.
+V2_NEW_ROLES = {
     "envelope",
     "budget_snapshot",
     "build_provenance",
+    "admission",
+    "budget_ledger",
+    "budget_charge",
+    "experiment_spec",
+    "model_audit",
+    "fuzz_log",
+    "crash_seed",
+    "fuzz_provenance",
+    "intel_snapshot",
+    "license_record",
 }
+V2_ROLES = V1_ROLES | V2_NEW_ROLES
 DIGEST = "sha256:" + "a" * 64
 OTHER_DIGEST = "sha256:" + "b" * 64
 VERSIONS = ("vulnerable", "fixed")
@@ -143,8 +180,10 @@ def _manifest(bundle_kind, *, verdict="INCONCLUSIVE", reason="EVIDENCE_INCOMPLET
 
 
 def test_v2_role_table_contains_v01_roles():
-    missing = sorted(V2_ROLES - set(evidence.V2_ROLE_NAMES))
-    assert not missing, f"v2 role table is missing required roles: {missing}"
+    # Exact equality in both directions: every registered v1/v2 role is
+    # accepted, and the implementation may not invent an unregistered role.
+    assert set(evidence.V2_ROLE_NAMES) == V2_ROLES
+    assert len(evidence.V2_ROLE_NAMES) == 40
 
 
 def test_verify_bundle_dispatches_v1_and_v2_by_manifest_schema(tmp_path):

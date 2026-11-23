@@ -5,7 +5,7 @@ from __future__ import annotations
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 import hashlib
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import threading
 import uuid
@@ -213,6 +213,31 @@ def claim_next(
                OR (state IN ('RUNNING', 'ARCHIVING')
                    AND (lease_expires_at IS NULL
                         OR lease_expires_at <= clock_timestamp()))"""
+    # v2 claim gating. A family row is only claimable to synchronize a BLOCKED
+    # family; AGGREGATING/COMPLETED families must never be handed to a worker.
+    # A non-BLOCKED child may only run while its parent family is AGGREGATING,
+    # so a family rejected into BLOCKED cannot have a READY child promoted to
+    # RUNNING. BLOCKED children stay claimable even under a BLOCKED/COMPLETED
+    # family so recovery can sync them and drain the rollback gate.
+    v2_parent_gate = ""
+    if job_contract_version == 2:
+        v2_parent_gate = """
+              AND (
+                  (job_kind = 'family'
+                   AND state = 'BLOCKED'
+                   AND workflow_synced = false)
+                  OR (job_kind IN ('campaign', 'round')
+                      AND (
+                          state = 'BLOCKED'
+                          OR EXISTS (
+                              SELECT 1 FROM jobs parent_job
+                              WHERE parent_job.job_id = jobs.parent_job_id
+                                AND parent_job.job_contract_version = 2
+                                AND parent_job.job_kind = 'family'
+                                AND parent_job.state = 'AGGREGATING'
+                          )
+                      ))
+              )"""
     with _connect(dsn) as connection:
         # A claim may run while a release is being promoted. Take the shared
         # side of the release lock for this transaction so a promotion that
@@ -249,6 +274,7 @@ def claim_next(
                    AND (lease_expires_at IS NULL
                         OR lease_expires_at <= clock_timestamp()))
                {execution_clause})
+               {v2_parent_gate}
             ORDER BY submitted_at
             FOR UPDATE SKIP LOCKED
             LIMIT 1
@@ -1055,6 +1081,33 @@ def finish_execution(
         return True
 
 
+_FAMILY_EVIDENCE_DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
+
+
+def _validate_family_evidence_pointer(
+    evidence_path: Any, evidence_digest: Any
+) -> None:
+    """Validate the lightweight ``family.json`` pointer written by T10.
+
+    This is intentionally syntax-only. T12 owns reading ``family.json``,
+    recomputing its content digest and producing the exports; T10 must not
+    inspect the file here.
+    """
+    if not isinstance(evidence_path, str) or not evidence_path.strip():
+        raise StateError("completing a family requires evidence_path")
+    if "\\" in evidence_path:
+        raise StateError("family evidence_path must use POSIX separators")
+    candidate = PurePosixPath(evidence_path)
+    if not candidate.is_absolute():
+        raise StateError("family evidence_path must be an absolute POSIX path")
+    if candidate.name != "family.json":
+        raise StateError("family evidence_path basename must be family.json")
+    if not isinstance(evidence_digest, str) or not _FAMILY_EVIDENCE_DIGEST.fullmatch(
+        evidence_digest
+    ):
+        raise StateError("family evidence_digest must be a sha256 digest")
+
+
 def complete_family(
     dsn: str,
     family_id: UUID,
@@ -1068,11 +1121,12 @@ def complete_family(
     only accepted identity is a ``job_kind = 'family'`` row on contract v2.
     Replaying the identical archived evidence pointer is idempotent; every
     other repeat or state is refused.
+
+    The pointer is validated syntactically only. Reading ``family.json``,
+    recomputing its digest and exporting the family index belongs to T12; this
+    path must never open the file or trust its bytes.
     """
-    if not isinstance(evidence_path, str) or not evidence_path.strip():
-        raise StateError("completing a family requires evidence_path")
-    if not isinstance(evidence_digest, str) or not evidence_digest.strip():
-        raise StateError("completing a family requires evidence_digest")
+    _validate_family_evidence_pointer(evidence_path, evidence_digest)
     with _connect(dsn) as connection:
         job = connection.execute(
             "SELECT state, job_kind, job_contract_version, evidence_path, "
@@ -1092,21 +1146,36 @@ def complete_family(
             raise StateError("family is already COMPLETED with different evidence")
         if job["state"] != "AGGREGATING":
             raise StateError(f"cannot complete a family while it is {job['state']}")
+        has_child = connection.execute(
+            "SELECT 1 FROM jobs WHERE parent_job_id = %s LIMIT 1",
+            (family_id,),
+        ).fetchone()
+        if has_child is None:
+            raise StateError("family has no children")
+        pending_envelope = connection.execute(
+            "SELECT 1 FROM family_envelopes "
+            "WHERE family_id = %s AND status = 'pending' LIMIT 1",
+            (family_id,),
+        ).fetchone()
+        if pending_envelope is not None:
+            raise StateError("family has a pending envelope")
         # The family aggregate is only complete when every child reached a
-        # terminal state. BLOCKED is terminal (a rejected/failed round still
-        # belongs to the aggregate); AWAITING_REVIEW, READY, RUNNING and the
-        # rest are not. The family row lock is already held, so a child cannot
-        # move between this check and the COMPLETED write without first taking
-        # the family lock through the normal review/worker paths.
-        non_terminal = connection.execute(
+        # terminal state and any BLOCKED child has already been synced by the
+        # worker/recovery path. An unsynced BLOCKED child would otherwise stay
+        # in the rollback drain set forever. AWAITING_REVIEW, READY, RUNNING
+        # and the rest are not terminal either. The family row lock is held,
+        # but a concurrent child INSERT is only safe because migration 013
+        # re-checks the parent state after waiting on this lock.
+        blocking_child = connection.execute(
             "SELECT 1 FROM jobs "
             "WHERE parent_job_id = %s "
-            "AND state NOT IN ('COMPLETED', 'REPRODUCED', 'NOT_REPRODUCED', "
+            "AND (state NOT IN ('COMPLETED', 'REPRODUCED', 'NOT_REPRODUCED', "
             "'INCONCLUSIVE', 'BLOCKED', 'FAILED') "
+            "OR (state = 'BLOCKED' AND workflow_synced = false)) "
             "LIMIT 1",
             (family_id,),
         ).fetchone()
-        if non_terminal is not None:
+        if blocking_child is not None:
             raise StateError("family has non-terminal children")
         updated = connection.execute(
             "UPDATE jobs SET state = 'COMPLETED', stage = 'done', "
@@ -1119,6 +1188,16 @@ def complete_family(
         ).fetchone()
         if updated is None:
             raise StateError("family state changed while completing it")
+        _audit(
+            connection,
+            family_id,
+            "family_completed",
+            stage="done",
+            detail={
+                "evidence_path": evidence_path,
+                "evidence_digest": evidence_digest,
+            },
+        )
         return True
 
 
@@ -1453,35 +1532,71 @@ def _request_exploration(request: Any) -> dict[str, Any] | None:
     return exploration
 
 
-def _original_allowed_ops(
-    request: Any, exploration: dict[str, Any]
-) -> set[str] | None:
-    """Return the request's allowed mutation ops when it declares any.
+def _original_mutation_limits(
+    request: Any, exploration: dict[str, Any] | None
+) -> tuple[set[str] | None, int | None]:
+    """Return the request's mutation ops and max input bytes when declared.
 
     Request v2 does not expose mutation_limits publicly, but a persisted row may
     carry one from an earlier gate. Both the documented exploration nesting and
     a top-level block are honored so a ceiling can never be silently bypassed.
+    Independent declarations are intersected (ops) or minimized (max input
+    bytes); malformed declarations fail closed to the empty surface / zero.
     """
     candidates: list[Any] = []
-    nested = exploration.get("mutation_limits")
-    if isinstance(nested, dict):
-        candidates.append(nested)
+    if isinstance(exploration, dict):
+        nested = exploration.get("mutation_limits")
+        if isinstance(nested, dict):
+            candidates.append(nested)
     if isinstance(request, dict):
         top_level = request.get("mutation_limits")
         if isinstance(top_level, dict):
             candidates.append(top_level)
-    declared: list[set[str]] = []
+    ops_floor: set[str] | None = None
+    input_floor: int | None = None
     for candidate in candidates:
         ops = candidate.get("allowed_ops")
         if isinstance(ops, list):
-            declared.append({op for op in ops if isinstance(op, str)})
-    if not declared:
-        return None
-    # Intersect independent declarations: a new envelope may not escape either.
-    floor = declared[0]
-    for ops in declared[1:]:
-        floor &= ops
-    return floor
+            declared = {op for op in ops if isinstance(op, str)}
+            ops_floor = declared if ops_floor is None else ops_floor & declared
+        elif ops is not None:
+            ops_floor = set() if ops_floor is None else ops_floor & set()
+        max_input_bytes = candidate.get("max_input_bytes")
+        if type(max_input_bytes) is int and max_input_bytes >= 0:
+            input_floor = (
+                max_input_bytes
+                if input_floor is None
+                else min(input_floor, max_input_bytes)
+            )
+        elif max_input_bytes is not None:
+            input_floor = 0 if input_floor is None else min(input_floor, 0)
+    return ops_floor, input_floor
+
+
+def _request_execute_seconds(request: Any) -> int:
+    """Return the request's fixed-family total-seconds ceiling.
+
+    A request without exploration is a fixed family whose default total budget
+    is the execute budget. Missing limits fall back to the contract default;
+    an explicitly malformed or non-positive value fails closed instead of
+    silently becoming unlimited.
+    """
+    default = contracts.DEFAULT_LIMITS["execute_seconds"]
+    if not isinstance(request, dict):
+        return default
+    limits = request.get("limits")
+    if limits is None:
+        return default
+    if not isinstance(limits, dict):
+        raise StateError("request.limits must be a JSON object")
+    execute_seconds = limits.get("execute_seconds")
+    if execute_seconds is None:
+        return default
+    if type(execute_seconds) is not int or execute_seconds < 1:
+        raise StateError(
+            "request.limits.execute_seconds must be a positive integer"
+        )
+    return execute_seconds
 
 
 def _assert_envelope_within_case_registry(
@@ -1569,10 +1684,11 @@ def _assert_envelope_not_expanded(
     """Reject a proposed envelope that widens the family's request ceilings.
 
     A request without exploration is a fixed family: only a fixed envelope is
-    acceptable. A guided request may tighten any budget, family or op set, but
-    never widen one, and a fixed request can never be re-opened as guided.
-    Case-registry ceilings are a separate T11 gate; this check only covers the
-    persisted request, which is the evidence available to T10.
+    acceptable, and its total budget defaults to the request's
+    ``limits.execute_seconds``. A guided request may tighten any budget, family
+    or op set, but never widen one, and a fixed request can never be re-opened
+    as guided. T10 checks the persisted request and the registered case
+    ceilings together; the request is not the only gate.
     """
     exploration = _request_exploration(request)
     if exploration is None:
@@ -1580,31 +1696,46 @@ def _assert_envelope_not_expanded(
             raise StateError(
                 "a request without exploration only accepts a fixed envelope"
             )
-        return
+        # Omitting exploration means the fixed defaults, not "no ceiling".
+        original_ceilings = {
+            "max_rounds": 1,
+            "max_total_seconds": _request_execute_seconds(request),
+            "max_fuzz_seconds": 0,
+        }
+        original_families: set[str] = set()
+    else:
+        original_mode = exploration.get("mode", "fixed")
+        if original_mode == "fixed" and envelope["mode"] == "guided":
+            raise StateError(
+                "a fixed family cannot be re-opened as a guided envelope"
+            )
+        # Missing request ceilings are treated conservatively as their fixed
+        # defaults rather than as "unlimited": an absent ceiling cannot widen.
+        ceiling_defaults = {
+            "max_rounds": 1,
+            "max_total_seconds": 0,
+            "max_fuzz_seconds": 0,
+        }
+        original_ceilings = {}
+        for field, default in ceiling_defaults.items():
+            original = exploration.get(field, default)
+            if type(original) is not int:
+                original = default
+            original_ceilings[field] = original
+        families = exploration.get("allowed_mutation_families")
+        original_families = (
+            {family for family in families if isinstance(family, str)}
+            if isinstance(families, list)
+            else set()
+        )
 
-    original_mode = exploration.get("mode", "fixed")
-    if original_mode == "fixed" and envelope["mode"] == "guided":
-        raise StateError("a fixed family cannot be re-opened as a guided envelope")
-
-    # Missing request ceilings are treated conservatively as their fixed
-    # defaults rather than as "unlimited": an absent ceiling cannot be widened.
-    ceiling_defaults = {"max_rounds": 1, "max_total_seconds": 0, "max_fuzz_seconds": 0}
-    for field, default in ceiling_defaults.items():
-        original = exploration.get(field, default)
-        if type(original) is not int:
-            original = default
+    for field, original in original_ceilings.items():
         if envelope[field] > original:
             raise StateError(
                 f"envelope.{field} {envelope[field]} exceeds the request "
                 f"ceiling {original}"
             )
 
-    families = exploration.get("allowed_mutation_families")
-    original_families = (
-        {family for family in families if isinstance(family, str)}
-        if isinstance(families, list)
-        else set()
-    )
     widened_families = sorted(
         set(envelope["allowed_mutation_families"]) - original_families
     )
@@ -1614,7 +1745,9 @@ def _assert_envelope_not_expanded(
             + ", ".join(widened_families)
         )
 
-    original_ops = _original_allowed_ops(request, exploration)
+    original_ops, original_max_input_bytes = _original_mutation_limits(
+        request, exploration
+    )
     if original_ops is not None:
         widened_ops = sorted(
             set(envelope["mutation_limits"]["allowed_ops"]) - original_ops
@@ -1624,6 +1757,15 @@ def _assert_envelope_not_expanded(
                 "envelope adds mutation ops outside the request: "
                 + ", ".join(widened_ops)
             )
+    if (
+        original_max_input_bytes is not None
+        and envelope["mutation_limits"]["max_input_bytes"] > original_max_input_bytes
+    ):
+        raise StateError(
+            "envelope.mutation_limits.max_input_bytes "
+            f"{envelope['mutation_limits']['max_input_bytes']} exceeds the "
+            f"request ceiling {original_max_input_bytes}"
+        )
 
 
 def propose_envelope(

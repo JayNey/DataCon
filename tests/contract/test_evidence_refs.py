@@ -1,11 +1,11 @@
 """TC-16/T10: v2 evidence references ``log/build`` and ``log/fuzz``.
 
 The grammar is frozen in interface-contract-delta §11. These tests exercise
-the parser through ``analysis_digest``: a v2 reference must be canonicalised
-(and therefore line numbers are bound by the digest), while malformed
-references must fail closed. Resolving a reference to bytes needs the v2 bundle
-verifier and is registered for the bundle work; the grammar and binding live
-here because they are pure contract.
+the T10 parser through ``analysis_digest``: a v2 reference must be
+canonicalised (and therefore line numbers are bound by the digest), while
+malformed references must fail closed. Resolving a reference against bundle
+bytes (reading the log, checking the digest and line bounds) belongs to T12/T13
+and is deliberately not implemented or asserted here.
 """
 
 from copy import deepcopy
@@ -44,7 +44,7 @@ def _analysis_with(*refs):
     return analysis
 
 
-def test_log_build_and_log_fuzz_refs_resolve_to_frozen_lines():
+def test_log_build_and_log_fuzz_refs_are_syntax_and_digest_bound():
     valid = _analysis_with(*VALID_REFS)
     digest = analysis_digest(valid)
     assert digest.startswith("sha256:")
