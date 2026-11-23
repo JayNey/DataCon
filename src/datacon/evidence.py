@@ -14,6 +14,7 @@ import hashlib
 import os
 from pathlib import Path, PurePosixPath
 import re
+import shlex
 import shutil
 import stat
 import uuid
@@ -150,7 +151,8 @@ _V2_EXECUTION_REQUIRED_ROLES = frozenset(
         "normal_error",
         "asan_log",
         "replay_stdout",
-        "replay_stderr",
+        # ``replay_stderr`` remains an allowed v0.1 role but the fixed
+        # 18-file replay layout uses ``asan_log`` for candidate stderr.
         "replay_metadata",
     }
 )
@@ -674,43 +676,245 @@ def _validate_manifest_header(
     return job_id, bundle_kind, plan_digest, files, verdict, reason_code
 
 
+def _v2_uuid(value: Any, label: str, *, allow_none: bool = False) -> str | None:
+    if value is None and allow_none:
+        return None
+    try:
+        return str(uuid.UUID(str(value)))
+    except (TypeError, ValueError, AttributeError) as error:
+        raise BundleError(
+            "INVALID_MANIFEST", f"manifest {label} must be a UUID"
+        ) from error
+
+
+def _v2_digest(value: Any, label: str, *, allow_none: bool = False) -> str | None:
+    if value is None and allow_none:
+        return None
+    if not isinstance(value, str) or not _DIGEST.fullmatch(value):
+        raise BundleError(
+            "INVALID_MANIFEST", f"manifest {label} must be a sha256 digest"
+        )
+    return value
+
+
+def _v2_text(value: Any, label: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise BundleError(
+            "INVALID_MANIFEST", f"manifest {label} must be a non-empty string"
+        )
+    return value
+
+
+def _v2_artifacts(value: Any, label: str) -> dict[str, dict[str, str]]:
+    if not isinstance(value, dict) or set(value) != set(_REPLAY_VERSIONS):
+        raise BundleError(
+            "INVALID_MANIFEST",
+            f"{label} must contain exactly vulnerable and fixed",
+        )
+    result: dict[str, dict[str, str]] = {}
+    for version in _REPLAY_VERSIONS:
+        artifact = value.get(version)
+        if not isinstance(artifact, dict) or set(artifact) != {
+            "artifact_digest",
+            "build_log_digest",
+        }:
+            raise BundleError(
+                "INVALID_MANIFEST",
+                f"{label}.{version} must contain artifact_digest and build_log_digest",
+            )
+        entry: dict[str, str] = {}
+        for field in ("artifact_digest", "build_log_digest"):
+            digest = _v2_digest(
+                artifact.get(field), f"{label}.{version}.{field}"
+            )
+            if digest is None:
+                raise BundleError(
+                    "INVALID_MANIFEST", f"{label}.{version}.{field} is required"
+                )
+            entry[field] = digest
+        result[version] = entry
+    return result
+
+
+def _v2_build_ref(value: Any, label: str) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != {
+        "source_job_id",
+        "generation",
+        "build_inputs_digest",
+        "artifacts",
+    }:
+        raise BundleError(
+            "INVALID_MANIFEST", f"{label} has missing or unknown fields"
+        )
+    generation = value.get("generation")
+    if type(generation) is not int or generation < 0:
+        raise BundleError(
+            "INVALID_MANIFEST", f"{label}.generation must be a non-negative integer"
+        )
+    return {
+        "source_job_id": _v2_uuid(value.get("source_job_id"), f"{label}.source_job_id"),
+        "generation": generation,
+        "build_inputs_digest": _v2_digest(
+            value.get("build_inputs_digest"), f"{label}.build_inputs_digest"
+        ),
+        "artifacts": _v2_artifacts(value.get("artifacts"), f"{label}.artifacts"),
+    }
+
+
+def _v2_reuse_origin(
+    value: Any, label: str, build_ref: Mapping[str, Any]
+) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != {
+        "source_job_id",
+        "generation",
+        "campaign_bundle_digest",
+        "artifacts",
+    }:
+        raise BundleError(
+            "INVALID_MANIFEST", f"{label} has missing or unknown fields"
+        )
+    generation = value.get("generation")
+    if type(generation) is not int or generation < 0:
+        raise BundleError(
+            "INVALID_MANIFEST", f"{label}.generation must be a non-negative integer"
+        )
+    origin = {
+        "source_job_id": _v2_uuid(value.get("source_job_id"), f"{label}.source_job_id"),
+        "generation": generation,
+        "campaign_bundle_digest": _v2_digest(
+            value.get("campaign_bundle_digest"), f"{label}.campaign_bundle_digest"
+        ),
+        "artifacts": _v2_artifacts(value.get("artifacts"), f"{label}.artifacts"),
+    }
+    if origin["generation"] != build_ref["generation"]:
+        raise BundleError(
+            "REUSE_MISMATCH",
+            "reuse_origin.generation must equal build_ref.generation",
+        )
+    if origin["source_job_id"] != build_ref["source_job_id"]:
+        raise BundleError(
+            "REUSE_MISMATCH",
+            "reuse_origin.source_job_id must equal build_ref.source_job_id",
+        )
+    if origin["artifacts"] != build_ref["artifacts"]:
+        raise BundleError(
+            "REUSE_MISMATCH",
+            "reuse_origin.artifacts must equal build_ref.artifacts",
+        )
+    return origin
+
+
 def _validate_v2_manifest_header(
     manifest: Mapping[str, Any],
 ) -> tuple[str, str, str | None, list[dict[str, Any]], str | None, str | None]:
-    """Validate the v2 manifest header without falling into v1 semantics.
+    """Validate the version-2 manifest identity and conditional fields.
 
-    This is the T10 dispatch skeleton: it pins the version, the closed v2 bundle
-    kind set, the campaign's null verdict/reason_code and the shared manifest
-    fields. Later v2 tasks extend the bundle-kind specific semantics; the v1
-    branch stays frozen and never sees a schema_version=2 document.
+    v2 is stricter than v1: the family identity, round shape, envelope,
+    provenance rules version, reuse conditions and fixed paths are all part of
+    the manifest contract. Semantic replay of report/plan belongs to later
+    evidence tasks; this header is the T10/T12 dispatch surface.
     """
     if (
         type(manifest.get("schema_version")) is not int
         or manifest.get("schema_version") != contracts.SCHEMA_VERSION_V2
     ):
         raise BundleError("INVALID_MANIFEST", "manifest schema_version must be 2")
-    # v2 requires bundle_kind explicitly. ``family`` (the family index) is not
-    # a bundle kind, so it is rejected here with a bundle_kind error.
     bundle_kind = manifest.get("bundle_kind")
     if not isinstance(bundle_kind, str) or bundle_kind not in _V2_BUNDLE_KINDS:
         raise BundleError("INVALID_MANIFEST", "manifest bundle_kind is invalid")
-    try:
-        job_id = str(uuid.UUID(str(manifest.get("job_id"))))
-    except (TypeError, ValueError, AttributeError) as error:
-        raise BundleError("INVALID_MANIFEST", "manifest job_id must be a UUID") from error
+    job_id = _v2_uuid(manifest.get("job_id"), "job_id")
+    if job_id is None:
+        raise BundleError("INVALID_MANIFEST", "manifest job_id is required")
+    identity_kind = bundle_kind in ("execution", "campaign")
+    family_id = _v2_uuid(
+        manifest.get("family_id"), "family_id", allow_none=not identity_kind
+    )
+    parent_job_id = _v2_uuid(
+        manifest.get("parent_job_id"),
+        "parent_job_id",
+        allow_none=not identity_kind,
+    )
+    if identity_kind and family_id != parent_job_id:
+        raise BundleError(
+            "INVALID_MANIFEST", "manifest family_id must equal parent_job_id"
+        )
+    round_no = manifest.get("round_no")
+    if bundle_kind == "campaign":
+        if round_no is not None:
+            raise BundleError(
+                "INVALID_MANIFEST", "campaign manifest round_no must be null"
+            )
+    elif bundle_kind == "execution":
+        if type(round_no) is not int or round_no < 1:
+            raise BundleError(
+                "INVALID_MANIFEST", "execution manifest round_no must be positive"
+            )
+    elif round_no is not None and (type(round_no) is not int or round_no < 1):
+        raise BundleError("INVALID_MANIFEST", "manifest round_no is invalid")
+
     plan_digest = manifest.get("plan_digest")
-    if bundle_kind == "execution":
-        if not isinstance(plan_digest, str) or not _DIGEST.fullmatch(plan_digest):
-            raise BundleError("INVALID_MANIFEST", "manifest plan_digest is invalid")
-    elif plan_digest is not None and (
-        not isinstance(plan_digest, str) or not _DIGEST.fullmatch(plan_digest)
-    ):
-        # Campaign and blocked bundles may be archived before a plan is
-        # frozen (campaign is a search record, not a verdict round).
-        raise BundleError("INVALID_MANIFEST", "manifest plan_digest is invalid")
+    if identity_kind:
+        plan_digest = _v2_digest(plan_digest, "plan_digest")
+    else:
+        _v2_digest(plan_digest, "plan_digest", allow_none=True)
+    envelope_digest = manifest.get("envelope_digest")
+    if identity_kind:
+        _v2_digest(envelope_digest, "envelope_digest")
+    else:
+        _v2_digest(envelope_digest, "envelope_digest", allow_none=True)
+    experiment_digest = manifest.get("experiment_digest")
+    _v2_digest(experiment_digest, "experiment_digest", allow_none=True)
+    if bundle_kind == "campaign" and experiment_digest is not None:
+        raise BundleError(
+            "INVALID_MANIFEST", "campaign manifest experiment_digest must be null"
+        )
+
+    rules_version = manifest.get("build_provenance_rules_version")
+    if identity_kind:
+        _v2_text(rules_version, "build_provenance_rules_version")
+    elif rules_version is not None:
+        _v2_text(rules_version, "build_provenance_rules_version")
+    try:
+        jsonutil.require_rfc3339(manifest.get("created_at"), "manifest.created_at")
+    except ValueError as error:
+        raise BundleError("INVALID_MANIFEST", str(error)) from error
+
+    build_ref_value = manifest.get("build_ref")
+    reuse_origin_value = manifest.get("reuse_origin")
+    if bundle_kind == "campaign":
+        if build_ref_value is not None or reuse_origin_value is not None:
+            raise BundleError(
+                "INVALID_MANIFEST",
+                "campaign manifest build_ref/reuse_origin must be null",
+            )
+    elif bundle_kind == "execution":
+        if reuse_origin_value is None:
+            if build_ref_value is not None:
+                raise BundleError(
+                    "INVALID_MANIFEST",
+                    "a non-reuse execution must not carry build_ref",
+                )
+            if experiment_digest is not None:
+                raise BundleError(
+                    "INVALID_MANIFEST",
+                    "a non-reuse execution must not carry experiment_digest",
+                )
+        else:
+            if build_ref_value is None:
+                raise BundleError(
+                    "INVALID_MANIFEST",
+                    "a reuse execution requires build_ref",
+                )
+            if experiment_digest is None:
+                raise BundleError(
+                    "INVALID_MANIFEST",
+                    "a reuse execution requires experiment_digest",
+                )
+            build_ref = _v2_build_ref(build_ref_value, "build_ref")
+            _v2_reuse_origin(reuse_origin_value, "reuse_origin", build_ref)
+
     verdict = manifest.get("verdict")
     if bundle_kind == "campaign":
-        # Campaign proves search observations, never a reproduction verdict.
         if verdict is not None:
             raise BundleError(
                 "INVALID_MANIFEST", "campaign bundle must not carry a verdict"
@@ -1275,7 +1479,48 @@ def _verify_named_material(
         )
 
 
+def _extract_compile_args_v1(recipe: bytes) -> tuple[str, ...]:
+    """Frozen copy of the v1 compile-argument extractor.
+
+    §12.1 requires the v1 verifier to keep its own copy: a rollback must verify
+    v1-era bundles with the baked semantics, not with whatever
+    ``datacon.tools.sandbox`` happens to expose after a later change. Do not
+    refactor this into a call to the v2 implementation.
+    """
+    try:
+        text = recipe.decode("utf-8")
+    except UnicodeError:
+        return ()
+    text = text.replace("\\\n", " ")
+    for line in text.splitlines():
+        stripped = line.strip()
+        if "clang" not in stripped or stripped.startswith("#"):
+            continue
+        try:
+            tokens = shlex.split(stripped)
+        except ValueError:
+            continue
+        try:
+            index = tokens.index("clang")
+        except ValueError:
+            continue
+        return tuple(
+            token
+            for token in tokens[index + 1 :]
+            if token.startswith("-")
+        )
+    return ()
+
+
+def _compile_args_from_recipe_v1(recipe: bytes) -> list[str]:
+    return list(_extract_compile_args_v1(recipe))
+
+
 def _compile_args_from_recipe(recipe: bytes) -> list[str]:
+    """v2 extractor: the live sandbox implementation.
+
+    The v1 branch must not call this function; see ``_compile_args_from_recipe_v1``.
+    """
     from datacon.tools.sandbox import _extract_compile_args
 
     return list(_extract_compile_args(recipe))
@@ -2077,7 +2322,7 @@ def _verify_partial_inconclusive(
         case_config, materials, recipe = _case_binding(plan, listed, data)
         _expected_stdout_from_case_config(case_config)
         _verify_materials(plan, listed, data, case_config, materials)
-        expected_compile_args = _compile_args_from_recipe(recipe)
+        expected_compile_args = _compile_args_from_recipe_v1(recipe)
         if list(environment.get("compile_args") or []) != expected_compile_args:
             raise BundleError(
                 "INVALID_MANIFEST",
@@ -2725,7 +2970,7 @@ def _verify_semantics(
     case_config, materials, recipe = _case_binding(plan, listed, data)
     expected_stdout = _expected_stdout_from_case_config(case_config)
     _verify_materials(plan, listed, data, case_config, materials)
-    expected_compile_args = _compile_args_from_recipe(recipe)
+    expected_compile_args = _compile_args_from_recipe_v1(recipe)
     if list(environment.get("compile_args") or []) != expected_compile_args:
         raise BundleError(
             "INVALID_MANIFEST",
@@ -2949,6 +3194,205 @@ def _read_listed_files(
     return data
 
 
+_V2_FIXED_PATH_ROLES = {
+    "report.json": "report_json",
+    "report.md": "report_markdown",
+    "plan.json": "plan",
+    "envelope.json": "envelope",
+    "budget/snapshot.json": "budget_snapshot",
+    "budget/ledger.json": "budget_ledger",
+    "budget/charges.json": "budget_charge",
+    "metadata/execution.json": "execution_metadata",
+    "metadata/probe.json": "probe",
+    "metadata/case.json": "case_config",
+    "review.json": "review",
+    "admission.json": "admission",
+    "model/audit.json": "model_audit",
+    "intel/snapshot.json": "intel_snapshot",
+    "intel/license.json": "license_record",
+}
+_V2_FIXED_ROLE_PATHS = {
+    role: path for path, role in _V2_FIXED_PATH_ROLES.items()
+}
+_V2_BUILD_ROLES = frozenset(
+    {"build_metadata", "build_log", "build_artifact", "build_provenance"}
+)
+_V2_REPLAY_ROLES = frozenset(
+    {
+        "normal_output",
+        "normal_error",
+        "asan_log",
+        "replay_stdout",
+        "replay_stderr",
+        "replay_metadata",
+    }
+)
+
+
+def _v2_replay_expected_paths() -> dict[str, str]:
+    expected: dict[str, str] = {}
+    for version in _REPLAY_VERSIONS:
+        for phase in _REPLAY_PHASES:
+            base = f"replay/{version}/{phase}/"
+            if phase == "normal":
+                expected[base + "stdout.log"] = "normal_output"
+                expected[base + "stderr.log"] = "normal_error"
+            else:
+                expected[base + "stdout.log"] = "replay_stdout"
+                expected[base + "stderr.log"] = "asan_log"
+            expected[base + "metadata.json"] = "replay_metadata"
+    return expected
+
+
+def _v2_required_role_paths(
+    listed: Mapping[str, Mapping[str, Any]], path: str, role: str
+) -> None:
+    entry = listed.get(path)
+    if entry is None:
+        raise BundleError(
+            "INVALID_MANIFEST", f"manifest is missing required evidence path: {path}"
+        )
+    if entry.get("role") != role:
+        raise BundleError(
+            "INVALID_MANIFEST",
+            f"evidence {path} must carry the {role} role, "
+            f"not {entry.get('role')!r}",
+        )
+
+
+def _verify_v2_build_layout(listed: Mapping[str, Mapping[str, Any]]) -> None:
+    for version in _REPLAY_VERSIONS:
+        prefix = f"build/{version}/"
+        group = {
+            path: entry for path, entry in listed.items() if path.startswith(prefix)
+        }
+        if not group:
+            raise BundleError(
+                "INVALID_MANIFEST", f"manifest is missing build/{version}/ evidence"
+            )
+        _v2_required_role_paths(listed, prefix + "metadata.json", "build_metadata")
+        _v2_required_role_paths(listed, prefix + "build.log", "build_log")
+        artifacts = 0
+        for path, entry in group.items():
+            relative = path[len(prefix) :]
+            if relative in ("metadata.json", "build.log"):
+                continue
+            if relative.startswith("build_provenance/"):
+                if entry["role"] != "build_provenance":
+                    raise BundleError(
+                        "INVALID_MANIFEST",
+                        f"evidence {path} must carry the build_provenance role",
+                    )
+                continue
+            if entry["role"] != "build_artifact":
+                raise BundleError(
+                    "INVALID_MANIFEST",
+                    f"evidence {path} must carry the build_artifact role",
+                )
+            artifacts += 1
+        if artifacts == 0:
+            raise BundleError(
+                "INVALID_MANIFEST",
+                f"manifest is missing a build_artifact for build/{version}/",
+            )
+    for path, entry in listed.items():
+        if entry["role"] in _V2_BUILD_ROLES and not (
+            path.startswith("build/vulnerable/") or path.startswith("build/fixed/")
+        ):
+            raise BundleError(
+                "INVALID_MANIFEST",
+                f"build evidence {path} is not at a fixed build path",
+            )
+
+
+def _verify_v2_replay_layout(
+    listed: Mapping[str, Mapping[str, Any]], bundle_kind: str
+) -> None:
+    expected = _v2_replay_expected_paths()
+    if bundle_kind == "execution":
+        for path, role in expected.items():
+            _v2_required_role_paths(listed, path, role)
+    for path, entry in listed.items():
+        if entry["role"] in _V2_REPLAY_ROLES:
+            if bundle_kind == "campaign":
+                raise BundleError(
+                    "INVALID_MANIFEST",
+                    "a campaign bundle must not carry replay evidence",
+                )
+            if path not in expected:
+                raise BundleError(
+                    "INVALID_MANIFEST",
+                    f"replay evidence {path} is not at a fixed replay path",
+                )
+            if expected[path] != entry["role"]:
+                raise BundleError(
+                    "INVALID_MANIFEST",
+                    f"evidence {path} must carry the {expected[path]} role, "
+                    f"not {entry['role']!r}",
+                )
+
+
+def _verify_v2_layout(
+    listed: Mapping[str, Mapping[str, Any]], bundle_kind: str
+) -> None:
+    for path, role in _V2_FIXED_PATH_ROLES.items():
+        entry = listed.get(path)
+        if entry is not None and entry["role"] != role:
+            raise BundleError(
+                "INVALID_MANIFEST",
+                f"evidence {path} must carry the {role} role, "
+                f"not {entry['role']!r}",
+            )
+    for path, entry in listed.items():
+        role = entry["role"]
+        fixed_path = _V2_FIXED_ROLE_PATHS.get(role)
+        if fixed_path is not None and fixed_path != path:
+            raise BundleError(
+                "INVALID_MANIFEST",
+                f"evidence role {role} must live at {fixed_path}, not {path}",
+            )
+        if role == "experiment_spec" and not (
+            path.startswith("experiments/") and path.endswith(".json")
+        ):
+            raise BundleError(
+                "INVALID_MANIFEST",
+                "experiment_spec evidence must live under experiments/*.json",
+            )
+
+    if bundle_kind in ("execution", "campaign"):
+        for path, role in (
+            ("metadata/execution.json", "execution_metadata"),
+            ("metadata/probe.json", "probe"),
+            ("metadata/case.json", "case_config"),
+        ):
+            _v2_required_role_paths(listed, path, role)
+        _verify_v2_build_layout(listed)
+        _verify_v2_replay_layout(listed, bundle_kind)
+
+    has_review = "review.json" in listed
+    has_admission = "admission.json" in listed
+    if bundle_kind == "execution":
+        if has_review == has_admission:
+            raise BundleError(
+                "INVALID_MANIFEST",
+                "an execution bundle must carry exactly one of "
+                "review.json or admission.json",
+            )
+    elif bundle_kind == "campaign":
+        if has_admission:
+            raise BundleError(
+                "INVALID_MANIFEST", "a campaign bundle must not carry admission.json"
+            )
+        if not has_review:
+            raise BundleError(
+                "INVALID_MANIFEST", "a campaign bundle requires review.json"
+            )
+    elif has_admission:
+        raise BundleError(
+            "INVALID_MANIFEST", "a blocked bundle must not carry admission.json"
+        )
+
+
 def _verify_bundle_v2(
     root_path: Path,
     manifest: dict[str, Any],
@@ -2988,6 +3432,7 @@ def _verify_bundle_v2(
         _require_blocked_paths(listed)
     else:
         _require_required_paths(listed, _V2_REQUIRED_PATHS[bundle_kind])
+    _verify_v2_layout(listed, bundle_kind)
     data = _read_listed_files(root_path, listed)
 
     return BundleVerification(

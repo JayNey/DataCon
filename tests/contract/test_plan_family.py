@@ -12,6 +12,8 @@ import hashlib
 
 from test_plan import PLAN as BASE_PLAN
 
+import pytest
+
 from datacon import jsonutil
 from datacon.contracts import canonical_plan_bytes, plan_digest
 
@@ -21,6 +23,7 @@ def _digest(token: str) -> str:
 
 
 FAMILY_ID = "2f1c0f5e-3d7a-4b6c-9f10-2a4b6c8d0e11"
+OTHER_FAMILY_ID = "3f1c0f5e-3d7a-4b6c-9f10-2a4b6c8d0e22"
 SOURCE_JOB_ID = "9a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d"
 ENVELOPE_DIGEST = _digest("5")
 OTHER_ENVELOPE_DIGEST = _digest("f")
@@ -132,7 +135,12 @@ def test_round_plan_binds_parent_round_envelope_and_build_ref():
     assert base_digest.startswith("sha256:")
 
     mutations = {
-        "parent_job_id": lambda plan: plan.__setitem__("parent_job_id", SOURCE_JOB_ID),
+        # parent_job_id is bound together with family_id: changing only one
+        # side is now rejected by the cross-field invariant, so the digest
+        # sensitivity of both identity fields is exercised on a valid pair.
+        "parent_job_id": lambda plan: plan.update(
+            family_id=OTHER_FAMILY_ID, parent_job_id=OTHER_FAMILY_ID
+        ),
         "round_no": lambda plan: plan.__setitem__("round_no", 3),
         "envelope_digest": lambda plan: plan.__setitem__(
             "envelope_digest", OTHER_ENVELOPE_DIGEST
@@ -192,6 +200,7 @@ def test_campaign_identity_is_special_child():
 
     ordinary = deepcopy(campaign)
     ordinary["round_no"] = 1
+    ordinary["inputs"] = deepcopy(BASE_PLAN["inputs"])
     assert plan_digest(ordinary) != campaign_digest, (
         "campaign treated as ordinary round: round_no=null is not bound"
     )
@@ -263,13 +272,12 @@ def test_parent_job_aggregates_without_rerun():
     assert campaign["experiment_digest"] is None, (
         "parent job froze an ExperimentSpec"
     )
-    campaign_digest = plan_digest(campaign)
+    plan_digest(campaign)
 
     with_build = deepcopy(campaign)
     with_build["build_ref"] = deepcopy(BUILD_REF)
-    assert plan_digest(with_build) != campaign_digest, (
-        "binding a build_ref to the parent plan did not change its digest"
-    )
+    with pytest.raises(ValueError):
+        plan_digest(with_build)
 
 
 def test_plan_digest_binds_experiment_and_provenance_version():
@@ -288,3 +296,56 @@ def test_plan_digest_binds_experiment_and_provenance_version():
         assert plan_digest(changed) != base_digest, (
             f"plan_digest does not bind {field}"
         )
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda plan: plan.__setitem__("family_id", OTHER_FAMILY_ID),
+        lambda plan: plan.__setitem__("family_id", "not-a-uuid"),
+        lambda plan: plan.__setitem__("parent_approval_digest", None),
+        lambda plan: plan.__setitem__("inputs", None),
+    ],
+)
+def test_round_plan_rejects_cross_field_violations(mutate):
+    plan = _round_plan()
+    mutate(plan)
+    with pytest.raises(ValueError):
+        plan_digest(plan)
+
+
+def test_campaign_plan_rejects_non_null_inputs():
+    plan = _campaign_plan()
+    plan["inputs"] = deepcopy(BASE_PLAN["inputs"])
+    with pytest.raises(ValueError):
+        plan_digest(plan)
+
+
+def test_campaign_plan_rejects_build_ref():
+    plan = _campaign_plan()
+    plan["build_ref"] = deepcopy(BUILD_REF)
+    with pytest.raises(ValueError):
+        plan_digest(plan)
+
+
+def test_first_round_rejects_parent_approval_digest():
+    plan = _round_plan(
+        round_no=1,
+        parent_approval_digest=APPROVAL_DIGEST,
+        build_ref=None,
+        experiment_digest=None,
+    )
+    with pytest.raises(ValueError):
+        plan_digest(plan)
+
+
+def test_build_ref_and_experiment_digest_are_coupled():
+    with_build_without_experiment = _round_plan(experiment_digest=None)
+    with pytest.raises(ValueError):
+        plan_digest(with_build_without_experiment)
+
+    without_build_with_experiment = _round_plan(
+        build_ref=None, experiment_digest=EXPERIMENT_DIGEST
+    )
+    with pytest.raises(ValueError):
+        plan_digest(without_build_with_experiment)

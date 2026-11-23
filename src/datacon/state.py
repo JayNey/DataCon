@@ -16,6 +16,7 @@ import psycopg
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
+from datacon import cases as case_registry
 from datacon import jsonutil
 
 REVIEW_WINDOW_HOURS = 24
@@ -94,7 +95,8 @@ def _locked_job(
     """
     job = connection.execute(
         "SELECT state, generation, lease_owner, lease_expires_at, "
-        "prepare_deadline_at, state_version, job_contract_version "
+        "prepare_deadline_at, state_version, job_contract_version, "
+        "job_kind, round_no, family_id "
         "FROM jobs WHERE job_id = %s FOR UPDATE",
         (job_id,),
     ).fetchone()
@@ -193,11 +195,14 @@ def claim_next(
     *,
     lease_seconds: int = LEASE_SECONDS,
     execute: bool = True,
+    job_contract_version: int = 1,
 ) -> dict | None:
     if not isinstance(worker_id, str) or not worker_id.strip():
         raise StateError("worker_id must be non-empty")
     if type(lease_seconds) is not int or not 1 <= lease_seconds <= 86400:
         raise StateError("lease_seconds is invalid")
+    if job_contract_version not in (1, 2):
+        raise StateError("job_contract_version must be 1 or 2")
     execution_clause = ""
     if execute:
         execution_clause = """
@@ -221,7 +226,8 @@ def claim_next(
             f"""
             SELECT job_id, state, workflow_synced
             FROM jobs
-            WHERE state = 'QUEUED'
+            WHERE job_contract_version = %s
+              AND (state = 'QUEUED'
                OR (state = 'PREPARING'
                    AND (lease_expires_at IS NULL
                         OR lease_expires_at <= clock_timestamp()))
@@ -241,11 +247,12 @@ def claim_next(
                    AND review_deadline_at IS NULL
                    AND (lease_expires_at IS NULL
                         OR lease_expires_at <= clock_timestamp()))
-               {execution_clause}
+               {execution_clause})
             ORDER BY submitted_at
             FOR UPDATE SKIP LOCKED
             LIMIT 1
-            """
+            """,
+            (job_contract_version,),
         ).fetchone()
         if row is None:
             return None
@@ -355,6 +362,7 @@ def freeze_plan(
     plan: dict[str, Any],
     plan_digest: str,
     summary: dict[str, Any],
+    envelope: Mapping[str, Any] | None = None,
 ) -> bool:
     """Freeze one plan unless the database clock says preparation expired.
 
@@ -373,6 +381,33 @@ def freeze_plan(
             if existing["plan_digest"] != plan_digest:
                 raise PlanConflict("a different plan is already frozen")
             return True
+        first_v2_plan = (
+            job["job_contract_version"] == 2
+            and job.get("job_kind") in ("campaign", "round")
+            and (
+                job.get("job_kind") == "campaign"
+                or job.get("round_no") == 1
+            )
+            and plan.get("schema_version") == 2
+        )
+        normalized_envelope: dict[str, Any] | None = None
+        if first_v2_plan:
+            if envelope is None:
+                raise StateError(
+                    "a v2 first plan requires the reviewed envelope body"
+                )
+            try:
+                normalized_envelope = _validate_envelope(dict(envelope))
+            except ValueError as error:
+                raise StateError(f"envelope is invalid: {error}") from error
+            if jsonutil.digest_json(normalized_envelope) != plan.get(
+                "envelope_digest"
+            ):
+                raise StateError(
+                    "envelope body does not match the plan envelope_digest"
+                )
+        elif envelope is not None:
+            raise StateError("only the first plan may freeze an envelope")
         if job["state"] not in ("PREPARING", "AWAITING_REVIEW"):
             raise StateError(f"cannot freeze a plan while the job is {job['state']}")
         if (
@@ -417,11 +452,28 @@ def freeze_plan(
             "AND state IN ('PREPARING', 'AWAITING_REVIEW') "
             "AND lease_expires_at IS NOT NULL "
             "AND lease_expires_at > clock_timestamp() "
-            "RETURNING job_id",
+            "RETURNING job_id, review_deadline_at",
             (REVIEW_WINDOW_HOURS, job_id, generation),
         ).fetchone()
         if updated is None:
             raise StaleGeneration("job changed while freezing the plan")
+        if normalized_envelope is not None:
+            # The first approved envelope is inserted in the same transaction
+            # as the first plan. Its deadline is the child's review deadline,
+            # so a worker timeout and the envelope sweep agree on one window.
+            connection.execute(
+                "INSERT INTO family_envelopes "
+                "(envelope_id, family_id, envelope_digest, envelope_json, "
+                "status, review_deadline_at) "
+                "VALUES (%s, %s, %s, %s, 'pending', %s)",
+                (
+                    uuid.uuid4(),
+                    job["family_id"],
+                    plan["envelope_digest"],
+                    Jsonb(normalized_envelope),
+                    updated["review_deadline_at"],
+                ),
+            )
         _audit(
             connection,
             job_id,
@@ -486,29 +538,31 @@ def block_job(
 
 
 def _archive_pending_blocked(
-    dsn: str, job_id: UUID, pending: list[tuple[str, str]]
+    dsn: str, pending: list[tuple[UUID, str, str]]
 ) -> None:
-    """Archive a just-committed BLOCKED transition (best effort).
+    """Archive every just-committed BLOCKED transition (best effort).
 
     The callback runs from ``ExitStack`` after the database context manager has
     committed. Filesystem/verification errors are turned into
     FAILED/EVIDENCE_WRITE_FAILED by ``record_blocked``; a control-plane
     database error is propagated rather than hidden behind a successful review
-    response.
+    response. A v2 review rejection/expiry blocks both the family and its first
+    child, so each row gets its own blocked bundle instead of being left with a
+    NULL evidence pointer.
     """
     if not pending:
         return
-    reason_code, message = pending[-1]
     # Imported lazily: execution imports state at module load time, so a
     # module-level import here would be circular.
     from datacon import execution
 
-    execution.record_blocked(
-        dsn,
-        job_id,
-        reason_code=reason_code,
-        message=message,
-    )
+    for job_id, reason_code, message in pending:
+        execution.record_blocked(
+            dsn,
+            job_id,
+            reason_code=reason_code,
+            message=message,
+        )
 
 
 def record_blocked_evidence(
@@ -869,6 +923,17 @@ def finish_execution(
         "INCONCLUSIVE",
     ):
         raise StateError("verdict is invalid")
+    if state == "COMPLETED":
+        # D40: COMPLETED is the v2 campaign/round search terminal, not a
+        # verdict. It must carry the archived pointer pair and nothing else.
+        if evidence_status != "archived" or not evidence_path or not evidence_digest:
+            raise StateError(
+                "COMPLETED requires archived evidence_path and evidence_digest"
+            )
+        if verdict is not None or verdict_reason is not None or reason_code is not None:
+            raise StateError(
+                "COMPLETED requires a null verdict, verdict_reason and reason_code"
+            )
     archived = evidence_status == "archived"
     if archived:
         if not evidence_path or not evidence_digest:
@@ -891,8 +956,14 @@ def finish_execution(
         # COMPLETED exists only in the v2 contract. Checking the version on the
         # locked row (not on caller input) keeps a v1 worker from writing a
         # state its own control plane cannot read.
-        if state == "COMPLETED" and job["job_contract_version"] != 2:
-            raise StateError("COMPLETED is only valid for a v2 job")
+        if state == "COMPLETED":
+            if job["job_contract_version"] != 2:
+                raise StateError("COMPLETED is only valid for a v2 job")
+            if job.get("job_kind") != "campaign":
+                raise StateError(
+                    "COMPLETED is only valid for a v2 campaign child; "
+                    "a family converges through complete_family"
+                )
         if job["state"] not in ("RUNNING", "ARCHIVING"):
             raise StateError(f"cannot finish execution while the job is {job['state']}")
         updated = connection.execute(
@@ -1357,6 +1428,85 @@ def _original_allowed_ops(
     return floor
 
 
+def _assert_envelope_within_case_registry(
+    envelope: dict[str, Any], request: Any
+) -> None:
+    """Reject an envelope that widens the registered case ceilings.
+
+    The request is only the operator's intent. The case registry is the source
+    of truth for the approved signature set, mutation surface and family
+    budget, so a widened envelope must fail even when the request allows it.
+    """
+    target = request.get("target") if isinstance(request, Mapping) else None
+    case_id = target.get("case_id") if isinstance(target, Mapping) else None
+    if not isinstance(case_id, str) or not case_id:
+        raise StateError("family request does not name a registered case")
+    try:
+        ceilings = case_registry.load_registry().exploration_ceilings(case_id)
+    except case_registry.CaseConfigurationError as error:
+        raise StateError(
+            f"case registry ceilings are unavailable: {error.message}"
+        ) from error
+
+    families = ceilings.get("allowed_mutation_families")
+    if isinstance(families, list):
+        allowed_families = {
+            family for family in families if isinstance(family, str)
+        }
+        widened_families = sorted(
+            set(envelope["allowed_mutation_families"]) - allowed_families
+        )
+        if widened_families:
+            raise StateError(
+                "envelope adds mutation families outside the case registry: "
+                + ", ".join(widened_families)
+            )
+
+    limits = ceilings.get("mutation_limits")
+    if isinstance(limits, dict):
+        allowed_ops = limits.get("allowed_ops")
+        if isinstance(allowed_ops, list):
+            ops = {op for op in allowed_ops if isinstance(op, str)}
+            widened_ops = sorted(
+                set(envelope["mutation_limits"]["allowed_ops"]) - ops
+            )
+            if widened_ops:
+                raise StateError(
+                    "envelope adds mutation ops outside the case registry: "
+                    + ", ".join(widened_ops)
+                )
+        max_input_bytes = limits.get("max_input_bytes")
+        if (
+            type(max_input_bytes) is int
+            and envelope["mutation_limits"]["max_input_bytes"] > max_input_bytes
+        ):
+            raise StateError(
+                "envelope.mutation_limits.max_input_bytes exceeds the case registry"
+            )
+
+    signatures = ceilings.get("accepted_signature_set")
+    if signatures is not None:
+        try:
+            allowed_signatures = _envelope_signature_set(signatures)
+        except ValueError as error:
+            raise StateError(
+                f"case registry accepted_signature_set is invalid: {error}"
+            ) from error
+        for signature in envelope["accepted_signature_set"]:
+            if signature not in allowed_signatures:
+                raise StateError(
+                    "envelope adds an accepted signature outside the case registry"
+                )
+
+    for field in ("max_rounds", "max_total_seconds", "max_fuzz_seconds"):
+        ceiling = ceilings.get(field)
+        if type(ceiling) is int and envelope[field] > ceiling:
+            raise StateError(
+                f"envelope.{field} {envelope[field]} exceeds the case registry "
+                f"ceiling {ceiling}"
+            )
+
+
 def _assert_envelope_not_expanded(
     envelope: dict[str, Any], request: Any
 ) -> None:
@@ -1466,8 +1616,22 @@ def propose_envelope(
             raise StateError(
                 f"family is {job['state']}, not AGGREGATING"
             )
+        # A changed-envelope re-approval only exists after the first plan was
+        # approved. Proposing earlier would race the first envelope that
+        # freeze_plan inserts and leave the family with two competing pending
+        # identities.
+        first_approval = connection.execute(
+            "SELECT 1 FROM family_approvals WHERE family_id = %s LIMIT 1",
+            (family_id,),
+        ).fetchone()
+        if first_approval is None:
+            raise StateError(
+                "family has no first approval; propose-envelope is only for "
+                "changed-envelope re-approval"
+            )
 
         _assert_envelope_not_expanded(normalized, job["request"])
+        _assert_envelope_within_case_registry(normalized, job["request"])
 
         try:
             inserted = connection.execute(
@@ -1553,6 +1717,7 @@ def _record_family_review(
     decision: str,
     reviewer_id: str,
     envelope_digest: str | None,
+    pending_blocked: list[tuple[UUID, str, str]],
 ) -> ReviewOutcome:
     """Record a human review against a v2 family and its first child.
 
@@ -1574,18 +1739,35 @@ def _record_family_review(
         "AS first_round",
         (job_id, job_id),
     ).fetchone()["first_round"]
-    child = connection.execute(
+    # The first child is determined by the family's exploration mode, not by
+    # the earliest submitted row: guided families review the campaign, fixed
+    # families review round 1. A duplicate first child is a data error, not a
+    # reason to silently review an arbitrary row.
+    exploration = _request_exploration(job.get("request")) or {}
+    mode = exploration.get("mode", "fixed")
+    if mode == "guided":
+        first_child_filter = "job_kind = 'campaign'"
+    else:
+        first_child_filter = "job_kind = 'round' AND round_no = 1"
+    children = connection.execute(
         "SELECT job_id, state, generation FROM jobs "
-        "WHERE parent_job_id = %s AND job_kind IN ('campaign', 'round') "
-        "ORDER BY submitted_at, job_id LIMIT 1",
+        f"WHERE parent_job_id = %s AND {first_child_filter} "
+        "ORDER BY submitted_at, job_id LIMIT 2",
         (job_id,),
-    ).fetchone()
-    if child is None:
+    ).fetchall()
+    if not children:
         return ReviewOutcome(
             "invalid_state",
             state=job["state"],
-            message="family has no child job",
+            message="family has no first child job",
         )
+    if len(children) > 1:
+        return ReviewOutcome(
+            "invalid_state",
+            state=job["state"],
+            message="family has more than one first child job",
+        )
+    child = children[0]
     if first_round:
         # Lock order is family then first child. The family lock is already
         # held; blocking here proves the order to any concurrent observer.
@@ -1692,18 +1874,28 @@ def _record_family_review(
             "WHERE envelope_id = %s AND status = 'pending'",
             (envelope["envelope_id"],),
         )
-        _block_v2_review_job(
-            connection,
-            child["job_id"],
-            reason_code="REVIEW_EXPIRED",
-            message="review deadline passed before a decision was recorded",
-        )
+        expiry_message = "review deadline passed before a decision was recorded"
+        if first_round:
+            # A first-round timeout is a review-object timeout: the child is
+            # still AWAITING_REVIEW and must converge with the family. A
+            # changed-envelope timeout only expires the envelope; the
+            # already-approved child stays untouched (§9.1).
+            _block_v2_review_job(
+                connection,
+                child["job_id"],
+                reason_code="REVIEW_EXPIRED",
+                message=expiry_message,
+            )
+            pending_blocked.append(
+                (child["job_id"], "REVIEW_EXPIRED", expiry_message)
+            )
         _block_v2_review_job(
             connection,
             job_id,
             reason_code="REVIEW_EXPIRED",
-            message="review deadline passed before a decision was recorded",
+            message=expiry_message,
         )
+        pending_blocked.append((job_id, "REVIEW_EXPIRED", expiry_message))
         _audit(
             connection,
             job_id,
@@ -1756,13 +1948,16 @@ def _record_family_review(
             "LIMIT 1",
             (job_id,),
         ).fetchone()
+        # The approval hash uses the exact microsecond value persisted in
+        # family_approvals.decided_at (fixed six-digit UTC fraction), never the
+        # seconds-only display rendering.
         approval_digest = jsonutil.digest_json(
             {
                 "family_id": str(job_id),
                 "first_plan_digest": first_plan_digest,
                 "envelope_digest": resolved_envelope,
                 "reviewer_id": reviewer_id,
-                "decided_at": jsonutil.timestamp(decision_at),
+                "decided_at": jsonutil.approval_timestamp(decision_at),
             }
         )
         connection.execute(
@@ -1840,18 +2035,27 @@ def _record_family_review(
     ).fetchone()
     if decided_envelope is None:
         raise StateError("family envelope changed while recording the review")
-    _block_v2_review_job(
-        connection,
-        child["job_id"],
-        reason_code="REVIEW_REJECTED",
-        message="review rejected by the operator",
-    )
+    rejection_message = "review rejected by the operator"
+    if first_round:
+        # A first-round rejection rejects the review object itself, so the
+        # first child is locked. Re-approving a changed envelope only rejects
+        # that envelope: the already-approved child must stay untouched.
+        _block_v2_review_job(
+            connection,
+            child["job_id"],
+            reason_code="REVIEW_REJECTED",
+            message=rejection_message,
+        )
+        pending_blocked.append(
+            (child["job_id"], "REVIEW_REJECTED", rejection_message)
+        )
     _block_v2_review_job(
         connection,
         job_id,
         reason_code="REVIEW_REJECTED",
-        message="review rejected by the operator",
+        message=rejection_message,
     )
+    pending_blocked.append((job_id, "REVIEW_REJECTED", rejection_message))
     _audit(
         connection,
         job_id,
@@ -1886,17 +2090,17 @@ def record_review(
     if len(reviewer_id) > 128:
         raise StateError("reviewer_id is too long")
 
-    pending_blocked: list[tuple[str, str]] = []
+    pending_blocked: list[tuple[UUID, str, str]] = []
     with ExitStack() as stack:
         # Registered before the connection so it runs after the transaction
         # commits (ExitStack unwinds in reverse order). record_review has no
         # worker lease; record_blocked_evidence intentionally does not require
         # one.
-        stack.callback(_archive_pending_blocked, dsn, job_id, pending_blocked)
+        stack.callback(_archive_pending_blocked, dsn, pending_blocked)
         connection = stack.enter_context(_connect(dsn))
         job = connection.execute(
             "SELECT state, reason_code, review_deadline_at, generation, "
-            "job_contract_version, job_kind, family_id "
+            "job_contract_version, job_kind, family_id, request "
             "FROM jobs WHERE job_id = %s FOR UPDATE",
             (job_id,),
         ).fetchone()
@@ -1914,6 +2118,7 @@ def record_review(
                 decision=decision,
                 reviewer_id=reviewer_id,
                 envelope_digest=envelope_digest,
+                pending_blocked=pending_blocked,
             )
         if job["job_contract_version"] != 1:
             raise StateError("v2 review target must be a family job")
@@ -2036,6 +2241,7 @@ def record_review(
             )
             pending_blocked.append(
                 (
+                    job_id,
                     "REVIEW_EXPIRED",
                     "review deadline passed before a decision was recorded",
                 )
@@ -2141,7 +2347,7 @@ def record_review(
         )
         if decision == "reject":
             pending_blocked.append(
-                ("REVIEW_REJECTED", "review rejected by the operator")
+                (job_id, "REVIEW_REJECTED", "review rejected by the operator")
             )
         return ReviewOutcome(
             "applied",
@@ -2156,10 +2362,39 @@ def record_review(
 
 
 def expire_review(dsn: str, job_id: UUID, generation: int) -> bool:
-    pending_blocked: list[tuple[str, str]] = []
+    """Expire the first child's review window and converge its family.
+
+    Lock order is global (§9.1): the child's immutable ``parent_job_id`` is
+    read without a lock, then the family row is locked, then the child. This
+    matches ``record_review`` (family -> child) so the two paths can never form
+    a child -> family vs family -> child deadlock. After both locks the child
+    is re-checked: a changed state, generation or lease still fails closed.
+    """
+    pending_blocked: list[tuple[UUID, str, str]] = []
     with ExitStack() as stack:
-        stack.callback(_archive_pending_blocked, dsn, job_id, pending_blocked)
+        stack.callback(_archive_pending_blocked, dsn, pending_blocked)
         connection = stack.enter_context(_connect(dsn))
+        identity = connection.execute(
+            "SELECT job_contract_version, job_kind, family_id "
+            "FROM jobs WHERE job_id = %s",
+            (job_id,),
+        ).fetchone()
+        if identity is None:
+            return False
+        family_id: UUID | None = None
+        family: dict[str, Any] | None = None
+        if (
+            identity["job_contract_version"] == 2
+            and identity["job_kind"] in ("campaign", "round")
+            and identity["family_id"] is not None
+        ):
+            family_id = identity["family_id"]
+            # Family first. The identity read above is lock-free because
+            # parent_job_id is immutable for the lifetime of the row.
+            family = connection.execute(
+                "SELECT state, generation FROM jobs WHERE job_id = %s FOR UPDATE",
+                (family_id,),
+            ).fetchone()
         job = connection.execute(
             "SELECT state, generation, review_deadline_at, lease_owner, "
             "lease_expires_at, job_contract_version, job_kind, family_id, "
@@ -2184,6 +2419,7 @@ def expire_review(dsn: str, job_id: UUID, generation: int) -> bool:
             raise StaleGeneration("the worker lease is no longer active")
         if not _review_window_closed(job["review_deadline_at"], db_now):
             return False
+        expiry_message = "review deadline passed before a decision was recorded"
         connection.execute(
             "UPDATE jobs SET state = 'BLOCKED', stage = 'blocked', "
             "reason_code = 'REVIEW_EXPIRED', last_error = %s, "
@@ -2191,7 +2427,7 @@ def expire_review(dsn: str, job_id: UUID, generation: int) -> bool:
             "workflow_synced = false, lease_owner = NULL, "
             "lease_expires_at = NULL, updated_at = clock_timestamp() "
             "WHERE job_id = %s AND generation = %s",
-            ("review deadline passed before a decision was recorded", job_id, generation),
+            (expiry_message, job_id, generation),
         )
         _audit(
             connection,
@@ -2204,18 +2440,11 @@ def expire_review(dsn: str, job_id: UUID, generation: int) -> bool:
                 "plan_digest": job["plan_digest"],
             },
         )
+        pending_blocked.append((job_id, "REVIEW_EXPIRED", expiry_message))
         # A v2 child is not the review unit: expire the family that owns it in
         # the same transaction so the aggregate can never stay AGGREGATING
         # after its pending envelope timed out.
-        if (
-            job["job_contract_version"] == 2
-            and job["job_kind"] in ("campaign", "round")
-            and job["family_id"] is not None
-        ):
-            family = connection.execute(
-                "SELECT state, generation FROM jobs WHERE job_id = %s FOR UPDATE",
-                (job["family_id"],),
-            ).fetchone()
+        if family_id is not None:
             if family is not None:
                 connection.execute(
                     "UPDATE jobs SET state = 'BLOCKED', stage = 'blocked', "
@@ -2224,19 +2453,16 @@ def expire_review(dsn: str, job_id: UUID, generation: int) -> bool:
                     "generation = generation + 1, workflow_synced = false, "
                     "lease_owner = NULL, lease_expires_at = NULL, "
                     "updated_at = clock_timestamp() WHERE job_id = %s",
-                    (
-                        "review deadline passed before a decision was recorded",
-                        job["family_id"],
-                    ),
+                    (expiry_message, family_id),
                 )
                 connection.execute(
                     "UPDATE family_envelopes SET status = 'expired' "
                     "WHERE family_id = %s AND status = 'pending'",
-                    (job["family_id"],),
+                    (family_id,),
                 )
                 _audit(
                     connection,
-                    job["family_id"],
+                    family_id,
                     "review_expired",
                     stage="blocked",
                     reason_code="REVIEW_EXPIRED",
@@ -2246,12 +2472,9 @@ def expire_review(dsn: str, job_id: UUID, generation: int) -> bool:
                         "plan_digest": job["plan_digest"],
                     },
                 )
-        pending_blocked.append(
-            (
-                "REVIEW_EXPIRED",
-                "review deadline passed before a decision was recorded",
-            )
-        )
+                pending_blocked.append(
+                    (family_id, "REVIEW_EXPIRED", expiry_message)
+                )
         return True
 
 
@@ -2271,6 +2494,7 @@ def expire_pending_envelopes(dsn: str) -> int:
     is conditional on ``status = 'pending'`` and ``state = 'AGGREGATING'``.
     """
     expired = 0
+    pending_blocked: list[tuple[UUID, str, str]] = []
     with _connect(dsn) as connection:
         candidates = connection.execute(
             "SELECT fe.envelope_id, fe.family_id, fe.envelope_digest "
@@ -2278,6 +2502,8 @@ def expire_pending_envelopes(dsn: str) -> int:
             "JOIN jobs AS j ON j.job_id = fe.family_id "
             "WHERE fe.status = 'pending' "
             "AND fe.review_deadline_at <= clock_timestamp() "
+            "AND EXISTS (SELECT 1 FROM family_approvals AS fa "
+            "WHERE fa.family_id = fe.family_id) "
             "AND j.state = 'AGGREGATING' "
             "AND j.job_kind = 'family' "
             "AND j.job_contract_version = 2 "
@@ -2342,7 +2568,15 @@ def expire_pending_envelopes(dsn: str) -> int:
                     "source": "pending_envelope_sweep",
                 },
             )
+            pending_blocked.append(
+                (
+                    candidate["family_id"],
+                    "REVIEW_EXPIRED",
+                    "review deadline passed before a decision was recorded",
+                )
+            )
             expired += 1
+    _archive_pending_blocked(dsn, pending_blocked)
     return expired
 
 
@@ -2439,6 +2673,20 @@ def status(dsn: str, job_id: UUID) -> dict[str, Any] | None:
 # ---------------------------------------------------------------------------
 
 RELEASE_ACTIVE_STATES = ("PREPARING", "RUNNING", "ARCHIVING")
+# v2 drain set: seven non-terminal states plus an unsynced BLOCKED row. A
+# family that is still AGGREGATING is a residual only when it has no
+# non-terminal child left; while a non-terminal child exists that child is the
+# drain unit. Counting the aggregate as well would double its slots and break
+# the single-execution-slot invariant.
+V2_NON_TERMINAL_STATES = (
+    "QUEUED",
+    "PREPARING",
+    "AWAITING_REVIEW",
+    "AGGREGATING",
+    "READY",
+    "RUNNING",
+    "ARCHIVING",
+)
 _RELEASE_DIGEST_FIELDS = ("candidate_digest", "manifest_digest")
 _MIGRATION_FILE = re.compile(r"^([0-9]{3})_[A-Za-z0-9_]+\.sql$")
 
@@ -2596,6 +2844,39 @@ def _validate_evidence_path_syntax(evidence_path: Any) -> None:
         )
 
 
+_ACTIVE_SLOT_SQL = (
+    "SELECT COUNT(*) AS active FROM jobs "
+    "WHERE state = ANY(%s) "
+    "OR (job_contract_version = 2 AND ("
+    "state IN ('QUEUED', 'PREPARING', 'AWAITING_REVIEW', "
+    "'READY', 'RUNNING', 'ARCHIVING') "
+    "OR (state = 'BLOCKED' AND workflow_synced = false) "
+    "OR (state = 'AGGREGATING' AND ("
+    "job_kind IS DISTINCT FROM 'family' "
+    "OR NOT EXISTS (SELECT 1 FROM jobs child "
+    "WHERE child.parent_job_id = jobs.job_id "
+    "AND child.job_contract_version = 2 "
+    "AND (child.state IN ('QUEUED', 'PREPARING', 'AWAITING_REVIEW', "
+    "'AGGREGATING', 'READY', 'RUNNING', 'ARCHIVING') "
+    "OR (child.state = 'BLOCKED'"
+    " AND child.workflow_synced = false)))))))"
+)
+
+
+def _active_slot_count(connection) -> int:
+    """Count rollback drain units on one connection.
+
+    Shared by ``ReleaseStore.active_slots()`` and ``switch()`` so the two
+    gates cannot drift. ``switch`` must call this instead of
+    ``active_slots()``: the latter opens/uses its own connection scope and
+    would re-enter the promotion transaction's advisory lock.
+    """
+    row = connection.execute(
+        _ACTIVE_SLOT_SQL, (list(RELEASE_ACTIVE_STATES),)
+    ).fetchone()
+    return int(row["active"])
+
+
 class ReleaseStore:
     """PostgreSQL-backed promotion state and append-only audit.
 
@@ -2705,28 +2986,8 @@ class ReleaseStore:
                 self._tx_local.switches = None
 
     def active_slots(self) -> int:
-        # v1 counts its three in-flight states. v2 adds the six child states
-        # plus an unsynced BLOCKED child. AGGREGATING is special: a family
-        # that already owns child rows is represented by those rows (counting
-        # the aggregate as well would double its drain units), while a
-        # childless AGGREGATING family is a residual in its own right. One
-        # OR'd predicate over one row also keeps a v2 job that matches the v1
-        # list from counting twice.
         with self._connection() as connection:
-            row = connection.execute(
-                "SELECT COUNT(*) AS active FROM jobs "
-                "WHERE state = ANY(%s) "
-                "OR (job_contract_version = 2 AND ("
-                "state IN ('QUEUED', 'PREPARING', 'AWAITING_REVIEW', "
-                "'READY', 'RUNNING', 'ARCHIVING') "
-                "OR (state = 'BLOCKED' AND workflow_synced = false) "
-                "OR (state = 'AGGREGATING' AND ("
-                "job_kind IS DISTINCT FROM 'family' "
-                "OR NOT EXISTS (SELECT 1 FROM jobs child "
-                "WHERE child.parent_job_id = jobs.job_id)))))",
-                (list(RELEASE_ACTIVE_STATES),),
-            ).fetchone()
-        return int(row["active"])
+            return _active_slot_count(connection)
 
     def active_release(self) -> dict[str, Any] | None:
         with self._connection() as connection:
@@ -2889,16 +3150,16 @@ class ReleaseStore:
         if action not in ("promote", "rollback"):
             raise ReleaseStateError(f"unknown release action: {action}")
         with self._connection() as connection:
-            if action == "promote":
-                active_row = connection.execute(
-                    "SELECT COUNT(*) AS active FROM jobs WHERE state = ANY(%s)",
-                    (list(RELEASE_ACTIVE_STATES),),
-                ).fetchone()
-                if int(active_row["active"]) != 0:
-                    raise ReleaseStateError(
-                        "promotion blocked: execution slots not drained "
-                        f"(active_slots={int(active_row['active'])})"
-                    )
+            # Promote and rollback share the same in-transaction drain gate.
+            # The switch runs inside the promotion transaction, so checking on
+            # this connection (not via active_slots()) keeps the advisory lock
+            # single-entry and the check atomic with the release_state write.
+            active = _active_slot_count(connection)
+            if active != 0:
+                raise ReleaseStateError(
+                    f"{action} blocked: execution slots not drained "
+                    f"(active_slots={active})"
+                )
             connection.execute(
                 "INSERT INTO release_state "
                 "(environment, image_id, config, migration_version, evidence_root) "

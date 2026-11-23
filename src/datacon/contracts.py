@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import uuid
 from collections.abc import Mapping
 from typing import Any
 
@@ -304,12 +305,12 @@ def _validate_request(request: Any) -> dict[str, Any]:
             optional={"limits"},
         )
     else:
-        # A v2 request is an explicit opt-in: the exploration block is part of
-        # the v2 shape (its mode defaults to fixed when omitted).
+        # A v2 request is an explicit opt-in. ``exploration`` is optional: an
+        # omitted block is the fixed mode, which produces no fuzz rounds.
         _object(
             request,
-            required={"schema_version", "cve_id", "target", "exploration"},
-            optional={"limits"},
+            required={"schema_version", "cve_id", "target"},
+            optional={"limits", "exploration"},
         )
 
     cve_id = _text(request["cve_id"], label="cve_id")
@@ -341,7 +342,7 @@ def _validate_request(request: Any) -> dict[str, Any]:
     }
     if version == SCHEMA_VERSION_V2:
         normalized["exploration"] = _exploration(
-            request["exploration"], limits
+            request.get("exploration", {}), limits
         )
     return normalized
 
@@ -733,10 +734,19 @@ def _plan_v2_extras(plan: Mapping[str, Any]) -> dict[str, Any]:
     round_no = plan["round_no"]
     if round_no is not None and (type(round_no) is not int or round_no < 1):
         raise ValueError("round_no must be null or a positive integer")
+    family_id = _text(plan["family_id"], label="family_id")
+    parent_job_id = _text(plan["parent_job_id"], label="parent_job_id")
+    for label, value in (("family_id", family_id), ("parent_job_id", parent_job_id)):
+        try:
+            uuid.UUID(value)
+        except (TypeError, ValueError) as error:
+            raise ValueError(f"{label} must be a UUID") from error
+    if family_id != parent_job_id:
+        raise ValueError("family_id must equal parent_job_id")
     return {
         "schema_version": schema_version,
-        "family_id": _text(plan["family_id"], label="family_id"),
-        "parent_job_id": _text(plan["parent_job_id"], label="parent_job_id"),
+        "family_id": family_id,
+        "parent_job_id": parent_job_id,
         "round_no": round_no,
         "parent_approval_digest": _optional_digest(
             plan["parent_approval_digest"], label="parent_approval_digest"
@@ -755,6 +765,51 @@ def _plan_v2_extras(plan: Mapping[str, Any]) -> dict[str, Any]:
             label="build_provenance_rules_version",
         ),
     }
+
+
+def _validate_plan_v2_cross_fields(
+    extras: Mapping[str, Any], inputs: dict[str, Any] | None
+) -> None:
+    """Enforce the Plan v2 identity/round/build cross-field invariants.
+
+    The eleven v2 fields are individually optional-shaped (``null`` is a
+    meaningful value), so the contract is only complete once the combinations
+    are checked: a campaign has no replay inputs or build, a first plan has no
+    parent approval, and a reused build always carries its ExperimentSpec.
+    """
+    round_no = extras["round_no"]
+    parent_approval_digest = extras["parent_approval_digest"]
+    build_ref = extras["build_ref"]
+    experiment_digest = extras["experiment_digest"]
+
+    if round_no is None:
+        if inputs is not None:
+            raise ValueError("campaign plans must have inputs=null")
+        if build_ref is not None:
+            raise ValueError("campaign plans must have build_ref=null")
+        if experiment_digest is not None:
+            raise ValueError("campaign plans must have experiment_digest=null")
+        if parent_approval_digest is not None:
+            raise ValueError(
+                "campaign plans must have parent_approval_digest=null"
+            )
+    else:
+        if inputs is None:
+            raise ValueError("round plans require inputs")
+        if round_no == 1:
+            if parent_approval_digest is not None:
+                raise ValueError(
+                    "the first round plan must have parent_approval_digest=null"
+                )
+            if build_ref is not None:
+                raise ValueError("the first round plan must have build_ref=null")
+        elif parent_approval_digest is None:
+            raise ValueError("rounds after the first require parent_approval_digest")
+
+    if build_ref is None and experiment_digest is not None:
+        raise ValueError("experiment_digest requires build_ref")
+    if build_ref is not None and experiment_digest is None:
+        raise ValueError("build_ref requires experiment_digest")
 
 
 def _normalize_plan(plan: Mapping[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -799,6 +854,8 @@ def _normalize_plan(plan: Mapping[str, Any]) -> tuple[dict[str, Any], dict[str, 
             "candidate": _digest(inputs["candidate"], label="inputs.candidate"),
             "normal": _digest(inputs["normal"], label="inputs.normal"),
         }
+    if extras is not None:
+        _validate_plan_v2_cross_fields(extras, normalized_inputs)
 
     signature = _object(
         plan["asan_signature"],

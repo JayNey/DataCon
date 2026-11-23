@@ -99,6 +99,11 @@ ROLLBACK_COMPATIBLE_MIGRATIONS: Mapping[str, str] = MappingProxyType(
         "010_v2_identity_review.sql": (
             "sha256:7f91a291653e409e77a318ea01d8755e2f1ee59ba97e4bde9a002feeca1d9deb"
         ),
+        # 011 adds a parent-identity trigger only; a v1 image that predates the
+        # v2 child writers is unaffected by it.
+        "011_v2_identity_parent_guard.sql": (
+            "sha256:5dae830915de5ffe2f9fa0db822393c104e3926db91028b729856531755ae30c"
+        ),
     }
 )
 _CVE_ID = re.compile(r"CVE-[0-9]{4}-[0-9]{4,}")

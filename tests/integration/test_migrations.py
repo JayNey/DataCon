@@ -387,3 +387,130 @@ def test_family_completed_satisfies_archived_evidence_check(
     )
     with pytest.raises(evidence.BundleError, match="bundle_kind"):
         evidence.verify_bundle(manifest_dir)
+
+
+def test_jobs_parent_job_id_must_be_v2_family(isolated_database):
+    family_id = _insert_family(isolated_database)
+
+    v1_parent = uuid4()
+    _insert_identity_job(
+        isolated_database,
+        v1_parent,
+        job_contract_version=1,
+        job_kind=None,
+        family_id=None,
+        parent_job_id=None,
+        round_no=None,
+    )
+    with pytest.raises(psycopg.errors.CheckViolation, match="jobs_parent"):
+        _insert_identity_job(
+            isolated_database,
+            uuid4(),
+            job_kind="round",
+            family_id=v1_parent,
+            parent_job_id=v1_parent,
+            round_no=1,
+        )
+
+    campaign_id = uuid4()
+    _insert_identity_job(
+        isolated_database,
+        campaign_id,
+        job_kind="campaign",
+        family_id=family_id,
+        parent_job_id=family_id,
+        round_no=None,
+    )
+    with pytest.raises(psycopg.errors.CheckViolation, match="jobs_parent"):
+        _insert_identity_job(
+            isolated_database,
+            uuid4(),
+            job_kind="round",
+            family_id=campaign_id,
+            parent_job_id=campaign_id,
+            round_no=1,
+        )
+
+    round_one = uuid4()
+    _insert_identity_job(
+        isolated_database,
+        round_one,
+        job_kind="round",
+        family_id=family_id,
+        parent_job_id=family_id,
+        round_no=1,
+    )
+    with pytest.raises(psycopg.errors.CheckViolation, match="jobs_parent"):
+        _insert_identity_job(
+            isolated_database,
+            uuid4(),
+            job_kind="round",
+            family_id=round_one,
+            parent_job_id=round_one,
+            round_no=2,
+        )
+
+    accepted = uuid4()
+    _insert_identity_job(
+        isolated_database,
+        accepted,
+        job_kind="round",
+        family_id=family_id,
+        parent_job_id=family_id,
+        round_no=2,
+    )
+    assert isolated_database.connection.execute(
+        "SELECT parent_job_id FROM jobs WHERE job_id = %s", (accepted,)
+    ).fetchone()[0] == family_id
+
+
+def test_jobs_parent_guard_rejects_update_to_non_family(isolated_database):
+    family_id = _insert_family(isolated_database)
+    campaign_id = uuid4()
+    _insert_identity_job(
+        isolated_database,
+        campaign_id,
+        job_kind="campaign",
+        family_id=family_id,
+        parent_job_id=family_id,
+        round_no=None,
+    )
+    round_id = uuid4()
+    _insert_identity_job(
+        isolated_database,
+        round_id,
+        job_kind="round",
+        family_id=family_id,
+        parent_job_id=family_id,
+        round_no=1,
+    )
+
+    with pytest.raises(psycopg.errors.CheckViolation, match="jobs_parent"):
+        isolated_database.connection.execute(
+            "UPDATE jobs SET parent_job_id = %s, family_id = %s "
+            "WHERE job_id = %s",
+            (campaign_id, campaign_id, round_id),
+        )
+
+
+def test_jobs_family_campaign_key_rejects_second_campaign(isolated_database):
+    family_id = _insert_family(isolated_database)
+    _insert_identity_job(
+        isolated_database,
+        uuid4(),
+        job_kind="campaign",
+        family_id=family_id,
+        parent_job_id=family_id,
+        round_no=None,
+    )
+    with pytest.raises(
+        psycopg.errors.UniqueViolation, match="jobs_family_campaign_key"
+    ):
+        _insert_identity_job(
+            isolated_database,
+            uuid4(),
+            job_kind="campaign",
+            family_id=family_id,
+            parent_job_id=family_id,
+            round_no=None,
+        )

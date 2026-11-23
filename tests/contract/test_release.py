@@ -140,7 +140,10 @@ def test_release_candidate_manifest_rejects_unknown_missing_and_bad_digests():
     manifest = _sample_rc_manifest()
     assert manifest["schema_version"] == 1
     assert manifest["contract_version"] == 1
-    assert manifest["migration_version"] == "010_v2_identity_review.sql"
+    latest_migration = sorted(
+        (REPO_ROOT / "migrations").glob("*.sql")
+    )[-1].name
+    assert manifest["migration_version"] == latest_migration
     assert len(manifest["migrations"]) >= 8
     release.validate_release_candidate_manifest(manifest)
 

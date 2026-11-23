@@ -55,6 +55,7 @@ def _insert_child(
     family_id,
     *,
     state_name,
+    job_kind="round",
     round_no=1,
     workflow_synced=True,
     generation=1,
@@ -73,7 +74,7 @@ def _insert_child(
         "job_contract_version, family_id, job_kind, parent_job_id, round_no, "
         "workflow_synced, generation, lease_owner, lease_expires_at, verdict, "
         "reason_code, evidence_status, evidence_path, evidence_digest) "
-        "VALUES (%s, %s, %s, 'execute', %s, 2, %s, 'round', %s, %s, %s, %s, "
+        "VALUES (%s, %s, %s, 'execute', %s, 2, %s, %s, %s, %s, %s, %s, "
         "%s, %s, %s, %s, %s, %s, %s)",
         (
             job_id,
@@ -81,6 +82,7 @@ def _insert_child(
             state_name,
             submitted_at or _now(),
             family_id,
+            job_kind,
             family_id,
             round_no,
             workflow_synced,
@@ -111,12 +113,27 @@ def _assert_drain_gate_blocks(database):
 
 def test_v1_worker_cannot_claim_v2_non_terminal_job(isolated_database):
     family_id = _insert_family(isolated_database)
+    child_id = _insert_child(
+        isolated_database,
+        family_id,
+        state_name="QUEUED",
+        job_kind="campaign",
+        round_no=None,
+    )
     try:
         _assert_drain_gate_blocks(isolated_database)
         assert (
             state.ReleaseStore(isolated_database.dsn).active_slots() == 1
         ), "v1 worker claimed a v2 non-terminal job"
+        assert state.claim_next(isolated_database.dsn, "v1-worker") is None, (
+            "v1 worker claimed a v2 job"
+        )
+        claimed = state.claim_next(
+            isolated_database.dsn, "v2-worker", job_contract_version=2
+        )
+        assert claimed is not None and claimed["job_id"] == child_id
     finally:
+        _delete_job(isolated_database, child_id)
         _delete_job(isolated_database, family_id)
 
 
@@ -205,6 +222,15 @@ def test_v1_worker_cannot_claim_v2_unsynced_blocked(isolated_database):
             "UPDATE jobs SET workflow_synced = true WHERE job_id = %s",
             (child_id,),
         )
+        # The synced BLOCKED child is terminal, but the family is still an
+        # AGGREGATING residual (D38/B-4). Complete the family to prove the
+        # synced child itself is not a drain unit.
+        isolated_database.connection.execute(
+            "UPDATE jobs SET state = 'COMPLETED', evidence_status = 'archived', "
+            "evidence_path = '/tmp/family.json', evidence_digest = %s "
+            "WHERE job_id = %s",
+            (DIGEST, family_id),
+        )
         assert store_handle.active_slots() == 0, (
             "a synced BLOCKED v2 job was treated as a rollback residual"
         )
@@ -219,6 +245,8 @@ def test_finish_execution_accepts_completed_terminal(isolated_database, tmp_path
         isolated_database,
         family_id,
         state_name="RUNNING",
+        job_kind="campaign",
+        round_no=None,
         generation=3,
         lease_owner="worker-p1",
         lease_expires_at=_now() + timedelta(minutes=10),
@@ -315,3 +343,148 @@ def test_rolled_back_v1_reads_only_v1_era_evidence(isolated_database, tmp_path):
     assert Path(found["path"]).resolve() == v1_bundle.resolve(), (
         "v1 control plane read v2 evidence"
     )
+
+
+def test_finish_execution_rejects_invalid_completed_combinations(
+    isolated_database, tmp_path
+):
+    family_id = _insert_family(isolated_database)
+    path = str(tmp_path / "campaign.json")
+
+    def finish(job_id, **overrides):
+        kwargs = {
+            "generation": 3,
+            "state": "COMPLETED",
+            "reason_code": None,
+            "verdict": None,
+            "verdict_reason": None,
+            "evidence_status": "archived",
+            "evidence_path": path,
+            "evidence_digest": DIGEST,
+        }
+        kwargs.update(overrides)
+        return state.finish_execution(isolated_database.dsn, job_id, **kwargs)
+
+    def running_child(**kwargs):
+        return _insert_child(
+            isolated_database,
+            family_id,
+            state_name="RUNNING",
+            generation=3,
+            lease_owner="worker-p1",
+            lease_expires_at=_now() + timedelta(minutes=10),
+            **kwargs,
+        )
+
+    round_id = running_child(job_kind="round", round_no=2)
+    with pytest.raises(state.StateError):
+        finish(round_id)
+
+    campaign_id = running_child(job_kind="campaign", round_no=None)
+    with pytest.raises(state.StateError):
+        finish(campaign_id, verdict="REPRODUCED")
+    with pytest.raises(state.StateError):
+        finish(campaign_id, evidence_status=None)
+    with pytest.raises(state.StateError):
+        finish(campaign_id, reason_code="REVIEW_REJECTED")
+
+    v1_id = uuid4()
+    isolated_database.connection.execute(
+        "INSERT INTO jobs (job_id, request, state, stage, submitted_at, "
+        "generation, lease_owner, lease_expires_at) "
+        "VALUES (%s, %s, 'RUNNING', 'execute', clock_timestamp(), 3, "
+        "'worker-p1', %s)",
+        (v1_id, Jsonb({"schema_version": 1}), _now() + timedelta(minutes=10)),
+    )
+    with pytest.raises(state.StateError):
+        finish(v1_id)
+
+    family_running = _insert_family(isolated_database, state_name="RUNNING")
+    isolated_database.connection.execute(
+        "UPDATE jobs SET generation = 3, lease_owner = 'worker-p1', "
+        "lease_expires_at = %s WHERE job_id = %s",
+        (_now() + timedelta(minutes=10), family_running),
+    )
+    with pytest.raises(state.StateError):
+        finish(family_running)
+
+    for job_id in (round_id, campaign_id, v1_id):
+        row = isolated_database.connection.execute(
+            "SELECT state, verdict, evidence_status FROM jobs WHERE job_id = %s",
+            (job_id,),
+        ).fetchone()
+        assert row[0] == "RUNNING", "a rejected COMPLETED write changed the row"
+        assert row[1] is None
+        assert row[2] is None
+
+
+def test_active_slots_counts_aggregating_family_only_after_children_terminal(
+    isolated_database,
+):
+    store_handle = state.ReleaseStore(isolated_database.dsn)
+
+    empty_family = _insert_family(isolated_database)
+    try:
+        assert store_handle.active_slots() == 1, (
+            "a childless AGGREGATING family is a residual"
+        )
+    finally:
+        _delete_job(isolated_database, empty_family)
+
+    family_id = _insert_family(isolated_database)
+    ready_child = _insert_child(isolated_database, family_id, state_name="READY")
+    try:
+        assert store_handle.active_slots() == 1, (
+            "an AGGREGATING family with a non-terminal child must not double count"
+        )
+    finally:
+        _delete_job(isolated_database, ready_child)
+
+    completed_child = _insert_child(
+        isolated_database,
+        family_id,
+        state_name="COMPLETED",
+        evidence_status="archived",
+        evidence_path="/tmp/campaign.json",
+        evidence_digest=DIGEST,
+    )
+    try:
+        assert store_handle.active_slots() == 1, (
+            "an AGGREGATING family with only terminal children is a residual"
+        )
+        with pytest.raises(release.ReleaseGateError, match="not drained"):
+            release._require_drained(store_handle, action="rollback")
+    finally:
+        _delete_job(isolated_database, completed_child)
+        _delete_job(isolated_database, family_id)
+
+
+def test_switch_drains_v2_residuals_for_promote_and_rollback(
+    isolated_database, tmp_path
+):
+    store_handle = state.ReleaseStore(isolated_database.dsn)
+    kwargs = {
+        "image_id": DIGEST,
+        "config": {"contract_version": 1},
+        "migration_version": LATEST_MIGRATION,
+        "evidence_root": str(tmp_path),
+        "candidate_digest": OTHER_DIGEST,
+    }
+
+    family_id = _insert_family(isolated_database)
+    try:
+        for action in ("promote", "rollback"):
+            with pytest.raises(state.ReleaseStateError, match="not drained"):
+                store_handle.switch(action=action, **kwargs)
+        child_id = _insert_child(isolated_database, family_id, state_name="READY")
+        try:
+            for action in ("promote", "rollback"):
+                with pytest.raises(state.ReleaseStateError, match="not drained"):
+                    store_handle.switch(action=action, **kwargs)
+        finally:
+            _delete_job(isolated_database, child_id)
+    finally:
+        _delete_job(isolated_database, family_id)
+
+    for action in ("promote", "rollback"):
+        store_handle.switch(action=action, **kwargs)
