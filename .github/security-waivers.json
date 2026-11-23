@@ -859,5 +859,26 @@
     "impact": "CVE-2026-124709 is a memory leak in openssl's QUIC stream handling. The legacy provider is loaded only when a caller explicitly requests it through an openssl configuration, which nothing in this repository does, and the image never speaks QUIC. No Debian 13 package carries a fix yet (3.5.7-1~deb13u3 installed, newest trixie/main 3.5.9-1~deb13u1 still affected). This waiver is removed once Debian publishes a fixed openssl, and the base digest is refreshed at that point.",
     "owner": "platform-security",
     "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-107494",
+    "scope": "package:libssl3t64",
+    "impact": "CVE-2026-107494 is a QUIC denial of service: the QUIC stack queues a RETIRE_CONNECTION_ID frame for every retransmitted NEW_CONNECTION_ID frame without an upper bound, so a remote malicious QUIC peer can exhaust memory. In this image the only consumer of libssl3t64 is Python's TLS client stack for outbound HTTPS; neither the control plane nor the worker terminates or opens QUIC connections, so the trigger path is unreachable here. Debian 13 has no fixed package yet: the pinned base digest ships 3.5.7-1~deb13u3 and Trivy reports no fixed version for trixie. This waiver is removed once Debian publishes a fixed openssl, and the base digest is refreshed at that point.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-107494",
+    "scope": "package:openssl",
+    "impact": "CVE-2026-107494 is a QUIC denial of service triggered by unbounded RETIRE_CONNECTION_ID frame queueing on retransmitted NEW_CONNECTION_ID frames. The openssl CLI is installed by the base image but nothing in this repository invokes it, and the image never speaks QUIC, so the CLI cannot be driven into the vulnerable code path. Debian 13 has no fixed package yet (3.5.7-1~deb13u3 installed; Trivy reports no fixed version for trixie). This waiver is removed once Debian publishes a fixed openssl, and the base digest is refreshed at that point.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
+  },
+  {
+    "id": "CVE-2026-107494",
+    "scope": "package:openssl-provider-legacy",
+    "impact": "CVE-2026-107494 is a QUIC denial of service triggered by unbounded RETIRE_CONNECTION_ID frame queueing on retransmitted NEW_CONNECTION_ID frames. The legacy provider is loaded only when a caller explicitly requests it through an openssl configuration, which nothing in this repository does, and the image never speaks QUIC. Debian 13 has no fixed package yet (3.5.7-1~deb13u3 installed; Trivy reports no fixed version for trixie). This waiver is removed once Debian publishes a fixed openssl, and the base digest is refreshed at that point.",
+    "owner": "platform-security",
+    "expires_at": "2027-02-15"
   }
 ]
