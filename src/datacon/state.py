@@ -17,6 +17,7 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
 from datacon import cases as case_registry
+from datacon import contracts
 from datacon import jsonutil
 
 REVIEW_WINDOW_HOURS = 24
@@ -96,7 +97,7 @@ def _locked_job(
     job = connection.execute(
         "SELECT state, generation, lease_owner, lease_expires_at, "
         "prepare_deadline_at, state_version, job_contract_version, "
-        "job_kind, round_no, family_id "
+        "job_kind, round_no, family_id, request "
         "FROM jobs WHERE job_id = %s FOR UPDATE",
         (job_id,),
     ).fetchone()
@@ -381,15 +382,45 @@ def freeze_plan(
             if existing["plan_digest"] != plan_digest:
                 raise PlanConflict("a different plan is already frozen")
             return True
-        first_v2_plan = (
-            job["job_contract_version"] == 2
-            and job.get("job_kind") in ("campaign", "round")
-            and (
+        first_v2_plan = False
+        if job["job_contract_version"] == 2:
+            # A v2 plan carries its own identity. The database CHECK proves the
+            # job row, but it cannot prove that the plan body the worker hands
+            # us names the same family/round. Recompute the digest from the
+            # complete Plan v2 body so a caller cannot freeze an arbitrary
+            # document under a trusted digest string.
+            if job.get("job_kind") not in ("campaign", "round"):
+                raise StateError(
+                    "only a v2 campaign or round child may freeze a plan"
+                )
+            if not isinstance(plan, Mapping):
+                raise StateError("plan must be a JSON object")
+            if plan.get("schema_version") != 2:
+                raise StateError(
+                    "a v2 job requires a plan with schema_version=2"
+                )
+            family_id_text = str(job.get("family_id"))
+            if (
+                plan.get("family_id") != family_id_text
+                or plan.get("parent_job_id") != family_id_text
+            ):
+                raise StateError(
+                    "plan family_id/parent_job_id do not match the job family"
+                )
+            if plan.get("round_no") != job.get("round_no"):
+                raise StateError(
+                    "plan round_no does not match the job round_no"
+                )
+            try:
+                computed_plan_digest = contracts.plan_digest(plan)
+            except (TypeError, ValueError) as error:
+                raise StateError(f"plan is invalid: {error}") from error
+            if computed_plan_digest != plan_digest:
+                raise StateError("plan_digest does not match the plan body")
+            first_v2_plan = (
                 job.get("job_kind") == "campaign"
                 or job.get("round_no") == 1
             )
-            and plan.get("schema_version") == 2
-        )
         normalized_envelope: dict[str, Any] | None = None
         if first_v2_plan:
             if envelope is None:
@@ -406,6 +437,15 @@ def freeze_plan(
                 raise StateError(
                     "envelope body does not match the plan envelope_digest"
                 )
+            # The first envelope is an approval boundary just like a
+            # propose-envelope body: it may tighten, never widen, the request
+            # and the registered case ceilings. Without these two checks a
+            # worker could freeze the first plan with an envelope the operator
+            # never authorized.
+            _assert_envelope_not_expanded(normalized_envelope, job["request"])
+            _assert_envelope_within_case_registry(
+                normalized_envelope, job["request"]
+            )
         elif envelope is not None:
             raise StateError("only the first plan may freeze an envelope")
         if job["state"] not in ("PREPARING", "AWAITING_REVIEW"):
@@ -1052,6 +1092,22 @@ def complete_family(
             raise StateError("family is already COMPLETED with different evidence")
         if job["state"] != "AGGREGATING":
             raise StateError(f"cannot complete a family while it is {job['state']}")
+        # The family aggregate is only complete when every child reached a
+        # terminal state. BLOCKED is terminal (a rejected/failed round still
+        # belongs to the aggregate); AWAITING_REVIEW, READY, RUNNING and the
+        # rest are not. The family row lock is already held, so a child cannot
+        # move between this check and the COMPLETED write without first taking
+        # the family lock through the normal review/worker paths.
+        non_terminal = connection.execute(
+            "SELECT 1 FROM jobs "
+            "WHERE parent_job_id = %s "
+            "AND state NOT IN ('COMPLETED', 'REPRODUCED', 'NOT_REPRODUCED', "
+            "'INCONCLUSIVE', 'BLOCKED', 'FAILED') "
+            "LIMIT 1",
+            (family_id,),
+        ).fetchone()
+        if non_terminal is not None:
+            raise StateError("family has non-terminal children")
         updated = connection.execute(
             "UPDATE jobs SET state = 'COMPLETED', stage = 'done', "
             "evidence_status = 'archived', evidence_path = %s, "
@@ -1723,16 +1779,12 @@ def _record_family_review(
 
     The caller already holds the family row lock. A first-round review also
     locks the first child (family -> child); a re-approval only touches the
-    family. Envelope identity is resolved from the first plan on the first
-    round and must be explicit afterwards; a decision never falls back to the
-    already-approved envelope.
+    family. The plan digest is validated first, then an already-decided
+    envelope is classified before the family state is consulted: a retry after
+    a first-round reject/expiry must still answer ``idempotent``/``expired``
+    even though the family is already ``BLOCKED``. Only a still-``pending``
+    envelope requires the family to be ``AGGREGATING``.
     """
-    if job["state"] != "AGGREGATING":
-        return ReviewOutcome(
-            "invalid_state",
-            state=job["state"],
-            message=f"family is {job['state']}, not AGGREGATING",
-        )
     first_round = connection.execute(
         "SELECT NOT EXISTS (SELECT 1 FROM reviews WHERE job_id = %s) "
         "AND NOT EXISTS (SELECT 1 FROM family_approvals WHERE family_id = %s) "
@@ -1798,17 +1850,30 @@ def _record_family_review(
         )
     plan_envelope = (plan["plan"] or {}).get("envelope_digest")
     if envelope_digest is None:
-        if not first_round:
-            return ReviewOutcome(
-                "envelope_mismatch",
-                state=job["state"],
-                message="re-approval requires an explicit envelope digest",
-            )
         if not isinstance(plan_envelope, str) or not plan_envelope:
             return ReviewOutcome(
                 "envelope_mismatch",
                 state=job["state"],
                 message="the first plan has no envelope digest",
+            )
+        # Omitting --envelope-digest is always a first-plan decision. A
+        # changed-envelope re-approval must name its pending digest: if the
+        # family currently has a different pending envelope, the omission is a
+        # mismatch rather than a silent fallback to the already-approved body.
+        pending_envelope = connection.execute(
+            "SELECT envelope_digest FROM family_envelopes "
+            "WHERE family_id = %s AND status = 'pending'",
+            (job_id,),
+        ).fetchone()
+        if (
+            pending_envelope is not None
+            and pending_envelope["envelope_digest"] != plan_envelope
+        ):
+            return ReviewOutcome(
+                "envelope_mismatch",
+                state=job["state"],
+                message="a changed pending envelope requires an explicit "
+                "envelope digest",
             )
         resolved_envelope = plan_envelope
     else:
@@ -1864,6 +1929,15 @@ def _record_family_review(
             "envelope_mismatch",
             state=job["state"],
             message="envelope digest is not the current pending envelope",
+        )
+    # §9.1 step 3 concludes with the state gate: only a still-pending envelope
+    # is a new decision. Already-decided envelopes were answered above even
+    # when the family is already BLOCKED or COMPLETED.
+    if job["state"] != "AGGREGATING":
+        return ReviewOutcome(
+            "invalid_state",
+            state=job["state"],
+            message=f"family is {job['state']}, not AGGREGATING",
         )
     decision_at = connection.execute(
         "SELECT clock_timestamp() AS db_now"
@@ -2392,9 +2466,18 @@ def expire_review(dsn: str, job_id: UUID, generation: int) -> bool:
             # Family first. The identity read above is lock-free because
             # parent_job_id is immutable for the lifetime of the row.
             family = connection.execute(
-                "SELECT state, generation FROM jobs WHERE job_id = %s FOR UPDATE",
+                "SELECT state, generation, evidence_status FROM jobs "
+                "WHERE job_id = %s FOR UPDATE",
                 (family_id,),
             ).fetchone()
+            if family is not None and (
+                family["state"] != "AGGREGATING"
+                or family["evidence_status"] == "archived"
+            ):
+                # The family already converged (COMPLETED/BLOCKED) or owns an
+                # archived pointer. Expiring a stale child row must never
+                # resurrect the aggregate or overwrite its evidence pointer.
+                return False
         job = connection.execute(
             "SELECT state, generation, review_deadline_at, lease_owner, "
             "lease_expires_at, job_contract_version, job_kind, family_id, "
@@ -2420,15 +2503,18 @@ def expire_review(dsn: str, job_id: UUID, generation: int) -> bool:
         if not _review_window_closed(job["review_deadline_at"], db_now):
             return False
         expiry_message = "review deadline passed before a decision was recorded"
-        connection.execute(
+        updated_child = connection.execute(
             "UPDATE jobs SET state = 'BLOCKED', stage = 'blocked', "
             "reason_code = 'REVIEW_EXPIRED', last_error = %s, "
             "state_version = state_version + 1, generation = generation + 1, "
             "workflow_synced = false, lease_owner = NULL, "
             "lease_expires_at = NULL, updated_at = clock_timestamp() "
-            "WHERE job_id = %s AND generation = %s",
+            "WHERE job_id = %s AND generation = %s "
+            "AND state = 'AWAITING_REVIEW' RETURNING job_id",
             (expiry_message, job_id, generation),
-        )
+        ).fetchone()
+        if updated_child is None:
+            raise StateError("child state changed while expiring the review")
         _audit(
             connection,
             job_id,
@@ -2440,41 +2526,46 @@ def expire_review(dsn: str, job_id: UUID, generation: int) -> bool:
                 "plan_digest": job["plan_digest"],
             },
         )
-        pending_blocked.append((job_id, "REVIEW_EXPIRED", expiry_message))
         # A v2 child is not the review unit: expire the family that owns it in
         # the same transaction so the aggregate can never stay AGGREGATING
-        # after its pending envelope timed out.
-        if family_id is not None:
-            if family is not None:
-                connection.execute(
-                    "UPDATE jobs SET state = 'BLOCKED', stage = 'blocked', "
-                    "reason_code = 'REVIEW_EXPIRED', last_error = %s, "
-                    "state_version = state_version + 1, "
-                    "generation = generation + 1, workflow_synced = false, "
-                    "lease_owner = NULL, lease_expires_at = NULL, "
-                    "updated_at = clock_timestamp() WHERE job_id = %s",
-                    (expiry_message, family_id),
-                )
-                connection.execute(
-                    "UPDATE family_envelopes SET status = 'expired' "
-                    "WHERE family_id = %s AND status = 'pending'",
-                    (family_id,),
-                )
-                _audit(
-                    connection,
-                    family_id,
-                    "review_expired",
-                    stage="blocked",
-                    reason_code="REVIEW_EXPIRED",
-                    detail={
-                        "generation": family["generation"],
-                        "child_job_id": str(job_id),
-                        "plan_digest": job["plan_digest"],
-                    },
-                )
-                pending_blocked.append(
-                    (family_id, "REVIEW_EXPIRED", expiry_message)
-                )
+        # after its pending envelope timed out. The conditional family UPDATE
+        # is the last line of defense against a concurrent COMPLETED write:
+        # without it a timed-out child could demote a finished family.
+        if family_id is not None and family is not None:
+            updated_family = connection.execute(
+                "UPDATE jobs SET state = 'BLOCKED', stage = 'blocked', "
+                "reason_code = 'REVIEW_EXPIRED', last_error = %s, "
+                "state_version = state_version + 1, "
+                "generation = generation + 1, workflow_synced = false, "
+                "lease_owner = NULL, lease_expires_at = NULL, "
+                "updated_at = clock_timestamp() "
+                "WHERE job_id = %s AND state = 'AGGREGATING' "
+                "RETURNING job_id",
+                (expiry_message, family_id),
+            ).fetchone()
+            if updated_family is None:
+                raise StateError("family state changed while expiring the review")
+            connection.execute(
+                "UPDATE family_envelopes SET status = 'expired' "
+                "WHERE family_id = %s AND status = 'pending'",
+                (family_id,),
+            )
+            _audit(
+                connection,
+                family_id,
+                "review_expired",
+                stage="blocked",
+                reason_code="REVIEW_EXPIRED",
+                detail={
+                    "generation": family["generation"],
+                    "child_job_id": str(job_id),
+                    "plan_digest": job["plan_digest"],
+                },
+            )
+            pending_blocked.append(
+                (family_id, "REVIEW_EXPIRED", expiry_message)
+            )
+        pending_blocked.append((job_id, "REVIEW_EXPIRED", expiry_message))
         return True
 
 

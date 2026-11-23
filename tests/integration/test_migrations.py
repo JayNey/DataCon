@@ -514,3 +514,54 @@ def test_jobs_family_campaign_key_rejects_second_campaign(isolated_database):
             parent_job_id=family_id,
             round_no=None,
         )
+
+
+# --- 012: demoting a family parent with live children ----------------------
+
+
+def test_family_parent_cannot_be_demoted_with_live_child(isolated_database):
+    family_id = _insert_family(isolated_database)
+    child_id = uuid4()
+    _insert_identity_job(
+        isolated_database,
+        child_id,
+        job_kind="round",
+        family_id=family_id,
+        parent_job_id=family_id,
+        round_no=1,
+    )
+
+    with pytest.raises(psycopg.errors.CheckViolation, match="parent_demot"):
+        isolated_database.connection.execute(
+            "UPDATE jobs SET job_contract_version = 1, family_id = NULL, "
+            "job_kind = NULL, parent_job_id = NULL, round_no = NULL "
+            "WHERE job_id = %s",
+            (family_id,),
+        )
+
+    assert isolated_database.connection.execute(
+        "SELECT job_contract_version, job_kind, family_id FROM jobs "
+        "WHERE job_id = %s",
+        (family_id,),
+    ).fetchone() == (2, "family", family_id)
+    assert isolated_database.connection.execute(
+        "SELECT parent_job_id FROM jobs WHERE job_id = %s",
+        (child_id,),
+    ).fetchone()[0] == family_id, "the demotion attempt rewrote the child parent"
+
+
+def test_family_parent_can_be_demoted_without_children(isolated_database):
+    family_id = _insert_family(isolated_database)
+
+    isolated_database.connection.execute(
+        "UPDATE jobs SET job_contract_version = 1, family_id = NULL, "
+        "job_kind = NULL, parent_job_id = NULL, round_no = NULL "
+        "WHERE job_id = %s",
+        (family_id,),
+    )
+
+    assert isolated_database.connection.execute(
+        "SELECT job_contract_version, job_kind, family_id, parent_job_id, "
+        "round_no FROM jobs WHERE job_id = %s",
+        (family_id,),
+    ).fetchone() == (1, None, None, None, None)

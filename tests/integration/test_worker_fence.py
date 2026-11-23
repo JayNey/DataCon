@@ -103,6 +103,148 @@ def _delete_job(database, job_id):
     database.connection.execute("DELETE FROM jobs WHERE job_id = %s", (job_id,))
 
 
+TERMINAL_CHILD_STATES = (
+    "COMPLETED",
+    "REPRODUCED",
+    "NOT_REPRODUCED",
+    "INCONCLUSIVE",
+    "BLOCKED",
+    "FAILED",
+)
+
+
+def test_complete_family_rejects_awaiting_review_child(
+    isolated_database, tmp_path
+):
+    family_id = _insert_family(isolated_database)
+    _insert_child(
+        isolated_database,
+        family_id,
+        state_name="AWAITING_REVIEW",
+    )
+    family_path = tmp_path / "family.json"
+    family_path.write_text('{"kind":"family_index","rounds":[]}', encoding="utf-8")
+
+    with pytest.raises(state.StateError, match="non-terminal"):
+        state.complete_family(
+            isolated_database.dsn,
+            family_id,
+            str(family_path),
+            DIGEST,
+        )
+
+    assert isolated_database.connection.execute(
+        "SELECT state, evidence_status, evidence_path, evidence_digest "
+        "FROM jobs WHERE job_id = %s",
+        (family_id,),
+    ).fetchone() == ("AGGREGATING", None, None, None)
+
+
+def test_complete_family_rejects_running_child(isolated_database, tmp_path):
+    family_id = _insert_family(isolated_database)
+    _insert_child(
+        isolated_database,
+        family_id,
+        state_name="RUNNING",
+        lease_owner="worker-p1",
+        lease_expires_at=_now() + timedelta(minutes=10),
+    )
+    family_path = tmp_path / "family.json"
+    family_path.write_text('{"kind":"family_index","rounds":[]}', encoding="utf-8")
+
+    with pytest.raises(state.StateError, match="non-terminal"):
+        state.complete_family(
+            isolated_database.dsn,
+            family_id,
+            str(family_path),
+            DIGEST,
+        )
+    assert isolated_database.connection.execute(
+        "SELECT state, evidence_status, evidence_path, evidence_digest "
+        "FROM jobs WHERE job_id = %s",
+        (family_id,),
+    ).fetchone() == ("AGGREGATING", None, None, None)
+
+
+def test_complete_family_accepts_all_children_terminal(
+    isolated_database, tmp_path
+):
+    family_id = _insert_family(isolated_database)
+    for round_no, state_name in enumerate(TERMINAL_CHILD_STATES, start=1):
+        _insert_child(
+            isolated_database,
+            family_id,
+            state_name=state_name,
+            round_no=round_no,
+            workflow_synced=True,
+        )
+    family_path = tmp_path / "family.json"
+    family_path.write_text('{"kind":"family_index","rounds":[]}', encoding="utf-8")
+
+    assert state.complete_family(
+        isolated_database.dsn,
+        family_id,
+        str(family_path),
+        DIGEST,
+    ) is True
+    assert isolated_database.connection.execute(
+        "SELECT state, verdict, reason_code, evidence_status, evidence_path, "
+        "evidence_digest FROM jobs WHERE job_id = %s",
+        (family_id,),
+    ).fetchone() == (
+        "COMPLETED",
+        None,
+        None,
+        "archived",
+        str(family_path),
+        DIGEST,
+    )
+
+
+def test_complete_family_is_idempotent_for_same_pointer(
+    isolated_database, tmp_path
+):
+    family_id = _insert_family(isolated_database)
+    _insert_child(
+        isolated_database,
+        family_id,
+        state_name="COMPLETED",
+    )
+    family_path = tmp_path / "family.json"
+    family_path.write_text('{"kind":"family_index","rounds":[]}', encoding="utf-8")
+
+    assert state.complete_family(
+        isolated_database.dsn,
+        family_id,
+        str(family_path),
+        DIGEST,
+    ) is True
+    before = isolated_database.connection.execute(
+        "SELECT state, evidence_status, evidence_path, evidence_digest, "
+        "state_version FROM jobs WHERE job_id = %s",
+        (family_id,),
+    ).fetchone()
+    assert state.complete_family(
+        isolated_database.dsn,
+        family_id,
+        str(family_path),
+        DIGEST,
+    ) is True
+    assert isolated_database.connection.execute(
+        "SELECT state, evidence_status, evidence_path, evidence_digest, "
+        "state_version FROM jobs WHERE job_id = %s",
+        (family_id,),
+    ).fetchone() == before, "the idempotent replay rewrote the family row"
+
+    with pytest.raises(state.StateError, match="different evidence"):
+        state.complete_family(
+            isolated_database.dsn,
+            family_id,
+            str(family_path),
+            OTHER_DIGEST,
+        )
+
+
 def _assert_drain_gate_blocks(database):
     store_handle = state.ReleaseStore(database.dsn)
     active_slots = store_handle.active_slots()

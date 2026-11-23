@@ -8,7 +8,9 @@ unimplemented submit/worker family creation path.
 
 from __future__ import annotations
 
+from copy import deepcopy
 from datetime import datetime, timedelta, timezone
+import hashlib
 import threading
 import time
 from uuid import uuid4
@@ -17,7 +19,7 @@ import psycopg
 import pytest
 from psycopg.types.json import Jsonb
 
-from datacon import jsonutil, state
+from datacon import contracts, jsonutil, state
 
 pytestmark = pytest.mark.postgres
 
@@ -987,20 +989,8 @@ def test_first_plan_freeze_inserts_pending_envelope_end_to_end(
     )
     body = dict(GUIDED_ENVELOPE_BODY)
     digest = jsonutil.digest_json(body)
-    plan = {
-        "schema_version": 2,
-        "family_id": str(family_id),
-        "parent_job_id": str(family_id),
-        "round_no": None,
-        "parent_approval_digest": None,
-        "envelope_digest": digest,
-        "build_ref": None,
-        "build_spec": BUILD_SPEC,
-        "compile_flags": ["-g"],
-        "experiment_digest": None,
-        "inputs": None,
-    }
-    plan_digest = "sha256:" + "d" * 64
+    plan = _v2_plan(family_id, round_no=None, envelope_digest=digest)
+    plan_digest = contracts.plan_digest(plan)
 
     with pytest.raises(state.StateError):
         state.propose_envelope(
@@ -1079,8 +1069,10 @@ def test_first_plan_freeze_inserts_pending_envelope_end_to_end(
             isolated_database.dsn,
             child_2,
             generation=1,
-            plan=plan | {"envelope_digest": digest},
-            plan_digest="sha256:" + "e" * 64,
+            plan=_v2_plan(family_2, round_no=None, envelope_digest=digest),
+            plan_digest=contracts.plan_digest(
+                _v2_plan(family_2, round_no=None, envelope_digest=digest)
+            ),
             summary={},
         )
     assert _row(
@@ -1257,3 +1249,721 @@ def test_envelope_reapproval_timeout_leaves_child_ready(
         "SELECT state, evidence_status FROM jobs WHERE job_id = %s",
         (seed["family_id"],),
     ) == ("BLOCKED", "archived")
+
+
+# --- T10 blocker regressions: review retries, expiry, freeze identity -------
+
+
+def test_reject_retry_returns_idempotent(isolated_database, tmp_path, monkeypatch):
+    monkeypatch.setenv("DATACON_EVIDENCE_ROOT", str(tmp_path / "evidence"))
+    seed = _seed_family(isolated_database)
+
+    first = _review(isolated_database, seed, decision="reject")
+    assert first.status == "applied"
+    counts_after_first = (
+        _row(
+            isolated_database,
+            "SELECT count(*) FROM reviews WHERE job_id = %s",
+            (seed["family_id"],),
+        )[0],
+        _row(
+            isolated_database,
+            "SELECT count(*) FROM family_approvals WHERE family_id = %s",
+            (seed["family_id"],),
+        )[0],
+        _row(
+            isolated_database,
+            "SELECT count(*) FROM family_envelopes WHERE family_id = %s",
+            (seed["family_id"],),
+        )[0],
+    )
+
+    retry = _review(isolated_database, seed, decision="reject")
+    assert retry.status == "idempotent", (
+        "a rejected first review must stay idempotent after the family is BLOCKED"
+    )
+    assert retry.review is not None
+    assert retry.review["decision"] == "reject"
+    assert counts_after_first == (1, 0, 1)
+    assert (
+        _row(
+            isolated_database,
+            "SELECT count(*) FROM reviews WHERE job_id = %s",
+            (seed["family_id"],),
+        )[0],
+        _row(
+            isolated_database,
+            "SELECT count(*) FROM family_approvals WHERE family_id = %s",
+            (seed["family_id"],),
+        )[0],
+        _row(
+            isolated_database,
+            "SELECT count(*) FROM family_envelopes WHERE family_id = %s",
+            (seed["family_id"],),
+        )[0],
+    ) == counts_after_first, "the idempotent retry appended a review row"
+    assert _row(
+        isolated_database,
+        "SELECT state, reason_code FROM jobs WHERE job_id = %s",
+        (seed["family_id"],),
+    ) == ("BLOCKED", "REVIEW_REJECTED")
+
+
+def test_expiry_retry_returns_expired(isolated_database, tmp_path, monkeypatch):
+    monkeypatch.setenv("DATACON_EVIDENCE_ROOT", str(tmp_path / "evidence"))
+    seed = _seed_family(
+        isolated_database,
+        review_deadline_at=_now() - timedelta(minutes=1),
+    )
+
+    first = _review(isolated_database, seed, decision="approve")
+    assert first.status == "expired"
+    counts_after_first = (
+        _row(
+            isolated_database,
+            "SELECT count(*) FROM reviews WHERE job_id = %s",
+            (seed["family_id"],),
+        )[0],
+        _row(
+            isolated_database,
+            "SELECT count(*) FROM family_approvals WHERE family_id = %s",
+            (seed["family_id"],),
+        )[0],
+        _row(
+            isolated_database,
+            "SELECT count(*) FROM family_envelopes WHERE family_id = %s",
+            (seed["family_id"],),
+        )[0],
+    )
+
+    retry = _review(isolated_database, seed, decision="approve")
+    assert retry.status == "expired", (
+        "an expired first review must stay expired after the family is BLOCKED"
+    )
+    assert counts_after_first == (0, 0, 1)
+    assert (
+        _row(
+            isolated_database,
+            "SELECT count(*) FROM reviews WHERE job_id = %s",
+            (seed["family_id"],),
+        )[0],
+        _row(
+            isolated_database,
+            "SELECT count(*) FROM family_approvals WHERE family_id = %s",
+            (seed["family_id"],),
+        )[0],
+        _row(
+            isolated_database,
+            "SELECT count(*) FROM family_envelopes WHERE family_id = %s",
+            (seed["family_id"],),
+        )[0],
+    ) == counts_after_first, "the expired retry appended an envelope or review"
+    assert _row(
+        isolated_database,
+        "SELECT status FROM family_envelopes WHERE family_id = %s",
+        (seed["family_id"],),
+    )[0] == "expired"
+
+
+def test_reject_retry_other_reviewer_returns_conflict(
+    isolated_database, tmp_path, monkeypatch
+):
+    monkeypatch.setenv("DATACON_EVIDENCE_ROOT", str(tmp_path / "evidence"))
+    seed = _seed_family(isolated_database)
+
+    first = _review(isolated_database, seed, decision="reject")
+    assert first.status == "applied"
+
+    retry = _review(
+        isolated_database,
+        seed,
+        decision="reject",
+        reviewer_id=REVIEWER_1,
+    )
+    assert retry.status == "conflict", (
+        "a rejected envelope retried by another reviewer must conflict"
+    )
+    assert _row(
+        isolated_database,
+        "SELECT count(*) FROM reviews WHERE job_id = %s",
+        (seed["family_id"],),
+    )[0] == 1
+    assert _row(
+        isolated_database,
+        "SELECT count(*) FROM family_approvals WHERE family_id = %s",
+        (seed["family_id"],),
+    )[0] == 0
+    assert _row(
+        isolated_database,
+        "SELECT status FROM family_envelopes WHERE family_id = %s",
+        (seed["family_id"],),
+    )[0] == "rejected"
+
+
+def test_expire_review_does_not_revert_completed_family(
+    isolated_database, tmp_path, monkeypatch
+):
+    monkeypatch.setenv("DATACON_EVIDENCE_ROOT", str(tmp_path / "evidence"))
+    seed = _seed_family(
+        isolated_database,
+        lease=True,
+        review_deadline_at=_now() - timedelta(minutes=1),
+    )
+    # complete_family refuses a non-terminal child (S-1), so converge the
+    # family with a terminal child first, then restore the stale child row that
+    # the expiry path must not resurface.
+    isolated_database.connection.execute(
+        "UPDATE jobs SET state = 'COMPLETED', stage = 'done', "
+        "evidence_status = 'archived', evidence_path = %s, evidence_digest = %s "
+        "WHERE job_id = %s",
+        (
+            str(tmp_path / "child.json"),
+            "sha256:" + "c" * 64,
+            seed["child_id"],
+        ),
+    )
+    family_path = tmp_path / "family.json"
+    family_path.write_text('{"kind":"family_index","rounds":[]}', encoding="utf-8")
+    family_digest = "sha256:" + "d" * 64
+    assert state.complete_family(
+        isolated_database.dsn,
+        seed["family_id"],
+        str(family_path),
+        family_digest,
+    )
+    before = _row(
+        isolated_database,
+        "SELECT state, evidence_status, evidence_path, evidence_digest "
+        "FROM jobs WHERE job_id = %s",
+        (seed["family_id"],),
+    )
+    assert before == (
+        "COMPLETED",
+        "archived",
+        str(family_path),
+        family_digest,
+    )
+
+    isolated_database.connection.execute(
+        "UPDATE jobs SET state = 'AWAITING_REVIEW', stage = 'review', "
+        "generation = 1, lease_owner = 'worker-p1', "
+        "lease_expires_at = now() + interval '10 minutes', "
+        "review_deadline_at = now() - interval '1 minute' "
+        "WHERE job_id = %s",
+        (seed["child_id"],),
+    )
+    assert state.expire_review(isolated_database.dsn, seed["child_id"], 1) is False
+
+    after = _row(
+        isolated_database,
+        "SELECT state, evidence_status, evidence_path, evidence_digest "
+        "FROM jobs WHERE job_id = %s",
+        (seed["family_id"],),
+    )
+    assert after == before, "expire_review overwrote a COMPLETED family pointer"
+    assert _row(
+        isolated_database,
+        "SELECT state FROM jobs WHERE job_id = %s",
+        (seed["child_id"],),
+    )[0] == "AWAITING_REVIEW", "expire_review blocked the child of a COMPLETED family"
+    assert _row(
+        isolated_database,
+        "SELECT status FROM family_envelopes WHERE family_id = %s",
+        (seed["family_id"],),
+    )[0] == "pending", "expire_review expired the envelope of a COMPLETED family"
+
+
+# Complete Plan v2 fixture. ``contracts.plan_digest`` validates the full v1
+# field set plus the eleven v2 additions, so a partial plan cannot be used to
+# prove the freeze identity checks (B-3/B-4).
+PLAN_ANALYSIS = {
+    "diff_digest": "sha256:" + "9" * 64,
+    "changed_paths": ["parser.c"],
+    "symbols": [
+        {
+            "name": "parse_token",
+            "path": "parser.c",
+            "role": "definition",
+            "revision": "vulnerable",
+            "start_line": 5,
+            "end_line": 18,
+        },
+    ],
+    "findings": [
+        {
+            "kind": "fact",
+            "statement": "the fix allocates one more byte",
+            "confidence": "high",
+            "evidence_refs": ["git:diff/a..b/parser.c"],
+        },
+    ],
+}
+
+PLAN_BASE = {
+    "case_id": "fixture-c-parser",
+    "cve_id": "CVE-2099-0001",
+    "case_config_digest": "sha256:" + "a" * 64,
+    "repository": {
+        "origin": "fixture://datacon/B01",
+        "bundle_digest": "sha256:" + "d" * 64,
+        "patch_digest": "sha256:" + "e" * 64,
+    },
+    "revisions": {"vulnerable": "b" * 40, "fixed": "c" * 40},
+    "dependencies_digest": "sha256:" + "f" * 64,
+    "image_digest": "sha256:" + "0" * 64,
+    "platform": "linux/amd64",
+    "toolchain": {
+        "compiler": "clang",
+        "sanitizer": "address",
+        "pinned_image_version": "19.1.7",
+    },
+    "asan_options": "detect_leaks=0:halt_on_error=1",
+    "harness_digest": "sha256:" + "2" * 64,
+    "expected_exit": {"normal": 0, "candidate_clean": 0, "candidate_asan": 86},
+    "asan_signature": {
+        "error": "heap-buffer-overflow",
+        "operation": "WRITE",
+        "access_size": 1,
+        "function": "parse_token",
+        "source": "parser.c",
+    },
+    "limits": contracts.DEFAULT_LIMITS,
+    "isolation": {
+        "network": "none",
+        "user": "65534:65534",
+        "read_only_root": True,
+        "cap_drop": ["ALL"],
+        "no_new_privileges": True,
+        "seccomp": "runtime/default",
+    },
+    "intel": {
+        "snapshot": "advisory.json",
+        "collected_at": "2026-01-02T00:00:00Z",
+        "content_digest": "sha256:" + "5" * 64,
+        "sources": ["https://nvd.invalid/1"],
+    },
+    "analysis": PLAN_ANALYSIS,
+    "analysis_digest": contracts.analysis_digest(PLAN_ANALYSIS),
+    "policy_version": "1",
+}
+
+PLAN_BUILD_RECIPE_DIGEST = (
+    "sha256:" + hashlib.sha256(jsonutil.canonical_bytes(BUILD_SPEC)).hexdigest()
+)
+
+
+def _v1_plan() -> dict:
+    plan = deepcopy(PLAN_BASE)
+    plan.update(
+        {
+            "build_recipe_digest": PLAN_BUILD_RECIPE_DIGEST,
+            "inputs": {
+                "candidate": "sha256:" + "3" * 64,
+                "normal": "sha256:" + "4" * 64,
+            },
+        }
+    )
+    return plan
+
+
+def _v2_plan(
+    family_id,
+    *,
+    round_no,
+    envelope_digest,
+    parent_approval_digest=None,
+) -> dict:
+    plan = _v1_plan()
+    plan.update(
+        {
+            "schema_version": 2,
+            "family_id": str(family_id),
+            "parent_job_id": str(family_id),
+            "round_no": round_no,
+            "parent_approval_digest": parent_approval_digest,
+            "envelope_digest": envelope_digest,
+            "build_ref": None,
+            "build_spec": deepcopy(BUILD_SPEC),
+            "compile_flags": ["-g"],
+            "experiment_digest": None,
+            "build_provenance_rules_version": "build-provenance-v1",
+            "build_recipe_digest": PLAN_BUILD_RECIPE_DIGEST,
+            "inputs": (
+                None
+                if round_no is None
+                else {
+                    "candidate": "sha256:" + "3" * 64,
+                    "normal": "sha256:" + "4" * 64,
+                }
+            ),
+        }
+    )
+    return plan
+
+
+def _freeze_seed(database, request, *, job_kind="campaign", state_name="PREPARING"):
+    family_id = uuid4()
+    _insert_plain_job(
+        database,
+        family_id,
+        request=request,
+        state_name="AGGREGATING",
+        family_id=family_id,
+        job_kind="family",
+        parent_job_id=None,
+    )
+    child_id = uuid4()
+    _insert_plain_job(
+        database,
+        child_id,
+        request=request,
+        state_name=state_name,
+        family_id=family_id,
+        job_kind=job_kind,
+        parent_job_id=family_id,
+        round_no=None if job_kind == "campaign" else 1,
+        lease=True,
+    )
+    return family_id, child_id
+
+
+def _assert_no_freeze_rows(database, family_id, child_id, state_name="PREPARING"):
+    assert _row(
+        database,
+        "SELECT count(*) FROM plans WHERE job_id = %s",
+        (child_id,),
+    )[0] == 0
+    assert _row(
+        database,
+        "SELECT count(*) FROM family_envelopes WHERE family_id = %s",
+        (family_id,),
+    )[0] == 0
+    assert _row(
+        database,
+        "SELECT state FROM jobs WHERE job_id = %s",
+        (child_id,),
+    )[0] == state_name
+
+
+def test_freeze_plan_rejects_wrong_family_id(isolated_database):
+    family_id, child_id = _freeze_seed(
+        isolated_database, _family_request("guided")
+    )
+    plan = _v2_plan(family_id, round_no=None, envelope_digest=ENVELOPE_1)
+    plan["family_id"] = plan["parent_job_id"] = str(uuid4())
+    digest = contracts.plan_digest(plan)
+
+    with pytest.raises(state.StateError, match="family_id"):
+        state.freeze_plan(
+            isolated_database.dsn,
+            child_id,
+            generation=1,
+            plan=plan,
+            plan_digest=digest,
+            summary={},
+            envelope=dict(GUIDED_ENVELOPE_BODY),
+        )
+    _assert_no_freeze_rows(isolated_database, family_id, child_id)
+
+
+def test_freeze_plan_rejects_wrong_parent_job_id(isolated_database):
+    family_id, child_id = _freeze_seed(
+        isolated_database, _family_request("guided")
+    )
+    # Plan v2 requires family_id == parent_job_id, so a contract-valid parent
+    # mismatch is expressed by pointing the identity pair at another UUID.
+    plan = _v2_plan(family_id, round_no=None, envelope_digest=ENVELOPE_1)
+    plan["family_id"] = plan["parent_job_id"] = str(uuid4())
+    digest = contracts.plan_digest(plan)
+
+    with pytest.raises(state.StateError, match="parent_job_id"):
+        state.freeze_plan(
+            isolated_database.dsn,
+            child_id,
+            generation=1,
+            plan=plan,
+            plan_digest=digest,
+            summary={},
+            envelope=dict(GUIDED_ENVELOPE_BODY),
+        )
+    _assert_no_freeze_rows(isolated_database, family_id, child_id)
+
+
+def test_freeze_plan_rejects_wrong_round_no(isolated_database):
+    family_id, child_id = _freeze_seed(
+        isolated_database, _family_request("guided")
+    )
+    plan = _v2_plan(
+        family_id,
+        round_no=2,
+        envelope_digest=ENVELOPE_1,
+        parent_approval_digest=APPROVAL_1,
+    )
+    digest = contracts.plan_digest(plan)
+
+    with pytest.raises(state.StateError, match="round_no"):
+        state.freeze_plan(
+            isolated_database.dsn,
+            child_id,
+            generation=1,
+            plan=plan,
+            plan_digest=digest,
+            summary={},
+            envelope=dict(GUIDED_ENVELOPE_BODY),
+        )
+    _assert_no_freeze_rows(isolated_database, family_id, child_id)
+
+
+def test_freeze_plan_rejects_tampered_plan_digest(isolated_database):
+    family_id, child_id = _freeze_seed(
+        isolated_database, _family_request("guided")
+    )
+    plan = _v2_plan(family_id, round_no=None, envelope_digest=ENVELOPE_1)
+    tampered = dict(plan, policy_version="tampered-policy")
+    tampered_digest = contracts.plan_digest(tampered)
+
+    with pytest.raises(state.StateError, match="plan_digest"):
+        state.freeze_plan(
+            isolated_database.dsn,
+            child_id,
+            generation=1,
+            plan=plan,
+            plan_digest=tampered_digest,
+            summary={},
+            envelope=dict(GUIDED_ENVELOPE_BODY),
+        )
+    _assert_no_freeze_rows(isolated_database, family_id, child_id)
+
+
+def test_freeze_plan_rejects_v1_plan_for_v2_job(isolated_database):
+    family_id, child_id = _freeze_seed(
+        isolated_database, _family_request("guided")
+    )
+    plan = _v1_plan()
+    digest = contracts.plan_digest(plan)
+
+    with pytest.raises(state.StateError, match="schema_version"):
+        state.freeze_plan(
+            isolated_database.dsn,
+            child_id,
+            generation=1,
+            plan=plan,
+            plan_digest=digest,
+            summary={},
+            envelope=dict(GUIDED_ENVELOPE_BODY),
+        )
+    _assert_no_freeze_rows(isolated_database, family_id, child_id)
+
+
+def test_freeze_plan_rejects_v2_family_job(isolated_database):
+    request = _family_request("guided")
+    family_id = uuid4()
+    _insert_plain_job(
+        isolated_database,
+        family_id,
+        request=request,
+        state_name="PREPARING",
+        family_id=family_id,
+        job_kind="family",
+        parent_job_id=None,
+        lease=True,
+    )
+    plan = _v2_plan(family_id, round_no=None, envelope_digest=ENVELOPE_1)
+    digest = contracts.plan_digest(plan)
+
+    with pytest.raises(state.StateError, match="campaign or round"):
+        state.freeze_plan(
+            isolated_database.dsn,
+            family_id,
+            generation=1,
+            plan=plan,
+            plan_digest=digest,
+            summary={},
+            envelope=dict(GUIDED_ENVELOPE_BODY),
+        )
+    _assert_no_freeze_rows(isolated_database, family_id, family_id)
+
+
+def test_first_envelope_must_not_exceed_request_max_rounds(isolated_database):
+    request = _family_request("guided")
+    request["exploration"]["max_rounds"] = 1
+    family_id, child_id = _freeze_seed(isolated_database, request)
+    body = dict(GUIDED_ENVELOPE_BODY)
+    body["max_rounds"] = 2
+    digest = jsonutil.digest_json(body)
+    plan = _v2_plan(family_id, round_no=None, envelope_digest=digest)
+    plan_digest = contracts.plan_digest(plan)
+
+    with pytest.raises(state.StateError, match="max_rounds"):
+        state.freeze_plan(
+            isolated_database.dsn,
+            child_id,
+            generation=1,
+            plan=plan,
+            plan_digest=plan_digest,
+            summary={},
+            envelope=body,
+        )
+    _assert_no_freeze_rows(isolated_database, family_id, child_id)
+
+
+def test_first_envelope_must_not_exceed_case_registry(isolated_database):
+    family_id, child_id = _freeze_seed(
+        isolated_database, _family_request("guided")
+    )
+    body = deepcopy(GUIDED_ENVELOPE_BODY)
+    body["mutation_limits"] = {
+        "allowed_ops": ["append"],
+        "max_input_bytes": 5000,
+    }
+    digest = jsonutil.digest_json(body)
+    plan = _v2_plan(family_id, round_no=None, envelope_digest=digest)
+    plan_digest = contracts.plan_digest(plan)
+
+    with pytest.raises(state.StateError, match="case registry"):
+        state.freeze_plan(
+            isolated_database.dsn,
+            child_id,
+            generation=1,
+            plan=plan,
+            plan_digest=plan_digest,
+            summary={},
+            envelope=body,
+        )
+    _assert_no_freeze_rows(isolated_database, family_id, child_id)
+
+
+def test_first_envelope_and_propose_reject_the_same_expansion(isolated_database):
+    request = _family_request("guided")
+    family_id, child_id = _freeze_seed(isolated_database, request)
+    body = deepcopy(GUIDED_ENVELOPE_BODY)
+    body["max_rounds"] = 9
+    digest = jsonutil.digest_json(body)
+    plan = _v2_plan(family_id, round_no=None, envelope_digest=digest)
+    plan_digest = contracts.plan_digest(plan)
+
+    with pytest.raises(state.StateError, match="max_rounds"):
+        state.freeze_plan(
+            isolated_database.dsn,
+            child_id,
+            generation=1,
+            plan=plan,
+            plan_digest=plan_digest,
+            summary={},
+            envelope=body,
+        )
+    _assert_no_freeze_rows(isolated_database, family_id, child_id)
+
+    approved = _seed_family(
+        isolated_database,
+        first_approval=True,
+        pending_envelope=None,
+    )
+    with pytest.raises(state.StateError, match="max_rounds"):
+        state.propose_envelope(
+            isolated_database.dsn,
+            approved["family_id"],
+            body,
+        )
+
+
+def test_first_approve_retry_without_digest_is_idempotent(isolated_database):
+    seed = _seed_family(isolated_database)
+    first = _review(isolated_database, seed, envelope_digest=None)
+    assert first.status == "applied"
+    count_approvals = _row(
+        isolated_database,
+        "SELECT count(*) FROM family_approvals WHERE family_id = %s",
+        (seed["family_id"],),
+    )[0]
+
+    retry = _review(isolated_database, seed, envelope_digest=None)
+    assert retry.status == "idempotent", (
+        "omitting --envelope-digest on the first-approve retry must resolve "
+        "to the approved first plan envelope"
+    )
+    assert _row(
+        isolated_database,
+        "SELECT count(*) FROM family_approvals WHERE family_id = %s",
+        (seed["family_id"],),
+    )[0] == count_approvals
+    assert _row(
+        isolated_database,
+        "SELECT count(*) FROM reviews WHERE job_id = %s",
+        (seed["family_id"],),
+    )[0] == 1
+
+
+def test_first_reject_retry_without_digest_is_idempotent(
+    isolated_database, tmp_path, monkeypatch
+):
+    monkeypatch.setenv("DATACON_EVIDENCE_ROOT", str(tmp_path / "evidence"))
+    seed = _seed_family(isolated_database)
+    first = _review(isolated_database, seed, decision="reject", envelope_digest=None)
+    assert first.status == "applied"
+
+    retry = _review(
+        isolated_database, seed, decision="reject", envelope_digest=None
+    )
+    assert retry.status == "idempotent", (
+        "omitting --envelope-digest on the first-reject retry must resolve "
+        "to the rejected first plan envelope"
+    )
+    assert _row(
+        isolated_database,
+        "SELECT count(*) FROM reviews WHERE job_id = %s",
+        (seed["family_id"],),
+    )[0] == 1
+    assert _row(
+        isolated_database,
+        "SELECT count(*) FROM family_approvals WHERE family_id = %s",
+        (seed["family_id"],),
+    )[0] == 0
+
+
+def test_changed_envelope_reapproval_without_digest_is_mismatch(isolated_database):
+    seed = _seed_family(
+        isolated_database,
+        first_approval=True,
+        pending_envelope=ENVELOPE_2,
+    )
+
+    outcome = _review(isolated_database, seed, envelope_digest=None)
+    assert outcome.status == "envelope_mismatch", (
+        "a changed pending envelope without --envelope-digest must fail closed"
+    )
+    assert outcome.reason_code == "REVIEW_ENVELOPE_MISMATCH"
+    assert _row(
+        isolated_database,
+        "SELECT count(*) FROM family_approvals WHERE family_id = %s",
+        (seed["family_id"],),
+    )[0] == 1
+    assert _row(
+        isolated_database,
+        "SELECT status FROM family_envelopes WHERE family_id = %s "
+        "AND envelope_digest = %s",
+        (seed["family_id"], ENVELOPE_2),
+    )[0] == "pending"
+
+
+def test_explicit_digest_reapproval_still_idempotent(isolated_database):
+    seed = _seed_family(
+        isolated_database,
+        first_approval=True,
+        pending_envelope=ENVELOPE_2,
+    )
+
+    applied = _review(isolated_database, seed, envelope_digest=ENVELOPE_2)
+    assert applied.status == "applied"
+    retry = _review(isolated_database, seed, envelope_digest=ENVELOPE_2)
+    assert retry.status == "idempotent"
+    assert _row(
+        isolated_database,
+        "SELECT count(*) FROM family_approvals WHERE family_id = %s",
+        (seed["family_id"],),
+    )[0] == 2
+    assert _row(
+        isolated_database,
+        "SELECT count(*) FROM reviews WHERE job_id = %s",
+        (seed["family_id"],),
+    )[0] == 1
