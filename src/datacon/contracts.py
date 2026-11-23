@@ -694,7 +694,14 @@ def _optional_digest(value: Any, *, label: str) -> str | None:
 
 
 def _build_spec(value: Any) -> dict[str, Any]:
-    """Accept the structured build input; T13 owns the build semantics."""
+    """Accept the structured build input; T13 owns the build semantics.
+
+    TODO(T13): implement the §5 normalization of the seven closed flags
+    (``-I -L -l -D -U -isystem -include``), preserve order, compare the
+    ``compile_flags`` multiset with ``build_spec.declared_compile_flags`` and
+    add positive/negative tests. T10 must not pretend raw list equality is the
+    §5 rule.
+    """
     if not isinstance(value, dict):
         raise ValueError("build_spec must be a JSON object")
     try:
@@ -764,7 +771,14 @@ def _build_ref(value: Any) -> dict[str, Any] | None:
 
 
 def _plan_v2_extras(plan: Mapping[str, Any]) -> dict[str, Any]:
-    """Normalize the eleven Plan v2 additions, preserving explicit nulls."""
+    """Normalize the eleven Plan v2 additions, preserving explicit nulls.
+
+    TODO(T13): ``compile_flags`` is currently validated as a list[str] only.
+    The §5 normalization must eventually require consistency with
+    ``build_spec.declared_compile_flags`` (order-preserving multiset), and the
+    normalized comparison needs positive/negative tests before this note can
+    be removed.
+    """
     schema_version = plan["schema_version"]
     if type(schema_version) is not int or schema_version != SCHEMA_VERSION_V2:
         raise ValueError(f"schema_version must be {SCHEMA_VERSION_V2} for a v2 plan")

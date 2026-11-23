@@ -367,3 +367,38 @@ def test_build_ref_still_requires_experiment_digest():
         build_ref=None, experiment_digest=EXPERIMENT_DIGEST
     )
     assert plan_digest(without_build_with_experiment).startswith("sha256:")
+
+
+def test_plan_digest_binds_a_changed_build_spec_with_its_new_recipe_digest():
+    base_digest = plan_digest(ROUND_PLAN_V2)
+    changed = deepcopy(ROUND_PLAN_V2)
+    changed["build_spec"]["env"]["CFLAGS"] = "-g -O2"
+    changed["build_recipe_digest"] = (
+        "sha256:"
+        + hashlib.sha256(jsonutil.canonical_bytes(changed["build_spec"])).hexdigest()
+    )
+    assert changed["build_recipe_digest"] != ROUND_PLAN_V2["build_recipe_digest"]
+    assert plan_digest(changed) != base_digest, (
+        "plan_digest did not bind build_spec after a consistent recipe update"
+    )
+
+
+def test_plan_digest_binds_compile_flags_with_matching_declared_flags():
+    base_digest = plan_digest(ROUND_PLAN_V2)
+    changed = deepcopy(ROUND_PLAN_V2)
+    changed["compile_flags"] = [*COMPILE_FLAGS, "-DV2=1"]
+    changed["build_spec"]["declared_compile_flags"] = list(changed["compile_flags"])
+    changed["build_recipe_digest"] = (
+        "sha256:"
+        + hashlib.sha256(jsonutil.canonical_bytes(changed["build_spec"])).hexdigest()
+    )
+    assert plan_digest(changed) != base_digest, (
+        "plan_digest did not bind compile_flags"
+    )
+
+
+def test_build_recipe_digest_must_match_build_spec():
+    changed = deepcopy(ROUND_PLAN_V2)
+    changed["build_recipe_digest"] = _digest("0")
+    with pytest.raises(ValueError, match="build_recipe_digest"):
+        plan_digest(changed)

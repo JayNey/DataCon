@@ -412,6 +412,8 @@ def test_complete_family_audits_once_and_validates_the_pointer(
         (str(tmp_path / "round.json"), DIGEST, "family.json"),
         ("relative/family.json", DIGEST, "absolute"),
         ("/tmp\\family.json", DIGEST, "POSIX"),
+        ("/tmp/../tmp/family.json", DIGEST, "must not contain"),
+        ("/" + "a" * 5000 + "/family.json", DIGEST, "at most"),
         (str(family_path), "sha256:" + "A" * 64, "sha256"),
         (str(family_path), "md5:" + "a" * 32, "sha256"),
     ]
@@ -971,7 +973,7 @@ def test_claim_next_v2_syncs_a_blocked_family_but_not_its_ready_child(
     assert claimed is not None and claimed["job_id"] == blocked_child
 
 
-def test_claim_next_v2_does_not_claim_a_child_of_a_completed_family(
+def test_claim_next_v2_claims_blocked_but_not_ready_children_of_a_completed_family(
     isolated_database,
 ):
     family_id = _insert_family(isolated_database)
@@ -1007,6 +1009,32 @@ def test_claim_next_v2_does_not_claim_a_child_of_a_completed_family(
         isolated_database.dsn, "v2-worker", job_contract_version=2
     )
     assert claimed is not None and claimed["job_id"] == blocked_child
+
+
+def test_claim_next_v2_currently_claims_a_deadline_free_awaiting_review_child(
+    isolated_database,
+):
+    # T10 does not decide the final worker semantics for a review child. The
+    # current gate can hand an AWAITING_REVIEW child whose review_deadline_at is
+    # null to a v2 worker, so the T11 worker must treat review/expiry
+    # explicitly instead of executing it. This test locks the current result;
+    # T11/T12 may tighten it.
+    family_id = _insert_family(isolated_database)
+    child_id = _insert_child(
+        isolated_database,
+        family_id,
+        state_name="AWAITING_REVIEW",
+    )
+
+    claimed = state.claim_next(
+        isolated_database.dsn, "v2-worker", job_contract_version=2
+    )
+    assert claimed is not None and claimed["job_id"] == child_id
+    state_name, lease_owner = isolated_database.connection.execute(
+        "SELECT state, lease_owner FROM jobs WHERE job_id = %s", (child_id,)
+    ).fetchone()
+    assert state_name == "AWAITING_REVIEW"
+    assert lease_owner == "v2-worker"
 
 
 def test_claim_next_v1_behaviour_is_unchanged(isolated_database):

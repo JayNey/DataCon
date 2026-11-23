@@ -217,3 +217,22 @@ def test_propose_envelope_rejects_case_registry_expansion(isolated_database):
         isolated_database.dsn, seed["family_id"], _envelope()
     )
     assert result["status"] == "pending"
+
+
+def test_propose_envelope_requires_a_first_approval(isolated_database):
+    seed = _seed_family(
+        isolated_database,
+        mode="guided",
+        first_approval=False,
+        pending_envelope=None,
+    )
+
+    with pytest.raises(state.StateError, match="no first approval"):
+        state.propose_envelope(
+            isolated_database.dsn, seed["family_id"], _envelope()
+        )
+    assert _row(
+        isolated_database,
+        "SELECT count(*) FROM family_envelopes WHERE family_id = %s",
+        (seed["family_id"],),
+    )[0] == 0

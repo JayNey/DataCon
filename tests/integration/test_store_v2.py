@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import json
+import threading
+import time
 
+import psycopg
 import pytest
 
-from datacon import contracts, store
+from datacon import contracts, state, store
 
 pytestmark = pytest.mark.postgres
 
@@ -68,3 +71,62 @@ def test_submit_v2_binary_family_is_archived_blocked(isolated_database, tmp_path
     assert row[2:4] == ("BLOCKED", "UNSUPPORTED_TARGET")
     assert row[4] == "archived", "binary v2 family was left without evidence"
     assert row[5] and row[6]
+
+
+def _wait_for_a_shared_release_lock_wait(database, timeout=10.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        with psycopg.connect(
+            database.dsn, autocommit=True, connect_timeout=5
+        ) as probe:
+            waiting = probe.execute(
+                "SELECT count(*) FROM pg_locks AS locks "
+                "JOIN pg_stat_activity AS activity USING (pid) "
+                "WHERE locks.locktype = 'advisory' AND NOT locks.granted "
+                "AND activity.datname = current_database() "
+                "AND activity.query LIKE '%pg_advisory_xact_lock_shared%'"
+            ).fetchone()[0]
+        if waiting:
+            return True
+        time.sleep(0.02)
+    return False
+
+
+def test_submit_waits_for_the_release_promotion_lock(isolated_database):
+    key = state.RELEASE_LOCK_PREFIX + state.RELEASE_ENVIRONMENT
+    holder = psycopg.connect(isolated_database.dsn, connect_timeout=5)
+    result = {}
+    errors = []
+
+    def runner():
+        try:
+            result["value"] = _submit(isolated_database, REQUEST_V2)
+        except BaseException as error:  # noqa: BLE001 - re-raised by the caller
+            errors.append(error)
+
+    thread = None
+    try:
+        holder.execute(
+            "SELECT pg_advisory_xact_lock(hashtext(%s))", (key,)
+        )
+        thread = threading.Thread(target=runner, daemon=True)
+        thread.start()
+        waited = _wait_for_a_shared_release_lock_wait(isolated_database)
+    finally:
+        holder.commit()
+        holder.close()
+
+    assert thread is not None
+    thread.join(timeout=30)
+    assert not thread.is_alive(), "submit did not finish after the lock release"
+    if errors:
+        raise errors[0]
+    assert waited, "submit never queued on the shared release lock"
+
+    submitted = result["value"]
+    assert submitted["state"] == "AGGREGATING"
+    row = isolated_database.connection.execute(
+        "SELECT job_kind, job_contract_version, state FROM jobs WHERE job_id = %s",
+        (submitted["job_id"],),
+    ).fetchone()
+    assert row == ("family", 2, "AGGREGATING")

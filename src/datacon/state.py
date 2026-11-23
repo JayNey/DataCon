@@ -398,6 +398,16 @@ def freeze_plan(
     the 24 hour window. The prepare deadline is re-checked after locking the
     job, which closes the window between the caller's last check and the plan
     write.
+
+    The contract-level plan validator cannot distinguish guided from fixed:
+    both modes share the plan body shape and only the request carries the
+    exploration mode. This layer therefore owns the mode-sensitive rule from
+    interface-contract-delta §3/§9.1: only the first v2 plan (guided campaign
+    or fixed ``round_no=1``) may carry ``parent_approval_digest=null``. Every
+    later v2 plan must reference a non-null parent approval. In particular a
+    guided ``round_no=1`` is a later plan because the guided campaign was the
+    first plan; the pure validator would otherwise accept it as a fixed first
+    round.
     """
     with _connect(dsn) as connection:
         # Lock order for every v2 path that touches both a family and its
@@ -504,6 +514,18 @@ def freeze_plan(
                 # approval.
                 raise StateError(
                     "a fixed first plan must have parent_approval_digest=null"
+                )
+            if (
+                not first_v2_plan
+                and plan.get("parent_approval_digest") is None
+            ):
+                # A guided round 1 is a later plan even though its round_no is
+                # 1: the guided campaign was the first plan. Rejecting the
+                # null before any write keeps a frozen-but-unreviewed plan
+                # from sitting outside the approval chain.
+                raise StateError(
+                    "a non-first v2 plan requires a non-null "
+                    "parent_approval_digest"
                 )
         normalized_envelope: dict[str, Any] | None = None
         if first_v2_plan:
@@ -1152,6 +1174,10 @@ def finish_execution(
 
 
 _FAMILY_EVIDENCE_DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
+# T12 will read and export this pointer. Bound its length and reject lexical
+# traversal now so a path can never escape the intended evidence root when the
+# read lands.
+MAX_FAMILY_EVIDENCE_PATH = 4096
 
 
 def _validate_family_evidence_pointer(
@@ -1161,15 +1187,27 @@ def _validate_family_evidence_pointer(
 
     This is intentionally syntax-only. T12 owns reading ``family.json``,
     recomputing its content digest and producing the exports; T10 must not
-    inspect the file here.
+    inspect the file here. That later read is why a lexical path traversal
+    (``..``), a non-canonical spelling or an unbounded path is rejected now:
+    the pointer is persisted and handed to T12, so a bad value must never
+    become trusted input.
     """
     if not isinstance(evidence_path, str) or not evidence_path.strip():
         raise StateError("completing a family requires evidence_path")
     if "\\" in evidence_path:
         raise StateError("family evidence_path must use POSIX separators")
+    if len(evidence_path) > MAX_FAMILY_EVIDENCE_PATH:
+        raise StateError(
+            "family evidence_path must be at most "
+            f"{MAX_FAMILY_EVIDENCE_PATH} characters"
+        )
     candidate = PurePosixPath(evidence_path)
     if not candidate.is_absolute():
         raise StateError("family evidence_path must be an absolute POSIX path")
+    if ".." in candidate.parts:
+        raise StateError("family evidence_path must not contain '..'")
+    if str(candidate) != evidence_path:
+        raise StateError("family evidence_path must be canonical")
     if candidate.name != "family.json":
         raise StateError("family evidence_path basename must be family.json")
     if not isinstance(evidence_digest, str) or not _FAMILY_EVIDENCE_DIGEST.fullmatch(
@@ -1195,6 +1233,12 @@ def complete_family(
     The pointer is validated syntactically only. Reading ``family.json``,
     recomputing its digest and exporting the family index belongs to T12; this
     path must never open the file or trust its bytes.
+
+    T10 only provides the "has at least one child and every child is terminal"
+    convergence interface. A childless family, its convergence conditions and
+    any family-level archive/export are owned by T11 (graph/rounds) and T12
+    (family export); this function deliberately keeps rejecting a childless
+    family until those tasks define the semantics.
     """
     _validate_family_evidence_pointer(evidence_path, evidence_digest)
     with _connect(dsn) as connection:
@@ -2037,10 +2081,10 @@ def _record_family_review(
     if first_round:
         # Lock order is family then first child. The family lock is already
         # held; blocking here proves the order to any concurrent observer.
-        connection.execute(
-            "SELECT job_id FROM jobs WHERE job_id = %s FOR UPDATE",
+        locked_child = connection.execute(
+            "SELECT state FROM jobs WHERE job_id = %s FOR UPDATE",
             (child["job_id"],),
-        )
+        ).fetchone()
     plan = connection.execute(
         "SELECT plan_digest, plan FROM plans WHERE job_id = %s "
         "ORDER BY created_at, plan_id LIMIT 1",
@@ -2143,6 +2187,24 @@ def _record_family_review(
             "envelope_mismatch",
             state=job["state"],
             message="envelope digest is not the current pending envelope",
+        )
+    # A first-round review object is the first child. Once it reached a verdict
+    # terminal (for example REPRODUCED/archived) it is no longer reviewable:
+    # writing reviews/approvals or blocking the family would attach a review
+    # decision to a verdict it can never rewrite. The gate runs before any
+    # write but after the already-decided/expired envelope answers above, so a
+    # retry of an expiry still reports "expired" rather than being misread as
+    # a fresh decision.
+    if first_round and (
+        locked_child is None or locked_child["state"] != "AWAITING_REVIEW"
+    ):
+        return ReviewOutcome(
+            "invalid_state",
+            state=job["state"],
+            message=(
+                "the first child is not AWAITING_REVIEW "
+                f"(it is {locked_child['state'] if locked_child else 'missing'})"
+            ),
         )
     # §9.1 step 3 concludes with the state gate: only a still-pending envelope
     # is a new decision. Already-decided envelopes were answered above even

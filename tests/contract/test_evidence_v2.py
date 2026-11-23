@@ -179,6 +179,23 @@ def _manifest(bundle_kind, *, verdict="INCONCLUSIVE", reason="EVIDENCE_INCOMPLET
     return common
 
 
+def test_v1_role_table_stays_frozen():
+    # The v1 table is frozen: v0.2 roles must live only in the v2 additive
+    # table, otherwise a v1 bundle could carry v0.2-only evidence roles.
+    assert set(evidence._ROLE_NAMES) == V1_ROLES
+    assert len(evidence._ROLE_NAMES) == 27
+    assert set(evidence._REQUIRED_ROLES) == {
+        "report_json",
+        "report_markdown",
+        "plan",
+        "review",
+    }
+    assert set(evidence._BLOCKED_REQUIRED_ROLES) == {
+        "report_json",
+        "report_markdown",
+    }
+
+
 def test_v2_role_table_contains_v01_roles():
     # Exact equality in both directions: every registered v1/v2 role is
     # accepted, and the implementation may not invent an unregistered role.
@@ -210,6 +227,35 @@ def test_v2_execution_bundle_verifies_with_fixed_paths(tmp_path):
     )
     verified = verify_bundle(root)
     assert verified.manifest["bundle_kind"] == "execution"
+
+
+@pytest.mark.parametrize("relative", ["envelope.json", "budget/snapshot.json"])
+def test_v2_execution_requires_envelope_and_budget_snapshot(tmp_path, relative):
+    files = _base_files(execution=True, campaign=False)
+    del files[relative]
+    root = _write_v2_bundle(
+        tmp_path,
+        _manifest("execution"),
+        files,
+        name="missing-" + relative.replace("/", "-"),
+    )
+    with pytest.raises(BundleError, match="missing required roles"):
+        verify_bundle(root)
+
+
+def test_v2_execution_accepts_admission_instead_of_review(tmp_path):
+    files = _base_files(execution=True, campaign=False)
+    del files["review.json"]
+    files["admission.json"] = ("admission", b'{"approval_kind":"policy"}\n')
+    root = _write_v2_bundle(
+        tmp_path,
+        _manifest("execution"),
+        files,
+        name="admission-only",
+    )
+    verified = verify_bundle(root)
+    assert "admission.json" in verified.file_data
+    assert "review.json" not in verified.file_data
 
 
 def test_v2_execution_requires_exactly_one_review_or_admission(tmp_path):

@@ -17,6 +17,7 @@ from datacon.verdict import (
     _exit_matches,
     decide_verdict,
     reason_allowed,
+    reason_allowed_v2,
 )
 
 SIGNATURE = {
@@ -423,14 +424,40 @@ ALL_TERMINAL_VERDICTS = (
 @pytest.mark.parametrize("code,expected", sorted(V02_REASON_VERDICTS.items()))
 def test_v02_reason_codes_belong_to_the_expected_closed_sets(code, expected):
     for verdict in ALL_TERMINAL_VERDICTS:
-        assert reason_allowed(verdict, code) is (verdict in expected), (
+        assert reason_allowed_v2(verdict, code) is (verdict in expected), (
             f"{code} was wrongly classified for {verdict}"
         )
+
+
+@pytest.mark.parametrize(
+    "verdict,code",
+    [
+        ("BLOCKED", "ADMISSION_DENIED"),
+        ("BLOCKED", "ENVELOPE_VIOLATION"),
+        ("BLOCKED", "HARNESS_REJECTED"),
+        ("BLOCKED", "BUILD_PROVENANCE_MISSING"),
+        ("FAILED", "BUILD_PROVENANCE_MISSING"),
+        ("FAILED", "REUSE_MISMATCH"),
+        ("INCONCLUSIVE", "BUDGET_EXHAUSTED"),
+        ("FAILED", "BUDGET_EXHAUSTED"),
+    ],
+)
+def test_v1_default_rejects_v02_only_reason_codes(verdict, code):
+    assert not reason_allowed(verdict, code)
+    assert not reason_allowed(verdict, code, schema_version=1)
+    assert reason_allowed_v2(verdict, code)
+    assert reason_allowed(verdict, code, schema_version=2)
 
 
 @pytest.mark.parametrize("verdict", ALL_TERMINAL_VERDICTS)
 def test_review_envelope_mismatch_is_not_a_terminal_reason(verdict):
     assert not reason_allowed(verdict, "REVIEW_ENVELOPE_MISMATCH")
+    assert not reason_allowed_v2(verdict, "REVIEW_ENVELOPE_MISMATCH")
+
+
+def test_unknown_reason_schema_version_is_rejected():
+    with pytest.raises(ValueError, match="schema_version"):
+        reason_allowed("BLOCKED", "ADMISSION_DENIED", schema_version=3)
 
 
 def test_blocked_reasons_cover_non_execution_terminals():

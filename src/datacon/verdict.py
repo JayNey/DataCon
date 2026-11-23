@@ -19,9 +19,12 @@ REQUIRED_PHASES = ("normal", *CANDIDATE_PHASES)
 # evidence verifier imports these sets instead of hard-coding a second copy.
 REPRODUCED_REASONS = frozenset({"ASAN_SIGNATURE_MATCHED"})
 NOT_REPRODUCED_REASONS = frozenset({"CANDIDATE_CLEAN"})
-INCONCLUSIVE_REASONS = frozenset(
+# The v1 writer/verifier is frozen. These sets are copied item-for-item from
+# the v1 branch and must not grow when v0.2 adds codes: the v1 control plane
+# only reads v1-era evidence (interface-contract-delta §12.1, README
+# invariant 9). ``reason_allowed`` defaults to this table.
+V1_INCONCLUSIVE_REASONS = frozenset(
     {
-        "BUDGET_EXHAUSTED",
         "CONTROL_FAILED",
         "EVIDENCE_INCOMPLETE",
         "FIXED_STILL_VULNERABLE",
@@ -34,18 +37,9 @@ INCONCLUSIVE_REASONS = frozenset(
         "VERDICT_UNCLASSIFIED",
     }
 )
-# BLOCKED/FAILED codes are the closed sets execution.py can actually return.
-# The v0.2 codes in interface-contract-delta §10 are additive: a code belongs
-# to every terminal verdict the spec's disposition column allows, and
-# REVIEW_ENVELOPE_MISMATCH deliberately stays out of all of them because it is
-# a review-call rejection code, not a job terminal reason.
-BLOCKED_REASONS = frozenset(
+V1_BLOCKED_REASONS = frozenset(
     {
-        "ADMISSION_DENIED",
-        "BUILD_PROVENANCE_MISSING",
         "DEADLINE_EXCEEDED",
-        "ENVELOPE_VIOLATION",
-        "HARNESS_REJECTED",
         "INVALID_REQUEST",
         "INVALID_STATE",
         "JOB_NOT_FOUND",
@@ -59,22 +53,53 @@ BLOCKED_REASONS = frozenset(
         "UNSUPPORTED_TARGET",
     }
 )
-FAILED_REASONS = frozenset(
+V1_FAILED_REASONS = frozenset({"BUILD_FAILED", "EVIDENCE_WRITE_FAILED"})
+V1_VERDICT_REASONS = {
+    "REPRODUCED": REPRODUCED_REASONS,
+    "NOT_REPRODUCED": NOT_REPRODUCED_REASONS,
+    "INCONCLUSIVE": V1_INCONCLUSIVE_REASONS,
+    "BLOCKED": V1_BLOCKED_REASONS,
+    "FAILED": V1_FAILED_REASONS,
+}
+
+# The v0.2 terminal sets are the v1 sets plus the additive codes from
+# interface-contract-delta §10. A code belongs to every terminal verdict the
+# spec's disposition column allows; REVIEW_ENVELOPE_MISMATCH deliberately
+# stays out of all of them because it is a review-call rejection code, not a
+# job terminal reason.
+V2_INCONCLUSIVE_REASONS = V1_INCONCLUSIVE_REASONS | frozenset(
+    {"BUDGET_EXHAUSTED"}
+)
+V2_BLOCKED_REASONS = V1_BLOCKED_REASONS | frozenset(
     {
-        "BUILD_FAILED",
-        "BUDGET_EXHAUSTED",
+        "ADMISSION_DENIED",
         "BUILD_PROVENANCE_MISSING",
-        "EVIDENCE_WRITE_FAILED",
+        "ENVELOPE_VIOLATION",
+        "HARNESS_REJECTED",
+    }
+)
+V2_FAILED_REASONS = V1_FAILED_REASONS | frozenset(
+    {
+        "BUILD_PROVENANCE_MISSING",
+        "BUDGET_EXHAUSTED",
         "REUSE_MISMATCH",
     }
 )
-VERDICT_REASONS = {
+V2_VERDICT_REASONS = {
     "REPRODUCED": REPRODUCED_REASONS,
     "NOT_REPRODUCED": NOT_REPRODUCED_REASONS,
-    "INCONCLUSIVE": INCONCLUSIVE_REASONS,
-    "BLOCKED": BLOCKED_REASONS,
-    "FAILED": FAILED_REASONS,
+    "INCONCLUSIVE": V2_INCONCLUSIVE_REASONS,
+    "BLOCKED": V2_BLOCKED_REASONS,
+    "FAILED": V2_FAILED_REASONS,
 }
+
+# Backwards-compatible names keep the v1 default. Code that validates v0.2
+# evidence must opt in through ``reason_allowed_v2`` (or
+# ``reason_allowed(..., schema_version=2)``).
+INCONCLUSIVE_REASONS = V1_INCONCLUSIVE_REASONS
+BLOCKED_REASONS = V1_BLOCKED_REASONS
+FAILED_REASONS = V1_FAILED_REASONS
+VERDICT_REASONS = V1_VERDICT_REASONS
 
 # Completed is the only status that can support a positive outcome. The other
 # values are the concrete ReplayResult/execution states that may appear in an
@@ -84,10 +109,30 @@ REPLAY_STATUSES = frozenset(
 )
 
 
-def reason_allowed(verdict: str, reason: str | None) -> bool:
-    """Return whether ``reason`` belongs to the closed set for ``verdict``."""
-    allowed = VERDICT_REASONS.get(verdict)
+def _reason_table(schema_version: int) -> dict[str, frozenset[str]]:
+    if schema_version == 1:
+        return V1_VERDICT_REASONS
+    if schema_version == 2:
+        return V2_VERDICT_REASONS
+    raise ValueError("schema_version must be 1 or 2")
+
+
+def reason_allowed(
+    verdict: str, reason: str | None, *, schema_version: int = 1
+) -> bool:
+    """Return whether ``reason`` belongs to the closed set for ``verdict``.
+
+    The default is the frozen v1 table. v0.2 evidence must pass
+    ``schema_version=2`` (or use ``reason_allowed_v2``) so a v1 verifier can
+    never silently accept a v0.2-only terminal code.
+    """
+    allowed = _reason_table(schema_version).get(verdict)
     return allowed is not None and reason in allowed
+
+
+def reason_allowed_v2(verdict: str, reason: str | None) -> bool:
+    """Return whether ``reason`` is a v0.2 terminal reason for ``verdict``."""
+    return reason_allowed(verdict, reason, schema_version=2)
 
 
 def replay_status_allowed(verdict: str, status: str) -> bool:

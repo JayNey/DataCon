@@ -27,6 +27,7 @@ from datacon.verdict import (
     VerdictPolicy,
     decide_verdict,
     reason_allowed,
+    reason_allowed_v2,
     replay_status_allowed,
 )
 
@@ -406,6 +407,7 @@ def write_bundle(
     verify: Callable[[Path], object] | None = None,
     dir_mode: int = 0o755,
     file_mode: int = 0o644,
+    schema_version: int = SCHEMA_VERSION,
 ) -> BundleInfo:
     """Create a new bundle directory and its manifest.
 
@@ -421,6 +423,17 @@ def write_bundle(
     job_text = str(uuid.UUID(str(job_id)))
     if not isinstance(bundle_kind, str) or bundle_kind not in _BUNDLE_KINDS:
         raise BundleError("INVALID_MANIFEST", "bundle_kind is invalid")
+    if type(schema_version) is not int or schema_version not in (1, 2):
+        raise BundleError("INVALID_MANIFEST", "evidence schema_version is invalid")
+    if schema_version == 2 and bundle_kind != "blocked":
+        # T10 only needs the v2 blocked archive path (review expiry/rejection
+        # and policy blocks). The execution/campaign writers are later tasks;
+        # refusing them here is safer than emitting a manifest missing their
+        # required identity fields.
+        raise BundleError(
+            "INVALID_MANIFEST",
+            "the v2 bundle writer currently supports only blocked bundles",
+        )
     if plan_digest is not None and (
         not isinstance(plan_digest, str) or not _DIGEST.fullmatch(plan_digest)
     ):
@@ -476,7 +489,14 @@ def write_bundle(
             raise BundleError(
                 "INVALID_MANIFEST", "a blocked bundle must record verdict BLOCKED"
             )
-        if report_reason is None or not reason_allowed("BLOCKED", report_reason):
+        reason_is_allowed = (
+            reason_allowed_v2
+            if schema_version == contracts.SCHEMA_VERSION_V2
+            else reason_allowed
+        )
+        if report_reason is None or not reason_is_allowed(
+            "BLOCKED", report_reason
+        ):
             raise BundleError(
                 "INVALID_MANIFEST",
                 "a blocked bundle requires an allowed BLOCKED reason_code",
@@ -570,9 +590,14 @@ def write_bundle(
         entries.sort(key=lambda item: item["path"])
 
         roles = {entry["role"] for entry in entries}
-        required_roles = (
-            _REQUIRED_ROLES if bundle_kind == "execution" else _BLOCKED_REQUIRED_ROLES
-        )
+        if schema_version == contracts.SCHEMA_VERSION_V2:
+            required_roles = _V2_REQUIRED_ROLES[bundle_kind]
+        else:
+            required_roles = (
+                _REQUIRED_ROLES
+                if bundle_kind == "execution"
+                else _BLOCKED_REQUIRED_ROLES
+            )
         if not required_roles <= roles:
             missing = sorted(required_roles - roles)
             raise BundleError(
@@ -580,7 +605,12 @@ def write_bundle(
                 "bundle is missing required roles: " + ", ".join(missing),
             )
         listed = {entry["path"]: entry for entry in entries}
-        if bundle_kind == "execution":
+        if schema_version == contracts.SCHEMA_VERSION_V2:
+            if bundle_kind == "blocked":
+                _require_blocked_paths(listed)
+            else:
+                _require_required_paths(listed, _V2_REQUIRED_PATHS[bundle_kind])
+        elif bundle_kind == "execution":
             _require_required_paths(listed, _REQUIRED_PATHS)
         else:
             _require_blocked_paths(listed)
@@ -589,7 +619,7 @@ def write_bundle(
             )
 
         manifest = {
-            "schema_version": SCHEMA_VERSION,
+            "schema_version": schema_version,
             "bundle_kind": bundle_kind,
             "job_id": job_text,
             "plan_digest": plan_digest,
@@ -951,7 +981,7 @@ def _validate_v2_manifest_header(
             or not _REASON_CODE.fullmatch(reason_code)
         ):
             raise BundleError("INVALID_MANIFEST", "manifest reason_code is invalid")
-        if not reason_allowed("BLOCKED", reason_code):
+        if not reason_allowed_v2("BLOCKED", reason_code):
             raise BundleError(
                 "INVALID_MANIFEST",
                 "manifest reason_code is not allowed for BLOCKED",
@@ -962,7 +992,9 @@ def _validate_v2_manifest_header(
             or not _REASON_CODE.fullmatch(reason_code)
         ):
             raise BundleError("INVALID_MANIFEST", "manifest reason_code is invalid")
-        if reason_code is not None and not reason_allowed(verdict, reason_code):
+        if reason_code is not None and not reason_allowed_v2(
+            verdict, reason_code
+        ):
             raise BundleError(
                 "INVALID_MANIFEST",
                 f"manifest reason_code is not allowed for {verdict}",
@@ -1015,7 +1047,10 @@ def resolve_evidence_ref(bundle_root: Path | str, ref: str) -> list[str]:
        single parser, so ``analysis_digest`` and this resolver cannot drift);
     2. read the bundle manifest and locate the role/path: ``build_log`` at
        ``build/{version}/build.log`` for ``log/build``, the unique
-       ``fuzz_log`` entry for ``log/fuzz``;
+       ``fuzz_log`` entry for ``log/fuzz``. Only ``log/fuzz:0`` is defined
+       today (the campaign fuzz log); a non-zero selector is reserved for
+       future per-round fuzz and fails closed instead of silently resolving
+       to the campaign log;
     3. read the file without following symlinks and require its byte count and
        SHA-256 to equal the manifest entry;
     4. require ``1 <= start <= end <= line_count``.
@@ -1028,6 +1063,12 @@ def resolve_evidence_ref(bundle_root: Path | str, ref: str) -> list[str]:
     syntax/non-UTF-8 (``INVALID_REFERENCE``), missing or ambiguous role/path
     (``MISSING_LOG``), digest/size mismatch (``DIGEST_MISMATCH``) and an
     out-of-range start/end (``LINE_OUT_OF_RANGE``).
+
+    T13 handoff: the v2 report/plan semantic replay must call this resolver
+    (or a wrapper) before claiming that a report line reference is backed by
+    verified bytes. T10 ships the API and its fail-closed tests but does not
+    wire it into the not-yet-implemented v2 report replay; the API must not be
+    deleted as "dead code" before T13 connects it.
     """
     try:
         parsed = contracts.parse_log_evidence_ref(ref)
@@ -1037,6 +1078,12 @@ def resolve_evidence_ref(bundle_root: Path | str, ref: str) -> list[str]:
         raise EvidenceRefError(
             "INVALID_REFERENCE",
             "only log/build and log/fuzz references can be resolved",
+        )
+    if parsed.kind == "fuzz" and parsed.selector != "0":
+        raise EvidenceRefError(
+            "INVALID_REFERENCE",
+            f"log/fuzz:{parsed.selector} is reserved for future per-round "
+            "fuzz logs and is not implemented",
         )
     root = Path(bundle_root)
     try:
@@ -1049,6 +1096,11 @@ def resolve_evidence_ref(bundle_root: Path | str, ref: str) -> list[str]:
         raise EvidenceRefError(
             "INVALID_REFERENCE",
             "log/build and log/fuzz references require a v2 manifest",
+        )
+    if manifest.get("bundle_kind") not in _V2_BUNDLE_KINDS:
+        raise EvidenceRefError(
+            "INVALID_REFERENCE",
+            "log/build and log/fuzz references require a v2 bundle_kind",
         )
     files = manifest.get("files")
     if not isinstance(files, list):

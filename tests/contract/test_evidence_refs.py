@@ -207,3 +207,87 @@ def test_resolve_evidence_ref_rejects_malformed_syntax(tmp_path, ref):
     with pytest.raises(evidence.EvidenceRefError) as raised:
         evidence.resolve_evidence_ref(root, ref)
     assert raised.value.reason_code == "INVALID_REFERENCE"
+
+
+@pytest.mark.parametrize("ref", ["log/fuzz:1#L1", "log/fuzz:12#L1"])
+def test_resolve_evidence_ref_rejects_nonzero_fuzz_selector(tmp_path, ref):
+    root = _write_bundle(tmp_path, _log_files())
+
+    with pytest.raises(evidence.EvidenceRefError) as raised:
+        evidence.resolve_evidence_ref(root, ref)
+    assert raised.value.reason_code == "INVALID_REFERENCE"
+    assert "reserved for future per-round fuzz" in raised.value.message
+
+
+def test_resolve_evidence_ref_rejects_non_utf8_log(tmp_path):
+    files = _log_files()
+    files["build/vulnerable/build.log"] = ("build_log", b"build line 1\n\xff\n")
+    root = _write_bundle(tmp_path, files)
+
+    with pytest.raises(evidence.EvidenceRefError) as raised:
+        evidence.resolve_evidence_ref(root, "log/build:vulnerable#L1")
+    assert raised.value.reason_code == "INVALID_REFERENCE"
+    assert "UTF-8" in raised.value.message
+
+
+def test_resolve_evidence_ref_rejects_a_symlinked_log(tmp_path):
+    root = _write_bundle(tmp_path, _log_files())
+    target = tmp_path / "outside.log"
+    target.write_bytes(BUILD_LOG)
+    log = root / "build/vulnerable/build.log"
+    log.unlink()
+    log.symlink_to(target)
+
+    with pytest.raises(evidence.EvidenceRefError) as raised:
+        evidence.resolve_evidence_ref(root, "log/build:vulnerable#L1")
+    assert raised.value.reason_code == "MISSING_LOG"
+    assert "symlink" in raised.value.message
+
+
+def test_resolve_evidence_ref_rejects_two_fuzz_logs(tmp_path):
+    files = _log_files()
+    files["fuzz/second.log"] = ("fuzz_log", FUZZ_LOG)
+    root = _write_bundle(tmp_path, files)
+
+    with pytest.raises(evidence.EvidenceRefError) as raised:
+        evidence.resolve_evidence_ref(root, "log/fuzz:0#L1")
+    assert raised.value.reason_code == "MISSING_LOG"
+    assert "exactly one fuzz_log" in raised.value.message
+
+
+def test_resolve_evidence_ref_rejects_a_v1_manifest(tmp_path):
+    root = _write_bundle(tmp_path, _log_files())
+    manifest_path = root / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["schema_version"] = 1
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(evidence.EvidenceRefError) as raised:
+        evidence.resolve_evidence_ref(root, "log/build:vulnerable#L1")
+    assert raised.value.reason_code == "INVALID_REFERENCE"
+    assert "v2 manifest" in raised.value.message
+
+
+def test_resolve_evidence_ref_rejects_a_non_v2_bundle_kind(tmp_path):
+    root = _write_bundle(tmp_path, _log_files())
+    manifest_path = root / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["bundle_kind"] = "family"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(evidence.EvidenceRefError) as raised:
+        evidence.resolve_evidence_ref(root, "log/build:vulnerable#L1")
+    assert raised.value.reason_code == "INVALID_REFERENCE"
+    assert "bundle_kind" in raised.value.message
+
+
+def test_resolve_evidence_ref_rejects_build_log_at_a_non_fixed_path(tmp_path):
+    files = _log_files()
+    del files["build/vulnerable/build.log"]
+    files["build/vulnerable/other.log"] = ("build_log", BUILD_LOG)
+    root = _write_bundle(tmp_path, files)
+
+    with pytest.raises(evidence.EvidenceRefError) as raised:
+        evidence.resolve_evidence_ref(root, "log/build:vulnerable#L1")
+    assert raised.value.reason_code == "MISSING_LOG"
+    assert "build/vulnerable/build.log" in raised.value.message

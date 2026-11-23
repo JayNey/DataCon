@@ -53,6 +53,7 @@ from datacon.verdict import (
     VerdictPolicy,
     decide_verdict,
     reason_allowed,
+    reason_allowed_v2,
 )
 
 ARCHIVE_RESERVE_MAX = 60
@@ -2995,6 +2996,7 @@ def archive_blocked(
     review: Mapping[str, Any] | None = None,
     expected_plan_digest: str | None = None,
     run_root: Path | str | None = None,
+    job_contract_version: int | None = None,
 ) -> tuple[str | None, str | None, str | None]:
     """Archive a terminal block without a lease or execution context.
 
@@ -3008,7 +3010,21 @@ def archive_blocked(
     temporary: Path | None = None
     try:
         job_id = str(uuid.UUID(str(job["job_id"])))
-        if not isinstance(reason_code, str) or not reason_allowed(
+        # The job contract version, not the evidence manifest version, decides
+        # which reason-code table applies. A v1 job must not start producing
+        # v0.2-only terminal codes just because this shared archiver can also
+        # serve v2 jobs.
+        version = (
+            job.get("job_contract_version", 1)
+            if job_contract_version is None
+            else job_contract_version
+        )
+        if version not in (1, 2):
+            raise BundleError(
+                "INVALID_MANIFEST", "job_contract_version must be 1 or 2"
+            )
+        allowed = reason_allowed_v2 if version == 2 else reason_allowed
+        if not isinstance(reason_code, str) or not allowed(
             "BLOCKED", reason_code
         ):
             raise BundleError(
@@ -3065,6 +3081,7 @@ def archive_blocked(
             verify=verify_bundle,
             dir_mode=0o755,
             file_mode=0o444,
+            schema_version=version,
         )
         temporary.rename(bundle)
         return info.manifest_digest, str(bundle.resolve()), None
@@ -3123,6 +3140,7 @@ def record_blocked(
         review=review,
         expected_plan_digest=expected_plan_digest,
         run_root=run_root,
+        job_contract_version=job.get("job_contract_version", 1),
     )
     recorded = state.record_blocked_evidence(
         dsn,
