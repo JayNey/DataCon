@@ -2892,6 +2892,7 @@ def _blocked_report(
     plan: Mapping[str, Any] | None,
     review: Mapping[str, Any] | None,
     expected_plan_digest: str | None = None,
+    schema_version: int = 1,
 ) -> tuple[dict[str, Any], str | None, dict[str, Any] | None, dict[str, Any] | None]:
     """Build a report for a terminal block that did not reach execution.
 
@@ -2901,6 +2902,8 @@ def _blocked_report(
     bundle records the block without pretending a complete plan existed (an
     expiry can leave only a plan, and submit-time rejection has neither).
     """
+    if type(schema_version) is not int or schema_version not in (1, 2):
+        raise ValueError("blocked report schema_version must be 1 or 2")
     plan_doc: dict[str, Any] | None = dict(plan) if isinstance(plan, Mapping) else None
     plan_digest: str | None = None
     if plan_doc is not None:
@@ -2957,7 +2960,7 @@ def _blocked_report(
     if review_doc is not None:
         evidence_refs.append("review.json")
     report: dict[str, Any] = {
-        "schema_version": 1,
+        "schema_version": schema_version,
         "job_id": str(job["job_id"]),
         "plan_digest": plan_digest,
         "cve_id": plan_map.get("cve_id") or request.get("cve_id"),
@@ -2983,6 +2986,8 @@ def _blocked_report(
         "cleanup_errors": [],
         "created_at": _utc_now(),
     }
+    if schema_version == contracts.SCHEMA_VERSION_V2:
+        report["bundle_kind"] = "blocked"
     return report, plan_digest, plan_doc, review_doc
 
 
@@ -3057,6 +3062,7 @@ def archive_blocked(
             plan=plan,
             review=review,
             expected_plan_digest=expected_plan_digest,
+            schema_version=version,
         )
         artifacts: dict[str, tuple[str, bytes]] = {}
         if plan_doc is not None:

@@ -198,6 +198,29 @@ _V2_REQUIRED_PATHS = {
     },
 }
 _ENTRY_FIELDS = frozenset({"path", "role", "size_bytes", "sha256"})
+# Closed top-level key set for Manifest v2 (§8 / §12.5). Blocked bundles may
+# omit nullable identity keys (§12.2), but unknown top-level keys are always
+# rejected.
+_V2_MANIFEST_FIELDS = frozenset(
+    {
+        "schema_version",
+        "bundle_kind",
+        "job_id",
+        "family_id",
+        "parent_job_id",
+        "round_no",
+        "plan_digest",
+        "envelope_digest",
+        "experiment_digest",
+        "build_provenance_rules_version",
+        "verdict",
+        "reason_code",
+        "created_at",
+        "build_ref",
+        "reuse_origin",
+        "files",
+    }
+)
 _VERDICTS = frozenset(
     {"REPRODUCED", "NOT_REPRODUCED", "INCONCLUSIVE", "BLOCKED", "FAILED"}
 )
@@ -349,6 +372,22 @@ def _read_artifact(value: bytes | bytearray | memoryview | Path | str) -> bytes:
     return data
 
 
+def _map_unsafe_file_error(
+    error: fileio.UnsafeFileError, label: Path | str
+) -> BundleError:
+    if error.kind == "SYMLINK":
+        return BundleError("SYMLINK", f"file is a symlink: {label}")
+    if error.kind == "NOT_REGULAR":
+        return BundleError(
+            "INVALID_MANIFEST", f"file is not a regular file: {label}"
+        )
+    if error.kind in ("TOO_LARGE", "CHANGED"):
+        return BundleError(
+            "DIGEST_MISMATCH", f"file changed while reading: {label}"
+        )
+    return BundleError("MISSING_FILE", f"file is not readable: {label}")
+
+
 def _read_bounded(path: Path, *, expected_size: int) -> bytes:
     """Read at most ``expected_size + 1`` bytes from a regular file.
 
@@ -362,19 +401,19 @@ def _read_bounded(path: Path, *, expected_size: int) -> bytes:
     try:
         return fileio.read_regular_file_bounded(path, max_bytes=expected_size)
     except fileio.UnsafeFileError as error:
-        if error.kind == "SYMLINK":
-            raise BundleError("SYMLINK", f"file is a symlink: {path}") from error
-        if error.kind == "NOT_REGULAR":
-            raise BundleError(
-                "INVALID_MANIFEST", f"file is not a regular file: {path}"
-            ) from error
-        if error.kind in ("TOO_LARGE", "CHANGED"):
-            raise BundleError(
-                "DIGEST_MISMATCH", f"file changed while reading: {path}"
-            ) from error
-        raise BundleError(
-            "MISSING_FILE", f"file is not readable: {path}"
-        ) from error
+        raise _map_unsafe_file_error(error, path) from error
+
+
+def _read_bounded_under_root(
+    root: Path, relative_path: str, *, expected_size: int
+) -> bytes:
+    """Read a bundle file step-by-step from ``root`` without following symlinks."""
+    try:
+        return fileio.read_regular_file_under_root_bounded(
+            root, relative_path, max_bytes=expected_size
+        )
+    except fileio.UnsafeFileError as error:
+        raise _map_unsafe_file_error(error, root / PurePosixPath(relative_path)) from error
 
 
 def _apply_bundle_modes(
@@ -461,9 +500,11 @@ def write_bundle(
         raise BundleError("INVALID_MANIFEST", "report reason_code is invalid")
     if (
         type(report.get("schema_version")) is not int
-        or report.get("schema_version") != SCHEMA_VERSION
+        or report.get("schema_version") != schema_version
     ):
-        raise BundleError("INVALID_MANIFEST", "report schema_version must be 1")
+        raise BundleError(
+            "INVALID_MANIFEST", f"report schema_version must be {schema_version}"
+        )
     if report.get("state") != report_verdict:
         raise BundleError(
             "INVALID_MANIFEST", "report state must equal report verdict"
@@ -608,6 +649,9 @@ def write_bundle(
         if schema_version == contracts.SCHEMA_VERSION_V2:
             if bundle_kind == "blocked":
                 _require_blocked_paths(listed)
+                _validate_blocked_artifacts(
+                    payloads, plan_digest=plan_digest, report=report
+                )
             else:
                 _require_required_paths(listed, _V2_REQUIRED_PATHS[bundle_kind])
         elif bundle_kind == "execution":
@@ -860,6 +904,12 @@ def _validate_v2_manifest_header(
         or manifest.get("schema_version") != contracts.SCHEMA_VERSION_V2
     ):
         raise BundleError("INVALID_MANIFEST", "manifest schema_version must be 2")
+    unknown_fields = sorted(set(manifest) - _V2_MANIFEST_FIELDS)
+    if unknown_fields:
+        raise BundleError(
+            "INVALID_MANIFEST",
+            "manifest contains unknown fields: " + ", ".join(unknown_fields),
+        )
     bundle_kind = manifest.get("bundle_kind")
     if not isinstance(bundle_kind, str) or bundle_kind not in _V2_BUNDLE_KINDS:
         raise BundleError("INVALID_MANIFEST", "manifest bundle_kind is invalid")
@@ -934,11 +984,6 @@ def _validate_v2_manifest_header(
                 raise BundleError(
                     "INVALID_MANIFEST",
                     "a non-reuse execution must not carry build_ref",
-                )
-            if experiment_digest is not None:
-                raise BundleError(
-                    "INVALID_MANIFEST",
-                    "a non-reuse execution must not carry experiment_digest",
                 )
         else:
             if build_ref_value is None:
@@ -1086,6 +1131,8 @@ def resolve_evidence_ref(bundle_root: Path | str, ref: str) -> list[str]:
             "fuzz logs and is not implemented",
         )
     root = Path(bundle_root)
+    if root.is_symlink():
+        raise EvidenceRefError("SYMLINK", "bundle root must not be a symlink")
     try:
         manifest, _ = _load_manifest(root)
     except BundleError as error:
@@ -1132,8 +1179,9 @@ def resolve_evidence_ref(bundle_root: Path | str, ref: str) -> list[str]:
         entry = matches[0]
 
     try:
-        data = _read_bounded(
-            root / PurePosixPath(entry["path"]),
+        data = _read_bounded_under_root(
+            root,
+            entry["path"],
             expected_size=entry["size_bytes"],
         )
     except BundleError as error:
@@ -3578,6 +3626,107 @@ def _verify_v2_layout(
         )
 
 
+def _verify_v2_blocked_semantics(
+    *,
+    job_id: str,
+    plan_digest: str | None,
+    verdict: str | None,
+    manifest_reason: str | None,
+    data: Mapping[str, bytes],
+) -> None:
+    """Verify report.json, report.md and optional plan/review on v2 blocked bundles."""
+    report = _parse_json_file(data, "report.json")
+    if (
+        type(report.get("schema_version")) is not int
+        or report.get("schema_version") != contracts.SCHEMA_VERSION_V2
+    ):
+        raise BundleError(
+            "INVALID_MANIFEST", "report schema_version must be 2"
+        )
+    if "bundle_kind" in report and report.get("bundle_kind") != "blocked":
+        raise BundleError(
+            "INVALID_MANIFEST", "report bundle_kind must be blocked"
+        )
+    if report.get("job_id") != job_id:
+        raise BundleError(
+            "INVALID_MANIFEST", "report job_id does not match manifest"
+        )
+    if report.get("plan_digest") != plan_digest:
+        raise BundleError(
+            "INVALID_MANIFEST", "report plan_digest does not match manifest"
+        )
+    report_verdict = report.get("verdict")
+    if report_verdict != "BLOCKED" or report_verdict != verdict:
+        raise BundleError(
+            "INVALID_MANIFEST", "a blocked bundle must record verdict BLOCKED"
+        )
+    if report.get("state") != "BLOCKED":
+        raise BundleError(
+            "INVALID_MANIFEST", "report state must equal report verdict"
+        )
+    report_reason = _reason_code_valid(report)
+    if manifest_reason != report_reason:
+        raise BundleError(
+            "INVALID_MANIFEST", "manifest reason_code does not match report"
+        )
+    if report_reason is None or not reason_allowed_v2("BLOCKED", report_reason):
+        raise BundleError(
+            "INVALID_MANIFEST",
+            "a blocked bundle requires an allowed BLOCKED reason_code",
+        )
+    missing = report.get("missing")
+    if not isinstance(missing, list) or not all(
+        isinstance(item, str) for item in missing
+    ):
+        raise BundleError(
+            "INVALID_MANIFEST", "report missing must be a list of strings"
+        )
+    report_error = report.get("error")
+    if report_error is not None and not isinstance(report_error, str):
+        raise BundleError(
+            "INVALID_MANIFEST", "report error must be text or null"
+        )
+    evidence_complete = report.get("evidence_complete")
+    if evidence_complete is not None and type(evidence_complete) is not bool:
+        raise BundleError(
+            "INVALID_MANIFEST", "report evidence_complete must be a boolean"
+        )
+    markdown = data.get("report.md")
+    if markdown is None:
+        raise BundleError("INVALID_MANIFEST", "report.md is missing")
+    expected_markdown = report.get("report_markdown_sha256")
+    if (
+        not isinstance(expected_markdown, str)
+        or not _SHA256_HEX.fullmatch(expected_markdown)
+    ):
+        raise BundleError(
+            "INVALID_MANIFEST",
+            "report report_markdown_sha256 is missing or invalid",
+        )
+    if _sha256(markdown) != expected_markdown:
+        raise BundleError(
+            "DIGEST_MISMATCH",
+            "report.md digest does not match report.json",
+        )
+    _verify_report_markdown(markdown, "BLOCKED", report_reason)
+    _validate_blocked_artifacts(data, plan_digest=plan_digest, report=report)
+    if plan_digest is None:
+        if report.get("review") is not None:
+            raise BundleError(
+                "INVALID_MANIFEST",
+                "report review must be null when review.json is absent",
+            )
+        return
+    plan = _parse_json_file(data, "plan.json")
+    for field in ("case_id", "cve_id"):
+        if report.get(field) is not None and report.get(field) != plan.get(
+            field
+        ):
+            raise BundleError(
+                "INVALID_MANIFEST", f"report {field} does not match the plan"
+            )
+
+
 def _verify_bundle_v2(
     root_path: Path,
     manifest: dict[str, Any],
@@ -3592,12 +3741,12 @@ def _verify_bundle_v2(
     files and digest tampering keep the same guarantees.
     """
     (
-        _job_id,
+        job_id,
         bundle_kind,
-        _plan_digest,
+        plan_digest,
         files,
-        _verdict,
-        _manifest_reason,
+        verdict,
+        manifest_reason,
     ) = _validate_v2_manifest_header(manifest)
     entries = []
     seen: set[str] = set()
@@ -3619,6 +3768,14 @@ def _verify_bundle_v2(
         _require_required_paths(listed, _V2_REQUIRED_PATHS[bundle_kind])
     _verify_v2_layout(listed, bundle_kind)
     data = _read_listed_files(root_path, listed)
+    if bundle_kind == "blocked":
+        _verify_v2_blocked_semantics(
+            job_id=job_id,
+            plan_digest=plan_digest,
+            verdict=verdict,
+            manifest_reason=manifest_reason,
+            data=data,
+        )
 
     return BundleVerification(
         root=root_path,

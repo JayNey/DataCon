@@ -396,7 +396,7 @@ def _evidence_ref(value: Any) -> str:
     if text.startswith("log/fuzz:"):
         if _FUZZ_REF.fullmatch(text) is None:
             raise ValueError(
-                "log/fuzz evidence_ref must be log/fuzz:<seed>#L<line>"
+                "log/fuzz evidence_ref must be log/fuzz:<round>#L<line>"
             )
         return text
     return text
@@ -407,7 +407,7 @@ class LogEvidenceRef:
     """A parsed v2 ``log/build`` or ``log/fuzz`` evidence reference.
 
     ``kind`` is ``build`` or ``fuzz``; ``selector`` is the build version
-    (``vulnerable``/``fixed``) or the fuzz seed. ``start``/``end`` are the
+    (``vulnerable``/``fixed``) or the fuzz round. ``start``/``end`` are the
     inclusive 1-based line bounds. ``text`` is the canonical reference.
     """
 

@@ -1942,9 +1942,43 @@ def _assert_no_freeze_rows(database, family_id, child_id, state_name="PREPARING"
     )[0] == state_name
 
 
+def _insert_approval(
+    database,
+    family_id,
+    *,
+    approval_digest,
+    envelope_digest,
+    supersedes=None,
+    reviewer_id=REVIEWER_1,
+):
+    approval_id = uuid4()
+    database.connection.execute(
+        "INSERT INTO family_approvals (approval_id, family_id, "
+        "approval_digest, envelope_digest, first_plan_digest, reviewer_id, "
+        "decided_at, supersedes) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+        (
+            approval_id,
+            family_id,
+            approval_digest,
+            envelope_digest,
+            FIRST_PLAN_DIGEST,
+            reviewer_id,
+            _now(),
+            supersedes,
+        ),
+    )
+    return approval_id
+
+
 def test_freeze_guided_round_one_does_not_enter_review(isolated_database):
     family_id, child_id = _freeze_seed(
         isolated_database, _family_request("guided"), job_kind="round"
+    )
+    _insert_approval(
+        isolated_database,
+        family_id,
+        approval_digest=APPROVAL_1,
+        envelope_digest=ENVELOPE_1,
     )
     plan = _v2_plan(
         family_id,
@@ -2121,6 +2155,12 @@ def test_freeze_fixed_later_round_does_not_enter_review(isolated_database):
         round_no=2,
         lease=True,
     )
+    _insert_approval(
+        isolated_database,
+        family_id,
+        approval_digest=APPROVAL_1,
+        envelope_digest=ENVELOPE_1,
+    )
     plan = _v2_plan(
         family_id,
         round_no=2,
@@ -2143,6 +2183,116 @@ def test_freeze_fixed_later_round_does_not_enter_review(isolated_database):
     )
     assert state_name == "PREPARING"
     assert review_deadline_at is None
+
+
+def test_freeze_non_first_plan_rejects_forged_approval_without_family_approval(
+    isolated_database,
+):
+    family_id, child_id = _freeze_seed(
+        isolated_database, _family_request("guided"), job_kind="round"
+    )
+    plan = _v2_plan(
+        family_id,
+        round_no=1,
+        envelope_digest=ENVELOPE_1,
+        parent_approval_digest=APPROVAL_1,
+    )
+    digest = contracts.plan_digest(plan)
+
+    with pytest.raises(state.StateError, match="family_approvals"):
+        state.freeze_plan(
+            isolated_database.dsn,
+            child_id,
+            generation=1,
+            plan=plan,
+            plan_digest=digest,
+            summary={},
+        )
+    _assert_no_freeze_rows(isolated_database, family_id, child_id)
+
+
+def test_freeze_non_first_plan_rejects_superseded_approval_digest(
+    isolated_database,
+):
+    family_id, child_id = _freeze_seed(
+        isolated_database, _family_request("guided"), job_kind="round"
+    )
+    approval_2 = "sha256:" + "d" * 64
+    first_id = _insert_approval(
+        isolated_database,
+        family_id,
+        approval_digest=APPROVAL_1,
+        envelope_digest=ENVELOPE_1,
+    )
+    _insert_approval(
+        isolated_database,
+        family_id,
+        approval_digest=approval_2,
+        envelope_digest=ENVELOPE_2,
+        supersedes=first_id,
+        reviewer_id=REVIEWER_2,
+    )
+    stale_plan = _v2_plan(
+        family_id,
+        round_no=1,
+        envelope_digest=ENVELOPE_1,
+        parent_approval_digest=APPROVAL_1,
+    )
+    with pytest.raises(state.StateError, match="parent_approval_digest"):
+        state.freeze_plan(
+            isolated_database.dsn,
+            child_id,
+            generation=1,
+            plan=stale_plan,
+            plan_digest=contracts.plan_digest(stale_plan),
+            summary={},
+        )
+    _assert_no_freeze_rows(isolated_database, family_id, child_id)
+
+    tail_plan = _v2_plan(
+        family_id,
+        round_no=1,
+        envelope_digest=ENVELOPE_2,
+        parent_approval_digest=approval_2,
+    )
+    assert state.freeze_plan(
+        isolated_database.dsn,
+        child_id,
+        generation=1,
+        plan=tail_plan,
+        plan_digest=contracts.plan_digest(tail_plan),
+        summary={},
+    ) is True
+
+
+def test_freeze_non_first_plan_rejects_envelope_mismatch_with_approval_tail(
+    isolated_database,
+):
+    family_id, child_id = _freeze_seed(
+        isolated_database, _family_request("guided"), job_kind="round"
+    )
+    _insert_approval(
+        isolated_database,
+        family_id,
+        approval_digest=APPROVAL_1,
+        envelope_digest=ENVELOPE_1,
+    )
+    mismatched_plan = _v2_plan(
+        family_id,
+        round_no=1,
+        envelope_digest=ENVELOPE_2,
+        parent_approval_digest=APPROVAL_1,
+    )
+    with pytest.raises(state.StateError, match="envelope_digest"):
+        state.freeze_plan(
+            isolated_database.dsn,
+            child_id,
+            generation=1,
+            plan=mismatched_plan,
+            plan_digest=contracts.plan_digest(mismatched_plan),
+            summary={},
+        )
+    _assert_no_freeze_rows(isolated_database, family_id, child_id)
 
 
 def test_freeze_plan_locks_family_then_child(isolated_database):
@@ -2354,8 +2504,8 @@ def test_freeze_plan_rejects_wrong_family_id(isolated_database):
         isolated_database, _family_request("guided")
     )
     plan = _v2_plan(family_id, round_no=None, envelope_digest=ENVELOPE_1)
-    plan["family_id"] = plan["parent_job_id"] = str(uuid4())
     digest = contracts.plan_digest(plan)
+    plan["family_id"] = str(uuid4())
 
     with pytest.raises(state.StateError, match="family_id"):
         state.freeze_plan(
@@ -2374,11 +2524,9 @@ def test_freeze_plan_rejects_wrong_parent_job_id(isolated_database):
     family_id, child_id = _freeze_seed(
         isolated_database, _family_request("guided")
     )
-    # Plan v2 requires family_id == parent_job_id, so a contract-valid parent
-    # mismatch is expressed by pointing the identity pair at another UUID.
     plan = _v2_plan(family_id, round_no=None, envelope_digest=ENVELOPE_1)
-    plan["family_id"] = plan["parent_job_id"] = str(uuid4())
     digest = contracts.plan_digest(plan)
+    plan["parent_job_id"] = str(uuid4())
 
     with pytest.raises(state.StateError, match="parent_job_id"):
         state.freeze_plan(

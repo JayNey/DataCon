@@ -244,6 +244,28 @@ def test_resolve_evidence_ref_rejects_a_symlinked_log(tmp_path):
     assert "symlink" in raised.value.message
 
 
+def test_resolve_evidence_ref_rejects_intermediate_directory_symlink(tmp_path):
+    secret = b"TOP_SECRET_OUTSIDE_LINE_1\nTOP_SECRET_OUTSIDE_LINE_2\n"
+    outside_dir = tmp_path / "outside-build-dir"
+    outside_dir.mkdir()
+    (outside_dir / "build.log").write_bytes(secret)
+
+    files = _log_files()
+    files["build/vulnerable/build.log"] = ("build_log", secret)
+    root = _write_bundle(tmp_path, files)
+
+    vuln_dir = root / "build/vulnerable"
+    (vuln_dir / "build.log").unlink()
+    vuln_dir.rmdir()
+    vuln_dir.symlink_to(outside_dir)
+
+    with pytest.raises(evidence.EvidenceRefError) as raised:
+        evidence.resolve_evidence_ref(root, "log/build:vulnerable#L1")
+    assert raised.value.reason_code == "MISSING_LOG"
+    assert "symlink" in raised.value.message
+    assert "TOP_SECRET_OUTSIDE_LINE_1" not in raised.value.message
+
+
 def test_resolve_evidence_ref_rejects_two_fuzz_logs(tmp_path):
     files = _log_files()
     files["fuzz/second.log"] = ("fuzz_log", FUZZ_LOG)

@@ -515,18 +515,43 @@ def freeze_plan(
                 raise StateError(
                     "a fixed first plan must have parent_approval_digest=null"
                 )
-            if (
-                not first_v2_plan
-                and plan.get("parent_approval_digest") is None
-            ):
-                # A guided round 1 is a later plan even though its round_no is
-                # 1: the guided campaign was the first plan. Rejecting the
-                # null before any write keeps a frozen-but-unreviewed plan
-                # from sitting outside the approval chain.
-                raise StateError(
-                    "a non-first v2 plan requires a non-null "
-                    "parent_approval_digest"
-                )
+            if not first_v2_plan:
+                parent_approval_digest = plan.get("parent_approval_digest")
+                if parent_approval_digest is None:
+                    # A guided round 1 is a later plan even though its round_no is
+                    # 1: the guided campaign was the first plan. Rejecting the
+                    # null before any write keeps a frozen-but-unreviewed plan
+                    # from sitting outside the approval chain.
+                    raise StateError(
+                        "a non-first v2 plan requires a non-null "
+                        "parent_approval_digest"
+                    )
+                # The family row is already locked FOR UPDATE above, so the
+                # approval chain tail cannot move while this check runs.
+                tails = connection.execute(
+                    "SELECT prior.approval_digest, prior.envelope_digest "
+                    "FROM family_approvals AS prior "
+                    "WHERE prior.family_id = %s AND NOT EXISTS ("
+                    "SELECT 1 FROM family_approvals AS later "
+                    "WHERE later.supersedes = prior.approval_id)",
+                    (job["family_id"],),
+                ).fetchall()
+                if len(tails) != 1:
+                    raise StateError(
+                        "a non-first v2 plan requires a single "
+                        "family_approvals chain tail"
+                    )
+                tail = tails[0]
+                if parent_approval_digest != tail["approval_digest"]:
+                    raise StateError(
+                        "plan parent_approval_digest does not match the "
+                        "family_approvals chain tail"
+                    )
+                if plan.get("envelope_digest") != tail["envelope_digest"]:
+                    raise StateError(
+                        "plan envelope_digest does not match the "
+                        "family_approvals chain tail"
+                    )
         normalized_envelope: dict[str, Any] | None = None
         if first_v2_plan:
             if envelope is None:
@@ -1194,6 +1219,14 @@ def _validate_family_evidence_pointer(
     """
     if not isinstance(evidence_path, str) or not evidence_path.strip():
         raise StateError("completing a family requires evidence_path")
+    if evidence_path.startswith("//"):
+        raise StateError("family evidence_path must not start with '//'")
+    if "\x00" in evidence_path or any(
+        ord(ch) < 0x20 or ord(ch) == 0x7F for ch in evidence_path
+    ):
+        raise StateError(
+            "family evidence_path must not contain control or NUL characters"
+        )
     if "\\" in evidence_path:
         raise StateError("family evidence_path must use POSIX separators")
     if len(evidence_path) > MAX_FAMILY_EVIDENCE_PATH:
@@ -2078,6 +2111,7 @@ def _record_family_review(
             message="family has more than one first child job",
         )
     child = children[0]
+    locked_child: dict[str, Any] | None = None
     if first_round:
         # Lock order is family then first child. The family lock is already
         # held; blocking here proves the order to any concurrent observer.

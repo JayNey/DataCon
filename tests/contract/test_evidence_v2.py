@@ -316,12 +316,54 @@ def test_campaign_bundle_has_no_verdict(tmp_path):
             verify_bundle(root)
 
 
-def test_blocked_bundle_only_requires_the_two_reports(tmp_path):
-    files = {
-        "report.json": ("report_json", b'{"report":true}\n'),
-        "report.md": ("report_markdown", b"# blocked\n"),
+def _blocked_files(
+    manifest,
+    *,
+    report_overrides=None,
+    markdown_override=None,
+    extra_files=None,
+):
+    reason = manifest["reason_code"]
+    markdown_text = (
+        markdown_override
+        if markdown_override is not None
+        else (
+            "# DataCon evidence report\n\n"
+            "- Verdict: **BLOCKED**\n"
+            f"- Reason: `{reason or ''}`\n"
+        )
+    )
+    markdown_bytes = markdown_text.encode("utf-8")
+    report = {
+        "schema_version": 2,
+        "bundle_kind": "blocked",
+        "job_id": manifest["job_id"],
+        "plan_digest": manifest["plan_digest"],
+        "state": "BLOCKED",
+        "verdict": "BLOCKED",
+        "reason_code": reason,
+        "review": None,
+        "missing": ["execution did not complete"],
+        "error": f"{reason}: blocked" if reason else None,
+        "evidence_complete": False,
+        "report_markdown_sha256": hashlib.sha256(markdown_bytes).hexdigest(),
     }
-    root = _write_v2_bundle(tmp_path, _manifest("blocked"), files, name="blocked")
+    if report_overrides:
+        report.update(report_overrides)
+    files = {
+        "report.json": ("report_json", json.dumps(report).encode("utf-8") + b"\n"),
+        "report.md": ("report_markdown", markdown_bytes),
+    }
+    if extra_files:
+        files.update(extra_files)
+    return files
+
+
+def test_blocked_bundle_only_requires_the_two_reports(tmp_path):
+    manifest = _manifest("blocked")
+    root = _write_v2_bundle(
+        tmp_path, manifest, _blocked_files(manifest), name="blocked"
+    )
     verified = verify_bundle(root)
     assert verified.manifest["bundle_kind"] == "blocked"
 
@@ -341,10 +383,7 @@ def test_v2_blocked_bundle_accepts_new_blocked_reason(tmp_path, reason):
     root = _write_v2_bundle(
         tmp_path,
         manifest,
-        {
-            "report.json": ("report_json", b'{"report":true}\n'),
-            "report.md": ("report_markdown", b"# blocked\n"),
-        },
+        _blocked_files(manifest),
         name=f"blocked-{reason.lower()}",
     )
 
@@ -491,3 +530,297 @@ def test_v1_verification_uses_frozen_compile_args_extractor(tmp_path, monkeypatc
         name="v2-after-monkeypatch",
     )
     assert verify_bundle(v2_root).manifest["schema_version"] == 2
+
+
+def test_v2_non_reuse_validation_accepts_experiment_digest_without_build_ref(tmp_path):
+    manifest = _manifest("execution")
+    manifest["experiment_digest"] = "sha256:" + "c" * 64
+    manifest["build_ref"] = None
+    manifest["reuse_origin"] = None
+    root = _write_v2_bundle(
+        tmp_path,
+        manifest,
+        _base_files(execution=True, campaign=False),
+        name="non-reuse-validation",
+    )
+    verified = verify_bundle(root)
+    assert verified.manifest["experiment_digest"] == "sha256:" + "c" * 64
+    assert verified.manifest["build_ref"] is None
+    assert verified.manifest["reuse_origin"] is None
+
+
+def test_v2_non_reuse_execution_still_rejects_build_ref_without_reuse_origin(tmp_path):
+    manifest = _manifest("execution")
+    manifest["experiment_digest"] = "sha256:" + "c" * 64
+    manifest["reuse_origin"] = None
+    manifest["build_ref"] = {
+        "source_job_id": str(uuid4()),
+        "generation": 1,
+        "build_inputs_digest": DIGEST,
+        "artifacts": {
+            "vulnerable": {
+                "artifact_digest": DIGEST,
+                "build_log_digest": OTHER_DIGEST,
+            },
+            "fixed": {
+                "artifact_digest": OTHER_DIGEST,
+                "build_log_digest": DIGEST,
+            },
+        },
+    }
+    root = _write_v2_bundle(
+        tmp_path,
+        manifest,
+        _base_files(execution=True, campaign=False),
+        name="non-reuse-with-build-ref",
+    )
+    with pytest.raises(BundleError, match="build_ref") as raised:
+        verify_bundle(root)
+    assert raised.value.reason_code == "INVALID_MANIFEST"
+
+
+@pytest.mark.parametrize("bundle_kind", ["execution", "campaign", "blocked"])
+def test_v2_manifest_rejects_unknown_top_level_key(tmp_path, bundle_kind):
+    if bundle_kind == "campaign":
+        manifest = _manifest("campaign", verdict=None, reason=None)
+        files = _base_files(execution=False, campaign=True)
+    elif bundle_kind == "execution":
+        manifest = _manifest("execution")
+        files = _base_files(execution=True, campaign=False)
+    else:
+        manifest = _manifest("blocked")
+        files = _blocked_files(manifest)
+    manifest["unexpected_top_level_key"] = "smuggled"
+    root = _write_v2_bundle(
+        tmp_path, manifest, files, name=f"unknown-key-{bundle_kind}"
+    )
+    with pytest.raises(BundleError, match="unknown") as raised:
+        verify_bundle(root)
+    assert raised.value.reason_code == "INVALID_MANIFEST"
+
+
+def test_write_bundle_v2_blocked_enforces_schema_version_and_plan_artifacts(tmp_path):
+    job_id = str(uuid4())
+    markdown = (
+        "# DataCon evidence report\n\n"
+        "- Verdict: **BLOCKED**\n"
+        "- Reason: `ADMISSION_DENIED`\n"
+    )
+    base_report = {
+        "schema_version": 1,
+        "bundle_kind": "blocked",
+        "job_id": job_id,
+        "plan_digest": None,
+        "state": "BLOCKED",
+        "verdict": "BLOCKED",
+        "reason_code": "ADMISSION_DENIED",
+        "review": None,
+        "missing": ["execution did not complete"],
+        "error": "ADMISSION_DENIED: denied",
+        "evidence_complete": False,
+    }
+
+    with pytest.raises(BundleError, match="schema_version") as raised:
+        evidence.write_bundle(
+            tmp_path / "v2-blocked-v1-report",
+            job_id=job_id,
+            plan_digest=None,
+            bundle_kind="blocked",
+            report=base_report,
+            report_markdown=markdown,
+            verdict="BLOCKED",
+            schema_version=2,
+        )
+    assert raised.value.reason_code == "INVALID_MANIFEST"
+
+    v2_report = dict(base_report, schema_version=2)
+    info = evidence.write_bundle(
+        tmp_path / "v2-blocked-ok",
+        job_id=job_id,
+        plan_digest=None,
+        bundle_kind="blocked",
+        report=v2_report,
+        report_markdown=markdown,
+        verdict="BLOCKED",
+        verify=verify_bundle,
+        schema_version=2,
+    )
+    verified = verify_bundle(info.root)
+    assert verified.manifest["schema_version"] == 2
+    assert json.loads(verified.file_data["report.json"])["schema_version"] == 2
+
+    with_plan_digest = dict(v2_report, plan_digest=DIGEST)
+    with pytest.raises(BundleError, match="plan.json") as raised:
+        evidence.write_bundle(
+            tmp_path / "v2-blocked-missing-plan",
+            job_id=job_id,
+            plan_digest=DIGEST,
+            bundle_kind="blocked",
+            report=with_plan_digest,
+            report_markdown=markdown,
+            verdict="BLOCKED",
+            schema_version=2,
+        )
+    assert raised.value.reason_code == "INVALID_MANIFEST"
+
+
+def test_archive_blocked_v2_emits_schema_version_2_and_verifies(
+    tmp_path, monkeypatch
+):
+    from datacon import execution
+
+    evidence_root = tmp_path / "evidence"
+    monkeypatch.setenv("DATACON_EVIDENCE_ROOT", str(evidence_root))
+    job = {
+        "job_id": str(uuid4()),
+        "job_contract_version": 2,
+        "request": {
+            "schema_version": 2,
+            "cve_id": "CVE-2099-0001",
+            "target": {
+                "kind": "source",
+                "case_id": "fixture-c-parser",
+                "goal": "v2 blocked archive test",
+            },
+            "limits": {
+                "cpu": 1,
+                "memory_mib": 512,
+                "pids": 64,
+                "scratch_mib": 256,
+                "prepare_seconds": 60,
+                "execute_seconds": 120,
+            },
+        },
+    }
+    digest, path, error = execution.archive_blocked(
+        job,
+        generation=1,
+        reason_code="ENVELOPE_VIOLATION",
+        message="envelope exceeded",
+    )
+    assert error is None, error
+    assert digest is not None and path is not None
+    verified = verify_bundle(path)
+    assert verified.manifest["schema_version"] == 2
+    assert verified.manifest["bundle_kind"] == "blocked"
+    report = json.loads(verified.file_data["report.json"])
+    assert report["schema_version"] == 2
+    assert report["bundle_kind"] == "blocked"
+    assert report["verdict"] == "BLOCKED"
+    assert report["reason_code"] == "ENVELOPE_VIOLATION"
+
+
+@pytest.mark.parametrize(
+    "case_name,overrides,markdown_override,expected_reason",
+    [
+        (
+            "verdict-mismatch",
+            {"verdict": "REPRODUCED", "state": "REPRODUCED"},
+            None,
+            "INVALID_MANIFEST",
+        ),
+        (
+            "reason-mismatch",
+            {"reason_code": "POLICY_DENIED"},
+            None,
+            "INVALID_MANIFEST",
+        ),
+        (
+            "plan-digest-mismatch",
+            {"plan_digest": DIGEST},
+            None,
+            "INVALID_MANIFEST",
+        ),
+        (
+            "report-schema-1",
+            {"schema_version": 1},
+            None,
+            "INVALID_MANIFEST",
+        ),
+        (
+            "review-without-plan",
+            {"review": {"decision": "reject"}},
+            None,
+            "INVALID_MANIFEST",
+        ),
+        (
+            "tampered-markdown-digest",
+            {"report_markdown_sha256": "0" * 64},
+            None,
+            "DIGEST_MISMATCH",
+        ),
+        (
+            "tampered-markdown-verdict",
+            None,
+            "# DataCon evidence report\n\n- Verdict: **REPRODUCED**\n- Reason: `REVIEW_REJECTED`\n",
+            "INVALID_MANIFEST",
+        ),
+    ],
+)
+def test_v2_blocked_verify_rejects_inconsistent_report_or_markdown(
+    tmp_path, case_name, overrides, markdown_override, expected_reason
+):
+    manifest = _manifest("blocked")
+    files = _blocked_files(
+        manifest,
+        report_overrides=overrides,
+        markdown_override=markdown_override,
+    )
+    root = _write_v2_bundle(tmp_path, manifest, files, name=f"bad-blocked-{case_name}")
+    with pytest.raises(BundleError) as raised:
+        verify_bundle(root)
+    assert raised.value.reason_code == expected_reason
+
+
+def test_v2_blocked_verify_checks_plan_and_review_consistency(tmp_path):
+    from test_evidence import PLAN, PLAN_DIGEST, REVIEW
+
+    manifest = _manifest("blocked")
+    manifest["plan_digest"] = PLAN_DIGEST
+    review = dict(REVIEW, decision="reject")
+    plan_bytes = json.dumps(PLAN).encode("utf-8") + b"\n"
+    review_bytes = json.dumps(review).encode("utf-8") + b"\n"
+
+    valid_files = _blocked_files(
+        manifest,
+        report_overrides={
+            "case_id": PLAN["case_id"],
+            "cve_id": PLAN["cve_id"],
+            "review": {
+                "reviewer_id": review["reviewer_id"],
+                "decision": review["decision"],
+                "plan_digest": review["plan_digest"],
+                "decided_at": review["decided_at"],
+            },
+        },
+        extra_files={
+            "plan.json": ("plan", plan_bytes),
+            "review.json": ("review", review_bytes),
+        },
+    )
+    ok_root = _write_v2_bundle(tmp_path, manifest, valid_files, name="blocked-plan-ok")
+    assert verify_bundle(ok_root).manifest["plan_digest"] == PLAN_DIGEST
+
+    mismatched_files = _blocked_files(
+        manifest,
+        report_overrides={
+            "case_id": "other-case",
+            "cve_id": PLAN["cve_id"],
+            "review": {
+                "reviewer_id": review["reviewer_id"],
+                "decision": review["decision"],
+                "plan_digest": review["plan_digest"],
+                "decided_at": review["decided_at"],
+            },
+        },
+        extra_files={
+            "plan.json": ("plan", plan_bytes),
+            "review.json": ("review", review_bytes),
+        },
+    )
+    bad_root = _write_v2_bundle(
+        tmp_path, manifest, mismatched_files, name="blocked-plan-case-mismatch"
+    )
+    with pytest.raises(BundleError, match="case_id") as raised:
+        verify_bundle(bad_root)
+    assert raised.value.reason_code == "INVALID_MANIFEST"

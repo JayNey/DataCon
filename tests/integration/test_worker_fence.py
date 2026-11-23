@@ -411,6 +411,9 @@ def test_complete_family_audits_once_and_validates_the_pointer(
     invalid_pointers = [
         (str(tmp_path / "round.json"), DIGEST, "family.json"),
         ("relative/family.json", DIGEST, "absolute"),
+        ("//a/family.json", DIGEST, "//"),
+        ("/a/b\n/family.json", DIGEST, "control"),
+        ("/a/\x00/family.json", DIGEST, "control"),
         ("/tmp\\family.json", DIGEST, "POSIX"),
         ("/tmp/../tmp/family.json", DIGEST, "must not contain"),
         ("/" + "a" * 5000 + "/family.json", DIGEST, "at most"),
