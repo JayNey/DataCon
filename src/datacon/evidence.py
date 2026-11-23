@@ -239,6 +239,17 @@ class BundleError(RuntimeError):
         self.message = message
 
 
+class EvidenceRefError(BundleError):
+    """A v2 log evidence reference cannot be resolved from bundle bytes.
+
+    ``reason_code`` is one of ``INVALID_REFERENCE`` (malformed/unsupported
+    syntax or non-UTF-8 log), ``MISSING_LOG`` (manifest role/path missing or
+    ambiguous), ``DIGEST_MISMATCH`` (bytes changed after the manifest was
+    signed) or ``LINE_OUT_OF_RANGE`` (start/end outside the 1-based line
+    count).
+    """
+
+
 @dataclass(frozen=True)
 class BundleInfo:
     root: Path
@@ -931,11 +942,31 @@ def _validate_v2_manifest_header(
             raise BundleError(
                 "INVALID_MANIFEST", "campaign bundle must not carry a reason_code"
             )
-    elif reason_code is not None and (
-        not isinstance(reason_code, str)
-        or not _REASON_CODE.fullmatch(reason_code)
-    ):
-        raise BundleError("INVALID_MANIFEST", "manifest reason_code is invalid")
+    elif bundle_kind == "blocked":
+        # A blocked bundle is a terminal non-execution record: its reason must
+        # be one of the closed BLOCKED codes. This is the same table the v1
+        # writer and the execution archiver consult.
+        if (
+            not isinstance(reason_code, str)
+            or not _REASON_CODE.fullmatch(reason_code)
+        ):
+            raise BundleError("INVALID_MANIFEST", "manifest reason_code is invalid")
+        if not reason_allowed("BLOCKED", reason_code):
+            raise BundleError(
+                "INVALID_MANIFEST",
+                "manifest reason_code is not allowed for BLOCKED",
+            )
+    else:
+        if reason_code is not None and (
+            not isinstance(reason_code, str)
+            or not _REASON_CODE.fullmatch(reason_code)
+        ):
+            raise BundleError("INVALID_MANIFEST", "manifest reason_code is invalid")
+        if reason_code is not None and not reason_allowed(verdict, reason_code):
+            raise BundleError(
+                "INVALID_MANIFEST",
+                f"manifest reason_code is not allowed for {verdict}",
+            )
     files = manifest.get("files")
     if not isinstance(files, list):
         raise BundleError("INVALID_MANIFEST", "manifest files must be a list")
@@ -973,6 +1004,108 @@ def _validate_entry(
     if not isinstance(sha, str) or not _SHA256_HEX.fullmatch(sha):
         raise BundleError("INVALID_MANIFEST", f"invalid sha256 for {path}")
     return {"path": path, "role": role, "size_bytes": size, "sha256": sha}
+
+
+def resolve_evidence_ref(bundle_root: Path | str, ref: str) -> list[str]:
+    """Resolve a v2 ``log/build``/``log/fuzz`` reference from verified bytes.
+
+    Resolution is fail-closed and follows interface-contract-delta §11:
+
+    1. parse the reference with the frozen grammar (``contracts`` remains the
+       single parser, so ``analysis_digest`` and this resolver cannot drift);
+    2. read the bundle manifest and locate the role/path: ``build_log`` at
+       ``build/{version}/build.log`` for ``log/build``, the unique
+       ``fuzz_log`` entry for ``log/fuzz``;
+    3. read the file without following symlinks and require its byte count and
+       SHA-256 to equal the manifest entry;
+    4. require ``1 <= start <= end <= line_count``.
+
+    Returns the selected lines as UTF-8 text **without** their trailing line
+    terminators, in ascending order (``["line 3", "line 4"]``). A single-line
+    reference returns a one-element list; blank lines are returned as ``""``.
+
+    Raises :class:`EvidenceRefError` with a fixed ``reason_code`` for malformed
+    syntax/non-UTF-8 (``INVALID_REFERENCE``), missing or ambiguous role/path
+    (``MISSING_LOG``), digest/size mismatch (``DIGEST_MISMATCH``) and an
+    out-of-range start/end (``LINE_OUT_OF_RANGE``).
+    """
+    try:
+        parsed = contracts.parse_log_evidence_ref(ref)
+    except (TypeError, ValueError) as error:
+        raise EvidenceRefError("INVALID_REFERENCE", str(error)) from error
+    if parsed is None:
+        raise EvidenceRefError(
+            "INVALID_REFERENCE",
+            "only log/build and log/fuzz references can be resolved",
+        )
+    root = Path(bundle_root)
+    try:
+        manifest, _ = _load_manifest(root)
+    except BundleError as error:
+        raise EvidenceRefError(
+            error.reason_code, f"the bundle manifest is not readable: {error.message}"
+        ) from error
+    if manifest.get("schema_version") != contracts.SCHEMA_VERSION_V2:
+        raise EvidenceRefError(
+            "INVALID_REFERENCE",
+            "log/build and log/fuzz references require a v2 manifest",
+        )
+    files = manifest.get("files")
+    if not isinstance(files, list):
+        raise EvidenceRefError("INVALID_REFERENCE", "manifest files must be a list")
+    entries: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    try:
+        for entry in files:
+            entries.append(_validate_entry(entry, seen, _V2_ROLE_NAMES))
+    except BundleError as error:
+        raise EvidenceRefError("INVALID_REFERENCE", error.message) from error
+
+    if parsed.kind == "build":
+        expected_path = f"build/{parsed.selector}/build.log"
+        matches = [entry for entry in entries if entry["path"] == expected_path]
+        if len(matches) != 1 or matches[0]["role"] != "build_log":
+            raise EvidenceRefError(
+                "MISSING_LOG",
+                f"manifest has no build_log at {expected_path}",
+            )
+        entry = matches[0]
+    else:
+        matches = [entry for entry in entries if entry["role"] == "fuzz_log"]
+        if len(matches) != 1:
+            raise EvidenceRefError(
+                "MISSING_LOG",
+                "manifest must carry exactly one fuzz_log evidence entry",
+            )
+        entry = matches[0]
+
+    try:
+        data = _read_bounded(
+            root / PurePosixPath(entry["path"]),
+            expected_size=entry["size_bytes"],
+        )
+    except BundleError as error:
+        if error.reason_code == "DIGEST_MISMATCH":
+            raise EvidenceRefError("DIGEST_MISMATCH", error.message) from error
+        raise EvidenceRefError("MISSING_LOG", error.message) from error
+    if len(data) != entry["size_bytes"] or _sha256(data) != entry["sha256"]:
+        raise EvidenceRefError(
+            "DIGEST_MISMATCH",
+            f"{entry['path']} does not match its manifest digest",
+        )
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise EvidenceRefError(
+            "INVALID_REFERENCE", f"{entry['path']} is not valid UTF-8"
+        ) from error
+    lines = text.splitlines()
+    if parsed.start < 1 or parsed.end < parsed.start or parsed.end > len(lines):
+        raise EvidenceRefError(
+            "LINE_OUT_OF_RANGE",
+            f"{parsed.text} does not fit within {len(lines)} log lines",
+        )
+    return lines[parsed.start - 1 : parsed.end]
 
 
 def _parse_json_file(data: Mapping[str, bytes], relative: str) -> dict[str, Any]:

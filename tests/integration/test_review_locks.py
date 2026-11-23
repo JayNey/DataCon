@@ -323,20 +323,25 @@ def _join(thread, result, errors):
     return result.get("value")
 
 
-def _family_lock_is_held(database, family_id, timeout=10.0):
-    """Return whether another transaction holds the family row lock."""
+def _job_lock_is_held(database, job_id, timeout=10.0):
+    """Return whether another transaction holds one job row lock."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         with psycopg.connect(database.dsn, autocommit=True, connect_timeout=5) as probe:
             try:
                 probe.execute(
                     "SELECT job_id FROM jobs WHERE job_id = %s FOR UPDATE NOWAIT",
-                    (family_id,),
+                    (job_id,),
                 )
             except psycopg.errors.LockNotAvailable:
                 return True
         time.sleep(0.02)
     return False
+
+
+def _family_lock_is_held(database, family_id, timeout=10.0):
+    """Return whether another transaction holds the family row lock."""
+    return _job_lock_is_held(database, family_id, timeout=timeout)
 
 
 def test_review_locks_family_then_first_child(isolated_database, tmp_path, monkeypatch):
@@ -414,6 +419,53 @@ def test_review_expiry_converges_family_and_child(
         "AND event_type = 'review_expired' ORDER BY event_id DESC LIMIT 1",
         (seed["family_id"],),
     ) is not None
+
+
+@pytest.mark.parametrize("expired", [False, True])
+def test_review_does_not_rewrite_a_child_verdict_terminal(
+    isolated_database, tmp_path, monkeypatch, expired
+):
+    monkeypatch.setenv("DATACON_EVIDENCE_ROOT", str(tmp_path / "evidence"))
+    seed = _seed_family(
+        isolated_database,
+        review_deadline_at=(
+            _now() - timedelta(minutes=1) if expired else None
+        ),
+    )
+    isolated_database.connection.execute(
+        "UPDATE jobs SET state = 'REPRODUCED', stage = 'archived', "
+        "verdict = 'REPRODUCED', verdict_reason = 'ASAN_SIGNATURE_MATCHED', "
+        "evidence_status = 'archived', evidence_path = %s, "
+        "evidence_digest = %s, lease_owner = NULL, lease_expires_at = NULL "
+        "WHERE job_id = %s",
+        (
+            f"evidence/{seed['child_id']}",
+            "sha256:" + "d" * 64,
+            seed["child_id"],
+        ),
+    )
+
+    outcome = _review(isolated_database, seed, decision="reject")
+    assert outcome.status in ("applied", "expired")
+
+    child_state, verdict, reason, evidence_path, evidence_digest = _row(
+        isolated_database,
+        "SELECT state, verdict, verdict_reason, evidence_path, "
+        "evidence_digest FROM jobs WHERE job_id = %s",
+        (seed["child_id"],),
+    )
+    assert (child_state, verdict, reason) == (
+        "REPRODUCED",
+        "REPRODUCED",
+        "ASAN_SIGNATURE_MATCHED",
+    ), "a verdict terminal child was rewritten by review reject/expiry"
+    assert evidence_path == f"evidence/{seed['child_id']}"
+    assert evidence_digest == "sha256:" + "d" * 64
+    assert _row(
+        isolated_database,
+        "SELECT state FROM jobs WHERE job_id = %s",
+        (seed["family_id"],),
+    )[0] == "BLOCKED"
 
 
 def test_envelope_reapproval_only_appends_family_approvals(isolated_database):
@@ -1700,6 +1752,301 @@ def _assert_no_freeze_rows(database, family_id, child_id, state_name="PREPARING"
         "SELECT state FROM jobs WHERE job_id = %s",
         (child_id,),
     )[0] == state_name
+
+
+def test_freeze_guided_round_one_does_not_enter_review(isolated_database):
+    family_id, child_id = _freeze_seed(
+        isolated_database, _family_request("guided"), job_kind="round"
+    )
+    plan = _v2_plan(
+        family_id,
+        round_no=1,
+        envelope_digest=ENVELOPE_1,
+        parent_approval_digest=APPROVAL_1,
+    )
+    plan["experiment_digest"] = "sha256:" + "3" * 64
+    digest = contracts.plan_digest(plan)
+
+    assert state.freeze_plan(
+        isolated_database.dsn,
+        child_id,
+        generation=1,
+        plan=plan,
+        plan_digest=digest,
+        summary={},
+    ) is True
+
+    state_name, review_deadline_at = _row(
+        isolated_database,
+        "SELECT state, review_deadline_at FROM jobs WHERE job_id = %s",
+        (child_id,),
+    )
+    assert state_name == "PREPARING"
+    assert state_name != "AWAITING_REVIEW"
+    assert review_deadline_at is None, (
+        "a non-first v2 plan must not open a review window"
+    )
+    assert _row(
+        isolated_database,
+        "SELECT count(*) FROM family_envelopes WHERE family_id = %s",
+        (family_id,),
+    )[0] == 0
+    assert _row(
+        isolated_database,
+        "SELECT count(*) FROM plans WHERE job_id = %s",
+        (child_id,),
+    )[0] == 1
+
+
+def test_freeze_fixed_round_one_rejects_parent_approval(isolated_database):
+    family_id, child_id = _freeze_seed(
+        isolated_database, _family_request("fixed"), job_kind="round"
+    )
+    body = _fixed_envelope_body(max_total_seconds=900)
+    envelope_digest = jsonutil.digest_json(body)
+    plan = _v2_plan(
+        family_id,
+        round_no=1,
+        envelope_digest=envelope_digest,
+        parent_approval_digest=APPROVAL_1,
+    )
+    digest = contracts.plan_digest(plan)
+
+    with pytest.raises(state.StateError, match="parent_approval_digest"):
+        state.freeze_plan(
+            isolated_database.dsn,
+            child_id,
+            generation=1,
+            plan=plan,
+            plan_digest=digest,
+            summary={},
+            envelope=body,
+        )
+    _assert_no_freeze_rows(isolated_database, family_id, child_id)
+
+
+def test_freeze_fixed_round_one_without_parent_approval_enters_review(
+    isolated_database,
+):
+    family_id, child_id = _freeze_seed(
+        isolated_database, _family_request("fixed"), job_kind="round"
+    )
+    body = _fixed_envelope_body(max_total_seconds=900)
+    envelope_digest = jsonutil.digest_json(body)
+    plan = _v2_plan(family_id, round_no=1, envelope_digest=envelope_digest)
+    digest = contracts.plan_digest(plan)
+
+    assert state.freeze_plan(
+        isolated_database.dsn,
+        child_id,
+        generation=1,
+        plan=plan,
+        plan_digest=digest,
+        summary={},
+        envelope=body,
+    ) is True
+
+    state_name, review_deadline_at = _row(
+        isolated_database,
+        "SELECT state, review_deadline_at FROM jobs WHERE job_id = %s",
+        (child_id,),
+    )
+    assert state_name == "AWAITING_REVIEW"
+    assert review_deadline_at is not None
+    assert _row(
+        isolated_database,
+        "SELECT status FROM family_envelopes WHERE family_id = %s",
+        (family_id,),
+    )[0] == "pending"
+
+
+def test_freeze_fixed_later_round_does_not_enter_review(isolated_database):
+    family_id = uuid4()
+    _insert_plain_job(
+        isolated_database,
+        family_id,
+        request=_family_request("fixed"),
+        state_name="AGGREGATING",
+        family_id=family_id,
+        job_kind="family",
+        parent_job_id=None,
+    )
+    child_id = uuid4()
+    _insert_plain_job(
+        isolated_database,
+        child_id,
+        request=_family_request("fixed"),
+        state_name="PREPARING",
+        family_id=family_id,
+        job_kind="round",
+        parent_job_id=family_id,
+        round_no=2,
+        lease=True,
+    )
+    plan = _v2_plan(
+        family_id,
+        round_no=2,
+        envelope_digest=ENVELOPE_1,
+        parent_approval_digest=APPROVAL_1,
+    )
+    assert state.freeze_plan(
+        isolated_database.dsn,
+        child_id,
+        generation=1,
+        plan=plan,
+        plan_digest=contracts.plan_digest(plan),
+        summary={},
+    ) is True
+
+    state_name, review_deadline_at = _row(
+        isolated_database,
+        "SELECT state, review_deadline_at FROM jobs WHERE job_id = %s",
+        (child_id,),
+    )
+    assert state_name == "PREPARING"
+    assert review_deadline_at is None
+
+
+def test_freeze_plan_locks_family_then_child(isolated_database):
+    family_id, child_id = _freeze_seed(
+        isolated_database, _family_request("guided")
+    )
+    body = dict(GUIDED_ENVELOPE_BODY)
+    digest = jsonutil.digest_json(body)
+    plan = _v2_plan(family_id, round_no=None, envelope_digest=digest)
+    plan_digest = contracts.plan_digest(plan)
+
+    holder = psycopg.connect(isolated_database.dsn, connect_timeout=5)
+    try:
+        holder.execute(
+            "SELECT job_id FROM jobs WHERE job_id = %s FOR UPDATE",
+            (child_id,),
+        )
+        thread, result, errors = _run_in_thread(
+            lambda: state.freeze_plan(
+                isolated_database.dsn,
+                child_id,
+                generation=1,
+                plan=plan,
+                plan_digest=plan_digest,
+                summary={},
+                envelope=body,
+            )
+        )
+        assert _family_lock_is_held(isolated_database, family_id), (
+            "freeze locked the child before the family"
+        )
+    finally:
+        holder.commit()
+        holder.close()
+
+    assert _join(thread, result, errors) is True
+
+
+def _install_slow_envelope_trigger(database):
+    database.connection.execute(
+        "DROP TRIGGER IF EXISTS test_slow_envelope ON family_envelopes"
+    )
+    database.connection.execute(
+        "DROP FUNCTION IF EXISTS test_slow_envelope_fn()"
+    )
+    database.connection.execute(
+        "CREATE FUNCTION test_slow_envelope_fn() RETURNS trigger "
+        "LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(0.5); RETURN NEW; END $$"
+    )
+    database.connection.execute(
+        "CREATE TRIGGER test_slow_envelope BEFORE INSERT ON family_envelopes "
+        "FOR EACH ROW EXECUTE FUNCTION test_slow_envelope_fn()"
+    )
+
+
+def _drop_slow_envelope_trigger(database):
+    database.connection.execute(
+        "DROP TRIGGER IF EXISTS test_slow_envelope ON family_envelopes"
+    )
+    database.connection.execute(
+        "DROP FUNCTION IF EXISTS test_slow_envelope_fn()"
+    )
+
+
+def test_freeze_plan_and_record_review_do_not_deadlock(isolated_database):
+    family_id, child_id = _freeze_seed(
+        isolated_database, _family_request("guided")
+    )
+    body = dict(GUIDED_ENVELOPE_BODY)
+    envelope_digest = jsonutil.digest_json(body)
+    plan = _v2_plan(family_id, round_no=None, envelope_digest=envelope_digest)
+    plan_digest = contracts.plan_digest(plan)
+
+    _install_slow_envelope_trigger(isolated_database)
+    freeze_thread = review_thread = None
+    try:
+        freeze_thread, freeze_result, freeze_errors = _run_in_thread(
+            lambda: state.freeze_plan(
+                isolated_database.dsn,
+                child_id,
+                generation=1,
+                plan=plan,
+                plan_digest=plan_digest,
+                summary={},
+                envelope=body,
+            )
+        )
+        # Wait until freeze holds the child lock while the BEFORE INSERT
+        # trigger is sleeping; record_review must then queue on the family,
+        # never on the child first.
+        assert _job_lock_is_held(isolated_database, child_id), (
+            "freeze never reached the child lock"
+        )
+        review_thread, review_result, review_errors = _run_in_thread(
+            lambda: state.record_review(
+                isolated_database.dsn,
+                family_id,
+                plan_digest=plan_digest,
+                decision="approve",
+                reviewer_id="reviewer-race",
+            )
+        )
+        try:
+            assert _join(freeze_thread, freeze_result, freeze_errors) is True
+            outcome = _join(review_thread, review_result, review_errors)
+        except psycopg.errors.DeadlockDetected as error:
+            pytest.fail(f"freeze_plan/record_review hit 40P01: {error}")
+        assert outcome.status in ("applied", "invalid_state", "idempotent")
+    finally:
+        for thread in (freeze_thread, review_thread):
+            if thread is not None:
+                thread.join(timeout=30)
+        _drop_slow_envelope_trigger(isolated_database)
+
+    family_state = _row(
+        isolated_database,
+        "SELECT state FROM jobs WHERE job_id = %s",
+        (family_id,),
+    )[0]
+    child_state = _row(
+        isolated_database,
+        "SELECT state FROM jobs WHERE job_id = %s",
+        (child_id,),
+    )[0]
+    review_count = _row(
+        isolated_database,
+        "SELECT count(*) FROM reviews WHERE job_id = %s",
+        (family_id,),
+    )[0]
+    envelope_status = _row(
+        isolated_database,
+        "SELECT status FROM family_envelopes WHERE family_id = %s",
+        (family_id,),
+    )[0]
+    assert family_state == "AGGREGATING"
+    if review_count == 0:
+        assert child_state == "AWAITING_REVIEW"
+        assert envelope_status == "pending"
+    else:
+        assert review_count == 1
+        assert child_state == "READY"
+        assert envelope_status == "approved"
 
 
 def test_freeze_plan_rejects_wrong_family_id(isolated_database):

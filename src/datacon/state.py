@@ -400,6 +400,42 @@ def freeze_plan(
     write.
     """
     with _connect(dsn) as connection:
+        # Lock order for every v2 path that touches both a family and its
+        # first child is fixed: family -> child (interface-contract-delta
+        # §9.1). The identity read is lock-free because family_id/job_kind/
+        # round_no are immutable for the row's lifetime; the child's
+        # generation/lease are re-validated after the family lock below.
+        identity = connection.execute(
+            "SELECT job_contract_version, job_kind, round_no, family_id "
+            "FROM jobs WHERE job_id = %s",
+            (job_id,),
+        ).fetchone()
+        if identity is None:
+            raise StateError("job does not exist")
+        if identity["job_contract_version"] == 2:
+            if identity.get("job_kind") not in ("campaign", "round"):
+                raise StateError(
+                    "only a v2 campaign or round child may freeze a plan"
+                )
+            family_id = identity.get("family_id")
+            if family_id is None:
+                raise StateError("a v2 child requires a family")
+            family = connection.execute(
+                "SELECT job_id, job_kind, job_contract_version, state "
+                "FROM jobs WHERE job_id = %s FOR UPDATE",
+                (family_id,),
+            ).fetchone()
+            if family is None:
+                raise StateError("the child family does not exist")
+            if (
+                family["job_contract_version"] != 2
+                or family["job_kind"] != "family"
+            ):
+                raise StateError("the child parent is not a v2 family")
+            if family["state"] != "AGGREGATING":
+                raise StateError(
+                    f"cannot freeze a plan while the family is {family['state']}"
+                )
         job = _locked_job(connection, job_id, generation=generation)
         existing = connection.execute(
             "SELECT plan_digest FROM plans WHERE job_id = %s", (job_id,)
@@ -426,6 +462,8 @@ def freeze_plan(
                     "a v2 job requires a plan with schema_version=2"
                 )
             family_id_text = str(job.get("family_id"))
+            if family_id_text != str(identity.get("family_id")):
+                raise StateError("the child family changed while freezing")
             if (
                 plan.get("family_id") != family_id_text
                 or plan.get("parent_job_id") != family_id_text
@@ -443,10 +481,30 @@ def freeze_plan(
                 raise StateError(f"plan is invalid: {error}") from error
             if computed_plan_digest != plan_digest:
                 raise StateError("plan_digest does not match the plan body")
-            first_v2_plan = (
-                job.get("job_kind") == "campaign"
-                or job.get("round_no") == 1
+            exploration = _request_exploration(job.get("request")) or {}
+            mode = exploration.get("mode", "fixed")
+            if mode not in ("fixed", "guided"):
+                raise StateError("exploration.mode is invalid")
+            # Guided's first plan is the campaign; only fixed has a first
+            # round plan. A guided round 1 is therefore a later plan and does
+            # not open a review window or require an envelope.
+            first_v2_plan = job.get("job_kind") == "campaign" or (
+                job.get("job_kind") == "round"
+                and job.get("round_no") == 1
+                and mode == "fixed"
             )
+            if (
+                job.get("job_kind") == "round"
+                and job.get("round_no") == 1
+                and mode == "fixed"
+                and plan.get("parent_approval_digest") is not None
+            ):
+                # The pure plan validator cannot see the mode; the fixed
+                # first plan is the one shape that must never carry a parent
+                # approval.
+                raise StateError(
+                    "a fixed first plan must have parent_approval_digest=null"
+                )
         normalized_envelope: dict[str, Any] | None = None
         if first_v2_plan:
             if envelope is None:
@@ -509,6 +567,18 @@ def freeze_plan(
             "VALUES (%s, %s, %s, %s, %s)",
             (uuid.uuid4(), job_id, plan_digest, Jsonb(plan), Jsonb(summary)),
         )
+        if job["job_contract_version"] == 2 and not first_v2_plan:
+            # A later v2 plan is admitted by the T12 policy path, not by a
+            # human review. It must not enter AWAITING_REVIEW or write a
+            # review_deadline_at; only the frozen row is recorded here.
+            _audit(
+                connection,
+                job_id,
+                "plan_frozen",
+                stage="prepare",
+                detail={"plan_digest": plan_digest, "generation": generation},
+            )
+            return True
         updated = connection.execute(
             "UPDATE jobs SET state = 'AWAITING_REVIEW', stage = 'review', "
             "review_deadline_at = clock_timestamp() + make_interval(hours => %s), "
@@ -1901,7 +1971,9 @@ def _block_v2_review_job(
         "workflow_synced = false, lease_owner = NULL, "
         "lease_expires_at = NULL, updated_at = clock_timestamp() "
         "WHERE job_id = %s "
-        "AND state NOT IN ('COMPLETED', 'FAILED', 'BLOCKED')",
+        "AND state NOT IN ('COMPLETED', 'FAILED', 'BLOCKED', "
+        "'REPRODUCED', 'NOT_REPRODUCED', 'INCONCLUSIVE') "
+        "RETURNING job_id",
         (reason_code, message, job_id),
     )
 

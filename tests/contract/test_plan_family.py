@@ -328,24 +328,42 @@ def test_campaign_plan_rejects_build_ref():
         plan_digest(plan)
 
 
-def test_first_round_rejects_parent_approval_digest():
+def test_round_one_accepts_parent_approval_for_guided_validation():
+    # Guided families approve the campaign first; a round 1 validation plan is
+    # therefore a later plan and carries its parent approval. It may also carry
+    # an ExperimentSpec without a build_ref because only a reuse-validation
+    # round consumes a campaign build.
     plan = _round_plan(
         round_no=1,
         parent_approval_digest=APPROVAL_DIGEST,
         build_ref=None,
-        experiment_digest=None,
+        experiment_digest=EXPERIMENT_DIGEST,
     )
-    with pytest.raises(ValueError):
-        plan_digest(plan)
+    assert plan_digest(plan).startswith("sha256:")
 
 
-def test_build_ref_and_experiment_digest_are_coupled():
+def test_non_reuse_validation_accepts_experiment_without_build_ref():
+    plan = _round_plan(
+        round_no=3,
+        parent_approval_digest=APPROVAL_DIGEST,
+        build_ref=None,
+        experiment_digest=EXPERIMENT_DIGEST,
+    )
+    assert plan_digest(plan).startswith("sha256:")
+
+
+def test_reuse_validation_accepts_build_ref_with_experiment_digest():
+    assert plan_digest(_round_plan()).startswith("sha256:")
+
+
+def test_build_ref_still_requires_experiment_digest():
     with_build_without_experiment = _round_plan(experiment_digest=None)
     with pytest.raises(ValueError):
         plan_digest(with_build_without_experiment)
 
+    # An ExperimentSpec may stand alone (non-reuse validation); it no longer
+    # implies a build_ref.
     without_build_with_experiment = _round_plan(
         build_ref=None, experiment_digest=EXPERIMENT_DIGEST
     )
-    with pytest.raises(ValueError):
-        plan_digest(without_build_with_experiment)
+    assert plan_digest(without_build_with_experiment).startswith("sha256:")

@@ -16,6 +16,7 @@ from datacon.verdict import (
     VerdictPolicy,
     _exit_matches,
     decide_verdict,
+    reason_allowed,
 )
 
 SIGNATURE = {
@@ -402,9 +403,37 @@ def test_forged_asan_source_prefix_is_rejected():
     assert signature_matches(replace(forged, source="parser.c"), SIGNATURE)
 
 
-def test_blocked_reasons_cover_non_execution_terminals():
-    from datacon.verdict import reason_allowed
+V02_REASON_VERDICTS = {
+    "BUILD_PROVENANCE_MISSING": frozenset({"BLOCKED", "FAILED"}),
+    "ENVELOPE_VIOLATION": frozenset({"BLOCKED"}),
+    "ADMISSION_DENIED": frozenset({"BLOCKED"}),
+    "REUSE_MISMATCH": frozenset({"FAILED"}),
+    "HARNESS_REJECTED": frozenset({"BLOCKED"}),
+    "BUDGET_EXHAUSTED": frozenset({"INCONCLUSIVE", "FAILED"}),
+}
+ALL_TERMINAL_VERDICTS = (
+    "REPRODUCED",
+    "NOT_REPRODUCED",
+    "INCONCLUSIVE",
+    "BLOCKED",
+    "FAILED",
+)
 
+
+@pytest.mark.parametrize("code,expected", sorted(V02_REASON_VERDICTS.items()))
+def test_v02_reason_codes_belong_to_the_expected_closed_sets(code, expected):
+    for verdict in ALL_TERMINAL_VERDICTS:
+        assert reason_allowed(verdict, code) is (verdict in expected), (
+            f"{code} was wrongly classified for {verdict}"
+        )
+
+
+@pytest.mark.parametrize("verdict", ALL_TERMINAL_VERDICTS)
+def test_review_envelope_mismatch_is_not_a_terminal_reason(verdict):
+    assert not reason_allowed(verdict, "REVIEW_ENVELOPE_MISMATCH")
+
+
+def test_blocked_reasons_cover_non_execution_terminals():
     for code in ("UNSUPPORTED_TARGET", "REVIEW_REJECTED", "REVIEW_EXPIRED"):
         assert reason_allowed("BLOCKED", code)
     # These codes still belong to the non-execution block set; they must not

@@ -21,6 +21,7 @@ REPRODUCED_REASONS = frozenset({"ASAN_SIGNATURE_MATCHED"})
 NOT_REPRODUCED_REASONS = frozenset({"CANDIDATE_CLEAN"})
 INCONCLUSIVE_REASONS = frozenset(
     {
+        "BUDGET_EXHAUSTED",
         "CONTROL_FAILED",
         "EVIDENCE_INCOMPLETE",
         "FIXED_STILL_VULNERABLE",
@@ -34,9 +35,17 @@ INCONCLUSIVE_REASONS = frozenset(
     }
 )
 # BLOCKED/FAILED codes are the closed sets execution.py can actually return.
+# The v0.2 codes in interface-contract-delta §10 are additive: a code belongs
+# to every terminal verdict the spec's disposition column allows, and
+# REVIEW_ENVELOPE_MISMATCH deliberately stays out of all of them because it is
+# a review-call rejection code, not a job terminal reason.
 BLOCKED_REASONS = frozenset(
     {
+        "ADMISSION_DENIED",
+        "BUILD_PROVENANCE_MISSING",
         "DEADLINE_EXCEEDED",
+        "ENVELOPE_VIOLATION",
+        "HARNESS_REJECTED",
         "INVALID_REQUEST",
         "INVALID_STATE",
         "JOB_NOT_FOUND",
@@ -50,7 +59,15 @@ BLOCKED_REASONS = frozenset(
         "UNSUPPORTED_TARGET",
     }
 )
-FAILED_REASONS = frozenset({"BUILD_FAILED", "EVIDENCE_WRITE_FAILED"})
+FAILED_REASONS = frozenset(
+    {
+        "BUILD_FAILED",
+        "BUDGET_EXHAUSTED",
+        "BUILD_PROVENANCE_MISSING",
+        "EVIDENCE_WRITE_FAILED",
+        "REUSE_MISMATCH",
+    }
+)
 VERDICT_REASONS = {
     "REPRODUCED": REPRODUCED_REASONS,
     "NOT_REPRODUCED": NOT_REPRODUCED_REASONS,

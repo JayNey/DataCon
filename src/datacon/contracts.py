@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import hashlib
 import json
 import re
@@ -32,7 +33,7 @@ _GIT_OID = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
 _BUILD_REF = re.compile(
     r"log/build:(vulnerable|fixed)#L([1-9][0-9]*)(?:-([1-9][0-9]*))?"
 )
-_FUZZ_REF = re.compile(r"log/fuzz:(0|[1-9][0-9]*)#L[1-9][0-9]*")
+_FUZZ_REF = re.compile(r"log/fuzz:(0|[1-9][0-9]*)#L([1-9][0-9]*)")
 _TARGET_KEYS = frozenset({"kind", "case_id", "goal"})
 _PLAN_FIELDS = frozenset(
     {
@@ -399,6 +400,42 @@ def _evidence_ref(value: Any) -> str:
             )
         return text
     return text
+
+
+@dataclass(frozen=True)
+class LogEvidenceRef:
+    """A parsed v2 ``log/build`` or ``log/fuzz`` evidence reference.
+
+    ``kind`` is ``build`` or ``fuzz``; ``selector`` is the build version
+    (``vulnerable``/``fixed``) or the fuzz seed. ``start``/``end`` are the
+    inclusive 1-based line bounds. ``text`` is the canonical reference.
+    """
+
+    kind: str
+    selector: str
+    start: int
+    end: int
+    text: str
+
+
+def parse_log_evidence_ref(value: Any) -> LogEvidenceRef | None:
+    """Parse a v2 log reference using the frozen §11 grammar.
+
+    Returns ``None`` for a valid v0.1 reference that is not a log reference
+    (for example ``git:diff/...``). Malformed ``log/build``/``log/fuzz`` text
+    raises ``ValueError`` exactly like ``analysis_digest`` does.
+    """
+    text = _evidence_ref(value)
+    match = _BUILD_REF.fullmatch(text)
+    if match is not None:
+        start = int(match.group(2))
+        end = int(match.group(3)) if match.group(3) is not None else start
+        return LogEvidenceRef("build", match.group(1), start, end, text)
+    match = _FUZZ_REF.fullmatch(text)
+    if match is not None:
+        line = int(match.group(2))
+        return LogEvidenceRef("fuzz", match.group(1), line, line, text)
+    return None
 
 
 def _normalize_symbol(value: Any) -> dict[str, Any]:
@@ -774,8 +811,19 @@ def _validate_plan_v2_cross_fields(
 
     The eleven v2 fields are individually optional-shaped (``null`` is a
     meaningful value), so the contract is only complete once the combinations
-    are checked: a campaign has no replay inputs or build, a first plan has no
-    parent approval, and a reused build always carries its ExperimentSpec.
+    are checked. The plan body does not carry the exploration mode, so this
+    pure validator cannot tell a guided round 1 (a later plan) from a fixed
+    round 1 (the first plan); ``state.freeze_plan`` applies that mode-sensitive
+    rule. Here a round plan with no parent approval is the fixed-first shape,
+    while every plan with a parent approval may or may not reuse a build:
+
+    * a campaign has no replay inputs, build or ExperimentSpec;
+    * a round plan always has replay inputs;
+    * no-parent-approval is only valid for fixed ``round_no=1`` with no build
+      and no ExperimentSpec;
+    * a parent approval permits a null or non-null ``build_ref``;
+    * a non-null ``build_ref`` always carries its ExperimentSpec, while a
+      non-reuse validation may carry an ExperimentSpec without a build.
     """
     round_no = extras["round_no"]
     parent_approval_digest = extras["parent_approval_digest"]
@@ -796,18 +844,18 @@ def _validate_plan_v2_cross_fields(
     else:
         if inputs is None:
             raise ValueError("round plans require inputs")
-        if round_no == 1:
-            if parent_approval_digest is not None:
+        if parent_approval_digest is None:
+            if round_no != 1:
                 raise ValueError(
-                    "the first round plan must have parent_approval_digest=null"
+                    "rounds after the first require parent_approval_digest"
                 )
             if build_ref is not None:
                 raise ValueError("the first round plan must have build_ref=null")
-        elif parent_approval_digest is None:
-            raise ValueError("rounds after the first require parent_approval_digest")
+            if experiment_digest is not None:
+                raise ValueError(
+                    "the first round plan must have experiment_digest=null"
+                )
 
-    if build_ref is None and experiment_digest is not None:
-        raise ValueError("experiment_digest requires build_ref")
     if build_ref is not None and experiment_digest is None:
         raise ValueError("build_ref requires experiment_digest")
 

@@ -280,6 +280,99 @@ def test_blocked_bundle_only_requires_the_two_reports(tmp_path):
     assert verified.manifest["bundle_kind"] == "blocked"
 
 
+@pytest.mark.parametrize(
+    "reason",
+    [
+        "ENVELOPE_VIOLATION",
+        "ADMISSION_DENIED",
+        "HARNESS_REJECTED",
+        "BUILD_PROVENANCE_MISSING",
+    ],
+)
+def test_v2_blocked_bundle_accepts_new_blocked_reason(tmp_path, reason):
+    manifest = _manifest("blocked")
+    manifest["reason_code"] = reason
+    root = _write_v2_bundle(
+        tmp_path,
+        manifest,
+        {
+            "report.json": ("report_json", b'{"report":true}\n'),
+            "report.md": ("report_markdown", b"# blocked\n"),
+        },
+        name=f"blocked-{reason.lower()}",
+    )
+
+    verified = verify_bundle(root)
+    assert verified.manifest["reason_code"] == reason
+    assert verified.manifest["verdict"] == "BLOCKED"
+
+
+@pytest.mark.parametrize(
+    "verdict,reason",
+    [
+        ("FAILED", "REUSE_MISMATCH"),
+        ("FAILED", "BUILD_PROVENANCE_MISSING"),
+        ("INCONCLUSIVE", "BUDGET_EXHAUSTED"),
+        ("FAILED", "BUDGET_EXHAUSTED"),
+    ],
+)
+def test_v2_execution_accepts_new_verdict_reason_codes(tmp_path, verdict, reason):
+    root = _write_v2_bundle(
+        tmp_path,
+        _manifest("execution", verdict=verdict, reason=reason),
+        _base_files(execution=True, campaign=False),
+        name=f"execution-{reason.lower()}-{verdict.lower()}",
+    )
+
+    assert verify_bundle(root).manifest["reason_code"] == reason
+
+
+@pytest.mark.parametrize(
+    "verdict,reason",
+    [
+        # BLOCKED is a closed set: a FAILED-only code cannot leak into it.
+        ("BLOCKED", "BUILD_FAILED"),
+        ("BLOCKED", "REUSE_MISMATCH"),
+        ("BLOCKED", "REVIEW_ENVELOPE_MISMATCH"),
+        # A review-call rejection code is not a job terminal reason.
+        ("INCONCLUSIVE", "ENVELOPE_VIOLATION"),
+        ("INCONCLUSIVE", "REVIEW_ENVELOPE_MISMATCH"),
+        ("FAILED", "ENVELOPE_VIOLATION"),
+    ],
+)
+def test_v2_manifest_rejects_reason_outside_verdict_closed_set(
+    tmp_path, verdict, reason
+):
+    root = _write_v2_bundle(
+        tmp_path,
+        _manifest("execution", verdict=verdict, reason=reason),
+        _base_files(execution=True, campaign=False),
+        name=f"bad-{reason.lower()}-{verdict.lower()}",
+    )
+
+    with pytest.raises(BundleError) as raised:
+        verify_bundle(root)
+    assert raised.value.reason_code == "INVALID_MANIFEST"
+
+
+def test_v2_blocked_bundle_rejects_missing_reason(tmp_path):
+    manifest = _manifest("blocked")
+    manifest["reason_code"] = None
+    root = _write_v2_bundle(
+        tmp_path,
+        manifest,
+        {
+            "report.json": ("report_json", b'{"report":true}\n'),
+            "report.md": ("report_markdown", b"# blocked\n"),
+        },
+        name="blocked-no-reason",
+    )
+
+    with pytest.raises(BundleError) as raised:
+        verify_bundle(root)
+    assert raised.value.reason_code == "INVALID_MANIFEST"
+
+
 def test_family_bundle_kind_is_not_a_bundle(tmp_path):
     manifest = _manifest("blocked")
     manifest["bundle_kind"] = "family"
