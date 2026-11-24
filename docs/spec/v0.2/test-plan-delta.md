@@ -90,7 +90,7 @@ T11 只验证图结构与节点幂等；policy 准入、轮次与预算容量的
 
 审核状态机与锁序的四条 D36 坐标及 D42 的四条信封坐标见 T10 的 `tests/integration/test_review_locks.py`；T12 复用它们验证重批后的 approval 链尾与 policy 边界，不重复创建测试。T12 另登记 D43 的 family 归档索引坐标与 `budget_ledger` 交叉 CHECK 坐标。
 
-改7 准入持久化三路径：`admitted` 写一行 `admissions` 与一条 `round_admitted`；`denied`（谓词拒绝或同 `(parent_job_id, round_no)` 异参冲突）不写 `admissions`、写一条 `round_admission_denied`；`already_admitted`（同参幂等重入）不写行、不写事件并返回既有 admission。`ROUND_ALREADY_ADMITTED` 只作为 outcome 的 `sub_reason` 与异参冲突的审计 `detail.sub_reason`，不进入 `jobs.reason_code`。以下 4 条准入持久化坐标均标 `postgres`（`tests/integration/test_admission.py`），不叠 `docker`/`asan`。
+改7 准入持久化三路径：`admitted` 写一行 `admissions` 与一条 `round_admitted`；`denied`（谓词拒绝或同 `(parent_job_id, round_no)` 异参冲突）不写 `admissions`、写一条 `round_admission_denied`；`already_admitted`（同参幂等重入）不写行、不写事件并返回既有 admission。`ROUND_ALREADY_ADMITTED` 只作为 outcome 的 `sub_reason` 与异参冲突的审计 `detail.sub_reason`，不进入 `jobs.reason_code`。以下 5 条准入持久化坐标均标 `postgres`（`tests/integration/test_admission.py`），不叠 `docker`/`asan`；第 5 条验证 `budget_snapshot_digest` 参与幂等比较。
 
 | 测试坐标 | 断言点 | 首次运行的预期失败信息 |
 | --- | --- | --- |
@@ -109,6 +109,7 @@ T11 只验证图结构与节点幂等；policy 准入、轮次与预算容量的
 | `tests/integration/test_admission.py::test_predicate_denial_writes_round_admission_denied_event`（`postgres`） | 谓词拒绝（如 `round_no > max_rounds`）不写 `admissions`，写一条 `round_admission_denied` | `AssertionError: predicate denial did not persist a denied event` |
 | `tests/integration/test_admission.py::test_idempotent_readmission_writes_no_second_event`（`postgres`） | 同参重入返回 `already_admitted`，不新增行、不写事件，返回既有 admission | `AssertionError: idempotent readmission wrote a second event` |
 | `tests/integration/test_admission.py::test_conflicting_readmission_is_denied`（`postgres`） | 同 `(parent_job_id, round_no)` 异参冲突返回 `ADMISSION_DENIED` + `sub_reason=ROUND_ALREADY_ADMITTED`，写一条 denied 事件 | `AssertionError: conflicting readmission was accepted` |
+| `tests/integration/test_admission.py::test_conflicting_budget_snapshot_is_denied`（`postgres`） | 同 `(parent_job_id, round_no)` 但 `budget_snapshot_digest` 不同的重入返回 `ADMISSION_DENIED` + `sub_reason=ROUND_ALREADY_ADMITTED`，不新增 admissions 行，写一条 denied 事件 | `AttributeError: module 'datacon.state' has no attribute 'record_admission'` |
 | `tests/contract/test_budget_ledger.py::test_concurrent_charge_cannot_overdraw_family_budget` | 两个数据库连接模拟竞争，最多一笔成功，余额不为负 | `AssertionError: remaining_total_seconds is negative` |
 | `tests/contract/test_budget_ledger.py::test_recovery_does_not_charge_twice` | 同一 `(job_id, step_key, attempt_no)` 恢复后只扣一次 | `AssertionError: budget charged twice after recovery` |
 | `tests/contract/test_budget_ledger.py::test_retry_with_new_attempt_charges_again` | 重试产生新 `attempt_no` 并再次扣费 | `AssertionError: retry was free` |
