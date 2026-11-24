@@ -402,3 +402,18 @@ def test_build_recipe_digest_must_match_build_spec():
     changed["build_recipe_digest"] = _digest("0")
     with pytest.raises(ValueError, match="build_recipe_digest"):
         plan_digest(changed)
+
+
+def test_plan_contract_rejects_a_split_family_parent_pair():
+    """Plan v2 identity is one value in two fields, not two free values.
+
+    ``family_id`` and ``parent_job_id`` must be equal, so the state layer's
+    "foreign family" check can only be exercised with a pair that names the
+    same other job. This contract test pins the reason the integration test
+    mutates both fields together.
+    """
+    plan = _campaign_plan()
+    plan["parent_job_id"] = OTHER_FAMILY_ID
+
+    with pytest.raises(ValueError, match="family_id must equal parent_job_id"):
+        plan_digest(plan)

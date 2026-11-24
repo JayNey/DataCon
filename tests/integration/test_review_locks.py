@@ -2729,13 +2729,31 @@ def test_freeze_plan_and_record_review_do_not_deadlock(isolated_database):
     assert envelope_status == "approved"
 
 
-def test_freeze_plan_rejects_wrong_family_id(isolated_database):
+def test_freeze_plan_rejects_a_contract_valid_foreign_family_identity(
+    isolated_database,
+):
+    """Reject a plan that is internally valid but names another family.
+
+    Plan v2 requires ``family_id == parent_job_id`` (contracts.plan_digest), so
+    a "wrong parent only" input would fail in the contract before the state
+    check. Mutating both identity fields keeps the plan contract-valid and
+    moves the digest with it, which is the only shape that exercises
+    ``freeze_plan``'s own family check. Deleting that check would freeze this
+    plan instead of raising.
+    """
     family_id, child_id = _freeze_seed(
         isolated_database, _family_request("guided")
     )
-    plan = _v2_plan(family_id, round_no=None, envelope_digest=ENVELOPE_1)
+    foreign_family = str(uuid4())
+    envelope_body = dict(GUIDED_ENVELOPE_BODY)
+    plan = _v2_plan(
+        family_id,
+        round_no=None,
+        envelope_digest=jsonutil.digest_json(envelope_body),
+    )
+    plan["family_id"] = foreign_family
+    plan["parent_job_id"] = foreign_family
     digest = contracts.plan_digest(plan)
-    plan["family_id"] = str(uuid4())
 
     with pytest.raises(state.StateError, match="family_id"):
         state.freeze_plan(
@@ -2745,28 +2763,7 @@ def test_freeze_plan_rejects_wrong_family_id(isolated_database):
             plan=plan,
             plan_digest=digest,
             summary={},
-            envelope=dict(GUIDED_ENVELOPE_BODY),
-        )
-    _assert_no_freeze_rows(isolated_database, family_id, child_id)
-
-
-def test_freeze_plan_rejects_wrong_parent_job_id(isolated_database):
-    family_id, child_id = _freeze_seed(
-        isolated_database, _family_request("guided")
-    )
-    plan = _v2_plan(family_id, round_no=None, envelope_digest=ENVELOPE_1)
-    digest = contracts.plan_digest(plan)
-    plan["parent_job_id"] = str(uuid4())
-
-    with pytest.raises(state.StateError, match="parent_job_id"):
-        state.freeze_plan(
-            isolated_database.dsn,
-            child_id,
-            generation=1,
-            plan=plan,
-            plan_digest=digest,
-            summary={},
-            envelope=dict(GUIDED_ENVELOPE_BODY),
+            envelope=envelope_body,
         )
     _assert_no_freeze_rows(isolated_database, family_id, child_id)
 
