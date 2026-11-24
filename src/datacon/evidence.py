@@ -1144,9 +1144,13 @@ def resolve_evidence_ref(bundle_root: Path | str, ref: str) -> list[str]:
 
     T13 handoff: the v2 report/plan semantic replay must call this resolver
     (or a wrapper) before claiming that a report line reference is backed by
-    verified bytes. T10 ships the API and its fail-closed tests but does not
-    wire it into the not-yet-implemented v2 report replay; the API must not be
-    deleted as "dead code" before T13 connects it.
+    verified bytes. When it does, a ``log/fuzz`` reference must be resolved
+    against the campaign bundle: this resolver rejects a fuzz log carried by
+    an execution or blocked bundle (or a campaign with a non-null round), so
+    T13 cannot silently replay the wrong archive. T10 ships the API and its
+    fail-closed tests but does not wire it into the not-yet-implemented v2
+    report replay; the API must not be deleted as "dead code" before T13
+    connects it.
     """
     try:
         parsed = contracts.parse_log_evidence_ref(ref)
@@ -1181,6 +1185,17 @@ def resolve_evidence_ref(bundle_root: Path | str, ref: str) -> list[str]:
         raise EvidenceRefError(
             "INVALID_REFERENCE",
             "log/build and log/fuzz references require a v2 bundle_kind",
+        )
+    if parsed.kind == "fuzz" and (
+        manifest.get("bundle_kind") != "campaign"
+        or manifest.get("round_no") is not None
+    ):
+        # §11: log/fuzz:0 is the campaign fuzz log, not any bundle that happens
+        # to carry a fuzz_log role. An execution/blocked bundle (or a campaign
+        # row with a round) cannot back a campaign line reference.
+        raise EvidenceRefError(
+            "INVALID_REFERENCE",
+            "log/fuzz references require a campaign bundle with round_no=null",
         )
     files = manifest.get("files")
     if not isinstance(files, list):

@@ -87,19 +87,23 @@ def _manifest(files):
                 "sha256": hashlib.sha256(data).hexdigest(),
             }
         )
+    identity = str(uuid4())
+    # A contract-valid campaign bundle: log/fuzz:0 is bound to the campaign
+    # archive (§11), so the fixture must be a campaign, not a blocked bundle
+    # that merely carries a fuzz_log role.
     return {
         "schema_version": 2,
-        "bundle_kind": "blocked",
+        "bundle_kind": "campaign",
         "job_id": str(uuid4()),
-        "family_id": None,
-        "parent_job_id": None,
+        "family_id": identity,
+        "parent_job_id": identity,
         "round_no": None,
         "plan_digest": None,
         "envelope_digest": None,
         "experiment_digest": None,
         "build_provenance_rules_version": None,
-        "verdict": "BLOCKED",
-        "reason_code": "REVIEW_REJECTED",
+        "verdict": None,
+        "reason_code": None,
         "build_ref": None,
         "reuse_origin": None,
         "created_at": "2099-01-01T00:00:00Z",
@@ -107,7 +111,7 @@ def _manifest(files):
     }
 
 
-def _write_bundle(tmp_path: Path, files):
+def _write_bundle(tmp_path: Path, files, *, manifest=None):
     root = tmp_path / f"refs-{uuid4().hex}"
     root.mkdir()
     for relative, (_role, data) in files.items():
@@ -115,7 +119,8 @@ def _write_bundle(tmp_path: Path, files):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(data)
     (root / "manifest.json").write_text(
-        json.dumps(_manifest(files)), encoding="utf-8"
+        json.dumps(manifest if manifest is not None else _manifest(files)),
+        encoding="utf-8",
     )
     return root
 
@@ -313,3 +318,45 @@ def test_resolve_evidence_ref_rejects_build_log_at_a_non_fixed_path(tmp_path):
         evidence.resolve_evidence_ref(root, "log/build:vulnerable#L1")
     assert raised.value.reason_code == "MISSING_LOG"
     assert "build/vulnerable/build.log" in raised.value.message
+
+
+@pytest.mark.parametrize("bundle_kind", ["execution", "blocked"])
+def test_resolve_evidence_ref_rejects_fuzz_log_outside_a_campaign(
+    tmp_path, bundle_kind
+):
+    files = _log_files()
+    manifest = _manifest(files)
+    manifest["bundle_kind"] = bundle_kind
+    if bundle_kind == "blocked":
+        manifest["verdict"] = "BLOCKED"
+        manifest["reason_code"] = "REVIEW_REJECTED"
+    else:
+        manifest["verdict"] = "INCONCLUSIVE"
+        manifest["reason_code"] = "EVIDENCE_INCOMPLETE"
+        manifest["round_no"] = 2
+    root = _write_bundle(tmp_path, files, manifest=manifest)
+
+    with pytest.raises(evidence.EvidenceRefError) as raised:
+        evidence.resolve_evidence_ref(root, "log/fuzz:0#L1")
+    assert raised.value.reason_code == "INVALID_REFERENCE"
+    assert "campaign bundle" in raised.value.message
+
+    # Only fuzz is tightened: a build log on the same non-campaign bundle
+    # still resolves.
+    assert evidence.resolve_evidence_ref(root, "log/build:vulnerable#L1") == [
+        "build line 1"
+    ]
+
+
+def test_resolve_evidence_ref_rejects_fuzz_log_on_a_campaign_with_a_round(
+    tmp_path,
+):
+    files = _log_files()
+    manifest = _manifest(files)
+    manifest["round_no"] = 3
+    root = _write_bundle(tmp_path, files, manifest=manifest)
+
+    with pytest.raises(evidence.EvidenceRefError) as raised:
+        evidence.resolve_evidence_ref(root, "log/fuzz:0#L1")
+    assert raised.value.reason_code == "INVALID_REFERENCE"
+    assert "round_no=null" in raised.value.message
