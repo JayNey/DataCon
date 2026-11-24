@@ -14,11 +14,16 @@ address checks.
 The module resolves no names and opens no sockets on its own: the resolver
 and the socket factory are injected per call, which keeps every path
 offline by default and contract-testable. It is deliberately not a general
-HTTP client: only origin-form, bodyless requests are sent; a response is
-parsed down to its blank line (status line plus header block, header keys
-lowercased) and its body is handed out as a chunk-by-chunk stream framed
-exactly by ``Content-Length``, so callers can count wire bytes while they
-stream.
+HTTP client: only origin-form, bodyless requests are sent. A response head
+(the status line, the header block and the blank line, all inclusive) is
+buffered only up to ``MAX_RESPONSE_HEAD_BYTES``: a head that accumulates
+past the cap is refused even when its blank line never arrives, so a
+runaway head cannot be buffered until the peer closes. Header keys are
+lowercased, ``Content-Length`` framing is validated strictly (a missing,
+non-integer or self-contradictory field leaves the response unframed), and
+the body is handed out as a chunk-by-chunk stream that yields exactly the
+declared ``Content-Length`` bytes and reports an early close as
+``CONTENT_TRUNCATED``, so callers can count wire bytes while they stream.
 """
 
 from __future__ import annotations
@@ -31,6 +36,11 @@ from urllib.parse import urlsplit
 CONNECT_TIMEOUT_SECONDS = 10.0
 READ_TIMEOUT_SECONDS = 30.0
 HTTPS_PORT = 443
+# A response head (status line, header block and blank line, all inclusive)
+# may never accumulate past this many bytes, whether or not its blank line
+# ever arrives: a larger head is refused as RESPONSE_HEAD_TOO_LARGE instead
+# of being buffered until the peer closes.
+MAX_RESPONSE_HEAD_BYTES = 64 * 1024
 _RECV_CHUNK_BYTES = 65536
 
 # Shared IPv4/IPv6 rejection set (security design delta 2.4 / 3.2): private,
@@ -78,8 +88,21 @@ class SafeHttpError(ValueError):
     an address answer inside the shared rejection set (the message names
     the offending ``address``), an empty resolution, a connect/TLS failure,
     a ``getpeername()`` peer that is not a validated address (no HTTP bytes
-    were sent), and an unparseable or truncated status line.
+    were sent), and an unparseable, oversized or unframed response head.
+
+    ``reason`` carries a stable token so callers can attribute the failure
+    without parsing the message: ``ADDRESS_DENIED`` (an answer inside the
+    rejection set, or not a literal IP at all), ``RESPONSE_HEAD_TOO_LARGE``
+    (the head accumulated past ``MAX_RESPONSE_HEAD_BYTES``),
+    ``RESPONSE_UNFRAMED`` (no trustworthy single ``Content-Length``), and
+    ``CONTENT_TRUNCATED`` (the wire closed before the declared body
+    arrived). Every other failure keeps the ``FETCH_FAILED`` default.
     """
+
+    def __init__(self, message: str, *, reason: str = "FETCH_FAILED") -> None:
+        super().__init__(message)
+        self.message = message
+        self.reason = reason
 
 
 class Resolver(Protocol):
@@ -199,13 +222,15 @@ def resolve_validated(host: str, *, resolver: Resolver) -> list[str]:
         except ValueError:
             raise SafeHttpError(
                 f"address answer {answer!r} for {host!r} is not a literal IP"
-                " address"
+                " address",
+                reason="ADDRESS_DENIED",
             ) from None
         if is_rejected_address(parsed):
             raise SafeHttpError(
                 f"address answer {answer!r} for {host!r} falls into the"
                 " shared rejection set (private, loopback, link-local,"
-                " CGNAT, multicast, reserved, unspecified or cloud metadata)"
+                " CGNAT, multicast, reserved, unspecified or cloud metadata)",
+                reason="ADDRESS_DENIED",
             )
         validated.append(str(parsed))
     return validated
@@ -215,16 +240,21 @@ def resolve_validated(host: str, *, resolver: Resolver) -> list[str]:
 class GuardedResponse:
     """One parsed response head plus its chunk-by-chunk body stream.
 
+    ``content_length`` is the validated single integer ``Content-Length``
+    value, or ``None`` when the head carried no ``Content-Length`` at all:
+    nothing frames such a body, so ``body_chunks`` yields no bytes either.
     ``headers`` maps lowercased header names to their values (the canonical
     lookup form: wire ``Content-Encoding`` is stored as ``content-encoding``).
-    ``body_chunks`` yields exactly the ``Content-Length`` body bytes as the
-    wire delivered them, so a caller can count bytes while streaming. Both
-    new fields stay out of equality: two responses compare by their status
-    line alone, exactly as before.
+    ``body_chunks`` yields exactly the declared body bytes as the wire
+    delivered them and raises ``CONTENT_TRUNCATED`` on an early close, so a
+    caller can count wire bytes while streaming. The non-status fields stay
+    out of equality: two responses compare by their status line alone,
+    exactly as before.
     """
 
     status: int
     reason: str = ""
+    content_length: int | None = None
     headers: Mapping[str, str] = field(
         default_factory=dict, compare=False, repr=False
     )
@@ -234,16 +264,20 @@ class GuardedResponse:
 
 
 def _iter_body_chunks(
-    socket: GuardedSocket, buffered: bytes, content_length: int
+    socket: GuardedSocket, buffered: bytes, content_length: int | None
 ) -> Iterator[bytes]:
     """Yield exactly ``content_length`` body bytes, wire chunk by wire chunk.
 
-    Bytes that already arrived together with the head are served first,
-    then one piece per ``recv`` return. An early orderly close (an empty
-    ``recv``) stops the stream short without inventing padding: counting a
-    shortfall or an overlong wire against a budget is the caller's job,
-    which is why the stream hands the wire truth through unchanged.
+    ``content_length is None`` means no ``Content-Length`` framed the
+    response, so not one body byte is handed out -- not even bytes that
+    already arrived together with the head. With a declared length, bytes
+    that rode along with the head are served first, then one piece per
+    ``recv`` return; an early orderly close (an empty ``recv``) with
+    declared bytes still undelivered raises ``CONTENT_TRUNCATED`` instead
+    of silently ending the stream short.
     """
+    if content_length is None:
+        return
     remaining = content_length
     if buffered and remaining:
         piece = buffered[:remaining]
@@ -252,7 +286,11 @@ def _iter_body_chunks(
     while remaining:
         chunk = socket.recv(_RECV_CHUNK_BYTES)
         if not chunk:
-            break
+            raise SafeHttpError(
+                f"connection closed with {remaining} of {content_length}"
+                " declared body bytes undelivered",
+                reason="CONTENT_TRUNCATED",
+            )
         piece = chunk[:remaining]
         remaining -= len(piece)
         yield piece
@@ -374,17 +412,71 @@ class GuardedConnection:
             headers[name.strip().lower()] = value.strip()
         return headers
 
+    @staticmethod
+    def _parse_content_length(
+        hostname: str, raw_lines: list[bytes]
+    ) -> int | None:
+        """Resolve the response's ``Content-Length`` to one integer or None.
+
+        Every ``Content-Length`` field is examined, however its name is
+        cased, and comma-joined values are split into their tokens: the
+        response is only framed when all of them agree on one ASCII
+        decimal integer (consistent repetitions are accepted). Conflicting
+        values leave the response unframed; a value that is not one
+        decimal integer fails the same way, and no field at all means
+        ``None`` -- nothing frames the body.
+        """
+        tokens: list[str] = []
+        for raw_line in raw_lines:
+            if not raw_line:
+                continue
+            line = raw_line.decode("ascii")
+            name, separator, value = line.partition(":")
+            if not separator or name.strip().lower() != "content-length":
+                continue
+            tokens.extend(token.strip() for token in value.split(","))
+        if not tokens:
+            return None
+        declared: set[int] = set()
+        for token in tokens:
+            if not token or not token.isascii() or not token.isdigit():
+                raise SafeHttpError(
+                    f"content-length {token!r} from {hostname!r} is not a"
+                    " decimal integer",
+                    reason="RESPONSE_UNFRAMED",
+                )
+            declared.add(int(token))
+        if len(declared) > 1:
+            raise SafeHttpError(
+                f"conflicting content-length fields {sorted(declared)!r}"
+                f" from {hostname!r}: there is no single declared length",
+                reason="RESPONSE_UNFRAMED",
+            )
+        return declared.pop()
+
     def read_response(self) -> GuardedResponse:
         """Read and parse one complete response head; the body streams after.
 
-        Reading stops at the blank line: the status line and the header
-        block (header keys lowercased) are parsed here, and the returned
-        response's ``body_chunks`` stream yields exactly the declared
-        ``Content-Length`` body bytes, one piece per ``recv`` return, so
-        the caller's wire counting sees the wire's own chunking.
+        The head (status line, header block and blank line, all inclusive)
+        is buffered only up to ``MAX_RESPONSE_HEAD_BYTES``: a head that
+        accumulates past the cap is refused with ``RESPONSE_HEAD_TOO_LARGE``
+        even while its blank line has not arrived yet. Once the blank line
+        lands, the status line and the header block (header keys
+        lowercased) are parsed here. The returned response's
+        ``content_length`` is the validated single integer length or
+        ``None`` when the head carried none, and its ``body_chunks`` stream
+        yields exactly the declared body bytes, one piece per ``recv``
+        return, so the caller's wire counting sees the wire's own chunking.
         """
         buffer = bytearray()
         while b"\r\n\r\n" not in buffer:
+            if len(buffer) > MAX_RESPONSE_HEAD_BYTES:
+                raise SafeHttpError(
+                    f"response head from {self._hostname!r} accumulated"
+                    f" {len(buffer)} bytes without reaching its blank line,"
+                    f" above the {MAX_RESPONSE_HEAD_BYTES} byte cap",
+                    reason="RESPONSE_HEAD_TOO_LARGE",
+                )
             chunk = self._socket.recv(_RECV_CHUNK_BYTES)
             if not chunk:
                 break
@@ -395,6 +487,13 @@ class GuardedConnection:
                 f"connection to {self._hostname!r} closed before the"
                 " response head (status line, headers and blank line)"
                 " arrived"
+            )
+        if len(head) + 4 > MAX_RESPONSE_HEAD_BYTES:
+            raise SafeHttpError(
+                f"response head from {self._hostname!r} is"
+                f" {len(head) + 4} bytes (status line through blank line),"
+                f" above the {MAX_RESPONSE_HEAD_BYTES} byte cap",
+                reason="RESPONSE_HEAD_TOO_LARGE",
             )
         lines = head.split(b"\r\n")
         status_line = lines[0]
@@ -428,26 +527,14 @@ class GuardedConnection:
             raise SafeHttpError(
                 f"transfer-encoding {transfer_encoding!r} from"
                 f" {self._hostname!r} is not supported: only Content-Length"
-                " framing is accepted for guarded responses"
+                " framing is accepted for guarded responses",
+                reason="RESPONSE_UNFRAMED",
             )
-        content_length = 0
-        raw_length = headers.get("content-length")
-        if raw_length is not None:
-            try:
-                content_length = int(raw_length)
-            except ValueError as error:
-                raise SafeHttpError(
-                    f"content-length {raw_length!r} from {self._hostname!r}"
-                    " is not an integer"
-                ) from error
-            if content_length < 0:
-                raise SafeHttpError(
-                    f"content-length {raw_length!r} from {self._hostname!r}"
-                    " is negative"
-                )
+        content_length = self._parse_content_length(self._hostname, lines[1:])
         return GuardedResponse(
             status=status,
             reason=parts[2] if len(parts) > 2 else "",
+            content_length=content_length,
             headers=headers,
             body_chunks=_iter_body_chunks(self._socket, rest, content_length),
         )

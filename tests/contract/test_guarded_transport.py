@@ -447,3 +447,213 @@ def test_guarded_transport_never_leaks_sockets_on_success():
         assert recv_positions, "a hop socket never read its scripted response"
         assert len(close_positions) == 1
         assert close_positions[0] > max(recv_positions)
+
+
+# ---------------------------------------------------------------------------
+# Self-review hardening of PR #44. The scripts below deliberately break the
+# "exactly one complete response" wire convention documented at the top of
+# this file -- a body shorter than its Content-Length, a head past the 64 KiB
+# cap, a head without Content-Length, a poisoned resolver answer, a body whose
+# chunks each cost fake time -- to pin how ``fetch_intel`` surfaces
+# ``safe_http`` failures and how a hop accounts for the time its body takes.
+# ---------------------------------------------------------------------------
+
+
+def _without_content_length(script):
+    """Strip the ``Content-Length`` header line from a ``_hop_script`` head.
+
+    The head stays the first chunk and the body chunks are untouched, so the
+    wire still carries the body bytes; only the declared length is gone.
+    """
+    head, *body_chunks = script
+    lines = head.split(b"\r\n")
+    kept = [line for line in lines if not line.lower().startswith(b"content-length:")]
+    assert len(kept) == len(lines) - 1, "script head must carry one Content-Length"
+    return [b"\r\n".join(kept), *body_chunks]
+
+
+def _assert_connection_released(factory):
+    """The one socket that was dialed got closed: no connection leaked."""
+    assert len(factory.sockets) == 1
+    (sock,) = factory.sockets
+    assert sock.closed
+    assert factory.events.count(("close", sock.index)) == 1
+
+
+def test_guarded_transport_surfaces_safe_http_failures_as_intel_errors():
+    from datacon.tools.intel_fetch import GuardedTransport, IntelFetchError, fetch_intel
+
+    url = f"https://{HOST}/advisory.txt"
+
+    def guarded_fetch(answers, factory):
+        transport = GuardedTransport(
+            resolver=FakeResolver({HOST: answers}),
+            socket_factory=factory,
+            clock=StepClock(step=0.25),
+        )
+        return fetch_intel(url, allowlist=ALLOWLIST, transport=transport)
+
+    # Callers only ever see IntelFetchError: every failure safe_http raises
+    # under a guarded hop surfaces as that type, carrying the transport's
+    # reason token as sub_reason, and never leaks the connection it opened.
+
+    # 1) the head declares 100 body bytes and the wire closes after 10: the
+    # bytes that did arrive must not pass for the complete advisory
+    factory = ScriptedSocketFactory(
+        [_hop_script(200, "OK", {"Content-Length": "100"}, b"0123456789")]
+    )
+    with pytest.raises(IntelFetchError) as caught:
+        guarded_fetch([PUBLIC_V4_PRIMARY], factory)
+    assert caught.value.sub_reason == "CONTENT_TRUNCATED"
+    _assert_connection_released(factory)
+
+    # 2) a response head twice the size of the 64 KiB cap
+    # (safe_http.MAX_RESPONSE_HEAD_BYTES, spelled out here because the
+    # constant belongs to the implementation round) is refused instead of
+    # being buffered and parsed like any other head
+    head_cap_bytes = 64 * 1024
+    factory = ScriptedSocketFactory(
+        [_hop_script(200, "OK", {"X-Pad": "x" * (2 * head_cap_bytes)})]
+    )
+    with pytest.raises(IntelFetchError) as caught:
+        guarded_fetch([PUBLIC_V4_PRIMARY], factory)
+    assert caught.value.sub_reason == "RESPONSE_HEAD_TOO_LARGE"
+    _assert_connection_released(factory)
+
+    # 3) a 200 answer without Content-Length is not "an empty body": its body
+    # bytes are on the wire but cannot be framed, so the fetch fails closed
+    # instead of handing back a silently empty advisory
+    factory = ScriptedSocketFactory(
+        [
+            _without_content_length(
+                _hop_script(
+                    200,
+                    "OK",
+                    {"Content-Type": "text/plain"},
+                    b"unframed advisory body\n",
+                    body_chunk_bytes=5,
+                )
+            )
+        ]
+    )
+    with pytest.raises(IntelFetchError) as caught:
+        guarded_fetch([PUBLIC_V4_PRIMARY], factory)
+    assert caught.value.sub_reason == "RESPONSE_UNFRAMED"
+    _assert_connection_released(factory)
+
+    # 4) a resolver answer inside the rejection set fails the same way as
+    # every other refused fetch -- IntelFetchError carrying ADDRESS_DENIED --
+    # instead of leaking the transport layer's own SafeHttpError type
+    factory = ScriptedSocketFactory([])
+    with pytest.raises(IntelFetchError) as caught:
+        guarded_fetch(["10.0.0.7"], factory)
+    assert caught.value.sub_reason == "ADDRESS_DENIED"
+    # the poisoned answer is refused before any socket exists: nothing was
+    # dialed and no wire event happened, so there is no connection to leak
+    assert factory.sockets == []
+    assert factory.events == []
+
+
+class ManualClock:
+    """Injectable clock that only moves when a double calls ``advance``.
+
+    Reading the clock never changes it, so a hop's ``elapsed_seconds`` is
+    exactly the fake time the scripted socket spent serving its body, however
+    often the transport samples it.
+    """
+
+    def __init__(self):
+        self.now = 0.0
+
+    def advance(self, seconds):
+        self.now += seconds
+
+    def __call__(self):
+        return self.now
+
+
+class SlowBodySocket(ScriptedSocket):
+    """A ``ScriptedSocket`` whose body chunks each cost a fixed fake-time step.
+
+    Serving the response head (the first scripted chunk) costs nothing; every
+    other non-empty ``recv`` advances the shared ``clock`` before handing the
+    body bytes over, so a body streamed in three chunks moves the clock three
+    times while no real time passes.
+    """
+
+    def __init__(self, wire_chunks, index, events, clock, seconds_per_body_chunk):
+        super().__init__(wire_chunks, index, events)
+        self._clock = clock
+        self._seconds_per_body_chunk = seconds_per_body_chunk
+        self._script_chunks = len(self._inbox)
+
+    def recv(self, size):
+        serving_head = len(self._inbox) == self._script_chunks
+        chunk = super().recv(size)
+        if chunk and not serving_head:
+            self._clock.advance(self._seconds_per_body_chunk)
+        return chunk
+
+
+class SlowBodySocketFactory(ScriptedSocketFactory):
+    """Socket factory handing out ``SlowBodySocket`` doubles on one clock."""
+
+    def __init__(self, hop_scripts, clock, seconds_per_body_chunk):
+        super().__init__(hop_scripts)
+        self._clock = clock
+        self._seconds_per_body_chunk = seconds_per_body_chunk
+
+    def __call__(self):
+        if not self._pending:
+            raise AssertionError(
+                "socket factory asked for an unscripted extra connection"
+            )
+        sock = SlowBodySocket(
+            self._pending.pop(0),
+            index=len(self.sockets),
+            events=self.events,
+            clock=self._clock,
+            seconds_per_body_chunk=self._seconds_per_body_chunk,
+        )
+        self.sockets.append(sock)
+        return sock
+
+
+def test_guarded_elapsed_includes_body_streaming():
+    from datacon.tools.intel_fetch import GuardedTransport, IntelFetchError, fetch_intel
+
+    url = f"https://{HOST}/slow-body.txt"
+    # one head chunk followed by exactly three ten-byte body chunks
+    body = b"0123456789" * 3
+    script = _hop_script(200, "OK", {}, body, body_chunk_bytes=10)
+    assert len(script) == 4
+
+    def build(seconds_per_body_chunk):
+        clock = ManualClock()
+        factory = SlowBodySocketFactory([script], clock, seconds_per_body_chunk)
+        transport = GuardedTransport(
+            resolver=FakeResolver({HOST: [PUBLIC_V4_PRIMARY]}),
+            socket_factory=factory,
+            clock=clock,
+        )
+        return clock, factory, transport
+
+    # three body chunks of fifty fake seconds each stream for 150 seconds in
+    # total, far past the 60 second budget, although the head arrived at
+    # zero: the time spent streaming a hop's body has to count as well
+    clock, factory, transport = build(50.0)
+    with pytest.raises(IntelFetchError, match="FETCH_TIMEOUT"):
+        fetch_intel(url, allowlist=ALLOWLIST, transport=transport)
+    # the timed-out hop still released its connection
+    assert [sock.closed for sock in factory.sockets] == [True]
+
+    # the same body streamed in three chunks of ten fake seconds takes 30
+    # seconds -- inside the budget -- and comes back complete
+    clock, factory, transport = build(10.0)
+    result = fetch_intel(url, allowlist=ALLOWLIST, transport=transport)
+    assert result.status == 200
+    assert result.body == body
+    assert result.hops == (url,)
+    # the clock really moved: the body cost thirty fake seconds, so the
+    # success above is a budget verdict and not a clock that never ticked
+    assert clock.now == 30.0
