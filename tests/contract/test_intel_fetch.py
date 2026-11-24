@@ -1,11 +1,11 @@
 """TC-02/TC-16: online intel fetching, snapshots and licensing (REQ-02/REQ-16).
 
-RED-phase contract tests for T15 (D44). ``datacon.tools.intel_fetch`` does
-not exist yet, so each coordinate imports the contract face inside the test
-function: every test then fails at its own missing entry point instead of
-one shared module-level collection error. The last coordinate asserts the
-``intel`` stage of the orchestration graph from ``datacon.workflow`` and its
-RED comes from the graph itself, not from this module.
+Contract tests for T15 (D44). Each coordinate imports the contract face
+inside the test function, so a missing entry point fails its own test
+instead of producing one shared module-level collection error. The graph
+coordinate ``test_intel_node_archives_missing_or_conflicting_snapshot``
+(README section 5 edge #6) needs the T11 ``intel`` node and ships with the
+T15 closeout change once #43 lands.
 
 Every HTTP interaction goes through the recording fake transport defined
 below: no test opens a socket, resolves DNS or sleeps. Simulated time is
@@ -465,24 +465,3 @@ def test_missing_or_disallowed_license_is_rejected():
     }
     with pytest.raises(Exception, match="LICENSE_REJECTED"):
         check_license(snapshot, registry_human_review_only)
-
-
-def test_intel_node_archives_missing_or_conflicting_snapshot():
-    from datacon.workflow import build_graph
-
-    graph = build_graph(
-        dsn="postgresql://intel-contract.invalid/datacon",
-        checkpointer=None,
-        contract_version=2,
-    )
-    nodes = set(graph.nodes)
-    assert "intel" in nodes, (
-        "the workflow graph needs an intel stage that consumes the snapshot "
-        "(missing snapshot -> MATERIAL_MISSING, source conflict -> "
-        "SOURCE_CONFLICT); missing or conflicting intel snapshot reached "
-        "version node"
-    )
-    assert "archive" in nodes, (
-        "missing or conflicting intel snapshots must be routed into the "
-        "archive node instead of continuing towards the version node"
-    )
