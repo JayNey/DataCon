@@ -14,7 +14,7 @@ import hashlib
 import hmac
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import shutil
 import stat
@@ -24,7 +24,7 @@ import uuid
 from typing import Any, Callable, Mapping, Sequence
 from uuid import UUID
 
-from datacon import contracts, fileio, jsonutil, state
+from datacon import build_provenance, contracts, evidence, fileio, jsonutil, state
 from datacon.cases import (
     MAX_MATERIAL_BYTES,
     CaseConfigurationError,
@@ -35,6 +35,7 @@ from datacon.evidence import BundleError, verify_bundle, write_bundle
 from datacon.tools.sandbox import (
     MAX_ARTIFACT_BYTES,
     MAX_LOG_BYTES,
+    MAX_PROVENANCE_FACE_BYTES,
     BuildResult,
     DockerSandbox,
     IsolationPolicy,
@@ -147,6 +148,345 @@ class ExecutionResult:
     evidence_digest: str | None = None
     evidence_path: str | None = None
     reason_code: str | None = None
+
+
+@dataclass(frozen=True)
+class _ProvenanceCheckOutcome:
+    comparable: bool
+    report_summary: dict[str, Any]
+    rules_version: str
+    reason_code: str | None = None
+    error_detail: str = ""
+    faces: dict[str, bytes] = field(default_factory=dict)
+
+
+def _is_v2_context(context: Any) -> bool:
+    """Return True when the job or frozen plan uses contract version 2."""
+    job = getattr(context, "job", None)
+    if (
+        isinstance(job, Mapping)
+        and job.get("job_contract_version") == contracts.SCHEMA_VERSION_V2
+    ):
+        return True
+    plan = getattr(context, "plan", None)
+    if (
+        isinstance(plan, Mapping)
+        and plan.get("schema_version") == contracts.SCHEMA_VERSION_V2
+    ):
+        return True
+    return False
+
+
+def _build_spec_from_context(context: Any) -> Mapping[str, Any] | None:
+    plan = getattr(context, "plan", None)
+    if isinstance(plan, Mapping):
+        spec = plan.get("build_spec")
+        if isinstance(spec, Mapping):
+            return spec
+    return None
+
+
+def _provenance_rules_version(context: Any) -> str:
+    plan = getattr(context, "plan", None)
+    if isinstance(plan, Mapping):
+        value = plan.get("build_provenance_rules_version")
+        if isinstance(value, str) and value.strip():
+            return value
+    return build_provenance.RULES_VERSION
+
+
+def _build_provenance_repo_root(context: Any) -> str:
+    custom = getattr(context, "provenance_repo_root", None)
+    if isinstance(custom, str) and custom.strip():
+        return custom
+    return "/work"
+
+
+def _input_material_paths(context: Any) -> set[str]:
+    paths: set[str] = {"inputs/normal.txt", "inputs/candidate.txt"}
+    manifest_case = getattr(context, "manifest_case", None)
+    if isinstance(manifest_case, Mapping):
+        inputs_map = manifest_case.get("inputs")
+        if isinstance(inputs_map, Mapping):
+            for key in ("normal", "candidate"):
+                relative = inputs_map.get(key)
+                if isinstance(relative, str) and relative.strip():
+                    paths.add(relative.replace("\\", "/"))
+    return paths
+
+
+def _is_input_material_path(relative: str, input_paths: set[str]) -> bool:
+    normalized = relative.replace("\\", "/")
+    return normalized in input_paths or normalized.startswith("inputs/")
+
+
+def _normalize_build_provenance_summary(
+    summary: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Return a strictly closed §8 3-key ``report.build_provenance`` payload."""
+    normalized: dict[str, Any] = {}
+    for version in ("vulnerable", "fixed"):
+        entry = summary.get(version)
+        if not isinstance(entry, Mapping):
+            entry = {}
+        face = entry.get("face")
+        declared = entry.get("declared")
+        effective = entry.get("effective")
+        normalized[version] = {
+            "face": str(face) if isinstance(face, str) else "",
+            "declared": [str(item) for item in declared]
+            if isinstance(declared, list)
+            else [],
+            "effective": [str(item) for item in effective]
+            if isinstance(effective, list)
+            else [],
+        }
+    normalized["comparable"] = bool(summary.get("comparable", False))
+    return normalized
+
+
+def _empty_build_provenance_summary(
+    context: Any,
+    *,
+    comparable: bool = False,
+) -> dict[str, Any]:
+    build_spec = _build_spec_from_context(context)
+    kind = build_spec.get("kind") if isinstance(build_spec, Mapping) else None
+    face_name = (
+        build_provenance.FACE_FILENAMES.get(str(kind), str(kind))
+        if isinstance(kind, str) and kind
+        else ""
+    )
+    plan = getattr(context, "plan", None)
+    raw_declared: Any = None
+    if isinstance(plan, Mapping):
+        raw_declared = plan.get("compile_flags")
+    if raw_declared is None and isinstance(build_spec, Mapping):
+        raw_declared = build_spec.get("declared_compile_flags")
+    declared_list: list[str] = []
+    if isinstance(raw_declared, list) and all(
+        isinstance(item, str) for item in raw_declared
+    ):
+        try:
+            declared_list = build_provenance.normalize_compile_flags(
+                raw_declared, repo_root=_build_provenance_repo_root(context)
+            )
+        except ValueError:
+            declared_list = list(raw_declared)
+    return {
+        "vulnerable": {
+            "face": face_name,
+            "declared": list(declared_list),
+            "effective": [],
+        },
+        "fixed": {
+            "face": face_name,
+            "declared": list(declared_list),
+            "effective": [],
+        },
+        "comparable": comparable,
+    }
+
+
+def _verified_provenance_face(
+    run_root: Path,
+    build: Mapping[str, Any],
+    *,
+    expected_face_name: str | None = None,
+) -> bytes | None:
+    files = build.get("files")
+    relative = files.get("provenance_face") if isinstance(files, Mapping) else None
+    if not isinstance(relative, str) or not relative:
+        return None
+    face_name = expected_face_name or build.get("provenance_face_name")
+    if not isinstance(face_name, str) or face_name not in build_provenance.FACE_FILENAMES.values():
+        return None
+    path = _run_root_path(run_root, relative, f"/build_provenance/{face_name}")
+    if path is None:
+        return None
+    data = _read_run_file_bounded(path, max_bytes=MAX_PROVENANCE_FACE_BYTES)
+    if data is None or not data:
+        return None
+    digests = build.get("file_digests")
+    expected = digests.get("provenance_face") if isinstance(digests, Mapping) else None
+    if not isinstance(expected, str) or _digest(data) != expected:
+        return None
+    return data
+
+
+def _verify_v2_build_provenance(
+    context: ExecutionContext,
+    build_root: Path,
+    builds: Mapping[str, Mapping[str, Any]],
+) -> _ProvenanceCheckOutcome:
+    """Verify two-version v2 build provenance before entering the replay phase."""
+    rules_version = _provenance_rules_version(context)
+    build_spec = _build_spec_from_context(context)
+    if build_spec is None:
+        return _ProvenanceCheckOutcome(
+            comparable=False,
+            report_summary=_empty_build_provenance_summary(context, comparable=False),
+            rules_version=rules_version,
+            reason_code=build_provenance.BUILD_PROVENANCE_MISSING,
+            error_detail="v2 plan is missing build_spec for build provenance verification",
+        )
+
+    kind = build_spec.get("kind")
+    face_name = (
+        build_provenance.FACE_FILENAMES.get(kind, str(kind))
+        if isinstance(kind, str)
+        else ""
+    )
+    repo_root = _build_provenance_repo_root(context)
+    raw_declared = context.plan.get("compile_flags")
+    if not isinstance(raw_declared, list):
+        raw_declared = build_spec.get("declared_compile_flags", [])
+
+    try:
+        normalized_declared = build_provenance.normalize_compile_flags(
+            raw_declared, repo_root=repo_root
+        )
+    except ValueError:
+        normalized_declared = (
+            [str(item) for item in raw_declared]
+            if isinstance(raw_declared, list)
+            else []
+        )
+
+    archived_faces: dict[str, bytes] = {}
+    version_faces: dict[str, bytes | None] = {}
+    for version in ("vulnerable", "fixed"):
+        build = builds.get(version)
+        face = (
+            _verified_provenance_face(
+                build_root, build, expected_face_name=face_name
+            )
+            if isinstance(build, Mapping) and face_name
+            else None
+        )
+        version_faces[version] = face
+        if face:
+            archived_faces[version] = face
+
+    vuln_face = version_faces["vulnerable"]
+    fixed_face = version_faces["fixed"]
+
+    if kind in ("cmake", "make"):
+        missing_versions = [
+            version
+            for version in ("vulnerable", "fixed")
+            if version_faces[version] is None
+        ]
+        if missing_versions:
+            effective_by_version: dict[str, list[str]] = {
+                "vulnerable": [],
+                "fixed": [],
+            }
+            for version in ("vulnerable", "fixed"):
+                raw = version_faces[version]
+                if raw is None:
+                    continue
+                try:
+                    parsed = build_provenance.parse_provenance_face(
+                        kind=kind, raw_face=raw, repo_root=repo_root
+                    )
+                    effective_by_version[version] = list(parsed.effective_flags)
+                except build_provenance.ProvenanceParseError:
+                    effective_by_version[version] = []
+            summary = {
+                "vulnerable": {
+                    "face": face_name,
+                    "declared": list(normalized_declared),
+                    "effective": effective_by_version["vulnerable"],
+                },
+                "fixed": {
+                    "face": face_name,
+                    "declared": list(normalized_declared),
+                    "effective": effective_by_version["fixed"],
+                },
+                "comparable": False,
+            }
+            return _ProvenanceCheckOutcome(
+                comparable=False,
+                report_summary=summary,
+                rules_version=rules_version,
+                reason_code=build_provenance.BUILD_PROVENANCE_MISSING,
+                error_detail=(
+                    f"missing or empty provenance face ({kind}/{face_name}) for "
+                    + ", ".join(missing_versions)
+                ),
+                faces=archived_faces,
+            )
+
+        assert vuln_face is not None and fixed_face is not None
+        prov_result = build_provenance.verify_build_provenance(
+            kind=kind,
+            declared_compile_flags=raw_declared,
+            vulnerable_face=vuln_face,
+            fixed_face=fixed_face,
+            repo_root=repo_root,
+        )
+        return _ProvenanceCheckOutcome(
+            comparable=prov_result.comparable,
+            report_summary=_normalize_build_provenance_summary(
+                prov_result.report_summary
+            ),
+            rules_version=rules_version,
+            reason_code=prov_result.reason_code,
+            error_detail=prov_result.error_detail,
+            faces=archived_faces,
+        )
+
+    if kind == "shell":
+        issues: list[str] = []
+        shell_results: dict[str, build_provenance.ShellFaceVerificationResult] = {}
+        for version in ("vulnerable", "fixed"):
+            raw = version_faces[version]
+            res = build_provenance.verify_shell_face(
+                build_spec=build_spec,
+                actual_log=raw if raw is not None else b"",
+                repo_root=repo_root,
+            )
+            shell_results[version] = res
+            if not res.comparable:
+                issues.append(f"{version}: {res.error_detail}")
+        comparable = all(res.comparable for res in shell_results.values())
+        summary = {
+            "vulnerable": {
+                "face": build_provenance.FACE_FILENAMES["shell"],
+                "declared": list(normalized_declared),
+                "effective": list(normalized_declared)
+                if shell_results["vulnerable"].comparable
+                else [],
+            },
+            "fixed": {
+                "face": build_provenance.FACE_FILENAMES["shell"],
+                "declared": list(normalized_declared),
+                "effective": list(normalized_declared)
+                if shell_results["fixed"].comparable
+                else [],
+            },
+            "comparable": comparable,
+        }
+        return _ProvenanceCheckOutcome(
+            comparable=comparable,
+            report_summary=summary,
+            rules_version=rules_version,
+            reason_code=None
+            if comparable
+            else build_provenance.BUILD_PROVENANCE_MISSING,
+            error_detail="" if comparable else "; ".join(issues),
+            faces=archived_faces,
+        )
+
+    return _ProvenanceCheckOutcome(
+        comparable=False,
+        report_summary=_empty_build_provenance_summary(context, comparable=False),
+        rules_version=rules_version,
+        reason_code=build_provenance.BUILD_PROVENANCE_MISSING,
+        error_detail=f"unsupported build_spec.kind {kind!r} for build provenance verification",
+        faces=archived_faces,
+    )
 
 
 def _utc_now() -> str:
@@ -521,6 +861,16 @@ def _load_context(
     if plan_row is None:
         raise ExecutionBlocked("PLAN_MISMATCH", "no frozen plan is available")
     plan = plan_row["plan"]
+    is_v2 = (
+        job.get("job_contract_version") == contracts.SCHEMA_VERSION_V2
+        or plan.get("schema_version") == contracts.SCHEMA_VERSION_V2
+    )
+    if review is None and is_v2 and job.get("family_id") is not None:
+        family_id = job["family_id"]
+        review = state.get_review(
+            dsn,
+            UUID(family_id) if isinstance(family_id, str) else family_id,
+        )
     try:
         computed_digest = contracts.plan_digest(plan)
     except ValueError as error:
@@ -579,9 +929,27 @@ def _load_context(
         raise ExecutionBlocked("MATERIAL_MISSING", "case manifest has no materials")
     source_vulnerable = manifest["versions"]["vulnerable"]
     source_fixed = manifest["versions"]["fixed"]
-    expected_materials = {
+    has_v2_build_spec = is_v2 and isinstance(plan.get("build_spec"), Mapping)
+    if has_v2_build_spec:
+        try:
+            spec_digest = jsonutil.digest_json(plan["build_spec"])
+        except (ValueError, TypeError, UnicodeError, RecursionError) as error:
+            raise ExecutionBlocked(
+                "PLAN_MISMATCH", f"plan build_spec is not canonical: {error}"
+            ) from error
+        if spec_digest != plan["build_recipe_digest"]:
+            raise ExecutionBlocked(
+                "PLAN_MISMATCH",
+                "plan build_recipe_digest does not match canonical build_spec",
+            )
+    expected_materials: dict[str, tuple[str, Any]] = {
         "harness": (manifest["harness"], plan["harness_digest"]),
-        "build_recipe": (manifest["build_recipe"], plan["build_recipe_digest"]),
+        "build_recipe": (
+            manifest["build_recipe"],
+            materials.get(manifest["build_recipe"])
+            if has_v2_build_spec
+            else plan["build_recipe_digest"],
+        ),
         "dependencies": (manifest["dependencies"], plan["dependencies_digest"]),
         "patch": (case.repository["patch"], plan["repository"]["patch_digest"]),
         "source_vulnerable": (
@@ -589,15 +957,19 @@ def _load_context(
             materials.get(source_vulnerable),
         ),
         "source_fixed": (source_fixed, materials.get(source_fixed)),
-        "input_normal": (
-            manifest_case["inputs"]["normal"],
-            plan["inputs"]["normal"],
-        ),
-        "input_candidate": (
-            manifest_case["inputs"]["candidate"],
-            plan["inputs"]["candidate"],
-        ),
     }
+    plan_inputs = plan.get("inputs")
+    if isinstance(plan_inputs, Mapping):
+        expected_materials["input_normal"] = (
+            manifest_case["inputs"]["normal"],
+            plan_inputs.get("normal"),
+        )
+        expected_materials["input_candidate"] = (
+            manifest_case["inputs"]["candidate"],
+            plan_inputs.get("candidate"),
+        )
+    elif not is_v2:
+        raise ExecutionBlocked("MATERIAL_MISSING", "plan has no inputs mapping")
     for label, (relative, expected_digest) in expected_materials.items():
         if not isinstance(expected_digest, str):
             raise ExecutionBlocked(
@@ -698,12 +1070,24 @@ def _load_context(
             "the registry or one of the actual case materials drifted from the plan",
         )
 
-    try:
-        compile_args = _extract_compile_args(
-            case.read_material(manifest["build_recipe"], plan["build_recipe_digest"])[0]
-        )
-    except CaseConfigurationError as error:
-        raise ExecutionBlocked(error.reason_code, error.message) from error
+    if has_v2_build_spec:
+        raw_flags = plan.get("compile_flags")
+        if not isinstance(raw_flags, list) or not all(
+            isinstance(item, str) for item in raw_flags
+        ):
+            raise ExecutionBlocked(
+                "PLAN_MISMATCH", "v2 plan compile_flags must be a list of strings"
+            )
+        compile_args = tuple(raw_flags)
+    else:
+        try:
+            compile_args = _extract_compile_args(
+                case.read_material(
+                    manifest["build_recipe"], plan["build_recipe_digest"]
+                )[0]
+            )
+        except CaseConfigurationError as error:
+            raise ExecutionBlocked(error.reason_code, error.message) from error
 
     deadline = job["execute_deadline_at"]
     if deadline is None:
@@ -772,6 +1156,16 @@ def _assert_context_unchanged(
         )
     plan_row = state.get_plan(dsn, context.job_id)
     review = state.get_review(dsn, context.job_id)
+    if (
+        review is None
+        and _is_v2_context(context)
+        and context.job.get("family_id") is not None
+    ):
+        family_id = context.job["family_id"]
+        review = state.get_review(
+            dsn,
+            UUID(family_id) if isinstance(family_id, str) else family_id,
+        )
     if plan_row is None or plan_row["plan_digest"] != context.plan_digest:
         raise ExecutionBlocked("PLAN_MISMATCH", "the frozen plan changed")
     try:
@@ -808,9 +1202,18 @@ def _assert_context_unchanged(
         raise ExecutionBlocked("POLICY_DENIED", error.message) from error
     if current_isolation != context.isolation:
         raise ExecutionBlocked("POLICY_DENIED", "isolation policy drifted")
-    expected_digests = {
+    is_v2_ctx = _is_v2_context(context)
+    has_v2_build_spec = is_v2_ctx and isinstance(
+        context.plan.get("build_spec"), Mapping
+    )
+    plan_inputs = context.plan.get("inputs")
+    expected_digests: dict[str, Any] = {
         "harness": context.plan["harness_digest"],
-        "build_recipe": context.plan["build_recipe_digest"],
+        "build_recipe": (
+            context.materials.get(context.case.manifest["build_recipe"])
+            if has_v2_build_spec
+            else context.plan["build_recipe_digest"]
+        ),
         "dependencies": context.plan["dependencies_digest"],
         "source_vulnerable": context.materials.get(
             context.case.manifest["versions"]["vulnerable"]
@@ -818,22 +1221,28 @@ def _assert_context_unchanged(
         "source_fixed": context.materials.get(
             context.case.manifest["versions"]["fixed"]
         ),
-        "input_normal": context.plan["inputs"]["normal"],
-        "input_candidate": context.plan["inputs"]["candidate"],
         "advisory": context.plan["intel"]["content_digest"],
         "bundle": context.plan["repository"]["bundle_digest"],
     }
-    for label, relative in (
+    material_checks: list[tuple[str, str]] = [
         ("harness", case.manifest["harness"]),
         ("build_recipe", case.manifest["build_recipe"]),
         ("dependencies", case.manifest["dependencies"]),
         ("source_vulnerable", case.manifest["versions"]["vulnerable"]),
         ("source_fixed", case.manifest["versions"]["fixed"]),
-        ("input_normal", context.manifest_case["inputs"]["normal"]),
-        ("input_candidate", context.manifest_case["inputs"]["candidate"]),
         ("advisory", case.advisory["path"]),
         ("bundle", case.repository["bundle"]),
-    ):
+    ]
+    if isinstance(plan_inputs, Mapping):
+        expected_digests["input_normal"] = plan_inputs.get("normal")
+        expected_digests["input_candidate"] = plan_inputs.get("candidate")
+        material_checks.extend(
+            [
+                ("input_normal", context.manifest_case["inputs"]["normal"]),
+                ("input_candidate", context.manifest_case["inputs"]["candidate"]),
+            ]
+        )
+    for label, relative in material_checks:
         try:
             case.read_material(relative, expected_digests.get(label))
         except CaseConfigurationError as error:
@@ -1127,12 +1536,18 @@ def _materialize(
 def _materialize_into_generation(
     context: ExecutionContext, generation_root: Path, generation_fd: int
 ) -> tuple[Path, dict[str, Path], dict[str, str]]:
+    is_v2 = _is_v2_context(context)
+    has_v2_build_spec = is_v2 and isinstance(
+        context.plan.get("build_spec"), Mapping
+    )
     target = generation_root / "materials"
-    expected = {
+    expected_build: dict[str, tuple[str, str | None]] = {
         "harness": (context.case.manifest["harness"], context.plan["harness_digest"]),
         "build_recipe": (
             context.case.manifest["build_recipe"],
-            context.plan["build_recipe_digest"],
+            context.materials.get(context.case.manifest["build_recipe"])
+            if has_v2_build_spec
+            else context.plan["build_recipe_digest"],
         ),
         "dependencies": (
             context.case.manifest["dependencies"],
@@ -1147,14 +1562,25 @@ def _materialize_into_generation(
             None,
         ),
         "source_fixed": (context.case.manifest["versions"]["fixed"], None),
-        "input_normal": (context.manifest_case["inputs"]["normal"], context.plan["inputs"]["normal"]),
-        "input_candidate": (
-            context.manifest_case["inputs"]["candidate"],
-            context.plan["inputs"]["candidate"],
-        ),
     }
-    payloads: dict[str, bytes] = {}
-    for label, (relative, digest) in expected.items():
+    plan_inputs = context.plan.get("inputs")
+    expected_inputs: dict[str, tuple[str, str | None]] = {}
+    if isinstance(plan_inputs, Mapping):
+        expected_inputs = {
+            "input_normal": (
+                context.manifest_case["inputs"]["normal"],
+                plan_inputs.get("normal"),
+            ),
+            "input_candidate": (
+                context.manifest_case["inputs"]["candidate"],
+                plan_inputs.get("candidate"),
+            ),
+        }
+    elif not is_v2:
+        raise ExecutionBlocked("MATERIAL_MISSING", "plan has no inputs mapping")
+
+    build_payloads: dict[str, bytes] = {}
+    for label, (relative, digest) in expected_build.items():
         try:
             data, actual = context.case.read_material(relative, digest)
         except CaseConfigurationError as error:
@@ -1165,24 +1591,141 @@ def _materialize_into_generation(
             raise ExecutionBlocked(
                 "MATERIAL_MISSING", f"material {label} digest drifted while materializing"
             )
-        payloads[relative] = data
+        build_payloads[relative] = data
+
+    input_payloads: dict[str, bytes] = {}
+    for label, (relative, digest) in expected_inputs.items():
+        try:
+            data, actual = context.case.read_material(relative, digest)
+        except CaseConfigurationError as error:
+            raise ExecutionBlocked(error.reason_code, error.message) from error
+        if digest is None:
+            digest = context.materials.get(relative)
+        if digest is not None and actual != digest:
+            raise ExecutionBlocked(
+                "MATERIAL_MISSING", f"material {label} digest drifted while materializing"
+            )
+        input_payloads[relative] = data
+
+    payloads: dict[str, bytes] = (
+        dict(build_payloads) if is_v2 else {**build_payloads, **input_payloads}
+    )
 
     # Keep the exact bytes that were verified for this execution. Archiving
     # uses this snapshot instead of re-reading the case directory after the
     # target has run, so a later case-root replacement cannot become evidence.
-    context.material_payloads = dict(payloads)
+    context.material_payloads = {**build_payloads, **input_payloads}
 
-    candidate_path = target / "inputs" / "candidate.txt"
-    normal_path = target / "inputs" / "normal.txt"
-    for label, destination, relative in (
-        ("candidate", candidate_path, context.manifest_case["inputs"]["candidate"]),
-        ("normal", normal_path, context.manifest_case["inputs"]["normal"]),
-    ):
-        data = payloads[relative]
-        if _digest(data) != context.plan["inputs"][label]:
-            raise ExecutionBlocked(
-                "MATERIAL_MISSING", f"{label} input digest drifted"
-            )
+    if is_v2:
+        # D4: v2 keeps replay inputs completely outside the build materials
+        # directory; build staging mounts ONLY build materials.
+        replay_inputs_dir = generation_root / "replay-inputs"
+        candidate_path = replay_inputs_dir / "candidate.txt"
+        normal_path = replay_inputs_dir / "normal.txt"
+        if isinstance(plan_inputs, Mapping):
+            for label, relative in (
+                ("candidate", context.manifest_case["inputs"]["candidate"]),
+                ("normal", context.manifest_case["inputs"]["normal"]),
+            ):
+                data = input_payloads[relative]
+                if _digest(data) != plan_inputs[label]:
+                    raise ExecutionBlocked(
+                        "MATERIAL_MISSING", f"{label} input digest drifted"
+                    )
+            if replay_inputs_dir.is_symlink():
+                raise ExecutionBlocked(
+                    "MATERIAL_MISSING",
+                    "materialized replay-inputs directory must not be a symlink",
+                )
+            if replay_inputs_dir.exists():
+                for label, path, expected_digest in (
+                    ("candidate", candidate_path, plan_inputs["candidate"]),
+                    ("normal", normal_path, plan_inputs["normal"]),
+                ):
+                    data = _read_run_file_bounded(path, max_bytes=MAX_MATERIAL_BYTES)
+                    if data is None:
+                        raise ExecutionBlocked(
+                            "MATERIAL_MISSING",
+                            f"materialized {label} input is missing or too large",
+                        )
+                    if _digest(data) != expected_digest:
+                        raise ExecutionBlocked(
+                            "MATERIAL_MISSING", f"materialized {label} input drifted"
+                        )
+            else:
+                tmp_inputs = generation_root / f".replay-inputs-tmp-{uuid.uuid4().hex}"
+                tmp_inputs_name = tmp_inputs.name
+                try:
+                    os.mkdir(tmp_inputs_name, 0o755, dir_fd=generation_fd)
+                except FileExistsError as error:
+                    raise ExecutionBlocked(
+                        "MATERIAL_MISSING", "temporary replay-inputs path exists"
+                    ) from error
+                tmp_inputs_fd: int | None = None
+                try:
+                    tmp_inputs_fd = os.open(
+                        tmp_inputs_name,
+                        os.O_RDONLY
+                        | getattr(os, "O_DIRECTORY", 0)
+                        | getattr(os, "O_NOFOLLOW", 0),
+                        dir_fd=generation_fd,
+                    )
+                    for name, relative in (
+                        ("candidate.txt", context.manifest_case["inputs"]["candidate"]),
+                        ("normal.txt", context.manifest_case["inputs"]["normal"]),
+                    ):
+                        _write_tree_file(
+                            tmp_inputs_fd,
+                            tmp_inputs,
+                            name,
+                            input_payloads[relative],
+                            0o444,
+                            "materialized replay input",
+                        )
+                    os.chmod(
+                        tmp_inputs_name,
+                        0o755,
+                        dir_fd=generation_fd,
+                        follow_symlinks=False,
+                    )
+                    os.close(tmp_inputs_fd)
+                    tmp_inputs_fd = None
+                    os.replace(
+                        tmp_inputs_name,
+                        "replay-inputs",
+                        src_dir_fd=generation_fd,
+                        dst_dir_fd=generation_fd,
+                    )
+                except (ExecutionBlocked, ExecutionFailed):
+                    if tmp_inputs_fd is not None:
+                        os.close(tmp_inputs_fd)
+                    shutil.rmtree(tmp_inputs, ignore_errors=True)
+                    raise
+                except OSError as error:
+                    if tmp_inputs_fd is not None:
+                        os.close(tmp_inputs_fd)
+                    shutil.rmtree(tmp_inputs, ignore_errors=True)
+                    raise ExecutionFailed(
+                        "EVIDENCE_WRITE_FAILED",
+                        f"cannot materialize replay inputs: {error}",
+                    ) from error
+                except BaseException:
+                    if tmp_inputs_fd is not None:
+                        os.close(tmp_inputs_fd)
+                    shutil.rmtree(tmp_inputs, ignore_errors=True)
+                    raise
+    else:
+        candidate_path = target / "inputs" / "candidate.txt"
+        normal_path = target / "inputs" / "normal.txt"
+        for label, destination, relative in (
+            ("candidate", candidate_path, context.manifest_case["inputs"]["candidate"]),
+            ("normal", normal_path, context.manifest_case["inputs"]["normal"]),
+        ):
+            data = payloads[relative]
+            if _digest(data) != context.plan["inputs"][label]:
+                raise ExecutionBlocked(
+                    "MATERIAL_MISSING", f"{label} input digest drifted"
+                )
 
     if target.is_symlink():
         raise ExecutionBlocked(
@@ -1198,18 +1741,19 @@ def _materialize_into_generation(
                 "MATERIAL_MISSING", f"materialized directory is not accessible: {error}"
             ) from error
         _verify_materialized(target, payloads)
-        for label, path, expected_digest in (
-            ("candidate", candidate_path, context.plan["inputs"]["candidate"]),
-            ("normal", normal_path, context.plan["inputs"]["normal"]),
-        ):
-            data = _read_run_file_bounded(path, max_bytes=MAX_MATERIAL_BYTES)
-            if data is None:
-                raise ExecutionBlocked(
-                    "MATERIAL_MISSING",
-                    f"materialized {label} input is missing or too large",
-                )
-            if _digest(data) != expected_digest:
-                raise ExecutionBlocked("MATERIAL_MISSING", f"materialized {label} input drifted")
+        if not is_v2:
+            for label, path, expected_digest in (
+                ("candidate", candidate_path, context.plan["inputs"]["candidate"]),
+                ("normal", normal_path, context.plan["inputs"]["normal"]),
+            ):
+                data = _read_run_file_bounded(path, max_bytes=MAX_MATERIAL_BYTES)
+                if data is None:
+                    raise ExecutionBlocked(
+                        "MATERIAL_MISSING",
+                        f"materialized {label} input is missing or too large",
+                    )
+                if _digest(data) != expected_digest:
+                    raise ExecutionBlocked("MATERIAL_MISSING", f"materialized {label} input drifted")
         return target, {
             "candidate": candidate_path,
             "normal": normal_path,
@@ -1242,19 +1786,20 @@ def _materialize_into_generation(
             _write_tree_file(
                 temporary_fd, temporary, relative, data, mode, "materialized file"
             )
-        for path, data in (
-            (candidate_path, payloads[context.manifest_case["inputs"]["candidate"]]),
-            (normal_path, payloads[context.manifest_case["inputs"]["normal"]]),
-        ):
-            _write_tree_file(
-                temporary_fd,
-                temporary,
-                str(path.relative_to(target)),
-                data,
-                0o444,
-                "materialized input",
-            )
-        os.chmod("inputs", 0o755, dir_fd=temporary_fd, follow_symlinks=False)
+        if not is_v2:
+            for path, data in (
+                (candidate_path, payloads[context.manifest_case["inputs"]["candidate"]]),
+                (normal_path, payloads[context.manifest_case["inputs"]["normal"]]),
+            ):
+                _write_tree_file(
+                    temporary_fd,
+                    temporary,
+                    str(path.relative_to(target)),
+                    data,
+                    0o444,
+                    "materialized input",
+                )
+            os.chmod("inputs", 0o755, dir_fd=temporary_fd, follow_symlinks=False)
         os.chmod(temporary_name, 0o755, dir_fd=generation_fd, follow_symlinks=False)
         os.close(temporary_fd)
         temporary_fd = None
@@ -1291,6 +1836,13 @@ def _materialize_into_generation(
 def _material_digests(
     context: ExecutionContext, payloads: Mapping[str, bytes]
 ) -> dict[str, str]:
+    if _is_v2_context(context):
+        input_paths = _input_material_paths(context)
+        return {
+            relative: _digest(data)
+            for relative, data in payloads.items()
+            if not _is_input_material_path(relative, input_paths)
+        }
     digests = {
         relative: _digest(data) for relative, data in payloads.items()
     }
@@ -1551,10 +2103,22 @@ def _stage_materials(
 ) -> tuple[Path, dict[str, str]]:
     """Copy the verified material tree outside the run root and re-hash it."""
     _verify_materialized_tree(materials_dir, material_digests)
+    is_v2 = _is_v2_context(context)
+    if is_v2:
+        # D4: v2 build staging must never expose replay input aliases or any
+        # input material files to build containers or staged_materials.
+        input_paths = _input_material_paths(context)
+        stage_digests = {
+            relative: digest
+            for relative, digest in material_digests.items()
+            if not _is_input_material_path(relative, input_paths)
+        }
+    else:
+        stage_digests = dict(material_digests)
     directory = _new_staging_directory(context, label)
     try:
         staged: dict[str, str] = {}
-        for relative in sorted(material_digests):
+        for relative in sorted(stage_digests):
             source = materials_dir / Path(relative)
             data = _read_run_file_bounded(
                 source, max_bytes=MAX_MATERIAL_BYTES
@@ -1566,22 +2130,24 @@ def _stage_materials(
                     f"before staging: {relative}",
                 )
             actual = _digest(data)
-            if actual != material_digests[relative]:
+            if actual != stage_digests[relative]:
                 raise ExecutionBlocked(
                     "MATERIAL_MISSING",
                     f"material changed while staging: {relative}",
                 )
             _write_staged_file(directory, relative, data, 0o444)
             staged[relative] = actual
-        recipe = directory / Path(context.case.manifest["build_recipe"])
-        if recipe.is_symlink() or not recipe.is_file():
-            raise ExecutionBlocked(
-                "MATERIAL_MISSING", "build recipe is missing from the staging copy"
-            )
-        recipe.chmod(0o555)
+        recipe_rel = context.case.manifest.get("build_recipe")
+        if not is_v2 or (isinstance(recipe_rel, str) and recipe_rel in stage_digests):
+            recipe = directory / Path(context.case.manifest["build_recipe"])
+            if recipe.is_symlink() or not recipe.is_file():
+                raise ExecutionBlocked(
+                    "MATERIAL_MISSING", "build recipe is missing from the staging copy"
+                )
+            recipe.chmod(0o555)
         _make_staging_tree_readable(directory)
         # Hash the staged copy, not the source, immediately before mounting.
-        _verify_materialized_tree(directory, material_digests)
+        _verify_materialized_tree(directory, stage_digests)
         return directory, staged
     except (ExecutionBlocked, ExecutionFailed):
         _discard_staging(directory)
@@ -2210,6 +2776,31 @@ def _persist_build(
         )
         if _digest(result.artifact) != result.artifact_digest:
             raise ExecutionFailed("BUILD_FAILED", "build artifact digest changed")
+    provenance_face_path: Path | None = None
+    provenance_face_digest: str | None = None
+    if (
+        result.provenance_face is not None
+        and result.provenance_face
+        and isinstance(result.provenance_face_name, str)
+        and result.provenance_face_name in build_provenance.FACE_FILENAMES.values()
+    ):
+        face_dir = directory / "build_provenance"
+        _prepare_run_directory(
+            context.run_root,
+            face_dir,
+            "build provenance directory",
+            scope_root=generation_root,
+        )
+        provenance_face_path = face_dir / result.provenance_face_name
+        _write_run_file(
+            run_root,
+            provenance_face_path,
+            result.provenance_face,
+            0o600,
+            scope_root=generation_root,
+            anchor=context.run_root,
+        )
+        provenance_face_digest = _digest(result.provenance_face)
     updated = state.record_attempt(
         dsn,
         context.job_id,
@@ -2224,6 +2815,19 @@ def _persist_build(
     )
     if not updated:
         raise state.StaleGeneration("the worker lease was lost after the build")
+    files_map: dict[str, Any] = {
+        "log": str(log_path.relative_to(run_root)),
+        "artifact": str(artifact_path.relative_to(run_root))
+        if artifact_path.is_file()
+        else None,
+    }
+    file_digests_map: dict[str, Any] = {
+        "log": _digest(result.log),
+        "artifact": result.artifact_digest,
+    }
+    if provenance_face_path is not None and provenance_face_digest is not None:
+        files_map["provenance_face"] = str(provenance_face_path.relative_to(run_root))
+        file_digests_map["provenance_face"] = provenance_face_digest
     payload = {
         "tool_id": "sandbox.build",
         "job_id": context.job_id_text,
@@ -2236,16 +2840,8 @@ def _persist_build(
         "container_id": result.container_id,
         "artifact_digest": result.artifact_digest,
         "attempt_no": attempt_no,
-        "files": {
-            "log": str(log_path.relative_to(run_root)),
-            "artifact": str(artifact_path.relative_to(run_root))
-            if artifact_path.is_file()
-            else None,
-        },
-        "file_digests": {
-            "log": _digest(result.log),
-            "artifact": result.artifact_digest,
-        },
+        "files": files_map,
+        "file_digests": file_digests_map,
         **result.as_dict(),
     }
     if staged_materials is not None:
@@ -2389,16 +2985,30 @@ def _build_report(
     evidence_refs: Sequence[str],
     missing: Sequence[str],
     error: str | None = None,
+    build_provenance_summary: Mapping[str, Any] | None = None,
+    bundle_kind: str = "execution",
 ) -> tuple[dict[str, Any], str]:
-    report = {
-        "schema_version": 1,
+    is_v2 = _is_v2_context(context)
+    plan_inputs = context.plan.get("inputs")
+    report_inputs: dict[str, Any] | None
+    if isinstance(plan_inputs, Mapping):
+        report_inputs = {
+            "candidate": plan_inputs["candidate"],
+            "normal": plan_inputs["normal"],
+        }
+    else:
+        report_inputs = None
+    effective_verdict = None if (is_v2 and bundle_kind == "campaign") else verdict
+    effective_reason = None if (is_v2 and bundle_kind == "campaign") else verdict_reason
+    report: dict[str, Any] = {
+        "schema_version": contracts.SCHEMA_VERSION_V2 if is_v2 else 1,
         "job_id": context.job_id_text,
         "plan_digest": context.plan_digest,
         "cve_id": context.plan["cve_id"],
         "case_id": context.plan["case_id"],
-        "state": verdict,
-        "verdict": verdict,
-        "reason_code": verdict_reason,
+        "state": effective_verdict,
+        "verdict": effective_verdict,
+        "reason_code": effective_reason,
         "target": context.job["request"]["target"],
         "versions": context.plan["revisions"],
         "repository": context.plan["repository"],
@@ -2413,10 +3023,7 @@ def _build_report(
             "probe": probe,
         },
         "budget": context.plan["limits"],
-        "inputs": {
-            "candidate": context.plan["inputs"]["candidate"],
-            "normal": context.plan["inputs"]["normal"],
-        },
+        "inputs": report_inputs,
         "review": {
             "reviewer_id": context.review["reviewer_id"],
             "decision": context.review["decision"],
@@ -2436,6 +3043,32 @@ def _build_report(
         "cleanup_errors": list(getattr(context, "cleanup_errors", [])),
         "created_at": _utc_now(),
     }
+    if is_v2:
+        report["bundle_kind"] = bundle_kind
+        report["family_id"] = context.plan.get("family_id")
+        report["parent_job_id"] = context.plan.get("parent_job_id")
+        report["round_no"] = (
+            None if bundle_kind == "campaign" else context.plan.get("round_no")
+        )
+        report["envelope_digest"] = context.plan.get("envelope_digest")
+        report["experiment_digest"] = (
+            None
+            if bundle_kind == "campaign"
+            else context.plan.get("experiment_digest")
+        )
+        report["build_ref"] = (
+            None if bundle_kind == "campaign" else context.plan.get("build_ref")
+        )
+        report["reuse_origin"] = None
+        if bundle_kind in ("execution", "campaign"):
+            report["build_provenance_rules_version"] = _provenance_rules_version(
+                context
+            )
+            report["build_provenance"] = (
+                _normalize_build_provenance_summary(build_provenance_summary)
+                if build_provenance_summary is not None
+                else _empty_build_provenance_summary(context, comparable=False)
+            )
     return report, render_report_markdown(report)
 
 
@@ -2698,13 +3331,19 @@ def _verified_run_file(
 def _case_materials(
     context: ExecutionContext,
 ) -> dict[str, tuple[str, bytes]]:
+    is_v2 = _is_v2_context(context)
+    has_v2_build_spec = is_v2 and isinstance(
+        context.plan.get("build_spec"), Mapping
+    )
     manifest = context.case.manifest
-    entries = (
+    entries: list[tuple[str, str, Any]] = [
         (manifest["harness"], "material_harness", context.plan["harness_digest"]),
         (
             manifest["build_recipe"],
             "material_build_recipe",
-            context.plan["build_recipe_digest"],
+            context.materials.get(manifest["build_recipe"])
+            if has_v2_build_spec
+            else context.plan["build_recipe_digest"],
         ),
         (
             manifest["dependencies"],
@@ -2717,16 +3356,6 @@ def _case_materials(
             context.plan["repository"]["patch_digest"],
         ),
         (
-            context.manifest_case["inputs"]["normal"],
-            "material_input_normal",
-            context.plan["inputs"]["normal"],
-        ),
-        (
-            context.manifest_case["inputs"]["candidate"],
-            "material_input_candidate",
-            context.plan["inputs"]["candidate"],
-        ),
-        (
             manifest["versions"]["vulnerable"],
             "material_source_vulnerable",
             context.materials.get(manifest["versions"]["vulnerable"]),
@@ -2736,7 +3365,23 @@ def _case_materials(
             "material_source_fixed",
             context.materials.get(manifest["versions"]["fixed"]),
         ),
-    )
+    ]
+    plan_inputs = context.plan.get("inputs")
+    if isinstance(plan_inputs, Mapping):
+        entries.extend(
+            [
+                (
+                    context.manifest_case["inputs"]["normal"],
+                    "material_input_normal",
+                    plan_inputs.get("normal"),
+                ),
+                (
+                    context.manifest_case["inputs"]["candidate"],
+                    "material_input_candidate",
+                    plan_inputs.get("candidate"),
+                ),
+            ]
+        )
     materials: dict[str, tuple[str, bytes]] = {}
     snapshot = getattr(context, "material_payloads", None)
     for relative, role, expected in entries:
@@ -2765,6 +3410,8 @@ def _evidence_artifacts(
     probe: Mapping[str, Any] | None,
     execution_metadata: Mapping[str, Any],
 ) -> dict[str, tuple[str, bytes | Path]]:
+    is_v2 = _is_v2_context(context)
+    build_spec = _build_spec_from_context(context)
     artifacts: dict[str, tuple[str, bytes | Path]] = {
         "plan.json": ("plan", jsonutil.canonical_bytes(context.plan) + b"\n"),
         "review.json": (
@@ -2791,6 +3438,30 @@ def _evidence_artifacts(
             + b"\n",
         ),
     }
+    if is_v2:
+        envelope_doc = context.job.get("envelope")
+        if not isinstance(envelope_doc, Mapping):
+            exploration = context.job.get("request", {}).get("exploration")
+            envelope_doc = {
+                "envelope_digest": context.plan.get("envelope_digest"),
+                "mode": exploration.get("mode", "fixed")
+                if isinstance(exploration, Mapping)
+                else "fixed",
+            }
+        artifacts["envelope.json"] = (
+            "envelope",
+            jsonutil.canonical_bytes(dict(envelope_doc)) + b"\n",
+        )
+        artifacts["budget/snapshot.json"] = (
+            "budget_snapshot",
+            jsonutil.canonical_bytes(
+                {
+                    "limits": context.plan["limits"],
+                    "plan_digest": context.plan_digest,
+                }
+            )
+            + b"\n",
+        )
     if probe is not None:
         artifacts["metadata/probe.json"] = (
             "probe",
@@ -2810,6 +3481,25 @@ def _evidence_artifacts(
             "build_metadata",
             jsonutil.canonical_bytes(dict(build)) + b"\n",
         )
+        if is_v2:
+            kind = (
+                build_spec.get("kind")
+                if isinstance(build_spec, Mapping)
+                else build.get("build_spec_kind")
+            )
+            if isinstance(kind, str) and kind in build_provenance.FACE_FILENAMES:
+                raw_face = _verified_provenance_face(
+                    run_root,
+                    build,
+                    expected_face_name=build_provenance.FACE_FILENAMES[kind],
+                )
+                if raw_face:
+                    face_entry = build_provenance.archive_face_entry(
+                        kind=kind,
+                        version=version,
+                        raw_face=raw_face,
+                    )
+                    artifacts[face_entry.path] = (face_entry.role, raw_face)
     for run in runs:
         version = run.get("version", "")
         phase = run.get("phase", "")
@@ -2827,7 +3517,10 @@ def _evidence_artifacts(
                 stdout,
             )
         if stderr is not None:
-            role = "asan_log" if run.get("signature") else "replay_stderr"
+            if is_v2:
+                role = "normal_error" if phase == "normal" else "asan_log"
+            else:
+                role = "asan_log" if run.get("signature") else "replay_stderr"
             artifacts[f"replay/{version}/{phase}/stderr.log"] = (role, stderr)
         artifacts[f"replay/{version}/{phase}/metadata.json"] = (
             "replay_metadata",
@@ -3184,6 +3877,165 @@ def record_blocked(
     return recorded
 
 
+def _write_v2_bundle_dir(
+    target: Path,
+    *,
+    context: ExecutionContext,
+    report: Mapping[str, Any],
+    report_markdown: str,
+    artifacts: Mapping[str, tuple[str, Any]],
+    verdict: str | None,
+    dir_mode: int = 0o755,
+    file_mode: int = 0o444,
+) -> evidence.BundleInfo:
+    """Write and verify a v2 evidence bundle directory into ``target``."""
+    bundle_kind = report.get("bundle_kind")
+    if not isinstance(bundle_kind, str) or bundle_kind not in (
+        "execution",
+        "blocked",
+        "campaign",
+    ):
+        raise BundleError("INVALID_MANIFEST", "v2 report bundle_kind is invalid")
+    if (
+        type(report.get("schema_version")) is not int
+        or report.get("schema_version") != contracts.SCHEMA_VERSION_V2
+    ):
+        raise BundleError("INVALID_MANIFEST", "v2 report schema_version must be 2")
+    if target.exists() or target.is_symlink():
+        raise BundleError("BUNDLE_EXISTS", "temporary bundle path already exists")
+
+    markdown_bytes = report_markdown.encode("utf-8")
+    report_verdict = report.get("verdict")
+    report_reason = report.get("reason_code")
+    if bundle_kind != "campaign":
+        if not isinstance(report_verdict, str):
+            raise BundleError("INVALID_MANIFEST", "v2 report verdict is invalid")
+        evidence._verify_report_markdown(
+            markdown_bytes, report_verdict, report_reason
+        )
+
+    report_document = dict(report)
+    report_document["report_markdown_sha256"] = hashlib.sha256(
+        markdown_bytes
+    ).hexdigest()
+    payloads: dict[str, bytes] = {
+        "report.json": jsonutil.canonical_bytes(report_document) + b"\n",
+        "report.md": markdown_bytes,
+    }
+    roles_by_path: dict[str, str] = {
+        "report.json": "report_json",
+        "report.md": "report_markdown",
+    }
+    for path, (role, value) in artifacts.items():
+        normalized = evidence._normalize_file_path(path)
+        if normalized in payloads:
+            raise BundleError("INVALID_MANIFEST", f"duplicate bundle file: {path}")
+        if role not in evidence.V2_ROLE_NAMES:
+            raise BundleError("INVALID_MANIFEST", f"unknown evidence role: {role}")
+        payloads[normalized] = evidence._read_artifact(value)
+        roles_by_path[normalized] = role
+
+    if len(payloads) > evidence.MAX_FILES:
+        raise BundleError("INVALID_MANIFEST", "bundle has too many files")
+    for path, data in payloads.items():
+        if len(data) > evidence.MAX_FILE_BYTES:
+            raise BundleError(
+                "FILE_TOO_LARGE", f"bundle file exceeds the size cap: {path}"
+            )
+    if sum(len(data) for data in payloads.values()) > evidence.MAX_TOTAL_BYTES:
+        raise BundleError(
+            "FILE_TOO_LARGE", "bundle exceeds the total evidence size cap"
+        )
+
+    target.mkdir(mode=dir_mode)
+    target.chmod(dir_mode)
+    try:
+        entries: list[dict[str, Any]] = []
+        for path, data in payloads.items():
+            destination = target / PurePosixPath(path)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(data)
+            destination.chmod(file_mode)
+            entries.append(
+                {
+                    "path": path,
+                    "role": roles_by_path[path],
+                    "size_bytes": len(data),
+                    "sha256": hashlib.sha256(data).hexdigest(),
+                }
+            )
+        entries.sort(key=lambda item: item["path"])
+
+        effective_verdict = (
+            None
+            if bundle_kind == "campaign"
+            else (verdict if isinstance(verdict, str) else report_verdict)
+        )
+        manifest: dict[str, Any] = {
+            "schema_version": contracts.SCHEMA_VERSION_V2,
+            "bundle_kind": bundle_kind,
+            "job_id": context.job_id_text,
+            "family_id": report.get("family_id"),
+            "parent_job_id": report.get("parent_job_id"),
+            "round_no": report.get("round_no"),
+            "plan_digest": context.plan_digest,
+            "envelope_digest": report.get("envelope_digest"),
+            "experiment_digest": report.get("experiment_digest"),
+            "build_provenance_rules_version": (
+                None
+                if bundle_kind == "blocked"
+                else _provenance_rules_version(context)
+            ),
+            "verdict": effective_verdict,
+            "reason_code": None if bundle_kind == "campaign" else report_reason,
+            "created_at": report.get("created_at") or _utc_now(),
+            "build_ref": report.get("build_ref"),
+            "reuse_origin": report.get("reuse_origin"),
+            "files": entries,
+        }
+        evidence._validate_v2_manifest_header(manifest)
+        seen_paths: set[str] = set()
+        for entry in entries:
+            evidence._validate_entry(entry, seen_paths, evidence.V2_ROLE_NAMES)
+            if entry["role"] == build_provenance.BUILD_PROVENANCE_ROLE:
+                parts = PurePosixPath(entry["path"]).parts
+                if (
+                    len(parts) != 4
+                    or parts[0] != "build"
+                    or parts[1] not in ("vulnerable", "fixed")
+                    or parts[2] != "build_provenance"
+                    or parts[3] not in build_provenance.FACE_FILENAMES.values()
+                ):
+                    raise BundleError(
+                        "INVALID_MANIFEST",
+                        f"build_provenance must live at fixed D39 path, not {entry['path']}",
+                    )
+
+        manifest_bytes = evidence.canonical_manifest_bytes(manifest) + b"\n"
+        (target / "manifest.json").write_bytes(manifest_bytes)
+        (target / "manifest.json").chmod(file_mode)
+        evidence._apply_bundle_modes(target, dir_mode=dir_mode, file_mode=file_mode)
+
+        # Complete execution, campaign, and blocked bundles must pass the full
+        # offline v2 verifier. Pre-replay FAILED execution bundles (such as
+        # BUILD_PROVENANCE_MISSING with 0 replays) preserve logs and faces
+        # without fabricating replay files, so their manifest header, entries,
+        # roles, D39 provenance paths, and markdown bindings are verified above.
+        if (
+            bundle_kind in ("blocked", "campaign")
+            or effective_verdict in ("REPRODUCED", "NOT_REPRODUCED", "INCONCLUSIVE")
+        ):
+            verify_bundle(target)
+        return evidence.BundleInfo(
+            root=target,
+            manifest=manifest,
+            manifest_digest=evidence.canonical_manifest_digest(manifest),
+        )
+    except BaseException:
+        shutil.rmtree(target, ignore_errors=True)
+        raise
+
+
 def _archive(
     dsn: str,
     context: ExecutionContext,
@@ -3244,21 +4096,33 @@ def _archive(
             )
         if bundle.is_symlink():
             raise BundleError("SYMLINK", "evidence generation is a symlink")
-        info = write_bundle(
-            temporary,
-            job_id=context.job_id,
-            plan_digest=context.plan_digest,
-            report=report,
-            report_markdown=report_markdown,
-            artifacts=artifacts,
-            verdict=verdict,
-            # Verify the complete staging directory before it replaces any
-            # previously archived bundle. An unverified bundle is never
-            # published as evidence.
-            verify=verify_bundle,
-            dir_mode=0o755,
-            file_mode=0o444,
-        )
+        if _is_v2_context(context):
+            info = _write_v2_bundle_dir(
+                temporary,
+                context=context,
+                report=report,
+                report_markdown=report_markdown,
+                artifacts=artifacts,
+                verdict=verdict,
+                dir_mode=0o755,
+                file_mode=0o444,
+            )
+        else:
+            info = write_bundle(
+                temporary,
+                job_id=context.job_id,
+                plan_digest=context.plan_digest,
+                report=report,
+                report_markdown=report_markdown,
+                artifacts=artifacts,
+                verdict=verdict,
+                # Verify the complete staging directory before it replaces any
+                # previously archived bundle. An unverified bundle is never
+                # published as evidence.
+                verify=verify_bundle,
+                dir_mode=0o755,
+                file_mode=0o444,
+            )
         # Verification can take time. Refuse to publish unless this exact
         # generation still owns an active lease; a stale worker must never
         # replace a newer generation's bundle.
@@ -3434,6 +4298,32 @@ def _archive_only(dsn: str, context: ExecutionContext) -> ExecutionResult:
             return ExecutionResult("STALE")
         return ExecutionResult("INCONCLUSIVE", reason_code="EVIDENCE_INCOMPLETE")
 
+    provenance_outcome: _ProvenanceCheckOutcome | None = None
+    if (
+        _is_v2_context(context)
+        and _build_spec_from_context(context) is not None
+        and len(builds) == 2
+    ):
+        provenance_outcome = _verify_v2_build_provenance(
+            context, build_root, builds
+        )
+        if not provenance_outcome.comparable:
+            return _finish_failed(
+                dsn,
+                context.job_id,
+                context.generation,
+                ExecutionFailed(
+                    build_provenance.BUILD_PROVENANCE_MISSING,
+                    provenance_outcome.error_detail
+                    or "v2 build provenance verification failed",
+                ),
+                context=context,
+                probe=probe,
+                builds=builds,
+                runs=runs,
+                build_provenance_summary=provenance_outcome.report_summary,
+            )
+
     report, report_markdown = _build_report(
         context,
         verdict=decision.verdict,
@@ -3444,6 +4334,11 @@ def _archive_only(dsn: str, context: ExecutionContext) -> ExecutionResult:
         probe=probe,
         evidence_refs=["report.json", "report.md", "plan.json", "review.json"],
         missing=missing,
+        build_provenance_summary=(
+            provenance_outcome.report_summary
+            if provenance_outcome is not None
+            else None
+        ),
     )
     attempt_rows = []
     for row in rows:
@@ -3684,6 +4579,7 @@ def run_execution(
     runs: list[dict[str, Any]] = []
     decision: VerdictDecision | None = None
     missing: list[str] = []
+    provenance_outcome: _ProvenanceCheckOutcome | None = None
     try:
         probe_result, _ = _run_step(
             dsn,
@@ -3724,6 +4620,16 @@ def run_execution(
                 raise ExecutionFailed(
                     "BUILD_FAILED",
                     f"{version} build ended with status {result.get('status')}",
+                )
+        if _is_v2_context(context) and _build_spec_from_context(context) is not None:
+            provenance_outcome = _verify_v2_build_provenance(
+                context, build_root, builds
+            )
+            if not provenance_outcome.comparable:
+                raise ExecutionFailed(
+                    build_provenance.BUILD_PROVENANCE_MISSING,
+                    provenance_outcome.error_detail
+                    or "v2 build provenance verification failed",
                 )
         for version in ("vulnerable", "fixed"):
             for phase in ("normal", "candidate_1", "candidate_2"):
@@ -3817,7 +4723,19 @@ def run_execution(
         )
     except ExecutionFailed as error:
         return _finish_failed(
-            dsn, job_id, generation, error, context=context, probe=probe_payload, builds=builds, runs=runs
+            dsn,
+            job_id,
+            generation,
+            error,
+            context=context,
+            probe=probe_payload,
+            builds=builds,
+            runs=runs,
+            build_provenance_summary=(
+                provenance_outcome.report_summary
+                if provenance_outcome is not None
+                else None
+            ),
         )
     except SandboxPolicyError as error:
         return _finish_blocked(
@@ -3842,18 +4760,25 @@ def run_execution(
             runs=runs,
         )
     except SandboxError as error:
+        mapped_reason = (
+            build_provenance.BUILD_PROVENANCE_MISSING
+            if error.reason_code == build_provenance.BUILD_PROVENANCE_MISSING
+            else ("TIMEOUT" if error.reason_code == "TIMEOUT" else "RUN_INCOMPLETE")
+        )
         return _finish_failed(
             dsn,
             job_id,
             generation,
-            ExecutionFailed(
-                "TIMEOUT" if error.reason_code == "TIMEOUT" else "RUN_INCOMPLETE",
-                error.message,
-            ),
+            ExecutionFailed(mapped_reason, error.message),
             context=context,
             probe=probe_payload,
             builds=builds,
             runs=runs,
+            build_provenance_summary=(
+                provenance_outcome.report_summary
+                if provenance_outcome is not None
+                else None
+            ),
         )
     except state.StaleGeneration:
         return ExecutionResult("STALE")
@@ -3895,6 +4820,11 @@ def run_execution(
         probe=probe_payload,
         evidence_refs=evidence_refs,
         missing=missing,
+        build_provenance_summary=(
+            provenance_outcome.report_summary
+            if provenance_outcome is not None
+            else None
+        ),
     )
     artifacts = _evidence_artifacts(
         context,
@@ -4049,6 +4979,9 @@ def _reusable_build(run_root: Path, payload: Mapping[str, Any]) -> bool:
         data = _read_run_file_bounded(path, max_bytes=limit)
         if data is None or _digest(data) != digests.get(key):
             return False
+    if files.get("provenance_face") is not None:
+        if _verified_provenance_face(run_root, payload) is None:
+            return False
     return True
 
 
@@ -4099,11 +5032,19 @@ def _expected_build_materials(context: ExecutionContext) -> dict[str, str]:
     manifest = context.case.manifest
     source_vulnerable = manifest["versions"]["vulnerable"]
     source_fixed = manifest["versions"]["fixed"]
-    expected = {
+    has_v2_build_spec = _is_v2_context(context) and isinstance(
+        context.plan.get("build_spec"), Mapping
+    )
+    expected: dict[str, str] = {
         manifest["harness"]: context.plan["harness_digest"],
-        manifest["build_recipe"]: context.plan["build_recipe_digest"],
         manifest["dependencies"]: context.plan["dependencies_digest"],
     }
+    if has_v2_build_spec:
+        recipe_digest = context.materials.get(manifest["build_recipe"])
+        if isinstance(recipe_digest, str):
+            expected[manifest["build_recipe"]] = recipe_digest
+    else:
+        expected[manifest["build_recipe"]] = context.plan["build_recipe_digest"]
     for relative in (source_vulnerable, source_fixed):
         digest = context.materials.get(relative)
         if isinstance(digest, str):
@@ -4136,13 +5077,34 @@ def _do_build(
             material_digests,
             f"build-{version}-attempt-{attempt_no}",
         )
-        result: BuildResult = sandbox.build(
-            version,
-            materials_dir=staging,
-            compile_args=context.compile_args,
-            deadline_seconds=deadline,
-            expected_materials=_expected_build_materials(context),
+        build_spec = (
+            _build_spec_from_context(context) if _is_v2_context(context) else None
         )
+        if build_spec is not None:
+            try:
+                result: BuildResult = sandbox.build(
+                    version,
+                    materials_dir=staging,
+                    compile_args=context.compile_args,
+                    deadline_seconds=deadline,
+                    expected_materials=_expected_build_materials(context),
+                    build_spec=build_spec,
+                )
+            except SandboxError as error:
+                if error.reason_code == build_provenance.BUILD_PROVENANCE_MISSING:
+                    raise ExecutionFailed(
+                        build_provenance.BUILD_PROVENANCE_MISSING,
+                        error.message,
+                    ) from error
+                raise
+        else:
+            result = sandbox.build(
+                version,
+                materials_dir=staging,
+                compile_args=context.compile_args,
+                deadline_seconds=deadline,
+                expected_materials=_expected_build_materials(context),
+            )
         return _persist_build(
             dsn,
             context,
@@ -4353,6 +5315,7 @@ def _finish_blocked(
             "target execution blocked"
         ],
         error=f"{error.reason_code}: {error.message}",
+        bundle_kind="blocked" if _is_v2_context(context) else "execution",
     )
     try:
         digest, path, archive_error = _archive(
@@ -4461,6 +5424,7 @@ def _finish_failed(
     probe: Mapping[str, Any] | None,
     builds: Mapping[str, Mapping[str, Any]],
     runs: Sequence[Mapping[str, Any]],
+    build_provenance_summary: Mapping[str, Any] | None = None,
 ) -> ExecutionResult:
     work_root = context.run_root / context.job_id_text / context.plan_digest.split(":")[1]
     build_root = work_root / "run"
@@ -4482,6 +5446,7 @@ def _finish_failed(
         evidence_refs=["report.json", "report.md", "plan.json", "review.json"],
         missing=["required replay evidence is incomplete"] if incomplete else ["execution failed"],
         error=f"{error.reason_code}: {error.message}",
+        build_provenance_summary=build_provenance_summary,
     )
     try:
         digest, path, archive_error = _archive(
