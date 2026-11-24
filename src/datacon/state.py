@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
+from datetime import datetime, timezone
 import hashlib
 from pathlib import Path, PurePosixPath
 import re
@@ -66,6 +67,24 @@ class ReviewOutcome:
             "envelope_mismatch": "REVIEW_ENVELOPE_MISMATCH",
             "job_not_found": "JOB_NOT_FOUND",
         }.get(self.status, "REVIEW_ERROR")
+
+
+@dataclass(frozen=True)
+class AdmissionOutcome:
+    """The result of one deterministic policy-admission predicate run.
+
+    ``admission`` carries exactly the row shape of the ``admissions`` table
+    when the round is admitted; a denied round has no admission row and only
+    the ``round_admission_denied`` audit event. ``event_detail`` is the same
+    audit detail so callers can persist it through ``_audit`` without
+    recomputing any decision input.
+    """
+
+    admitted: bool
+    reason_code: str | None
+    admission: dict[str, Any] | None
+    event_type: str
+    event_detail: dict[str, Any]
 
 
 def _connect(dsn: str):
@@ -2032,6 +2051,206 @@ def propose_envelope(
         "status": "pending",
         "review_deadline_at": review_deadline_at,
     }
+
+
+def policy_admit_round(
+    *,
+    store: Any = None,
+    clock: Any,
+    job_id: UUID | str,
+    parent_job_id: UUID | str,
+    envelope: Mapping[str, Any],
+    parent_approval_digest: str | None,
+    approval_chain_tail_digest: str | None,
+    seed_digest: str,
+    round_no: int,
+    budget_snapshot: Mapping[str, Any],
+    experiment: Mapping[str, Any] | None = None,
+    recomputable: bool = True,
+    campaign_bundle_digest: str | None = None,
+    admission_id: UUID | str | None = None,
+    existing_rounds: Any = (),
+) -> AdmissionOutcome:
+    """Decide one policy round and emit exactly one admission audit event.
+
+    The predicate is pure and deterministic: the envelope, parent approval,
+    seed, round, budget snapshot and injected clock are its only inputs. It
+    never reads or writes ``reviews`` / ``family_approvals``. When ``store`` is
+    supplied, an admitted round writes one ``admissions`` row
+    (``approval_kind='policy'``) and appends ``round_admitted``; a denied
+    round writes no admission row and appends ``round_admission_denied``.
+    Round capacity is checked here rather than delegated to the
+    ``UNIQUE(parent_job_id, round_no)`` backstop.
+    """
+    if not isinstance(envelope, Mapping):
+        raise StateError("envelope must be a JSON object")
+    try:
+        normalized_envelope = contracts.normalize_envelope(envelope)
+    except ValueError as error:
+        raise StateError(f"envelope is invalid: {error}") from error
+    try:
+        envelope_digest = contracts.envelope_digest(normalized_envelope)
+    except ValueError as error:
+        raise StateError(f"envelope is invalid: {error}") from error
+
+    try:
+        job_id = str(uuid.UUID(str(job_id)))
+        parent_job_id = str(uuid.UUID(str(parent_job_id)))
+    except (TypeError, ValueError) as error:
+        raise StateError("admission job ids must be UUIDs") from error
+    if admission_id is None:
+        admission_id = uuid.uuid4()
+    else:
+        try:
+            admission_id = uuid.UUID(str(admission_id))
+        except (TypeError, ValueError) as error:
+            raise StateError("admission_id must be a UUID") from error
+
+    try:
+        seed_digest = jsonutil.require_digest(seed_digest, "seed_digest")
+    except ValueError as error:
+        raise StateError(str(error)) from error
+    if parent_approval_digest is not None:
+        try:
+            parent_approval_digest = jsonutil.require_digest(
+                parent_approval_digest, "parent_approval_digest"
+            )
+        except ValueError as error:
+            raise StateError(str(error)) from error
+    if approval_chain_tail_digest is not None:
+        try:
+            approval_chain_tail_digest = jsonutil.require_digest(
+                approval_chain_tail_digest, "approval_chain_tail_digest"
+            )
+        except ValueError as error:
+            raise StateError(str(error)) from error
+    if campaign_bundle_digest is not None:
+        try:
+            campaign_bundle_digest = jsonutil.require_digest(
+                campaign_bundle_digest, "campaign_bundle_digest"
+            )
+        except ValueError as error:
+            raise StateError(str(error)) from error
+
+    if not callable(clock):
+        raise StateError("clock must be callable")
+    decided_at = clock()
+    if not isinstance(decided_at, datetime) or decided_at.tzinfo is None:
+        raise StateError("clock must return a timezone-aware datetime")
+    decided_at_text = jsonutil.timestamp(decided_at.astimezone(timezone.utc))
+
+    try:
+        budget_snapshot = dict(budget_snapshot)
+        budget_snapshot_digest = jsonutil.digest_json(budget_snapshot)
+    except (TypeError, ValueError) as error:
+        raise StateError(
+            f"budget_snapshot must be canonical JSON: {error}"
+        ) from error
+    if not budget_snapshot:
+        raise StateError("budget_snapshot must not be empty")
+
+    if type(recomputable) is not bool:
+        raise StateError("recomputable must be a boolean")
+    if type(existing_rounds) not in (tuple, list, set, frozenset):
+        existing_rounds = tuple(existing_rounds)
+    admitted_rounds = set(existing_rounds)
+
+    predicate_version = normalized_envelope["admission_predicate_version"]
+    reason_code: str | None = None
+    sub_reason: str | None = None
+    supporting_bundle_digest: str | None = None
+
+    if parent_approval_digest is None:
+        reason_code = "ADMISSION_DENIED"
+        sub_reason = "PARENT_APPROVAL_MISSING"
+    elif (
+        approval_chain_tail_digest is None
+        or parent_approval_digest != approval_chain_tail_digest
+    ):
+        reason_code = "ADMISSION_DENIED"
+        sub_reason = "PARENT_APPROVAL_NOT_CHAIN_TAIL"
+    elif type(round_no) is not int or round_no < 1:
+        reason_code = "ADMISSION_DENIED"
+        sub_reason = "INVALID_ROUND_NO"
+    elif round_no > normalized_envelope["max_rounds"]:
+        reason_code = "ADMISSION_DENIED"
+        sub_reason = "ROUND_BEYOND_MAX_ROUNDS"
+    elif round_no in admitted_rounds:
+        reason_code = "ADMISSION_DENIED"
+        sub_reason = "ROUND_ALREADY_ADMITTED"
+    elif not recomputable and campaign_bundle_digest is None:
+        reason_code = "ADMISSION_DENIED"
+        sub_reason = "SUPPORTING_BUNDLE_MISSING"
+    else:
+        if experiment is not None:
+            try:
+                contracts.check_experiment_against_envelope(
+                    experiment, normalized_envelope
+                )
+            except contracts.EnvelopeViolation as error:
+                reason_code = "ENVELOPE_VIOLATION"
+                sub_reason = str(error)
+
+    if reason_code is None and not recomputable:
+        supporting_bundle_digest = campaign_bundle_digest
+
+    detail: dict[str, Any] = {
+        "job_id": job_id,
+        "parent_job_id": parent_job_id,
+        "round_no": round_no,
+        "approval_kind": "policy",
+        "envelope_digest": envelope_digest,
+        "parent_approval_digest": parent_approval_digest,
+        "seed_digest": seed_digest,
+        "predicate_version": predicate_version,
+        "recomputable": recomputable,
+        "supporting_bundle_digest": supporting_bundle_digest,
+        "budget_snapshot_digest": budget_snapshot_digest,
+    }
+
+    admission: dict[str, Any] | None
+    if reason_code is None:
+        admission = {
+            "admission_id": str(admission_id),
+            "job_id": job_id,
+            "parent_job_id": parent_job_id,
+            "round_no": round_no,
+            "approval_kind": "policy",
+            "envelope_digest": envelope_digest,
+            "parent_approval_digest": parent_approval_digest,
+            "seed_digest": seed_digest,
+            "predicate_version": predicate_version,
+            "recomputable": recomputable,
+            "supporting_bundle_digest": supporting_bundle_digest,
+            "decided_at": decided_at_text,
+        }
+        event_type = "round_admitted"
+    else:
+        admission = None
+        event_type = "round_admission_denied"
+        detail["reason_code"] = reason_code
+        detail["sub_reason"] = sub_reason
+
+    event = {
+        "event_type": event_type,
+        "job_id": job_id,
+        "stage": "admission",
+        "reason_code": reason_code,
+        "detail": detail,
+    }
+
+    if store is not None:
+        if admission is not None:
+            store.record_admission(admission)
+        store.append_event(event)
+
+    return AdmissionOutcome(
+        admitted=admission is not None,
+        reason_code=reason_code,
+        admission=admission,
+        event_type=event_type,
+        event_detail=detail,
+    )
 
 
 # A decided family envelope maps back to the review decision it recorded. The

@@ -108,9 +108,44 @@ MAX_ACCESS_SIZE = 2**31 - 1
 _USER_ID = re.compile(r"(?:0|[1-9][0-9]{0,9})")
 _MAX_USER_ID = 2**32 - 1
 
+# Interface-contract-delta §2: the envelope body is closed. ``envelope_digest``
+# is deliberately not part of the body; it is the canonical digest of these
+# eleven fields and is computed with the digest itself excluded.
+_ENVELOPE_FIELDS = frozenset(
+    {
+        "mode",
+        "allowed_mutation_families",
+        "mutation_limits",
+        "seed_corpus_digest",
+        "fuzz_image_digest",
+        "harness_digest",
+        "max_rounds",
+        "max_total_seconds",
+        "max_fuzz_seconds",
+        "accepted_signature_set",
+        "admission_predicate_version",
+    }
+)
+_ENVELOPE_MUTATION_LIMIT_FIELDS = frozenset({"allowed_ops", "max_input_bytes"})
+_ENVELOPE_SIGNATURE_FIELDS = frozenset({"error", "function", "source"})
+_ENVELOPE_SIGNATURE_OPTIONAL = frozenset({"operation", "access_size"})
+_ENVELOPE_MODES = frozenset({"fixed", "guided"})
+_ENVELOPE_MAX_ACCESS_SIZE = 2**31 - 1
+
 
 class InvalidRequest(ValueError):
     """The request does not conform to the version 1 input contract."""
+
+
+class EnvelopeViolation(ValueError):
+    """An ExperimentSpec leaves the approved exploration envelope.
+
+    T12 keeps this separate from ``InvalidRequest`` so a deterministic
+    planning violation is reported as ``ENVELOPE_VIOLATION`` before any build
+    attempt, instead of being mistaken for a malformed request.
+    """
+
+    reason_code = "ENVELOPE_VIOLATION"
 
 
 def _object(
@@ -172,6 +207,370 @@ def _digest(value: Any, *, label: str) -> str:
     if not _SHA256.fullmatch(digest):
         raise ValueError(f"{label} must be a sha256 digest")
     return digest
+
+
+def _envelope_text(value: Any, *, label: str) -> str:
+    """Require a non-empty, whitespace-free envelope identifier."""
+    text = jsonutil.require_text(value, label)
+    if any(character.isspace() for character in text):
+        raise ValueError(f"{label} must not contain whitespace")
+    return text
+
+
+def _envelope_string_list(value: Any, *, label: str) -> list[str]:
+    if not isinstance(value, list):
+        raise ValueError(f"{label} must be a JSON array")
+    result: list[str] = []
+    seen: set[str] = set()
+    for index, item in enumerate(value):
+        text = _envelope_text(item, label=f"{label}[{index}]")
+        if text in seen:
+            raise ValueError(f"{label} must not contain duplicates")
+        seen.add(text)
+        result.append(text)
+    return result
+
+
+def _envelope_digest_or_null(value: Any, *, label: str) -> str | None:
+    if value is None:
+        return None
+    return _digest(value, label=label)
+
+
+def _envelope_signature_set(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        raise ValueError("envelope.accepted_signature_set must be a JSON array")
+    normalized: list[dict[str, Any]] = []
+    for index, item in enumerate(value):
+        label = f"accepted_signature_set[{index}]"
+        signature = _object(
+            item,
+            required=set(_ENVELOPE_SIGNATURE_FIELDS),
+            optional=set(_ENVELOPE_SIGNATURE_OPTIONAL),
+        )
+        entry: dict[str, Any] = {
+            field: _text(signature[field], label=f"{label}.{field}")
+            for field in ("error", "function", "source")
+        }
+        if "operation" in signature:
+            operation = _text(
+                signature["operation"], label=f"{label}.operation"
+            )
+            if operation not in _ASAN_OPERATIONS:
+                raise ValueError(f"{label}.operation must be READ or WRITE")
+            entry["operation"] = operation
+        if "access_size" in signature:
+            access_size = signature["access_size"]
+            if (
+                type(access_size) is not int
+                or not 1 <= access_size <= _ENVELOPE_MAX_ACCESS_SIZE
+            ):
+                raise ValueError(
+                    f"{label}.access_size must be an integer between 1 and "
+                    f"{_ENVELOPE_MAX_ACCESS_SIZE}"
+                )
+            entry["access_size"] = access_size
+        normalized.append(entry)
+    return normalized
+
+
+def normalize_envelope(
+    value: Any, *, toolchain_image_digest: str | None = None
+) -> dict[str, Any]:
+    """Validate and normalize the closed eleven-field exploration envelope.
+
+    ``envelope_digest`` is not part of the body. ``mutation_limits``,
+    ``allowed_mutation_families`` and both budget ceilings are retained in the
+    normalized object so every one of them participates in the canonical
+    digest. A guided envelope without an explicitly approved independent fuzz
+    image binds ``fuzz_image_digest`` to the fixed toolchain image digest; a
+    fixed envelope always uses its degenerate, empty mutation surface.
+    """
+    _object(value, required=set(_ENVELOPE_FIELDS))
+
+    mode = value["mode"]
+    if not isinstance(mode, str) or mode not in _ENVELOPE_MODES:
+        raise ValueError("envelope.mode must be fixed or guided")
+
+    families = _envelope_string_list(
+        value["allowed_mutation_families"],
+        label="envelope.allowed_mutation_families",
+    )
+    limits = _object(
+        value["mutation_limits"],
+        required=set(_ENVELOPE_MUTATION_LIMIT_FIELDS),
+    )
+    allowed_ops = _envelope_string_list(
+        limits["allowed_ops"],
+        label="envelope.mutation_limits.allowed_ops",
+    )
+    max_input_bytes = limits["max_input_bytes"]
+    if type(max_input_bytes) is not int or max_input_bytes < 0:
+        raise ValueError(
+            "envelope.mutation_limits.max_input_bytes must be a non-negative "
+            "integer"
+        )
+
+    seed_corpus_digest = _envelope_digest_or_null(
+        value["seed_corpus_digest"], label="envelope.seed_corpus_digest"
+    )
+    fuzz_image_digest = _envelope_digest_or_null(
+        value["fuzz_image_digest"], label="envelope.fuzz_image_digest"
+    )
+    harness_digest = _digest(
+        value["harness_digest"], label="envelope.harness_digest"
+    )
+
+    max_rounds = value["max_rounds"]
+    if type(max_rounds) is not int or max_rounds < 1:
+        raise ValueError("envelope.max_rounds must be a positive integer")
+    max_total_seconds = value["max_total_seconds"]
+    if type(max_total_seconds) is not int or max_total_seconds < 1:
+        raise ValueError(
+            "envelope.max_total_seconds must be a positive integer"
+        )
+    max_fuzz_seconds = value["max_fuzz_seconds"]
+    if (
+        type(max_fuzz_seconds) is not int
+        or not 0 <= max_fuzz_seconds <= max_total_seconds
+    ):
+        raise ValueError(
+            "envelope.max_fuzz_seconds must be an integer between 0 and "
+            "max_total_seconds"
+        )
+
+    accepted_signature_set = _envelope_signature_set(
+        value["accepted_signature_set"]
+    )
+    admission_predicate_version = _envelope_text(
+        value["admission_predicate_version"],
+        label="envelope.admission_predicate_version",
+    )
+
+    if toolchain_image_digest is not None:
+        toolchain_image_digest = _digest(
+            toolchain_image_digest, label="toolchain_image_digest"
+        )
+
+    if mode == "fixed":
+        if families:
+            raise ValueError(
+                "fixed envelope requires allowed_mutation_families=[]"
+            )
+        if allowed_ops:
+            raise ValueError(
+                "fixed envelope requires mutation_limits.allowed_ops=[]"
+            )
+        if max_input_bytes != 0:
+            raise ValueError(
+                "fixed envelope requires mutation_limits.max_input_bytes=0"
+            )
+        if seed_corpus_digest is not None:
+            raise ValueError("fixed envelope requires seed_corpus_digest=null")
+        if fuzz_image_digest is not None:
+            raise ValueError("fixed envelope requires fuzz_image_digest=null")
+        if max_rounds != 1:
+            raise ValueError("fixed envelope requires max_rounds=1")
+        if max_fuzz_seconds != 0:
+            raise ValueError("fixed envelope requires max_fuzz_seconds=0")
+    else:
+        if not families:
+            raise ValueError(
+                "guided envelope requires a non-empty "
+                "allowed_mutation_families"
+            )
+        if seed_corpus_digest is None:
+            raise ValueError("guided envelope requires seed_corpus_digest")
+        if fuzz_image_digest is None:
+            if toolchain_image_digest is None:
+                raise ValueError(
+                    "guided envelope requires fuzz_image_digest or a "
+                    "toolchain image digest"
+                )
+            fuzz_image_digest = toolchain_image_digest
+
+    return {
+        "mode": mode,
+        "allowed_mutation_families": families,
+        "mutation_limits": {
+            "allowed_ops": allowed_ops,
+            "max_input_bytes": max_input_bytes,
+        },
+        "seed_corpus_digest": seed_corpus_digest,
+        "fuzz_image_digest": fuzz_image_digest,
+        "harness_digest": harness_digest,
+        "max_rounds": max_rounds,
+        "max_total_seconds": max_total_seconds,
+        "max_fuzz_seconds": max_fuzz_seconds,
+        "accepted_signature_set": accepted_signature_set,
+        "admission_predicate_version": admission_predicate_version,
+    }
+
+
+def fixed_envelope(
+    *,
+    harness_digest: str,
+    accepted_signature_set: list[dict[str, Any]],
+    max_total_seconds: int,
+    admission_predicate_version: str = "admission-v1",
+) -> dict[str, Any]:
+    """Build the fixed-mode degenerate envelope (§2).
+
+    The null fuzz fields and empty mutation surface are part of the canonical
+    body, so they are hashed by ``envelope_digest`` even though no fuzz round
+    can run under this authorization.
+    """
+    return normalize_envelope(
+        {
+            "mode": "fixed",
+            "allowed_mutation_families": [],
+            "mutation_limits": {"allowed_ops": [], "max_input_bytes": 0},
+            "seed_corpus_digest": None,
+            "fuzz_image_digest": None,
+            "harness_digest": harness_digest,
+            "max_rounds": 1,
+            "max_total_seconds": max_total_seconds,
+            "max_fuzz_seconds": 0,
+            "accepted_signature_set": accepted_signature_set,
+            "admission_predicate_version": admission_predicate_version,
+        }
+    )
+
+
+def guided_envelope(
+    *,
+    allowed_mutation_families: list[str],
+    mutation_limits: Mapping[str, Any],
+    seed_corpus_digest: str,
+    toolchain_image_digest: str,
+    harness_digest: str,
+    max_rounds: int,
+    max_total_seconds: int,
+    max_fuzz_seconds: int,
+    accepted_signature_set: list[dict[str, Any]],
+    fuzz_image_digest: str | None = None,
+    admission_predicate_version: str = "admission-v1",
+) -> dict[str, Any]:
+    """Build a guided envelope, defaulting the fuzz image to the toolchain.
+
+    An independent fuzz image is an explicit approval decision: callers must
+    pass ``fuzz_image_digest`` to widen it away from the fixed toolchain image.
+    """
+    return normalize_envelope(
+        {
+            "mode": "guided",
+            "allowed_mutation_families": allowed_mutation_families,
+            "mutation_limits": mutation_limits,
+            "seed_corpus_digest": seed_corpus_digest,
+            "fuzz_image_digest": fuzz_image_digest,
+            "harness_digest": harness_digest,
+            "max_rounds": max_rounds,
+            "max_total_seconds": max_total_seconds,
+            "max_fuzz_seconds": max_fuzz_seconds,
+            "accepted_signature_set": accepted_signature_set,
+            "admission_predicate_version": admission_predicate_version,
+        },
+        toolchain_image_digest=toolchain_image_digest,
+    )
+
+
+def envelope_digest(
+    envelope: Mapping[str, Any], *, toolchain_image_digest: str | None = None
+) -> str:
+    """Return the canonical SHA-256 of the envelope body, excluding itself."""
+    if not isinstance(envelope, Mapping):
+        raise ValueError("envelope must be a JSON object")
+    body = dict(envelope)
+    body.pop("envelope_digest", None)
+    normalized = normalize_envelope(
+        body, toolchain_image_digest=toolchain_image_digest
+    )
+    return jsonutil.digest_json(normalized)
+
+
+def check_mutation_constraints(
+    constraints: Any, envelope: Mapping[str, Any]
+) -> None:
+    """Require ``ExperimentSpec.mutation_constraints`` to be a subset (§4)."""
+    normalized = normalize_envelope(envelope)
+    try:
+        constraints = _object(
+            constraints,
+            required={"allowed_ops", "max_input_bytes"},
+        )
+    except ValueError as error:
+        raise EnvelopeViolation(str(error)) from error
+    allowed_ops = normalized["mutation_limits"]["allowed_ops"]
+    operations = constraints["allowed_ops"]
+    if not isinstance(operations, list):
+        raise EnvelopeViolation(
+            "mutation_constraints.allowed_ops must be a JSON array"
+        )
+    for index, operation in enumerate(operations):
+        if not isinstance(operation, str):
+            raise EnvelopeViolation(
+                f"mutation_constraints.allowed_ops[{index}] must be a string"
+            )
+        if operation not in allowed_ops:
+            raise EnvelopeViolation(
+                "mutation_constraints.allowed_ops contains an operation "
+                f"outside the envelope: {operation}"
+            )
+    max_input_bytes = constraints["max_input_bytes"]
+    if type(max_input_bytes) is not int or max_input_bytes < 0:
+        raise EnvelopeViolation(
+            "mutation_constraints.max_input_bytes must be a non-negative "
+            "integer"
+        )
+    if max_input_bytes > normalized["mutation_limits"]["max_input_bytes"]:
+        raise EnvelopeViolation(
+            "mutation_constraints.max_input_bytes is greater than the "
+            "envelope mutation_limits.max_input_bytes"
+        )
+
+
+def check_experiment_against_envelope(
+    experiment: Mapping[str, Any], envelope: Mapping[str, Any]
+) -> None:
+    """Reject an ExperimentSpec before any build is attempted.
+
+    Only the envelope-bound fields are checked here. The nine-field
+    ExperimentSpec closure and signature matching belong to T14; this function
+    enforces the §4 rule that a spec may tighten, never widen, the approved
+    mutation surface, input family or accepted signatures.
+    """
+    if not isinstance(experiment, Mapping):
+        raise EnvelopeViolation("ExperimentSpec must be a JSON object")
+    normalized = normalize_envelope(envelope)
+
+    if "input_family" in experiment:
+        input_family = experiment["input_family"]
+        if (
+            not isinstance(input_family, str)
+            or input_family not in normalized["allowed_mutation_families"]
+        ):
+            raise EnvelopeViolation(
+                "ExperimentSpec.input_family is outside the envelope "
+                "allowed_mutation_families"
+            )
+
+    if "mutation_constraints" in experiment:
+        check_mutation_constraints(
+            experiment["mutation_constraints"], normalized
+        )
+
+    if "expected_signature" in experiment:
+        try:
+            expected = _envelope_signature_set(
+                [experiment["expected_signature"]]
+            )[0]
+        except ValueError as error:
+            raise EnvelopeViolation(str(error)) from error
+        if expected not in normalized["accepted_signature_set"]:
+            raise EnvelopeViolation(
+                "ExperimentSpec.expected_signature is outside the envelope "
+                "accepted_signature_set"
+            )
 
 
 def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
