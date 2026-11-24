@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 import hashlib
 import math
+import threading
 from typing import Any, Callable, Literal, Mapping, Protocol, Sequence, TypedDict, runtime_checkable
 from uuid import uuid4
 
@@ -308,22 +309,27 @@ class DeterministicClock:
         if start.tzinfo is None:
             start = start.replace(tzinfo=timezone.utc)
         self._now = start.astimezone(timezone.utc)
+        self._lock = threading.Lock()
 
     def now(self) -> datetime:
-        return self._now
+        with self._lock:
+            return self._now
 
     def advance(self, seconds: float | int) -> datetime:
         if isinstance(seconds, bool) or not isinstance(seconds, (int, float)):
             raise ValueError("seconds must be a finite non-negative number")
         if not math.isfinite(seconds) or seconds < 0:
             raise ValueError("seconds must be a finite non-negative number")
-        self._now = self._now + timedelta(seconds=float(seconds))
-        return self._now
+        with self._lock:
+            self._now = self._now + timedelta(seconds=float(seconds))
+            return self._now
 
     def timestamp(self, *, microseconds: bool = False) -> str:
+        with self._lock:
+            current = self._now
         if microseconds:
-            return self._now.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
-        return self._now.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+            return current.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+        return current.replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
 @runtime_checkable
@@ -913,6 +919,7 @@ class NodeReentryLedger:
     """
 
     def __init__(self) -> None:
+        self._lock = threading.Lock()
         self._node_results: dict[IdempotencyKey, dict[str, Any]] = {}
         self._charge_keys: set[tuple[str, str, int]] = set()
         self._charges_by_job: dict[str, list[BudgetChargeRecord]] = {}
@@ -920,14 +927,16 @@ class NodeReentryLedger:
         self._archives_by_job: dict[str, list[ArchiveRecord]] = {}
 
     def get(self, key: IdempotencyKey) -> dict[str, Any] | None:
-        cached = self._node_results.get(key)
-        if cached is None:
-            return None
-        return copy.deepcopy(cached)
+        with self._lock:
+            cached = self._node_results.get(key)
+            if cached is None:
+                return None
+            return copy.deepcopy(cached)
 
     def record(self, key: IdempotencyKey, result: Mapping[str, Any]) -> dict[str, Any]:
         snapshot = copy.deepcopy(dict(result))
-        self._node_results[key] = snapshot
+        with self._lock:
+            self._node_results[key] = snapshot
         return copy.deepcopy(snapshot)
 
     def record_charge(
@@ -943,36 +952,41 @@ class NodeReentryLedger:
         charge_kind: str = "general",
     ) -> bool:
         charge_key = (job_id, step_key, attempt_no)
-        if charge_key in self._charge_keys:
-            return False
-        self._charge_keys.add(charge_key)
-        entry = BudgetChargeRecord(
-            job_id=job_id,
-            family_id=family_id,
-            step_key=step_key,
-            attempt_no=attempt_no,
-            seconds=float(seconds),
-            fuzz_seconds=float(fuzz_seconds),
-            charge_kind=charge_kind,
-            recorded_at=recorded_at,
-        )
-        self._charges_by_job.setdefault(job_id, []).append(entry)
-        self._charges_by_family.setdefault(family_id, []).append(entry)
-        return True
+        with self._lock:
+            if charge_key in self._charge_keys:
+                return False
+            self._charge_keys.add(charge_key)
+            entry = BudgetChargeRecord(
+                job_id=job_id,
+                family_id=family_id,
+                step_key=step_key,
+                attempt_no=attempt_no,
+                seconds=float(seconds),
+                fuzz_seconds=float(fuzz_seconds),
+                charge_kind=charge_kind,
+                recorded_at=recorded_at,
+            )
+            self._charges_by_job.setdefault(job_id, []).append(entry)
+            self._charges_by_family.setdefault(family_id, []).append(entry)
+            return True
 
     def charge_count(self, job_id: str) -> int:
-        return len(self._charges_by_job.get(job_id, ()))
+        with self._lock:
+            return len(self._charges_by_job.get(job_id, ()))
 
     def charges_for_job(self, job_id: str) -> tuple[BudgetChargeRecord, ...]:
-        return tuple(self._charges_by_job.get(job_id, ()))
+        with self._lock:
+            return tuple(self._charges_by_job.get(job_id, ()))
 
     def total_charged_seconds(self, family_id: str) -> float:
-        return sum(item.seconds for item in self._charges_by_family.get(family_id, ()))
+        with self._lock:
+            return sum(item.seconds for item in self._charges_by_family.get(family_id, ()))
 
     def total_fuzz_seconds(self, family_id: str) -> float:
-        return sum(
-            item.fuzz_seconds for item in self._charges_by_family.get(family_id, ())
-        )
+        with self._lock:
+            return sum(
+                item.fuzz_seconds for item in self._charges_by_family.get(family_id, ())
+            )
 
     def record_archive(
         self,
@@ -996,14 +1010,17 @@ class NodeReentryLedger:
             archive_digest=archive_digest,
             recorded_at=recorded_at,
         )
-        self._archives_by_job.setdefault(job_id, []).append(entry)
+        with self._lock:
+            self._archives_by_job.setdefault(job_id, []).append(entry)
         return entry
 
     def archive_count(self, job_id: str) -> int:
-        return len(self._archives_by_job.get(job_id, ()))
+        with self._lock:
+            return len(self._archives_by_job.get(job_id, ()))
 
     def archives_for_job(self, job_id: str) -> tuple[ArchiveRecord, ...]:
-        return tuple(self._archives_by_job.get(job_id, ()))
+        with self._lock:
+            return tuple(self._archives_by_job.get(job_id, ()))
 
 
 # ---------------------------------------------------------------------------
@@ -1076,6 +1093,15 @@ def _node_key(
         attempt_no = default_attempt_no
     generation = state.get("generation", 1)
     return (job_id, stage, step_key, attempt_no, generation)
+
+
+def _validate_max_build_retries(value: Any) -> int:
+    if type(value) is not int or value < 0 or value > 1:
+        raise ValueError(
+            "max_build_retries must be an int in [0, 1] "
+            "(README §5 edge #19 bounds build_diagnose to at most 1 extra retry)"
+        )
+    return value
 
 
 def _serialize_build_result(result: BuildResult) -> dict[str, Any]:
@@ -1210,19 +1236,33 @@ def _build_v2_node_map(
                 message=str(error),
             )
 
-        if result.status != "ready":
+        snapshot_digest = (
+            result.snapshot_digest.strip()
+            if isinstance(result.snapshot_digest, str)
+            else ""
+        )
+        if result.status != "ready" or not snapshot_digest:
+            if result.status != "ready":
+                reason_code = result.reason_code or "MATERIAL_MISSING"
+                error_message = result.message
+            else:
+                # Edge #6 fail-closed: ready status without a valid snapshot_digest
+                # must never enter version with unverified content.
+                reason_code = "MATERIAL_MISSING"
+                error_message = (
+                    result.message or "intel snapshot_digest is missing or blank"
+                )
             update: dict[str, Any] = {
                 "state": "BLOCKED",
-                "reason_code": result.reason_code or "MATERIAL_MISSING",
-                "error_message": result.message,
+                "reason_code": reason_code,
+                "error_message": error_message,
                 "intel_summary": dict(result.summary),
                 "next_route": "archive",
                 "visited_nodes": _append_visited(state, "intel"),
             }
         else:
             summary = dict(result.summary)
-            if result.snapshot_digest is not None:
-                summary["snapshot_digest"] = result.snapshot_digest
+            summary["snapshot_digest"] = snapshot_digest
             update = {
                 "intel_summary": summary,
                 "next_route": "version",
@@ -1327,6 +1367,10 @@ def _build_v2_node_map(
         )
         cached = ledger.get(key)
         if cached is not None:
+            if state.get("envelope_digest"):
+                cached["envelope_digest"] = state["envelope_digest"]
+            if state.get("first_plan_digest"):
+                cached["first_plan_digest"] = state["first_plan_digest"]
             return cached
 
         aggregated = hypothesis_aggregator.aggregate(
@@ -1402,8 +1446,10 @@ def _build_v2_node_map(
                     "visited_nodes": _append_visited(state, "review"),
                 }
             elif decision.edge == "await_review":
-                # D42: REVIEW_ENVELOPE_MISMATCH stays non-terminal.
-                update = {
+                # D42: REVIEW_ENVELOPE_MISMATCH stays non-terminal and must not
+                # be cached in NodeReentryLedger so a subsequent review with a
+                # corrected envelope_digest under the same generation can proceed.
+                return {
                     "state": "AWAITING_REVIEW",
                     "reason_code": decision.reason_code,
                     "terminal_node": None,
@@ -1532,7 +1578,7 @@ def _build_v2_node_map(
         if cached is not None:
             return cached
 
-        max_retries = state.get("max_build_retries", 1)
+        max_retries = _validate_max_build_retries(state.get("max_build_retries", 1))
         job_kind = state.get("job_kind", "round")
         diagnosis = build_diagnoser.diagnose(
             job_id=state["job_id"],
@@ -1955,8 +2001,12 @@ class OrchestrationRunner:
         self.verdict_policy: verdict_mod.VerdictPolicy = (
             verdict_policy or DEFAULT_VERDICT_POLICY
         )
-        self.max_build_retries = max_build_retries
+        self.max_build_retries = _validate_max_build_retries(max_build_retries)
         self.ledger = NodeReentryLedger()
+        self._slot_table_lock = threading.Lock()
+        self._family_locks: dict[str, threading.Lock] = {}
+        self._active_children_by_family: dict[str, int] = {}
+        self._max_concurrent_by_family: dict[str, int] = {}
         self._node_map = _build_v2_node_map(
             sandbox=self.sandbox,
             clock=self.clock,
@@ -1988,6 +2038,18 @@ class OrchestrationRunner:
     def archive_count(self, job_id: str) -> int:
         return self.ledger.archive_count(job_id)
 
+    def _family_slot_lock(self, family_id: str) -> threading.Lock:
+        with self._slot_table_lock:
+            lock = self._family_locks.get(family_id)
+            if lock is None:
+                lock = threading.Lock()
+                self._family_locks[family_id] = lock
+            return lock
+
+    def max_concurrent_children(self, family_id: str) -> int:
+        with self._slot_table_lock:
+            return self._max_concurrent_by_family.get(family_id, 0)
+
     def execute_node(
         self,
         *,
@@ -1997,6 +2059,8 @@ class OrchestrationRunner:
         round_no: int | None = 1,
         target_kind: str = "source",
         is_first_plan: bool | None = None,
+        envelope_digest: str | None = None,
+        first_plan_digest: str | None = None,
         parent_approval_digest: str | None = None,
         seed_bytes: bytes | None = None,
         request: Mapping[str, Any] | None = None,
@@ -2025,6 +2089,10 @@ class OrchestrationRunner:
         }
         if is_first_plan is not None:
             state["is_first_plan"] = is_first_plan
+        if envelope_digest is not None:
+            state["envelope_digest"] = envelope_digest
+        if first_plan_digest is not None:
+            state["first_plan_digest"] = first_plan_digest
         return node_fn(state)
 
     def run_child(
@@ -2077,11 +2145,24 @@ class OrchestrationRunner:
         if first_plan_digest is not None:
             initial["first_plan_digest"] = first_plan_digest
 
-        started_at = self.clock.now()
-        final_state: Mapping[str, Any] = self.graph.invoke(initial)
-        if self.clock.now() <= started_at:
-            self.clock.advance(0.001)
-        finished_at = self.clock.now()
+        slot_lock = self._family_slot_lock(family_id)
+        with slot_lock:
+            with self._slot_table_lock:
+                active = self._active_children_by_family.get(family_id, 0) + 1
+                self._active_children_by_family[family_id] = active
+                self._max_concurrent_by_family[family_id] = max(
+                    self._max_concurrent_by_family.get(family_id, 0),
+                    active,
+                )
+            try:
+                started_at = self.clock.now()
+                final_state: Mapping[str, Any] = self.graph.invoke(initial)
+                if self.clock.now() <= started_at:
+                    self.clock.advance(0.001)
+                finished_at = self.clock.now()
+            finally:
+                with self._slot_table_lock:
+                    self._active_children_by_family[family_id] -= 1
 
         return ChildRunOutcome(
             job_id=job_id,
@@ -2125,7 +2206,7 @@ class OrchestrationRunner:
         if max_rounds < 0:
             raise ValueError("max_rounds must be non-negative")
 
-        family_states: list[str] = ["PREPARING", "AGGREGATING"]
+        family_states: list[str] = ["AGGREGATING"]
         transitions: list[dict[str, Any]] = []
         windows: list[ChildExecutionWindow] = []
         round_children: list[ChildRunOutcome] = []
@@ -2299,6 +2380,7 @@ class OrchestrationRunner:
         terminal_family_state = str(family_graph_state.get("state", family_final_state))
         family_states.append(terminal_family_state)
 
+        max_concurrent = max(max_concurrent, self.max_concurrent_children(family_id))
         return FamilyRunOutcome(
             family_id=family_id,
             state=terminal_family_state,

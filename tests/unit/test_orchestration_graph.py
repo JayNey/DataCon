@@ -7,9 +7,12 @@ docs/spec/v0.2/README.md §5 (14 nodes and 26 edges).
 from __future__ import annotations
 
 from datetime import timedelta
+import threading
+from typing import Any, Mapping, Sequence
 from uuid import uuid4
 
 from fakes import FakeClock, FakeEnvelopePolicy, FakeReviewGate, FakeSandbox
+import pytest
 
 from datacon import workflow
 
@@ -169,6 +172,48 @@ def test_graph_nodes_and_edges_match_v02_readme():
     assert v1_nodes == {"prepare", "await_review"}
     assert v1_edges == {("prepare", "await_review")}
 
+    # Edge #6 (intel -> archive) must fail closed if an IntelProvider claims
+    # status="ready" with a missing or blank snapshot_digest.
+    for bad_digest in (None, "", "   "):
+
+        class _UnverifiedIntelProvider:
+            def __init__(self, digest: str | None) -> None:
+                self._digest = digest
+
+            def resolve_intel(
+                self,
+                *,
+                job_id: str,
+                family_id: str,
+                request: Mapping[str, Any],
+            ) -> workflow.IntelResult:
+                del job_id, family_id, request
+                return workflow.IntelResult(
+                    status="ready",
+                    snapshot_digest=self._digest,
+                    summary={"source": "unverified"},
+                )
+
+        intel_clock = FakeClock()
+        intel_sandbox = FakeSandbox(clock=intel_clock)
+        intel_runner = workflow.OrchestrationRunner(
+            sandbox=intel_sandbox,
+            clock=intel_clock,
+            intel_provider=_UnverifiedIntelProvider(bad_digest),
+        )
+        intel_outcome = intel_runner.run_child(
+            job_id=str(uuid4()),
+            family_id=str(uuid4()),
+            job_kind="round",
+            round_no=1,
+            target_kind="source",
+        )
+        assert intel_outcome.terminal_node == "archive"
+        assert intel_outcome.state == "BLOCKED"
+        assert intel_outcome.reason_code == "MATERIAL_MISSING"
+        assert "version" not in intel_outcome.visited_nodes
+        assert len(intel_sandbox.build_calls) == 0
+
 
 def test_build_diagnose_retry_is_bounded_to_once():
     clock = FakeClock()
@@ -212,6 +257,59 @@ def test_build_diagnose_retry_is_bounded_to_once():
     assert len(sandbox.replay_calls) == 0, (
         f"exhausted build retry must never invoke sandbox.replay, got {len(sandbox.replay_calls)} call(s)"
     )
+
+    # README §5 edge #19 bounds max_build_retries to int in [0, 1].
+    for invalid_retries in (-1, 2, True, False, 1.0):
+        with pytest.raises(ValueError, match="max_build_retries"):
+            runner_cls(
+                sandbox=sandbox,
+                clock=clock,
+                max_build_retries=invalid_retries,  # type: ignore[arg-type]
+            )
+
+    zero_retry_sandbox = FakeSandbox(clock=clock, retryable_build_failures=2)
+    zero_retry_runner = runner_cls(
+        sandbox=zero_retry_sandbox,
+        clock=clock,
+        review_gate=FakeReviewGate(clock=clock, decision="approve"),
+        envelope_policy=FakeEnvelopePolicy(clock=clock, default_admit=True),
+        max_build_retries=0,
+    )
+    zero_retry_outcome = zero_retry_runner.run_child(
+        job_id=str(uuid4()),
+        family_id=str(uuid4()),
+        job_kind="round",
+        round_no=1,
+        target_kind="source",
+    )
+    assert len(zero_retry_sandbox.build_calls) == 1
+    assert zero_retry_outcome.terminal_node == "archive"
+    assert zero_retry_outcome.reason_code == "BUILD_FAILED"
+
+    # Non-retryable build_diagnose_failure metadata from FakeSandbox archives
+    # immediately without retrying.
+    diag_fail_sandbox = FakeSandbox(
+        clock=clock,
+        build_faults=("build_diagnose_failure",),
+    )
+    diag_fail_runner = runner_cls(
+        sandbox=diag_fail_sandbox,
+        clock=clock,
+        review_gate=FakeReviewGate(clock=clock, decision="approve"),
+        envelope_policy=FakeEnvelopePolicy(clock=clock, default_admit=True),
+    )
+    diag_fail_outcome = diag_fail_runner.run_child(
+        job_id=str(uuid4()),
+        family_id=str(uuid4()),
+        job_kind="round",
+        round_no=1,
+        target_kind="source",
+    )
+    assert len(diag_fail_sandbox.build_calls) == 1
+    assert len(diag_fail_sandbox.replay_calls) == 0
+    assert diag_fail_outcome.terminal_node == "archive"
+    assert diag_fail_outcome.state == "FAILED"
+    assert diag_fail_outcome.reason_code == "BUILD_FAILED"
 
 
 def test_node_reentry_is_a_noop():
@@ -328,6 +426,71 @@ def test_node_reentry_is_a_noop():
     assert len(sandbox.build_calls) > builds_before_new_gen
     # Same (job_id, step_key, attempt_no) on a new generation does not double-charge.
     assert runner.charge_count(job_id) == charges_before_retry + 1
+
+    # D42: Non-terminal parked review (await_review / REVIEW_ENVELOPE_MISMATCH)
+    # must NOT be cached as a completed no-op in NodeReentryLedger, so a retry
+    # with the corrected envelope_digest under the same generation succeeds,
+    # after which decided review outcomes remain cached as no-ops.
+    expected_envelope = "sha256:" + "e" * 64
+    wrong_envelope = "sha256:" + "f" * 64
+    parked_clock = FakeClock()
+    parked_sandbox = FakeSandbox(clock=parked_clock)
+    parked_review_gate = FakeReviewGate(
+        clock=parked_clock,
+        decision="approve",
+        expected_envelope_digest=expected_envelope,
+        review_deadline_at=parked_clock.now() + timedelta(hours=24),
+    )
+    parked_runner = runner_cls(
+        sandbox=parked_sandbox,
+        clock=parked_clock,
+        review_gate=parked_review_gate,
+        envelope_policy=FakeEnvelopePolicy(clock=parked_clock, default_admit=True),
+    )
+    parked_job_id = str(uuid4())
+    parked_family_id = str(uuid4())
+    parked_outcome = parked_runner.run_child(
+        job_id=parked_job_id,
+        family_id=parked_family_id,
+        job_kind="round",
+        round_no=1,
+        generation=1,
+        is_first_plan=True,
+        envelope_digest=wrong_envelope,
+    )
+    assert parked_outcome.state == "AWAITING_REVIEW"
+    assert parked_outcome.reason_code == "REVIEW_ENVELOPE_MISMATCH"
+    assert parked_outcome.terminal_node is None
+    assert parked_review_gate.review_writes == 0
+    assert len(parked_sandbox.build_calls) == 0
+
+    approved_outcome = parked_runner.run_child(
+        job_id=parked_job_id,
+        family_id=parked_family_id,
+        job_kind="round",
+        round_no=1,
+        generation=1,
+        is_first_plan=True,
+        envelope_digest=expected_envelope,
+    )
+    assert approved_outcome.terminal_node == "archive"
+    assert approved_outcome.approval_digest is not None
+    assert parked_review_gate.review_writes == 1
+    builds_after_approval = len(parked_sandbox.build_calls)
+    assert builds_after_approval > 0
+
+    replayed_outcome = parked_runner.run_child(
+        job_id=parked_job_id,
+        family_id=parked_family_id,
+        job_kind="round",
+        round_no=1,
+        generation=1,
+        is_first_plan=True,
+        envelope_digest=expected_envelope,
+    )
+    assert replayed_outcome.approval_digest == approved_outcome.approval_digest
+    assert parked_review_gate.review_writes == 1
+    assert len(parked_sandbox.build_calls) == builds_after_approval
 
 
 def test_reverse_route_archives_as_unsupported():
@@ -506,8 +669,14 @@ def test_family_children_execute_serially():
     assert "RUNNING" not in family_run.family_states_observed, (
         f"family job must use AGGREGATING rather than RUNNING: observed={family_run.family_states_observed}"
     )
+    assert "PREPARING" not in family_run.family_states_observed, (
+        f"v2 family job starts in AGGREGATING rather than PREPARING: observed={family_run.family_states_observed}"
+    )
     assert "AGGREGATING" in family_run.family_states_observed, (
         f"family job must enter AGGREGATING while children run: observed={family_run.family_states_observed}"
+    )
+    assert family_run.family_states_observed == ("AGGREGATING", "COMPLETED"), (
+        f"expected family lifecycle ('AGGREGATING', 'COMPLETED'), got {family_run.family_states_observed}"
     )
 
     timeline = family_run.child_execution_windows
@@ -519,3 +688,201 @@ def test_family_children_execute_serially():
             f"child {nxt.job_id} started at {nxt.started_at} before previous child "
             f"{prev.job_id} finished at {prev.finished_at}"
         )
+
+    # Real multi-threaded mutual exclusion (D29): concurrent run_child calls on
+    # the same family_id must serialize (max_concurrent_children == 1), while
+    # independent family_ids are allowed to execute concurrently.
+    same_family_clock = FakeClock()
+    same_family_delegate = FakeSandbox(clock=same_family_clock)
+    first_entered = threading.Event()
+    second_entered = threading.Event()
+    release_first = threading.Event()
+    concurrency_lock = threading.Lock()
+    active_same_family = 0
+    peak_same_family = 0
+    first_thread_id: int | None = None
+
+    class _SameFamilyConcurrencySandbox:
+        def probe(self, *, deadline_seconds: float = 120.0):
+            return same_family_delegate.probe(deadline_seconds=deadline_seconds)
+
+        def build(
+            self,
+            version: str,
+            *,
+            compile_args: Sequence[str] = (),
+            deadline_seconds: float = 300.0,
+            expected_materials: Mapping[str, str] | None = None,
+        ):
+            nonlocal active_same_family, peak_same_family, first_thread_id
+            current_tid = threading.get_ident()
+            is_first_call = False
+            with concurrency_lock:
+                if first_thread_id is None:
+                    first_thread_id = current_tid
+                    is_first_call = True
+                elif current_tid != first_thread_id:
+                    second_entered.set()
+                active_same_family += 1
+                peak_same_family = max(peak_same_family, active_same_family)
+            try:
+                if is_first_call:
+                    first_entered.set()
+                    assert release_first.wait(timeout=5.0)
+                return same_family_delegate.build(
+                    version,
+                    compile_args=compile_args,
+                    deadline_seconds=deadline_seconds,
+                    expected_materials=expected_materials,
+                )
+            finally:
+                with concurrency_lock:
+                    active_same_family -= 1
+
+        def replay(
+            self,
+            version: str,
+            phase: str,
+            *,
+            timeout_seconds: float = 10.0,
+            deadline_seconds: float | None = None,
+            expected_artifact_digest: str | None = None,
+            expected_input_digest: str | None = None,
+        ):
+            return same_family_delegate.replay(
+                version,
+                phase,
+                timeout_seconds=timeout_seconds,
+                deadline_seconds=deadline_seconds,
+                expected_artifact_digest=expected_artifact_digest,
+                expected_input_digest=expected_input_digest,
+            )
+
+    concurrent_runner = runner_cls(
+        sandbox=_SameFamilyConcurrencySandbox(),
+        clock=same_family_clock,
+        review_gate=FakeReviewGate(clock=same_family_clock, decision="approve"),
+        envelope_policy=FakeEnvelopePolicy(clock=same_family_clock, default_admit=True),
+    )
+    shared_family_id = str(uuid4())
+    outcomes: list[workflow.ChildRunOutcome] = []
+    errors: list[BaseException] = []
+    outcomes_lock = threading.Lock()
+    second_started = threading.Event()
+
+    def _run_one(round_no: int, signal_start: threading.Event | None = None) -> None:
+        try:
+            if signal_start is not None:
+                signal_start.set()
+            result = concurrent_runner.run_child(
+                job_id=str(uuid4()),
+                family_id=shared_family_id,
+                job_kind="round",
+                round_no=round_no,
+                is_first_plan=True,
+            )
+            with outcomes_lock:
+                outcomes.append(result)
+        except BaseException as exc:  # noqa: BLE001
+            with outcomes_lock:
+                errors.append(exc)
+
+    t1 = threading.Thread(target=_run_one, args=(1,))
+    t2 = threading.Thread(target=_run_one, args=(2, second_started))
+    t1.start()
+    assert first_entered.wait(timeout=5.0)
+    t2.start()
+    assert second_started.wait(timeout=5.0)
+    assert not second_entered.wait(timeout=0.05), (
+        "second child of the same family entered build while first child held the slot"
+    )
+    release_first.set()
+    t1.join(timeout=5.0)
+    t2.join(timeout=5.0)
+    assert not errors, f"concurrent same-family run_child raised: {errors!r}"
+    assert len(outcomes) == 2
+    assert peak_same_family == 1
+    assert concurrent_runner.max_concurrent_children(shared_family_id) == 1
+    ordered = sorted(outcomes, key=lambda item: item.started_at or same_family_clock.now())
+    assert ordered[0].finished_at is not None and ordered[1].started_at is not None
+    assert ordered[1].started_at >= ordered[0].finished_at
+
+    # Independent family_ids must NOT block one another on a global lock.
+    indep_clock = FakeClock()
+    indep_delegate = FakeSandbox(clock=indep_clock)
+    barrier = threading.Barrier(2, timeout=5.0)
+    indep_first_per_thread = threading.local()
+
+    class _IndependentFamiliesBarrierSandbox:
+        def probe(self, *, deadline_seconds: float = 120.0):
+            return indep_delegate.probe(deadline_seconds=deadline_seconds)
+
+        def build(
+            self,
+            version: str,
+            *,
+            compile_args: Sequence[str] = (),
+            deadline_seconds: float = 300.0,
+            expected_materials: Mapping[str, str] | None = None,
+        ):
+            if not getattr(indep_first_per_thread, "synced", False):
+                indep_first_per_thread.synced = True
+                barrier.wait()
+            return indep_delegate.build(
+                version,
+                compile_args=compile_args,
+                deadline_seconds=deadline_seconds,
+                expected_materials=expected_materials,
+            )
+
+        def replay(
+            self,
+            version: str,
+            phase: str,
+            *,
+            timeout_seconds: float = 10.0,
+            deadline_seconds: float | None = None,
+            expected_artifact_digest: str | None = None,
+            expected_input_digest: str | None = None,
+        ):
+            return indep_delegate.replay(
+                version,
+                phase,
+                timeout_seconds=timeout_seconds,
+                deadline_seconds=deadline_seconds,
+                expected_artifact_digest=expected_artifact_digest,
+                expected_input_digest=expected_input_digest,
+            )
+
+    indep_runner = runner_cls(
+        sandbox=_IndependentFamiliesBarrierSandbox(),
+        clock=indep_clock,
+        review_gate=FakeReviewGate(clock=indep_clock, decision="approve"),
+        envelope_policy=FakeEnvelopePolicy(clock=indep_clock, default_admit=True),
+    )
+    indep_errors: list[BaseException] = []
+
+    def _run_independent(fam_id: str) -> None:
+        try:
+            indep_runner.run_child(
+                job_id=str(uuid4()),
+                family_id=fam_id,
+                job_kind="round",
+                round_no=1,
+                is_first_plan=True,
+            )
+        except BaseException as exc:  # noqa: BLE001
+            indep_errors.append(exc)
+
+    fam_a, fam_b = str(uuid4()), str(uuid4())
+    ta = threading.Thread(target=_run_independent, args=(fam_a,))
+    tb = threading.Thread(target=_run_independent, args=(fam_b,))
+    ta.start()
+    tb.start()
+    ta.join(timeout=5.0)
+    tb.join(timeout=5.0)
+    assert not indep_errors, (
+        f"independent family_ids failed to run concurrently: {indep_errors!r}"
+    )
+    assert indep_runner.max_concurrent_children(fam_a) == 1
+    assert indep_runner.max_concurrent_children(fam_b) == 1

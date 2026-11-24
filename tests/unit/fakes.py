@@ -14,6 +14,7 @@ from datetime import datetime, timedelta, timezone
 import hashlib
 import math
 from pathlib import Path
+import threading
 from typing import Any, Mapping, Sequence
 
 import psycopg
@@ -81,26 +82,32 @@ class FakeClock:
             start = start.replace(tzinfo=timezone.utc)
         self._now = start.astimezone(timezone.utc)
         self._monotonic = 0.0
+        self._lock = threading.Lock()
 
     def now(self) -> datetime:
-        return self._now
+        with self._lock:
+            return self._now
 
     def monotonic(self) -> float:
-        return self._monotonic
+        with self._lock:
+            return self._monotonic
 
     def advance(self, seconds: float | int) -> datetime:
         if isinstance(seconds, bool) or not isinstance(seconds, (int, float)):
             raise ValueError("seconds must be a finite non-negative number")
         if not math.isfinite(seconds) or seconds < 0:
             raise ValueError("seconds must be a finite non-negative number")
-        self._now = self._now + timedelta(seconds=float(seconds))
-        self._monotonic += float(seconds)
-        return self._now
+        with self._lock:
+            self._now = self._now + timedelta(seconds=float(seconds))
+            self._monotonic += float(seconds)
+            return self._now
 
     def timestamp(self, *, microseconds: bool = False) -> str:
+        with self._lock:
+            current = self._now
         if microseconds:
-            return self._now.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
-        return self._now.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+            return current.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+        return current.replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
 @dataclass(frozen=True)
@@ -161,6 +168,7 @@ class FakeSandbox:
         self._probe_faults: deque[str] = deque()
         self.inject_probe_faults(probe_faults)
 
+        self._lock = threading.Lock()
         self.calls: list[SandboxCall] = []
         self._seq = 0
 
@@ -203,8 +211,13 @@ class FakeSandbox:
         return self.provenance_faces.get(version)
 
     def _next_container(self, suffix: str) -> tuple[int, str]:
-        self._seq += 1
-        return self._seq, f"fake-datacon-{suffix}-{self._seq:03d}"
+        with self._lock:
+            self._seq += 1
+            return self._seq, f"fake-datacon-{suffix}-{self._seq:03d}"
+
+    def _pop_fault(self, queue: deque[str]) -> str | None:
+        with self._lock:
+            return queue.popleft() if queue else None
 
     def _record(
         self,
@@ -219,20 +232,20 @@ class FakeSandbox:
         fault: str | None,
         outcome_status: str,
     ) -> None:
-        self.calls.append(
-            SandboxCall(
-                seq=seq,
-                operation=operation,
-                version=version,
-                phase=phase,
-                input_digest=input_digest,
-                compile_args=compile_args,
-                container_name=container_name,
-                timestamp=self.clock.timestamp(),
-                fault_injected=fault,
-                outcome_status=outcome_status,
-            )
+        call = SandboxCall(
+            seq=seq,
+            operation=operation,
+            version=version,
+            phase=phase,
+            input_digest=input_digest,
+            compile_args=compile_args,
+            container_name=container_name,
+            timestamp=self.clock.timestamp(),
+            fault_injected=fault,
+            outcome_status=outcome_status,
         )
+        with self._lock:
+            self.calls.append(call)
 
     def _maybe_raise_exception_fault(self, fault: str | None) -> None:
         if fault == "container_start_error":
@@ -248,7 +261,7 @@ class FakeSandbox:
 
     def probe(self, *, deadline_seconds: float = 120.0) -> ProbeReport:
         seq, container = self._next_container("probe")
-        fault = self._probe_faults.popleft() if self._probe_faults else None
+        fault = self._pop_fault(self._probe_faults)
         if fault in (
             "container_start_error",
             "lease_expired",
@@ -337,7 +350,7 @@ class FakeSandbox:
             if expected_materials is not None
             else _sha256_digest(f"{materials_dir}:{version}".encode("utf-8"))
         )
-        fault = self._build_faults.popleft() if self._build_faults else None
+        fault = self._pop_fault(self._build_faults)
         if fault in (
             "container_start_error",
             "lease_expired",
@@ -474,7 +487,7 @@ class FakeSandbox:
         input_digest = expected_input_digest or _sha256_digest(
             f"{input_path}:{version}:{phase}".encode("utf-8")
         )
-        fault = self._replay_faults.popleft() if self._replay_faults else None
+        fault = self._pop_fault(self._replay_faults)
         if fault in (
             "container_start_error",
             "lease_expired",
