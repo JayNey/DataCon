@@ -1967,6 +1967,8 @@ def test_blocked_reason_set_stays_closed():
     assert reason_allowed("BLOCKED", "MATERIAL_IO_ERROR")
     assert not reason_allowed("BLOCKED", "NOT_A_REAL_REASON")
     assert not reason_allowed("FAILED", "MATERIAL_IO_ERROR")
+    # v0.2-only terminal codes must not leak into the frozen v1 verifier.
+    assert not reason_allowed("BLOCKED", "ADMISSION_DENIED")
 
 
 def test_truncated_replay_log_still_must_match_its_output_digests(tmp_path):
@@ -2892,6 +2894,84 @@ def _rewrite_manifest(root: Path, change) -> None:
     manifest = json.loads(path.read_text(encoding="utf-8"))
     change(manifest)
     path.write_text(json.dumps(manifest), encoding="utf-8")
+
+
+def test_v1_blocked_bundle_accepts_a_v1_reason(tmp_path):
+    info = make_blocked_bundle(tmp_path, reason="POLICY_DENIED")
+    verified = verify_bundle(info.root)
+    assert verified.manifest["schema_version"] == 1
+    assert verified.manifest["reason_code"] == "POLICY_DENIED"
+
+
+def test_v1_blocked_bundle_rejects_a_v02_only_reason(tmp_path):
+    # Build a byte-consistent v1 bundle first, then rewrite every reason-bearing
+    # document and digest. The only remaining reason to reject is the closed
+    # reason set, so this is the same-bytes regression for the v1 freeze.
+    info = make_blocked_bundle(tmp_path, reason="POLICY_DENIED")
+    _set_verdict(info.root, "BLOCKED", "ADMISSION_DENIED")
+
+    with pytest.raises(BundleError) as caught:
+        verify_bundle(info.root)
+    assert caught.value.reason_code == "INVALID_MANIFEST"
+    assert "ADMISSION_DENIED" in caught.value.message
+    assert "not allowed for BLOCKED" in caught.value.message
+
+
+def test_v1_inconclusive_bundle_rejects_budget_exhausted(tmp_path):
+    info = make_bundle(tmp_path, name="v1-budget")
+    _set_verdict(info.root, "INCONCLUSIVE", "BUDGET_EXHAUSTED")
+
+    with pytest.raises(BundleError) as caught:
+        verify_bundle(info.root)
+    assert caught.value.reason_code == "INVALID_MANIFEST"
+    assert "BUDGET_EXHAUSTED" in caught.value.message
+
+
+def test_archive_blocked_dispatches_the_reason_set_by_job_version(
+    tmp_path, monkeypatch
+):
+    from datacon import execution
+
+    evidence_root = tmp_path / "evidence"
+    monkeypatch.setenv("DATACON_EVIDENCE_ROOT", str(evidence_root))
+    base_job = {
+        "job_id": JOB_ID,
+        "request": {
+            "schema_version": 2,
+            "cve_id": PLAN["cve_id"],
+            "target": {
+                "kind": "source",
+                "case_id": PLAN["case_id"],
+                "goal": "archive reason dispatch",
+            },
+            "limits": dict(PLAN["limits"]),
+        },
+    }
+
+    v1_job = dict(base_job, job_contract_version=1)
+    digest, path, error = execution.archive_blocked(
+        v1_job,
+        generation=1,
+        reason_code="ADMISSION_DENIED",
+        message="v1 job must not archive a v0.2-only reason",
+    )
+    assert (digest, path) == (None, None)
+    assert error is not None and "ADMISSION_DENIED" in error
+    assert not evidence_root.exists(), "the rejected v1 job created evidence"
+
+    v2_job = dict(base_job, job_contract_version=2)
+    digest, path, error = execution.archive_blocked(
+        v2_job,
+        generation=1,
+        reason_code="ADMISSION_DENIED",
+        message="v2 job may archive a v0.2 reason",
+    )
+    assert error is None, error
+    assert digest is not None and path is not None
+    verified = verify_bundle(path)
+    assert verified.manifest["schema_version"] == 2
+    assert verified.manifest["bundle_kind"] == "blocked"
+    assert verified.manifest["reason_code"] == "ADMISSION_DENIED"
 
 
 def test_blocked_bundle_accepts_plan_and_approved_review(tmp_path):

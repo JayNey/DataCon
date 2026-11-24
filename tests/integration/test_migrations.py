@@ -1,3 +1,5 @@
+import json
+from hashlib import sha256
 from pathlib import Path
 from uuid import uuid4
 
@@ -5,6 +7,8 @@ import psycopg
 import pytest
 from psycopg import sql
 from psycopg.types.json import Jsonb
+
+from datacon import evidence, release
 
 pytestmark = pytest.mark.postgres
 
@@ -149,3 +153,504 @@ def test_migration_can_be_applied_repeatedly(database, postgres_dsn):
         ).fetchone() == ("text", "YES")
     finally:
         database.execute("DELETE FROM jobs WHERE job_id = %s", (sentinel_id,))
+
+
+# --- T10: jobs v2 identity, migration registration and COMPLETED evidence ---
+
+
+def _insert_identity_job(
+    database,
+    job_id,
+    *,
+    job_contract_version=2,
+    job_kind="round",
+    family_id=None,
+    parent_job_id=None,
+    round_no=1,
+    state_name="QUEUED",
+):
+    database.connection.execute(
+        "INSERT INTO jobs (job_id, request, state, submitted_at, "
+        "job_contract_version, family_id, job_kind, parent_job_id, round_no) "
+        "VALUES (%s, %s, %s, clock_timestamp(), %s, %s, %s, %s, %s)",
+        (
+            job_id,
+            Jsonb({"schema_version": 2}),
+            state_name,
+            job_contract_version,
+            family_id,
+            job_kind,
+            parent_job_id,
+            round_no,
+        ),
+    )
+
+
+def _insert_family(database):
+    family_id = uuid4()
+    _insert_identity_job(
+        database,
+        family_id,
+        job_kind="family",
+        family_id=family_id,
+        parent_job_id=None,
+        round_no=None,
+        state_name="AGGREGATING",
+    )
+    return family_id
+
+
+def test_jobs_parent_round_unique_rejects_duplicate(isolated_database):
+    family_id = _insert_family(isolated_database)
+    round_one = uuid4()
+    _insert_identity_job(
+        isolated_database,
+        round_one,
+        job_kind="round",
+        family_id=family_id,
+        parent_job_id=family_id,
+        round_no=1,
+    )
+    with pytest.raises(
+        psycopg.errors.UniqueViolation, match="jobs_parent_round_key"
+    ):
+        _insert_identity_job(
+            isolated_database,
+            uuid4(),
+            job_kind="round",
+            family_id=family_id,
+            parent_job_id=family_id,
+            round_no=1,
+        )
+
+
+def test_jobs_parent_round_checks_reject_half_null(isolated_database):
+    family_id = _insert_family(isolated_database)
+    half_null_rows = [
+        # round with no round_no
+        dict(
+            job_kind="round",
+            family_id=family_id,
+            parent_job_id=family_id,
+            round_no=None,
+        ),
+        # round with no parent
+        dict(
+            job_kind="round",
+            family_id=None,
+            parent_job_id=None,
+            round_no=1,
+        ),
+        # v1 row carrying a v2 identity column
+        dict(
+            job_contract_version=1,
+            job_kind=None,
+            family_id=family_id,
+            parent_job_id=None,
+            round_no=None,
+        ),
+    ]
+    for fields in half_null_rows:
+        with pytest.raises(psycopg.errors.CheckViolation, match="jobs_"):
+            _insert_identity_job(isolated_database, uuid4(), **fields)
+
+
+def test_jobs_round_no_rejects_zero(isolated_database):
+    family_id = _insert_family(isolated_database)
+    with pytest.raises(psycopg.errors.CheckViolation, match="jobs_"):
+        _insert_identity_job(
+            isolated_database,
+            uuid4(),
+            job_kind="round",
+            family_id=family_id,
+            parent_job_id=family_id,
+            round_no=0,
+        )
+
+
+def test_jobs_v2_identity_columns_cannot_all_be_null(isolated_database):
+    with pytest.raises(psycopg.errors.CheckViolation, match="jobs_"):
+        _insert_identity_job(
+            isolated_database,
+            uuid4(),
+            job_contract_version=2,
+            job_kind=None,
+            family_id=None,
+            parent_job_id=None,
+            round_no=None,
+        )
+
+
+def test_jobs_rejects_self_parent(isolated_database):
+    job_id = uuid4()
+    with pytest.raises(psycopg.errors.CheckViolation, match="jobs_"):
+        _insert_identity_job(
+            isolated_database,
+            job_id,
+            job_kind="round",
+            family_id=job_id,
+            parent_job_id=job_id,
+            round_no=1,
+        )
+
+
+def test_new_migration_sequence_register_rollback_compatibility(isolated_database):
+    migrations = sorted((ROOT / "migrations").glob("*.sql"))
+    new_migrations = [
+        migration for migration in migrations if int(migration.name[:3]) >= 10
+    ]
+    assert new_migrations, "migration 010 missing from rollback allowlist"
+
+    registry = dict(release.ROLLBACK_COMPATIBLE_MIGRATIONS)
+    for migration in new_migrations:
+        expected = "sha256:" + sha256(migration.read_bytes()).hexdigest()
+        assert migration.name in registry, (
+            f"migration {migration.name} missing from rollback allowlist"
+        )
+        assert registry[migration.name] == expected, (
+            f"migration {migration.name} rollback digest is not the reviewed file"
+        )
+        assert migration.name[:3] != "009"
+
+    # Every migration is re-runnable; applying the whole sequence again must not
+    # change the ledger or fail on an existing constraint.
+    connection = isolated_database.connection
+    for migration in migrations:
+        connection.execute(migration.read_text(encoding="utf-8"))
+    for migration in migrations:
+        connection.execute(migration.read_text(encoding="utf-8"))
+    applied = connection.execute("SELECT count(*) FROM schema_migrations").fetchone()[0]
+    assert applied == len(migrations)
+
+
+def test_family_completed_satisfies_archived_evidence_check(
+    isolated_database, tmp_path
+):
+    family_id = uuid4()
+    family_json = tmp_path / "family.json"
+    family_json.write_text('{"kind":"family_index","rounds":[]}', encoding="utf-8")
+    digest = "sha256:" + "a" * 64
+    isolated_database.connection.execute(
+        "INSERT INTO jobs (job_id, request, state, stage, submitted_at, verdict, "
+        "reason_code, evidence_status, evidence_path, evidence_digest, "
+        "job_contract_version, family_id, job_kind) "
+        "VALUES (%s, %s, 'COMPLETED', 'done', clock_timestamp(), NULL, NULL, "
+        "'archived', %s, %s, 2, %s, 'family')",
+        (
+            family_id,
+            Jsonb({"schema_version": 2}),
+            str(family_json),
+            digest,
+            family_id,
+        ),
+    )
+    row = isolated_database.connection.execute(
+        "SELECT state, verdict, reason_code, evidence_status, evidence_path "
+        "FROM jobs WHERE job_id = %s",
+        (family_id,),
+    ).fetchone()
+    assert row == (
+        "COMPLETED",
+        None,
+        None,
+        "archived",
+        str(family_json),
+    )
+
+    with pytest.raises(
+        psycopg.errors.CheckViolation, match="jobs_archived_evidence_check"
+    ):
+        isolated_database.connection.execute(
+            "INSERT INTO jobs (job_id, request, state, submitted_at, verdict, "
+            "reason_code, evidence_status, evidence_path, evidence_digest, "
+            "job_contract_version, family_id, job_kind) "
+            "VALUES (%s, %s, 'COMPLETED', clock_timestamp(), NULL, NULL, "
+            "'archived', NULL, %s, 2, %s, 'family')",
+            (uuid4(), Jsonb({"schema_version": 2}), digest, uuid4()),
+        )
+
+    manifest_dir = tmp_path / "family-bundle"
+    manifest_dir.mkdir()
+    (manifest_dir / "manifest.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "bundle_kind": "family",
+                "job_id": str(uuid4()),
+                "plan_digest": None,
+                "verdict": None,
+                "reason_code": None,
+                "files": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(evidence.BundleError, match="bundle_kind"):
+        evidence.verify_bundle(manifest_dir)
+
+
+def test_jobs_parent_job_id_must_be_v2_family(isolated_database):
+    family_id = _insert_family(isolated_database)
+
+    v1_parent = uuid4()
+    _insert_identity_job(
+        isolated_database,
+        v1_parent,
+        job_contract_version=1,
+        job_kind=None,
+        family_id=None,
+        parent_job_id=None,
+        round_no=None,
+    )
+    with pytest.raises(psycopg.errors.CheckViolation, match="jobs_parent"):
+        _insert_identity_job(
+            isolated_database,
+            uuid4(),
+            job_kind="round",
+            family_id=v1_parent,
+            parent_job_id=v1_parent,
+            round_no=1,
+        )
+
+    campaign_id = uuid4()
+    _insert_identity_job(
+        isolated_database,
+        campaign_id,
+        job_kind="campaign",
+        family_id=family_id,
+        parent_job_id=family_id,
+        round_no=None,
+    )
+    with pytest.raises(psycopg.errors.CheckViolation, match="jobs_parent"):
+        _insert_identity_job(
+            isolated_database,
+            uuid4(),
+            job_kind="round",
+            family_id=campaign_id,
+            parent_job_id=campaign_id,
+            round_no=1,
+        )
+
+    round_one = uuid4()
+    _insert_identity_job(
+        isolated_database,
+        round_one,
+        job_kind="round",
+        family_id=family_id,
+        parent_job_id=family_id,
+        round_no=1,
+    )
+    with pytest.raises(psycopg.errors.CheckViolation, match="jobs_parent"):
+        _insert_identity_job(
+            isolated_database,
+            uuid4(),
+            job_kind="round",
+            family_id=round_one,
+            parent_job_id=round_one,
+            round_no=2,
+        )
+
+    accepted = uuid4()
+    _insert_identity_job(
+        isolated_database,
+        accepted,
+        job_kind="round",
+        family_id=family_id,
+        parent_job_id=family_id,
+        round_no=2,
+    )
+    assert isolated_database.connection.execute(
+        "SELECT parent_job_id FROM jobs WHERE job_id = %s", (accepted,)
+    ).fetchone()[0] == family_id
+
+
+def test_jobs_parent_guard_rejects_update_to_non_family(isolated_database):
+    family_id = _insert_family(isolated_database)
+    campaign_id = uuid4()
+    _insert_identity_job(
+        isolated_database,
+        campaign_id,
+        job_kind="campaign",
+        family_id=family_id,
+        parent_job_id=family_id,
+        round_no=None,
+    )
+    round_id = uuid4()
+    _insert_identity_job(
+        isolated_database,
+        round_id,
+        job_kind="round",
+        family_id=family_id,
+        parent_job_id=family_id,
+        round_no=1,
+    )
+
+    with pytest.raises(psycopg.errors.CheckViolation, match="jobs_parent"):
+        isolated_database.connection.execute(
+            "UPDATE jobs SET parent_job_id = %s, family_id = %s "
+            "WHERE job_id = %s",
+            (campaign_id, campaign_id, round_id),
+        )
+
+
+def test_jobs_family_campaign_key_rejects_second_campaign(isolated_database):
+    family_id = _insert_family(isolated_database)
+    _insert_identity_job(
+        isolated_database,
+        uuid4(),
+        job_kind="campaign",
+        family_id=family_id,
+        parent_job_id=family_id,
+        round_no=None,
+    )
+    with pytest.raises(
+        psycopg.errors.UniqueViolation, match="jobs_family_campaign_key"
+    ):
+        _insert_identity_job(
+            isolated_database,
+            uuid4(),
+            job_kind="campaign",
+            family_id=family_id,
+            parent_job_id=family_id,
+            round_no=None,
+        )
+
+
+# --- 012: demoting a family parent with live children ----------------------
+
+
+def test_family_parent_cannot_be_demoted_with_live_child(isolated_database):
+    family_id = _insert_family(isolated_database)
+    child_id = uuid4()
+    _insert_identity_job(
+        isolated_database,
+        child_id,
+        job_kind="round",
+        family_id=family_id,
+        parent_job_id=family_id,
+        round_no=1,
+    )
+
+    with pytest.raises(psycopg.errors.CheckViolation, match="parent_demot"):
+        isolated_database.connection.execute(
+            "UPDATE jobs SET job_contract_version = 1, family_id = NULL, "
+            "job_kind = NULL, parent_job_id = NULL, round_no = NULL "
+            "WHERE job_id = %s",
+            (family_id,),
+        )
+
+    assert isolated_database.connection.execute(
+        "SELECT job_contract_version, job_kind, family_id FROM jobs "
+        "WHERE job_id = %s",
+        (family_id,),
+    ).fetchone() == (2, "family", family_id)
+    assert isolated_database.connection.execute(
+        "SELECT parent_job_id FROM jobs WHERE job_id = %s",
+        (child_id,),
+    ).fetchone()[0] == family_id, "the demotion attempt rewrote the child parent"
+
+
+def test_family_parent_can_be_demoted_without_children(isolated_database):
+    family_id = _insert_family(isolated_database)
+
+    isolated_database.connection.execute(
+        "UPDATE jobs SET job_contract_version = 1, family_id = NULL, "
+        "job_kind = NULL, parent_job_id = NULL, round_no = NULL "
+        "WHERE job_id = %s",
+        (family_id,),
+    )
+
+    assert isolated_database.connection.execute(
+        "SELECT job_contract_version, job_kind, family_id, parent_job_id, "
+        "round_no FROM jobs WHERE job_id = %s",
+        (family_id,),
+    ).fetchone() == (1, None, None, None, None)
+
+
+# --- 013: a child may only be inserted under an AGGREGATING family ---------
+
+
+MIGRATION_013 = ROOT / "migrations" / "013_v2_child_insert_parent_state_guard.sql"
+
+
+def test_013_parent_state_guard_is_reentrant_and_registered(isolated_database):
+    sql = MIGRATION_013.read_text(encoding="utf-8")
+    isolated_database.connection.execute(sql)
+    isolated_database.connection.execute(sql)
+
+    expected = "sha256:" + sha256(MIGRATION_013.read_bytes()).hexdigest()
+    assert release.ROLLBACK_COMPATIBLE_MIGRATIONS[MIGRATION_013.name] == expected
+
+    family_id = _insert_family(isolated_database)
+    first_child = uuid4()
+    _insert_identity_job(
+        isolated_database,
+        first_child,
+        job_kind="round",
+        family_id=family_id,
+        parent_job_id=family_id,
+        round_no=1,
+    )
+    isolated_database.connection.execute(
+        "UPDATE jobs SET state = 'COMPLETED', stage = 'done' WHERE job_id = %s",
+        (family_id,),
+    )
+
+    with pytest.raises(psycopg.errors.CheckViolation, match="aggregating_family"):
+        _insert_identity_job(
+            isolated_database,
+            uuid4(),
+            job_kind="round",
+            family_id=family_id,
+            parent_job_id=family_id,
+            round_no=2,
+        )
+
+    other_family = _insert_family(isolated_database)
+    other_child = uuid4()
+    _insert_identity_job(
+        isolated_database,
+        other_child,
+        job_kind="round",
+        family_id=other_family,
+        parent_job_id=other_family,
+        round_no=1,
+    )
+    with pytest.raises(psycopg.errors.CheckViolation, match="aggregating_family"):
+        isolated_database.connection.execute(
+            "UPDATE jobs SET parent_job_id = %s, family_id = %s WHERE job_id = %s",
+            (family_id, family_id, other_child),
+        )
+
+
+def test_rollback_gate_fails_closed_when_013_is_not_registered(
+    isolated_database, monkeypatch
+):
+    from types import MappingProxyType
+
+    import datacon.release as release_module
+
+    migrations = sorted((ROOT / "migrations").glob("*.sql"))
+    applied = {
+        migration.name: "sha256:" + sha256(migration.read_bytes()).hexdigest()
+        for migration in migrations
+    }
+    registry = {
+        name: digest
+        for name, digest in release_module.ROLLBACK_COMPATIBLE_MIGRATIONS.items()
+        if not name.startswith("013_")
+    }
+    monkeypatch.setattr(
+        release_module,
+        "ROLLBACK_COMPATIBLE_MIGRATIONS",
+        MappingProxyType(registry),
+    )
+    with pytest.raises(
+        release.ReleaseGateError,
+        match="without a declared.*013_v2_child_insert_parent_state_guard",
+    ):
+        release_module._verify_rollback_migrations(
+            target_version="009_b03_acceptance.sql",
+            current_version=migrations[-1].name,
+            applied=applied,
+        )

@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import errno
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import stat
 
 
@@ -70,7 +70,12 @@ def _relative_name(path: Path | str) -> str:
     return target.name
 
 
-def read_regular_file_bounded(path: Path | str, *, max_bytes: int) -> bytes:
+def read_regular_file_bounded(
+    path: Path | str,
+    *,
+    max_bytes: int,
+    dir_fd: int | None = None,
+) -> bytes:
     """Return a regular file's bytes without following symlinks or blocking.
 
     ``O_NONBLOCK`` makes a FIFO return immediately; ``fstat`` then rejects it
@@ -81,7 +86,7 @@ def read_regular_file_bounded(path: Path | str, *, max_bytes: int) -> bytes:
         os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
     )
     try:
-        descriptor = os.open(path, flags)
+        descriptor = os.open(path, flags, dir_fd=dir_fd)
     except OSError as error:
         if error.errno == errno.ELOOP:
             raise UnsafeFileError(
@@ -138,6 +143,76 @@ def read_regular_file_bounded(path: Path | str, *, max_bytes: int) -> bytes:
         return data
     finally:
         os.close(descriptor)
+
+
+def _is_symlink_component(
+    name: Path | str, *, dir_fd: int | None = None
+) -> bool:
+    try:
+        info = os.lstat(name, dir_fd=dir_fd)
+    except OSError:
+        return False
+    return stat.S_ISLNK(info.st_mode)
+
+
+def read_regular_file_under_root_bounded(
+    root: Path | str,
+    relative_path: str,
+    *,
+    max_bytes: int,
+) -> bytes:
+    """Read a regular file under ``root``, rejecting symlinks at every segment.
+
+    ``O_NOFOLLOW`` on a multi-segment path only guards the leaf component. This
+    helper walks each directory component from ``root`` with
+    ``O_RDONLY|O_DIRECTORY|O_NOFOLLOW`` relative to the previous directory
+    descriptor, and finally opens the leaf relative to its parent descriptor.
+    """
+    pure = PurePosixPath(relative_path)
+    parts = pure.parts
+    if pure.is_absolute() or not parts or any(
+        part in ("", ".", "..") for part in parts
+    ):
+        raise UnsafeFileError(
+            "UNSAFE_PATH", f"relative path is unsafe: {relative_path}"
+        )
+    dir_flags = _final_flags(os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        current_fd = os.open(root, dir_flags)
+    except OSError as error:
+        if error.errno == errno.ELOOP or (
+            error.errno == errno.ENOTDIR and _is_symlink_component(root)
+        ):
+            raise UnsafeFileError(
+                "SYMLINK", f"root path is a symlink: {root}"
+            ) from error
+        raise UnsafeFileError(
+            "UNREADABLE", f"root directory is not readable: {error}"
+        ) from error
+    try:
+        for part in parts[:-1]:
+            try:
+                next_fd = os.open(part, dir_flags, dir_fd=current_fd)
+            except OSError as error:
+                if error.errno == errno.ELOOP or (
+                    error.errno == errno.ENOTDIR
+                    and _is_symlink_component(part, dir_fd=current_fd)
+                ):
+                    raise UnsafeFileError(
+                        "SYMLINK",
+                        f"path traverses a symlink: {relative_path}",
+                    ) from error
+                raise UnsafeFileError(
+                    "UNREADABLE",
+                    f"directory component is not readable: {error}",
+                ) from error
+            os.close(current_fd)
+            current_fd = next_fd
+        return read_regular_file_bounded(
+            parts[-1], max_bytes=max_bytes, dir_fd=current_fd
+        )
+    finally:
+        os.close(current_fd)
 
 
 def _make_owner_writable(

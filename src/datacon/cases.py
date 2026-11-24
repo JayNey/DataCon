@@ -337,6 +337,78 @@ class CaseRegistry:
             advisory=entry["advisory"],
         )
 
+    def exploration_ceilings(self, case_id: str) -> dict[str, Any]:
+        """Return the registered exploration ceiling block for ``case_id``.
+
+        A registry may declare a top-level ``exploration_ceilings`` object. The
+        only irreducible ceiling is the case's approved ASan signature: a
+        proposed envelope can never admit a signature the case did not
+        approve. Other fields (mutation families, ``mutation_limits``, round
+        and budget ceilings) tighten the request only when the registry
+        declares them.
+        """
+        definition = self.case(case_id)
+        declared = self.document.get("exploration_ceilings")
+        block: Any = None
+        if declared is not None and not isinstance(declared, dict):
+            raise CaseConfigurationError(
+                "MATERIAL_MISSING",
+                "case registry exploration_ceilings must be an object",
+            )
+        if isinstance(declared, dict):
+            block = declared.get(case_id)
+        if block is None:
+            return {
+                "accepted_signature_set": [
+                    dict(definition.manifest["asan_signature"])
+                ]
+            }
+        if not isinstance(block, dict):
+            raise CaseConfigurationError(
+                "MATERIAL_MISSING",
+                f"case registry exploration_ceilings[{case_id}] must be an object",
+            )
+        ceilings = dict(block)
+        ceilings.setdefault(
+            "accepted_signature_set",
+            [dict(definition.manifest["asan_signature"])],
+        )
+        families = ceilings.get("allowed_mutation_families")
+        if families is not None and (
+            not isinstance(families, list)
+            or any(not isinstance(item, str) for item in families)
+        ):
+            raise CaseConfigurationError(
+                "MATERIAL_MISSING",
+                "case registry allowed_mutation_families must be a string array",
+            )
+        limits = ceilings.get("mutation_limits")
+        if limits is not None:
+            ops = limits.get("allowed_ops") if isinstance(limits, dict) else None
+            if (
+                not isinstance(limits, dict)
+                or not isinstance(ops, list)
+                or any(not isinstance(item, str) for item in ops)
+                or type(limits.get("max_input_bytes")) is not int
+                or limits["max_input_bytes"] < 0
+            ):
+                raise CaseConfigurationError(
+                    "MATERIAL_MISSING",
+                    "case registry mutation_limits is invalid",
+                )
+        for field in ("max_rounds", "max_total_seconds", "max_fuzz_seconds"):
+            amount = ceilings.get(field)
+            if amount is not None and (type(amount) is not int or amount < 0):
+                raise CaseConfigurationError(
+                    "MATERIAL_MISSING",
+                    f"case registry {field} must be a non-negative integer",
+                )
+        if ceilings.get("max_rounds") == 0:
+            raise CaseConfigurationError(
+                "MATERIAL_MISSING", "case registry max_rounds must be positive"
+            )
+        return ceilings
+
     def cves(self) -> dict[str, str]:
         return {
             case_id: entry["cve_id"]

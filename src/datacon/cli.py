@@ -54,9 +54,21 @@ def _parser() -> argparse.ArgumentParser:
     status = commands.add_parser("status", help="look up one job")
     status.add_argument("job_id")
 
+    propose = commands.add_parser(
+        "propose-envelope",
+        help="propose a changed family envelope for human re-approval",
+    )
+    propose.add_argument("family_id")
+    propose.add_argument("--request", required=True, type=Path)
+
     review = commands.add_parser("review", help="record an operator review decision")
     review.add_argument("job_id")
     review.add_argument("--plan-digest", required=True)
+    review.add_argument(
+        "--envelope-digest",
+        default=None,
+        help="v2 family envelope digest (sha256)",
+    )
     review.add_argument("--decision", required=True, choices=("approve", "reject"))
 
     worker = commands.add_parser("worker", help="claim and advance queued jobs")
@@ -188,12 +200,45 @@ def _status(args) -> int:
     return 0
 
 
+def _propose_envelope(args) -> int:
+    family_id = _parse_job_id(args.family_id)
+    if family_id is None:
+        return _error(2, "INVALID_REQUEST", "family_id must be a UUID")
+    try:
+        size = args.request.stat().st_size
+        if size > MAX_REQUEST_BYTES:
+            raise ValueError(f"envelope payload exceeds {MAX_REQUEST_BYTES} bytes")
+        envelope = jsonutil.loads_strict(
+            args.request.read_text(encoding="utf-8")
+        )
+        operator = _operator_id()
+    except (jsonutil.StrictJsonError, UnicodeError, OSError, ValueError) as error:
+        return _error(2, "INVALID_REQUEST", f"cannot read envelope: {error}")
+    dsn = _database_url()
+    if not dsn:
+        return _error(1, "DATABASE_NOT_CONFIGURED", "set DATACON_DATABASE_URL")
+    try:
+        result = state.propose_envelope(
+            dsn, family_id, envelope, operator_id=operator
+        )
+    except psycopg.Error as error:
+        return _error(1, "DATABASE_ERROR", _database_error_message(error))
+    except state.StateError as error:
+        return _error(3, "STATE_ERROR", str(error))
+    print(json.dumps(result, ensure_ascii=False))
+    return 0
+
+
 def _review(args) -> int:
     job_id = _parse_job_id(args.job_id)
     if job_id is None:
         return _error(2, "INVALID_REQUEST", "job_id must be a UUID")
     if not _DIGEST.fullmatch(args.plan_digest):
         return _error(2, "INVALID_REQUEST", "plan_digest must be a sha256 digest")
+    if args.envelope_digest is not None and not _DIGEST.fullmatch(
+        args.envelope_digest
+    ):
+        return _error(2, "INVALID_REQUEST", "envelope_digest must be a sha256 digest")
     try:
         operator = _operator_id()
     except ValueError as error:
@@ -208,6 +253,7 @@ def _review(args) -> int:
             plan_digest=args.plan_digest,
             decision=args.decision,
             reviewer_id=operator,
+            envelope_digest=args.envelope_digest,
         )
     except psycopg.Error as error:
         return _error(1, "DATABASE_ERROR", _database_error_message(error))
@@ -460,6 +506,8 @@ def main(argv: list[str] | None = None) -> int:
         return _submit(args)
     if args.command == "status":
         return _status(args)
+    if args.command == "propose-envelope":
+        return _propose_envelope(args)
     if args.command == "review":
         return _review(args)
     if args.command == "worker":

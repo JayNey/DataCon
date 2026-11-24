@@ -1070,6 +1070,14 @@ def test_review_rejection_archives_exportable_blocked_bundle(
     )
     assert current["reason_code"] == "REVIEW_REJECTED"
     assert manifest["plan_digest"] == digest
+    # v1 control: the same archiver must keep writing the frozen v1 report
+    # shape. A v1 report has schema_version 1 and no ``bundle_kind``.
+    assert manifest["schema_version"] == 1
+    report_doc = json.loads(
+        (tmp_path / "exported" / "report.json").read_text(encoding="utf-8")
+    )
+    assert report_doc["schema_version"] == 1
+    assert "bundle_kind" not in report_doc
     paths = {entry["path"] for entry in manifest["files"]}
     assert {"plan.json", "review.json"} <= paths
     review_doc = json.loads(

@@ -61,5 +61,33 @@
         "digest": "sha256:0ae4a1322297c7416970967cc3e6e511b1019341068dd21c448b120854adaf91"
       }
     }
+  },
+  "exploration_ceilings": {
+    "fixture-c-parser": {
+      "allowed_mutation_families": [
+        "byte_flip",
+        "length_boundary"
+      ],
+      "mutation_limits": {
+        "allowed_ops": [
+          "append",
+          "truncate",
+          "byte_flip"
+        ],
+        "max_input_bytes": 4096
+      },
+      "accepted_signature_set": [
+        {
+          "error": "heap-buffer-overflow",
+          "function": "parse_token",
+          "source": "parser.c",
+          "operation": "WRITE",
+          "access_size": 1
+        }
+      ],
+      "max_rounds": 8,
+      "max_total_seconds": 900,
+      "max_fuzz_seconds": 300
+    }
   }
 }

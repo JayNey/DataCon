@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import hashlib
 import json
 import re
+import uuid
 from collections.abc import Mapping
 from typing import Any
 
@@ -12,6 +14,7 @@ from datacon import cases as case_registry
 from datacon import jsonutil
 
 SCHEMA_VERSION = 1
+SCHEMA_VERSION_V2 = 2
 MAX_REQUEST_BYTES = 64 * 1024
 
 DEFAULT_LIMITS: dict[str, int] = {
@@ -27,6 +30,10 @@ DEFAULT_LIMITS: dict[str, int] = {
 _CVE_ID = re.compile(r"CVE-[0-9]{4}-[0-9]{4,}")
 _SHA256 = re.compile(r"sha256:[0-9a-f]{64}")
 _GIT_OID = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
+_BUILD_REF = re.compile(
+    r"log/build:(vulnerable|fixed)#L([1-9][0-9]*)(?:-([1-9][0-9]*))?"
+)
+_FUZZ_REF = re.compile(r"log/fuzz:(0|[1-9][0-9]*)#L([1-9][0-9]*)")
 _TARGET_KEYS = frozenset({"kind", "case_id", "goal"})
 _PLAN_FIELDS = frozenset(
     {
@@ -53,6 +60,35 @@ _PLAN_FIELDS = frozenset(
         "policy_version",
     }
 )
+# The eleven fields Plan v2 adds on top of the frozen v1 twenty-one. The v1
+# set above stays untouched so v1 canonical bytes and digests do not move.
+_PLAN_V2_EXTRA = frozenset(
+    {
+        "schema_version",
+        "family_id",
+        "parent_job_id",
+        "round_no",
+        "parent_approval_digest",
+        "envelope_digest",
+        "build_ref",
+        "build_spec",
+        "compile_flags",
+        "experiment_digest",
+        "build_provenance_rules_version",
+    }
+)
+_EXPLORATION_FIELDS = frozenset(
+    {
+        "mode",
+        "allowed_mutation_families",
+        "max_rounds",
+        "max_total_seconds",
+        "max_fuzz_seconds",
+    }
+)
+# Case-specific exploration ceilings arrive with the admission predicate work;
+# this is only the conservative policy ceiling enforced at request parsing.
+MAX_EXPLORATION_ROUNDS = 1000
 _ANALYSIS_FIELDS = frozenset(
     {"diff_digest", "changed_paths", "symbols", "findings"}
 )
@@ -153,15 +189,130 @@ def _registered_cases() -> Mapping[str, str]:
         raise ValueError(f"case registry is unavailable: {error.message}") from error
 
 
-def _validate_request(request: Any) -> dict[str, Any]:
-    _object(
-        request,
-        required={"schema_version", "cve_id", "target"},
-        optional={"limits"},
+def _positive_int(value: Any, *, label: str, maximum: int) -> int:
+    if type(value) is not int or not 1 <= value <= maximum:
+        raise ValueError(f"{label} must be an integer between 1 and {maximum}")
+    return value
+
+
+def _exploration(value: Any, limits: Mapping[str, int]) -> dict[str, Any]:
+    """Validate the optional Request v2 exploration intent.
+
+    The request only declares intent; the case registry and human-approved
+    envelope tighten it later. T10 therefore validates shape, defaults and
+    budget ceilings, not case-specific mutation-family membership.
+    """
+    _object(value, required=set(), optional=set(_EXPLORATION_FIELDS))
+    mode = value.get("mode", "fixed")
+    if mode not in ("fixed", "guided"):
+        raise ValueError("exploration.mode must be fixed or guided")
+
+    if mode == "fixed":
+        families = value.get("allowed_mutation_families", [])
+        if not isinstance(families, list) or families:
+            raise ValueError(
+                "fixed exploration requires allowed_mutation_families to be empty"
+            )
+        max_rounds = value.get("max_rounds", 1)
+        if type(max_rounds) is not int or max_rounds != 1:
+            raise ValueError("fixed exploration requires max_rounds=1")
+        max_fuzz_seconds = value.get("max_fuzz_seconds", 0)
+        if type(max_fuzz_seconds) is not int or max_fuzz_seconds != 0:
+            raise ValueError("fixed exploration requires max_fuzz_seconds=0")
+        max_total_seconds = value.get(
+            "max_total_seconds", limits["execute_seconds"]
+        )
+        _positive_int(
+            max_total_seconds,
+            label="exploration.max_total_seconds",
+            maximum=limits["execute_seconds"],
+        )
+        return {
+            "mode": "fixed",
+            "allowed_mutation_families": [],
+            "max_rounds": 1,
+            "max_total_seconds": max_total_seconds,
+            "max_fuzz_seconds": 0,
+        }
+
+    families = value.get("allowed_mutation_families")
+    if not isinstance(families, list) or not families:
+        raise ValueError(
+            "guided exploration requires a non-empty allowed_mutation_families"
+        )
+    normalized_families = []
+    for family in families:
+        if not isinstance(family, str) or not family.strip():
+            raise ValueError("allowed_mutation_families must contain strings")
+        if "\x00" in family or any(character.isspace() for character in family):
+            raise ValueError(
+                "allowed_mutation_families must not contain whitespace or NUL"
+            )
+        family.encode("utf-8")
+        normalized_families.append(family)
+    normalized_families = sorted(set(normalized_families))
+
+    max_rounds = value.get("max_rounds")
+    _positive_int(
+        max_rounds,
+        label="exploration.max_rounds",
+        maximum=MAX_EXPLORATION_ROUNDS,
     )
+    max_total_seconds = value.get("max_total_seconds")
+    _positive_int(
+        max_total_seconds,
+        label="exploration.max_total_seconds",
+        maximum=limits["execute_seconds"],
+    )
+    max_fuzz_seconds = value.get("max_fuzz_seconds")
+    if (
+        type(max_fuzz_seconds) is not int
+        or not 0 <= max_fuzz_seconds <= max_total_seconds
+    ):
+        raise ValueError(
+            "exploration.max_fuzz_seconds must be an integer between 0 and "
+            "max_total_seconds"
+        )
+    return {
+        "mode": "guided",
+        "allowed_mutation_families": normalized_families,
+        "max_rounds": max_rounds,
+        "max_total_seconds": max_total_seconds,
+        "max_fuzz_seconds": max_fuzz_seconds,
+    }
+
+
+def _validate_request(request: Any) -> dict[str, Any]:
+    if not isinstance(request, dict):
+        raise ValueError("expected a JSON object")
+    if "schema_version" not in request:
+        _object(
+            request,
+            required={"schema_version", "cve_id", "target"},
+            optional={"limits"},
+        )
     version = request["schema_version"]
-    if type(version) is not int or version != SCHEMA_VERSION:
-        raise ValueError(f"schema_version must be {SCHEMA_VERSION}")
+    if type(version) is not int or version not in (
+        SCHEMA_VERSION,
+        SCHEMA_VERSION_V2,
+    ):
+        raise ValueError(
+            f"schema_version must be {SCHEMA_VERSION} or {SCHEMA_VERSION_V2}"
+        )
+    if version == SCHEMA_VERSION:
+        _object(
+            request,
+            required={"schema_version", "cve_id", "target"},
+            optional={"limits"},
+        )
+    else:
+        # A v2 request is an explicit opt-in. ``exploration`` is optional: an
+        # omitted block is the fixed mode, which produces no fuzz rounds.
+        _object(
+            request,
+            required={"schema_version", "cve_id", "target"},
+            optional={"limits", "exploration"},
+        )
 
     cve_id = _text(request["cve_id"], label="cve_id")
     if not _CVE_ID.fullmatch(cve_id):
@@ -184,12 +335,17 @@ def _validate_request(request: Any) -> dict[str, Any]:
 
     limits_value = request["limits"] if "limits" in request else {}
     limits = _limits(limits_value, require_all=False)
-    return {
+    normalized = {
         "schema_version": version,
         "cve_id": cve_id,
         "target": {"kind": kind, "case_id": case_id, "goal": goal},
         "limits": limits,
     }
+    if version == SCHEMA_VERSION_V2:
+        normalized["exploration"] = _exploration(
+            request.get("exploration", {}), limits
+        )
+    return normalized
 
 
 def parse_request(payload: str | bytes) -> dict[str, Any]:
@@ -225,7 +381,61 @@ def _evidence_ref(value: Any) -> str:
         raise ValueError("evidence_ref is too long")
     if any(character.isspace() for character in text):
         raise ValueError("evidence_ref must not contain whitespace")
+    if text.startswith("log/build:"):
+        match = _BUILD_REF.fullmatch(text)
+        if match is None:
+            raise ValueError(
+                "log/build evidence_ref must be "
+                "log/build:vulnerable|fixed#L<line>[-<end>]"
+            )
+        start = int(match.group(2))
+        end = int(match.group(3)) if match.group(3) is not None else start
+        if start > end:
+            raise ValueError("log/build evidence_ref line range must be ascending")
+        return text
+    if text.startswith("log/fuzz:"):
+        if _FUZZ_REF.fullmatch(text) is None:
+            raise ValueError(
+                "log/fuzz evidence_ref must be log/fuzz:<round>#L<line>"
+            )
+        return text
     return text
+
+
+@dataclass(frozen=True)
+class LogEvidenceRef:
+    """A parsed v2 ``log/build`` or ``log/fuzz`` evidence reference.
+
+    ``kind`` is ``build`` or ``fuzz``; ``selector`` is the build version
+    (``vulnerable``/``fixed``) or the fuzz round. ``start``/``end`` are the
+    inclusive 1-based line bounds. ``text`` is the canonical reference.
+    """
+
+    kind: str
+    selector: str
+    start: int
+    end: int
+    text: str
+
+
+def parse_log_evidence_ref(value: Any) -> LogEvidenceRef | None:
+    """Parse a v2 log reference using the frozen §11 grammar.
+
+    Returns ``None`` for a valid v0.1 reference that is not a log reference
+    (for example ``git:diff/...``). Malformed ``log/build``/``log/fuzz`` text
+    raises ``ValueError`` exactly like ``analysis_digest`` does.
+    """
+    text = _evidence_ref(value)
+    match = _BUILD_REF.fullmatch(text)
+    if match is not None:
+        start = int(match.group(2))
+        end = int(match.group(3)) if match.group(3) is not None else start
+        return LogEvidenceRef("build", match.group(1), start, end, text)
+    match = _FUZZ_REF.fullmatch(text)
+    if match is not None:
+        line = int(match.group(2))
+        return LogEvidenceRef("fuzz", match.group(1), line, line, text)
+    return None
 
 
 def _normalize_symbol(value: Any) -> dict[str, Any]:
@@ -477,8 +687,203 @@ def _toolchain_value(value: Any, label: str) -> Any:
     raise ValueError(f"{label} contains an unsupported value")
 
 
+def _optional_digest(value: Any, *, label: str) -> str | None:
+    if value is None:
+        return None
+    return _digest(value, label=label)
+
+
+def _build_spec(value: Any) -> dict[str, Any]:
+    """Accept the structured build input; T13 owns the build semantics.
+
+    TODO(T13): implement the §5 normalization of the seven closed flags
+    (``-I -L -l -D -U -isystem -include``), preserve order, compare the
+    ``compile_flags`` multiset with ``build_spec.declared_compile_flags`` and
+    add positive/negative tests. T10 must not pretend raw list equality is the
+    §5 rule.
+    """
+    if not isinstance(value, dict):
+        raise ValueError("build_spec must be a JSON object")
+    try:
+        jsonutil.canonical_bytes(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"build_spec must be canonical JSON: {error}") from error
+    return value
+
+
+def _compile_flags(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        raise ValueError("compile_flags must be a list")
+    flags = []
+    for flag in value:
+        if not isinstance(flag, str):
+            raise ValueError("compile_flags must contain only strings")
+        flag.encode("utf-8")
+        flags.append(flag)
+    return flags
+
+
+def _build_ref(value: Any) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    _object(
+        value,
+        required={
+            "source_job_id",
+            "generation",
+            "build_inputs_digest",
+            "artifacts",
+        },
+    )
+    generation = value["generation"]
+    if type(generation) is not int or generation < 0:
+        raise ValueError("build_ref.generation must be a non-negative integer")
+    artifacts = _object(
+        value["artifacts"],
+        required={"vulnerable", "fixed"},
+    )
+    normalized_artifacts = {}
+    for version in ("vulnerable", "fixed"):
+        artifact = _object(
+            artifacts[version],
+            required={"artifact_digest", "build_log_digest"},
+        )
+        normalized_artifacts[version] = {
+            "artifact_digest": _digest(
+                artifact["artifact_digest"],
+                label=f"build_ref.artifacts.{version}.artifact_digest",
+            ),
+            "build_log_digest": _digest(
+                artifact["build_log_digest"],
+                label=f"build_ref.artifacts.{version}.build_log_digest",
+            ),
+        }
+    return {
+        "source_job_id": _text(
+            value["source_job_id"], label="build_ref.source_job_id"
+        ),
+        "generation": generation,
+        "build_inputs_digest": _digest(
+            value["build_inputs_digest"], label="build_ref.build_inputs_digest"
+        ),
+        "artifacts": normalized_artifacts,
+    }
+
+
+def _plan_v2_extras(plan: Mapping[str, Any]) -> dict[str, Any]:
+    """Normalize the eleven Plan v2 additions, preserving explicit nulls.
+
+    TODO(T13): ``compile_flags`` is currently validated as a list[str] only.
+    The §5 normalization must eventually require consistency with
+    ``build_spec.declared_compile_flags`` (order-preserving multiset), and the
+    normalized comparison needs positive/negative tests before this note can
+    be removed.
+    """
+    schema_version = plan["schema_version"]
+    if type(schema_version) is not int or schema_version != SCHEMA_VERSION_V2:
+        raise ValueError(f"schema_version must be {SCHEMA_VERSION_V2} for a v2 plan")
+    round_no = plan["round_no"]
+    if round_no is not None and (type(round_no) is not int or round_no < 1):
+        raise ValueError("round_no must be null or a positive integer")
+    family_id = _text(plan["family_id"], label="family_id")
+    parent_job_id = _text(plan["parent_job_id"], label="parent_job_id")
+    for label, value in (("family_id", family_id), ("parent_job_id", parent_job_id)):
+        try:
+            uuid.UUID(value)
+        except (TypeError, ValueError) as error:
+            raise ValueError(f"{label} must be a UUID") from error
+    if family_id != parent_job_id:
+        raise ValueError("family_id must equal parent_job_id")
+    return {
+        "schema_version": schema_version,
+        "family_id": family_id,
+        "parent_job_id": parent_job_id,
+        "round_no": round_no,
+        "parent_approval_digest": _optional_digest(
+            plan["parent_approval_digest"], label="parent_approval_digest"
+        ),
+        "envelope_digest": _digest(
+            plan["envelope_digest"], label="envelope_digest"
+        ),
+        "build_ref": _build_ref(plan["build_ref"]),
+        "build_spec": _build_spec(plan["build_spec"]),
+        "compile_flags": _compile_flags(plan["compile_flags"]),
+        "experiment_digest": _optional_digest(
+            plan["experiment_digest"], label="experiment_digest"
+        ),
+        "build_provenance_rules_version": _text(
+            plan["build_provenance_rules_version"],
+            label="build_provenance_rules_version",
+        ),
+    }
+
+
+def _validate_plan_v2_cross_fields(
+    extras: Mapping[str, Any], inputs: dict[str, Any] | None
+) -> None:
+    """Enforce the Plan v2 identity/round/build cross-field invariants.
+
+    The eleven v2 fields are individually optional-shaped (``null`` is a
+    meaningful value), so the contract is only complete once the combinations
+    are checked. The plan body does not carry the exploration mode, so this
+    pure validator cannot tell a guided round 1 (a later plan) from a fixed
+    round 1 (the first plan); ``state.freeze_plan`` applies that mode-sensitive
+    rule. Here a round plan with no parent approval is the fixed-first shape,
+    while every plan with a parent approval may or may not reuse a build:
+
+    * a campaign has no replay inputs, build or ExperimentSpec;
+    * a round plan always has replay inputs;
+    * no-parent-approval is only valid for fixed ``round_no=1`` with no build
+      and no ExperimentSpec;
+    * a parent approval permits a null or non-null ``build_ref``;
+    * a non-null ``build_ref`` always carries its ExperimentSpec, while a
+      non-reuse validation may carry an ExperimentSpec without a build.
+    """
+    round_no = extras["round_no"]
+    parent_approval_digest = extras["parent_approval_digest"]
+    build_ref = extras["build_ref"]
+    experiment_digest = extras["experiment_digest"]
+
+    if round_no is None:
+        if inputs is not None:
+            raise ValueError("campaign plans must have inputs=null")
+        if build_ref is not None:
+            raise ValueError("campaign plans must have build_ref=null")
+        if experiment_digest is not None:
+            raise ValueError("campaign plans must have experiment_digest=null")
+        if parent_approval_digest is not None:
+            raise ValueError(
+                "campaign plans must have parent_approval_digest=null"
+            )
+    else:
+        if inputs is None:
+            raise ValueError("round plans require inputs")
+        if parent_approval_digest is None:
+            if round_no != 1:
+                raise ValueError(
+                    "rounds after the first require parent_approval_digest"
+                )
+            if build_ref is not None:
+                raise ValueError("the first round plan must have build_ref=null")
+            if experiment_digest is not None:
+                raise ValueError(
+                    "the first round plan must have experiment_digest=null"
+                )
+
+    if build_ref is not None and experiment_digest is None:
+        raise ValueError("build_ref requires experiment_digest")
+
+
 def _normalize_plan(plan: Mapping[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
-    _object(plan, required=set(_PLAN_FIELDS))
+    if not isinstance(plan, dict):
+        raise ValueError("expected a JSON object")
+    is_v2 = "schema_version" in plan
+    extras = None
+    if is_v2:
+        _object(plan, required=set(_PLAN_FIELDS) | _PLAN_V2_EXTRA)
+        extras = _plan_v2_extras(plan)
+    else:
+        _object(plan, required=set(_PLAN_FIELDS))
     case_id = _text(plan["case_id"], label="case_id")
     cve_id = _text(plan["cve_id"], label="cve_id")
     if not _CVE_ID.fullmatch(cve_id):
@@ -503,9 +908,16 @@ def _normalize_plan(plan: Mapping[str, Any]) -> tuple[dict[str, Any], dict[str, 
     if len(vulnerable) != len(fixed):
         raise ValueError("revisions must use the same Git object format")
 
-    inputs = _object(plan["inputs"], required={"candidate", "normal"})
-    candidate = _digest(inputs["candidate"], label="inputs.candidate")
-    normal = _digest(inputs["normal"], label="inputs.normal")
+    if is_v2 and plan["inputs"] is None:
+        normalized_inputs = None
+    else:
+        inputs = _object(plan["inputs"], required={"candidate", "normal"})
+        normalized_inputs = {
+            "candidate": _digest(inputs["candidate"], label="inputs.candidate"),
+            "normal": _digest(inputs["normal"], label="inputs.normal"),
+        }
+    if extras is not None:
+        _validate_plan_v2_cross_fields(extras, normalized_inputs)
 
     signature = _object(
         plan["asan_signature"],
@@ -550,6 +962,22 @@ def _normalize_plan(plan: Mapping[str, Any]) -> tuple[dict[str, Any], dict[str, 
     if declared_analysis_digest != computed_analysis_digest:
         raise ValueError("analysis_digest does not match the supplied analysis")
 
+    declared_build_recipe_digest = _digest(
+        plan["build_recipe_digest"], label="build_recipe_digest"
+    )
+    if extras is not None:
+        computed_build_recipe_digest = (
+            "sha256:"
+            + hashlib.sha256(
+                jsonutil.canonical_bytes(extras["build_spec"])
+            ).hexdigest()
+        )
+        if declared_build_recipe_digest != computed_build_recipe_digest:
+            raise ValueError("build_recipe_digest does not match build_spec")
+        build_recipe_digest = computed_build_recipe_digest
+    else:
+        build_recipe_digest = declared_build_recipe_digest
+
     normalized = {
         "case_id": case_id,
         "cve_id": cve_id,
@@ -573,11 +1001,9 @@ def _normalize_plan(plan: Mapping[str, Any]) -> tuple[dict[str, Any], dict[str, 
         "platform": platform,
         "toolchain": toolchain,
         "asan_options": asan_options,
-        "build_recipe_digest": _digest(
-            plan["build_recipe_digest"], label="build_recipe_digest"
-        ),
+        "build_recipe_digest": build_recipe_digest,
         "harness_digest": _digest(plan["harness_digest"], label="harness_digest"),
-        "inputs": {"candidate": candidate, "normal": normal},
+        "inputs": normalized_inputs,
         "expected_exit": _expected_exit(plan["expected_exit"]),
         "asan_signature": asan_signature,
         "limits": _limits(plan["limits"], require_all=True),
@@ -586,6 +1012,8 @@ def _normalize_plan(plan: Mapping[str, Any]) -> tuple[dict[str, Any], dict[str, 
         "analysis_digest": computed_analysis_digest,
         "policy_version": _text(plan["policy_version"], label="policy_version"),
     }
+    if extras is not None:
+        normalized.update(extras)
     return normalized, analysis
 
 

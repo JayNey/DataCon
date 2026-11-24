@@ -56,7 +56,7 @@ def test_each_budget_rejects_one_above_its_maximum(key):
     "overrides",
     [
         {"schema_version": True},
-        {"schema_version": 2},
+        {"schema_version": 2, "exploration": []},
         {"schema_version": 1.0},
         {"schema_version": "1"},
         {"cve_id": "cve-2099-0001"},
@@ -146,3 +146,44 @@ def test_invalid_utf8_bytes_are_rejected():
 def test_case_registry_must_match_the_cve():
     with pytest.raises(InvalidRequest):
         parse_request(payload(cve_id="CVE-2099-0002"))
+
+
+V2_REQUEST = {
+    "schema_version": 2,
+    "cve_id": "CVE-2099-0001",
+    "target": {
+        "kind": "source",
+        "case_id": "fixture-c-parser",
+        "goal": "验证固定输入在缺陷版触发预期 ASan 异常",
+    },
+}
+
+
+def test_v2_exploration_is_optional_and_defaults_to_fixed():
+    result = parse_request(json.dumps(V2_REQUEST))
+    assert result["schema_version"] == 2
+    assert result["exploration"]["mode"] == "fixed"
+    assert result["exploration"]["allowed_mutation_families"] == []
+    assert result["exploration"]["max_rounds"] == 1
+    assert result["exploration"]["max_fuzz_seconds"] == 0
+
+
+def test_v2_keeps_schema_cve_and_target_required():
+    for key in ("schema_version", "cve_id", "target"):
+        request = dict(V2_REQUEST)
+        del request[key]
+        with pytest.raises(InvalidRequest):
+            parse_request(json.dumps(request))
+
+
+def test_v2_guided_exploration_still_validates_shape():
+    request = dict(V2_REQUEST)
+    request["exploration"] = {
+        "mode": "guided",
+        "allowed_mutation_families": ["byte_flip"],
+        "max_rounds": 4,
+        "max_total_seconds": 600,
+        "max_fuzz_seconds": 120,
+    }
+    result = parse_request(json.dumps(request))
+    assert result["exploration"]["mode"] == "guided"

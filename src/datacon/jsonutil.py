@@ -138,6 +138,19 @@ def timestamp(value: datetime) -> str:
     return value.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def approval_timestamp(value: datetime) -> str:
+    """Render a ``family_approvals.decided_at`` for the approval digest.
+
+    The database keeps microsecond resolution, while the v1 display
+    ``timestamp`` intentionally drops it. The approval hash must survive an
+    offline recomputation from the persisted row, so it uses a fixed six-digit
+    UTC fraction (including an all-zero fraction) and never the display helper.
+    """
+    if not isinstance(value, datetime) or value.tzinfo is None:
+        raise ValueError("approval_timestamp requires a timezone-aware datetime")
+    return value.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
 def safe_relative_path(value: Any, label: str, *, allow_dot: bool = False) -> str:
     text = require_text(value, label)
     if "\\" in text:

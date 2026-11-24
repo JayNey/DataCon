@@ -23,7 +23,7 @@ from datacon.tools.sandbox import _extract_compile_args
 from datacon.verdict import RunObservation, VerdictPolicy, decide_verdict
 
 SCHEMA_VERSION = 1
-CONTRACT_VERSION = contracts.SCHEMA_VERSION
+CONTRACT_VERSION = 1
 # One source of truth for the pinned analysis toolchain. ci.yml and release.yml
 # are checked against this constant by tests/contract/test_release_workflow.py;
 # duplicating the literal in a second module is a release-blocking drift.
@@ -46,7 +46,6 @@ SECCOMP_PROFILE_DIGEST = (
 )
 APPROVAL_MAX_AGE = timedelta(hours=24)
 APPROVAL_FUTURE_SKEW = timedelta(minutes=5)
-ACTIVE_JOB_STATES = ("PREPARING", "RUNNING", "ARCHIVING")
 RELEASE_ENVIRONMENT = "internal-lab"
 TEST_REPORT_FILES = (
     "junit-asan.xml",
@@ -94,6 +93,27 @@ ROLLBACK_COMPATIBLE_MIGRATIONS: Mapping[str, str] = MappingProxyType(
         # before 009 keeps working across it.
         "009_b03_acceptance.sql": (
             "sha256:f5905caf9ab61702c32297c519ca711d4e21c810a55c668543e811939ed7f235"
+        ),
+        # 010 only adds v2 identity/review/budget tables and additive jobs
+        # columns, so an image built before 010 keeps working across it.
+        "010_v2_identity_review.sql": (
+            "sha256:7f91a291653e409e77a318ea01d8755e2f1ee59ba97e4bde9a002feeca1d9deb"
+        ),
+        # 011 adds a parent-identity trigger only; a v1 image that predates the
+        # v2 child writers is unaffected by it.
+        "011_v2_identity_parent_guard.sql": (
+            "sha256:5dae830915de5ffe2f9fa0db822393c104e3926db91028b729856531755ae30c"
+        ),
+        # 012 adds a parent-demotion trigger only; it protects v2 child rows
+        # from a family downgrade and is inert for a v1 image.
+        "012_v2_parent_demotion_guard.sql": (
+            "sha256:74f6189ca191be47fcd68b40a21c80dbc5850f4170bbf48db2356019de3959cd"
+        ),
+        # 013 tightens 011's parent guard to require an AGGREGATING family. It
+        # only rejects new v2 child inserts/rebinds, so a v1 image that never
+        # writes v2 children is unaffected.
+        "013_v2_child_insert_parent_state_guard.sql": (
+            "sha256:cb8319f42175bc3150b62a3902e10cbebd26b58987180978286c26a34b62c637"
         ),
     }
 )
