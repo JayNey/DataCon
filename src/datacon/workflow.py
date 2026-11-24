@@ -25,6 +25,44 @@ from datacon.agents.analysis import (
     analyze_case,
 )
 from datacon.cases import TransientCaseError
+from datacon.orchestration import (
+    AdmissionDecision as AdmissionDecision,
+    ArchiveRecord as ArchiveRecord,
+    AttemptStore as AttemptStore,
+    BudgetChargeRecord as BudgetChargeRecord,
+    BuildDiagnoser as BuildDiagnoser,
+    BuildDiagnosis as BuildDiagnosis,
+    CampaignResult as CampaignResult,
+    CampaignRunner as CampaignRunner,
+    ChargeArchiveStore as ChargeArchiveStore,
+    ChildExecutionWindow as ChildExecutionWindow,
+    ChildRunOutcome as ChildRunOutcome,
+    ClockProtocol as ClockProtocol,
+    EnvelopePolicy as EnvelopePolicy,
+    FAMILY_ORCHESTRATION_EDGES as FAMILY_ORCHESTRATION_EDGES,
+    FamilyRunOutcome as FamilyRunOutcome,
+    HypothesisAggregationResult as HypothesisAggregationResult,
+    HypothesisAggregator as HypothesisAggregator,
+    IN_JOB_ORCHESTRATION_EDGES as IN_JOB_ORCHESTRATION_EDGES,
+    IdempotencyKey as IdempotencyKey,
+    IntelProvider as IntelProvider,
+    IntelResult as IntelResult,
+    IterationDecision as IterationDecision,
+    IterationGate as IterationGate,
+    NodeContext as NodeContext,
+    NodeReentryLedger as NodeReentryLedger,
+    ORCHESTRATION_EDGES as ORCHESTRATION_EDGES,
+    ORCHESTRATION_NODES as ORCHESTRATION_NODES,
+    OrchestrationEdge as OrchestrationEdge,
+    OrchestrationRunner as OrchestrationRunner,
+    OrchestrationState as OrchestrationState,
+    ReviewDecision as ReviewDecision,
+    ReviewGate as ReviewGate,
+    SandboxProtocol as SandboxProtocol,
+    StepKey as StepKey,
+    build_v2_graph as build_v2_graph,
+    run_idempotent as run_idempotent,
+)
 from datacon.tools.source import TransientSourceToolError
 
 
@@ -146,8 +184,29 @@ def build_graph(
     checkpointer,
     *,
     case_root: str | None = None,
+    contract_version: int = 1,
+    **v2_kwargs: Any,
 ):
-    """Compile the Supervisor graph keyed by ``thread_id=job_id``."""
+    """Compile the Supervisor graph keyed by ``thread_id=job_id``.
+
+    ``contract_version=1`` (default) keeps the frozen v0.1 two-node graph
+    (``prepare -> await_review``). ``contract_version=2`` dispatches to the
+    v0.2 14-node orchestration graph (:func:`build_v2_graph`).
+    """
+    if contract_version == 2:
+        return build_v2_graph(
+            dsn=dsn,
+            checkpointer=checkpointer,
+            case_root=case_root,
+            **v2_kwargs,
+        )
+    if contract_version != 1:
+        raise ValueError(f"unsupported contract_version: {contract_version!r}")
+    if v2_kwargs:
+        unexpected = ", ".join(sorted(v2_kwargs))
+        raise TypeError(
+            f"build_graph(contract_version=1) got unexpected keyword argument(s): {unexpected}"
+        )
 
     def prepare(graph_state: SupervisorState) -> dict[str, Any]:
         job_id = _uuid(graph_state["job_id"])
