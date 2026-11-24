@@ -6,6 +6,7 @@ docs/spec/v0.2/README.md §5 (14 nodes and 26 edges).
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import timedelta
 import threading
 from typing import Any, Mapping, Sequence
@@ -14,7 +15,10 @@ from uuid import uuid4
 from fakes import FakeClock, FakeEnvelopePolicy, FakeReviewGate, FakeSandbox
 import pytest
 
+from datacon import jsonutil
+from datacon import state as state_store
 from datacon import workflow
+from datacon.tools.sandbox import SandboxPolicyError
 
 EXPECTED_NODES_V02 = frozenset(
     {
@@ -311,6 +315,75 @@ def test_build_diagnose_retry_is_bounded_to_once():
     assert diag_fail_outcome.state == "FAILED"
     assert diag_fail_outcome.reason_code == "BUILD_FAILED"
 
+    # Edge #22: provenance_missing routes directly build_diagnose -> archive
+    # with BUILD_PROVENANCE_MISSING (0 retries, 0 replays, never enters verify).
+    prov_clock = FakeClock()
+    prov_delegate = FakeSandbox(clock=prov_clock)
+
+    class _ProvenanceMissingSandbox:
+        def probe(self, *, deadline_seconds: float = 120.0):
+            return prov_delegate.probe(deadline_seconds=deadline_seconds)
+
+        def build(
+            self,
+            version: str,
+            *,
+            compile_args: Sequence[str] = (),
+            deadline_seconds: float = 300.0,
+            expected_materials: Mapping[str, str] | None = None,
+        ):
+            built = prov_delegate.build(
+                version,
+                compile_args=compile_args,
+                deadline_seconds=deadline_seconds,
+                expected_materials=expected_materials,
+            )
+            return replace(
+                built,
+                metadata={**built.metadata, "provenance_missing": True},
+            )
+
+        def replay(
+            self,
+            version: str,
+            phase: str,
+            *,
+            timeout_seconds: float = 10.0,
+            deadline_seconds: float | None = None,
+            expected_artifact_digest: str | None = None,
+            expected_input_digest: str | None = None,
+        ):
+            return prov_delegate.replay(
+                version,
+                phase,
+                timeout_seconds=timeout_seconds,
+                deadline_seconds=deadline_seconds,
+                expected_artifact_digest=expected_artifact_digest,
+                expected_input_digest=expected_input_digest,
+            )
+
+    prov_runner = runner_cls(
+        sandbox=_ProvenanceMissingSandbox(),
+        clock=prov_clock,
+        review_gate=FakeReviewGate(clock=prov_clock, decision="approve"),
+        envelope_policy=FakeEnvelopePolicy(clock=prov_clock, default_admit=True),
+    )
+    prov_outcome = prov_runner.run_child(
+        job_id=str(uuid4()),
+        family_id=str(uuid4()),
+        job_kind="round",
+        round_no=1,
+        target_kind="source",
+    )
+    assert prov_outcome.visited_nodes.count("build") == 1
+    assert prov_outcome.visited_nodes.count("build_diagnose") == 1
+    assert len(prov_delegate.build_calls) == 2
+    assert len(prov_delegate.replay_calls) == 0
+    assert "verify" not in prov_outcome.visited_nodes
+    assert prov_outcome.terminal_node == "archive"
+    assert prov_outcome.state == "FAILED"
+    assert prov_outcome.reason_code == "BUILD_PROVENANCE_MISSING"
+
 
 def test_node_reentry_is_a_noop():
     clock = FakeClock()
@@ -427,10 +500,30 @@ def test_node_reentry_is_a_noop():
     # Same (job_id, step_key, attempt_no) on a new generation does not double-charge.
     assert runner.charge_count(job_id) == charges_before_retry + 1
 
+    # First-write-wins record_completed + idempotent record_archive across generations.
+    fww_ledger = workflow.NodeReentryLedger()
+    fww_key = workflow.StepKey(str(uuid4()), "prepare", "fww_step", 1, 1)
+    assert fww_ledger.record_completed(fww_key, {"marker": "first"}) == {
+        "marker": "first"
+    }
+    assert fww_ledger.record_completed(fww_key, {"marker": "second"}) == {
+        "marker": "first"
+    }
+    assert fww_ledger.get_completed(fww_key) == {"marker": "first"}
+
+    # Re-entering archive under a new generation still deduplicates by job_id.
+    gen2_archive = runner.execute_node(
+        family_id=family_id,
+        idempotency_key=(job_id, "archive", "archive_step", 1, 2),
+    )
+    assert runner.archive_count(job_id) == 1
+    assert gen2_archive["archive_digest"] == first["archive_digest"]
+
     # D42: Non-terminal parked review (await_review / REVIEW_ENVELOPE_MISMATCH)
     # must NOT be cached as a completed no-op in NodeReentryLedger, so a retry
-    # with the corrected envelope_digest under the same generation succeeds,
-    # after which decided review outcomes remain cached as no-ops.
+    # with the corrected envelope_digest under the same generation succeeds
+    # (and hypothesis_aggregator recomputes first_plan_digest consistently on
+    # cache hit), after which decided review outcomes remain cached as no-ops.
     expected_envelope = "sha256:" + "e" * 64
     wrong_envelope = "sha256:" + "f" * 64
     parked_clock = FakeClock()
@@ -441,9 +534,44 @@ def test_node_reentry_is_a_noop():
         expected_envelope_digest=expected_envelope,
         review_deadline_at=parked_clock.now() + timedelta(hours=24),
     )
+
+    class _CountingAggregator:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.last_experiment_digest: str | None = None
+
+        def aggregate(
+            self,
+            *,
+            job_id: str,
+            family_id: str,
+            job_kind: str,
+            round_no: int | None,
+            target_kind: str,
+            route_facts: Mapping[str, Any],
+            seed_bytes: bytes | None = None,
+        ) -> workflow.HypothesisAggregationResult:
+            self.calls += 1
+            spec = {
+                "family_id": family_id,
+                "job_kind": job_kind,
+                "round_no": round_no,
+                "target_kind": target_kind,
+                "seed_bytes": seed_bytes.hex() if seed_bytes is not None else None,
+                "evidence_refs": list(route_facts.get("evidence_refs", ())),
+            }
+            digest = jsonutil.digest_json(spec)
+            self.last_experiment_digest = digest
+            return workflow.HypothesisAggregationResult(
+                experiment_spec=spec,
+                experiment_digest=digest,
+            )
+
+    counting_aggregator = _CountingAggregator()
     parked_runner = runner_cls(
         sandbox=parked_sandbox,
         clock=parked_clock,
+        hypothesis_aggregator=counting_aggregator,
         review_gate=parked_review_gate,
         envelope_policy=FakeEnvelopePolicy(clock=parked_clock, default_admit=True),
     )
@@ -463,6 +591,18 @@ def test_node_reentry_is_a_noop():
     assert parked_outcome.terminal_node is None
     assert parked_review_gate.review_writes == 0
     assert len(parked_sandbox.build_calls) == 0
+    assert counting_aggregator.calls == 1
+    assert counting_aggregator.last_experiment_digest is not None
+
+    expected_recomputed_first_plan = jsonutil.digest_json(
+        {
+            "family_id": parked_family_id,
+            "job_kind": "round",
+            "envelope_digest": expected_envelope,
+            "experiment_digest": counting_aggregator.last_experiment_digest,
+        }
+    )
+    parked_review_gate.expected_first_plan_digest = expected_recomputed_first_plan
 
     approved_outcome = parked_runner.run_child(
         job_id=parked_job_id,
@@ -476,6 +616,15 @@ def test_node_reentry_is_a_noop():
     assert approved_outcome.terminal_node == "archive"
     assert approved_outcome.approval_digest is not None
     assert parked_review_gate.review_writes == 1
+    assert counting_aggregator.calls == 1
+    assert (
+        parked_review_gate.checks[0]["first_plan_digest"]
+        != parked_review_gate.checks[1]["first_plan_digest"]
+    )
+    assert (
+        parked_review_gate.checks[1]["first_plan_digest"]
+        == expected_recomputed_first_plan
+    )
     builds_after_approval = len(parked_sandbox.build_calls)
     assert builds_after_approval > 0
 
@@ -520,6 +669,7 @@ def test_node_reentry_is_a_noop():
     custom_store = _CustomAttemptStore()
     assert isinstance(custom_store, workflow.AttemptStore)
     assert isinstance(runner.ledger, workflow.AttemptStore)
+    assert isinstance(runner.ledger, workflow.ChargeArchiveStore)
 
     custom_sandbox = FakeSandbox(clock=FakeClock())
     custom_runner = runner_cls(
@@ -538,6 +688,215 @@ def test_node_reentry_is_a_noop():
     assert second_custom == first_custom
     assert custom_store.record_calls == [step_key]
     assert custom_store.get_calls == [step_key, step_key]
+
+    # Custom ChargeArchiveStore-only injection (distinct from AttemptStore).
+    class _CustomChargeArchiveStore:
+        def __init__(self) -> None:
+            self.charge_keys: set[tuple[str, str, int]] = set()
+            self.charges: list[tuple[str, str, float, float]] = []
+            self.archives: dict[str, workflow.ArchiveRecord] = {}
+
+        def record_charge(
+            self,
+            *,
+            job_id: str,
+            family_id: str,
+            step_key: str,
+            attempt_no: int,
+            seconds: float,
+            recorded_at: str,
+            fuzz_seconds: float = 0.0,
+            charge_kind: str = "general",
+        ) -> bool:
+            del recorded_at, charge_kind
+            ck = (job_id, step_key, attempt_no)
+            if ck in self.charge_keys:
+                return False
+            self.charge_keys.add(ck)
+            self.charges.append((job_id, family_id, float(seconds), float(fuzz_seconds)))
+            return True
+
+        def charge_count(self, job_id: str) -> int:
+            return sum(1 for item in self.charges if item[0] == job_id)
+
+        def total_charged_seconds(self, family_id: str) -> float:
+            return sum(item[2] for item in self.charges if item[1] == family_id)
+
+        def total_fuzz_seconds(self, family_id: str) -> float:
+            return sum(item[3] for item in self.charges if item[1] == family_id)
+
+        def record_archive(
+            self,
+            *,
+            job_id: str,
+            family_id: str,
+            job_kind: str,
+            state: str,
+            verdict: str | None,
+            reason_code: str | None,
+            archive_digest: str,
+            recorded_at: str,
+        ) -> workflow.ArchiveRecord:
+            if job_id in self.archives:
+                return self.archives[job_id]
+            rec = workflow.ArchiveRecord(
+                job_id=job_id,
+                family_id=family_id,
+                job_kind=job_kind,
+                state=state,
+                verdict=verdict,
+                reason_code=reason_code,
+                archive_digest=archive_digest,
+                recorded_at=recorded_at,
+            )
+            self.archives[job_id] = rec
+            return rec
+
+        def archive_count(self, job_id: str) -> int:
+            return 1 if job_id in self.archives else 0
+
+    custom_ca_store = _CustomChargeArchiveStore()
+    assert isinstance(custom_ca_store, workflow.ChargeArchiveStore)
+    assert not isinstance(custom_ca_store, workflow.AttemptStore)
+    ca_clock = FakeClock()
+    ca_sandbox = FakeSandbox(clock=ca_clock)
+    ca_runner = runner_cls(
+        sandbox=ca_sandbox,
+        clock=ca_clock,
+        ledger=custom_ca_store,
+    )
+    assert isinstance(ca_runner.attempt_store, workflow.AttemptStore)
+    assert ca_runner.attempt_store is not custom_ca_store
+    ca_job_id = str(uuid4())
+    ca_family_id = str(uuid4())
+    ca_outcome = ca_runner.run_child(
+        job_id=ca_job_id,
+        family_id=ca_family_id,
+        job_kind="round",
+        round_no=1,
+        is_first_plan=True,
+    )
+    assert ca_outcome.terminal_node == "archive"
+    assert custom_ca_store.charge_count(ca_job_id) >= 2
+    assert custom_ca_store.archive_count(ca_job_id) == 1
+    assert custom_ca_store.total_charged_seconds(ca_family_id) > 0.0
+    assert workflow.build_v2_graph(
+        sandbox=ca_sandbox, clock=ca_clock, ledger=custom_ca_store
+    ) is not None
+
+    # StaleGeneration + oom/log_truncated policy exceptions must NOT poison
+    # AttemptStore, allowing subsequent recovery under the same StepKey.
+    stale_clock = FakeClock()
+    stale_sandbox = FakeSandbox(clock=stale_clock, build_faults=("stale_generation",))
+    stale_runner = runner_cls(sandbox=stale_sandbox, clock=stale_clock)
+    stale_key = workflow.StepKey(str(uuid4()), "build", "build_step", 1, 1)
+    with pytest.raises(state_store.StaleGeneration):
+        stale_runner.execute_node(family_id=family_id, idempotency_key=stale_key)
+    assert stale_runner.attempt_store.get_completed(stale_key) is None
+    assert stale_runner.charge_count(stale_key.job_id) == 0
+    recovered_stale = stale_runner.execute_node(
+        family_id=family_id, idempotency_key=stale_key
+    )
+    assert recovered_stale["build_artifacts"]["vulnerable"]["status"] == "completed"
+    assert stale_runner.charge_count(stale_key.job_id) == 1
+
+    for policy_fault in ("oom", "log_truncated"):
+        fault_clock = FakeClock()
+        fault_delegate = FakeSandbox(clock=fault_clock, probe_faults=(policy_fault,))
+
+        class _FaultingBuildSandbox:
+            def __init__(self, delegate: FakeSandbox) -> None:
+                self._delegate = delegate
+                self._failed_once = False
+
+            def probe(self, *, deadline_seconds: float = 120.0):
+                return self._delegate.probe(deadline_seconds=deadline_seconds)
+
+            def build(
+                self,
+                version: str,
+                *,
+                compile_args: Sequence[str] = (),
+                deadline_seconds: float = 300.0,
+                expected_materials: Mapping[str, str] | None = None,
+            ):
+                if not self._failed_once:
+                    self._failed_once = True
+                    # Triggers SandboxPolicyError from FakeSandbox.probe for oom/log_truncated.
+                    self._delegate.probe()
+                return self._delegate.build(
+                    version,
+                    compile_args=compile_args,
+                    deadline_seconds=deadline_seconds,
+                    expected_materials=expected_materials,
+                )
+
+            def replay(
+                self,
+                version: str,
+                phase: str,
+                *,
+                timeout_seconds: float = 10.0,
+                deadline_seconds: float | None = None,
+                expected_artifact_digest: str | None = None,
+                expected_input_digest: str | None = None,
+            ):
+                return self._delegate.replay(
+                    version,
+                    phase,
+                    timeout_seconds=timeout_seconds,
+                    deadline_seconds=deadline_seconds,
+                    expected_artifact_digest=expected_artifact_digest,
+                    expected_input_digest=expected_input_digest,
+                )
+
+        fault_runner = runner_cls(
+            sandbox=_FaultingBuildSandbox(fault_delegate),
+            clock=fault_clock,
+        )
+        fault_key = workflow.StepKey(str(uuid4()), "build", f"{policy_fault}_step", 1, 1)
+        with pytest.raises(SandboxPolicyError):
+            fault_runner.execute_node(family_id=family_id, idempotency_key=fault_key)
+        assert fault_runner.attempt_store.get_completed(fault_key) is None
+        assert fault_runner.charge_count(fault_key.job_id) == 0
+        recovered_fault = fault_runner.execute_node(
+            family_id=family_id, idempotency_key=fault_key
+        )
+        assert recovered_fault["build_artifacts"]["vulnerable"]["status"] == "completed"
+        assert fault_runner.charge_count(fault_key.job_id) == 1
+
+    # Also verify non-raising oom/log_truncated replay faults produce deterministic
+    # INCONCLUSIVE reason codes without duplicating side effects on re-entry.
+    for replay_fault, expected_reason in (
+        ("oom", "RESOURCE_LIMITED"),
+        ("log_truncated", "EVIDENCE_INCOMPLETE"),
+    ):
+        rf_clock = FakeClock()
+        rf_sandbox = FakeSandbox(clock=rf_clock, replay_faults=(replay_fault,))
+        rf_runner = runner_cls(sandbox=rf_sandbox, clock=rf_clock)
+        rf_job_id = str(uuid4())
+        rf_first = rf_runner.run_child(
+            job_id=rf_job_id,
+            family_id=family_id,
+            job_kind="round",
+            round_no=1,
+            generation=1,
+            is_first_plan=True,
+        )
+        assert rf_first.state == "INCONCLUSIVE"
+        assert rf_first.reason_code == expected_reason
+        replays_after_rf = len(rf_sandbox.replay_calls)
+        rf_second = rf_runner.run_child(
+            job_id=rf_job_id,
+            family_id=family_id,
+            job_kind="round",
+            round_no=1,
+            generation=1,
+            is_first_plan=True,
+        )
+        assert rf_second.reason_code == expected_reason
+        assert len(rf_sandbox.replay_calls) == replays_after_rf
+        assert rf_runner.archive_count(rf_job_id) == 1
 
     # Verify run_idempotent skips record_completed when should_cache returns False.
     ephemeral_key = workflow.StepKey(job_id, "review", "ephemeral", 1, 1)
@@ -705,6 +1064,106 @@ def test_family_level_transitions_create_next_round_child():
         assert child.parent_job_id == family_id and child.terminal_node == "archive", (
             f"each spawned round child must belong to family {family_id} and archive itself: {child!r}"
         )
+
+    # Conclusive round-2 verdict (NOT_REPRODUCED) completes with no stop_reason_code.
+    assert family_run.state == "COMPLETED"
+    assert family_run.reason_code is None
+    assert family_run.stop_reason_code is None
+
+    # Budget exhaustion keeps family COMPLETED (reason_code=None) while
+    # surfacing stop_reason_code="BUDGET_EXHAUSTED" and stopping before round 2.
+    budget_clock = FakeClock()
+    budget_runner = runner_cls(
+        sandbox=FakeSandbox(clock=budget_clock, replay_faults=("timeout",)),
+        clock=budget_clock,
+        review_gate=FakeReviewGate(clock=budget_clock, decision="approve"),
+        envelope_policy=FakeEnvelopePolicy(clock=budget_clock, default_admit=True),
+    )
+    budget_run = budget_runner.run_family_guided(
+        family_id=str(uuid4()),
+        candidate_seeds=[b"seed-budget-1", b"seed-budget-2"],
+        max_rounds=2,
+        max_total_seconds=5.0,
+    )
+    assert len(budget_run.round_children) == 1
+    assert budget_run.state == "COMPLETED"
+    assert budget_run.reason_code is None
+    assert budget_run.stop_reason_code == "BUDGET_EXHAUSTED"
+
+    # Non-review campaign blocks (e.g. MATERIAL_MISSING in intel or prepare)
+    # propagate BLOCKED + reason_code + stop_reason_code to the family job.
+    for req_key in ("intel_blocked_reason", "prepare_blocked_reason"):
+        blk_clock = FakeClock()
+        blk_runner = runner_cls(
+            sandbox=FakeSandbox(clock=blk_clock),
+            clock=blk_clock,
+            review_gate=FakeReviewGate(clock=blk_clock, decision="approve"),
+            envelope_policy=FakeEnvelopePolicy(clock=blk_clock, default_admit=True),
+        )
+        blk_run = blk_runner.run_family_guided(
+            family_id=str(uuid4()),
+            candidate_seeds=[b"seed-1"],
+            max_rounds=2,
+            request={req_key: "MATERIAL_MISSING"},
+        )
+        assert blk_run.campaign_child.state == "BLOCKED"
+        assert blk_run.campaign_child.reason_code == "MATERIAL_MISSING"
+        assert blk_run.state == "BLOCKED"
+        assert blk_run.reason_code == "MATERIAL_MISSING"
+        assert blk_run.stop_reason_code == "MATERIAL_MISSING"
+        assert blk_run.round_children == ()
+        assert blk_run.visited_nodes == ("prepare", "AGGREGATING", "archive")
+        assert blk_run.family_states_observed == ("AGGREGATING", "BLOCKED")
+
+    # Campaign FAILED converges the v2 family to COMPLETED (families have no
+    # FAILED state) while recording stop_reason_code="BUILD_FAILED".
+    fail_clock = FakeClock()
+    fail_runner = runner_cls(
+        sandbox=FakeSandbox(clock=fail_clock, build_faults=("build_diagnose_failure",)),
+        clock=fail_clock,
+        review_gate=FakeReviewGate(clock=fail_clock, decision="approve"),
+        envelope_policy=FakeEnvelopePolicy(clock=fail_clock, default_admit=True),
+    )
+    fail_run = fail_runner.run_family_guided(
+        family_id=str(uuid4()),
+        candidate_seeds=[b"seed-1"],
+        max_rounds=2,
+    )
+    assert fail_run.campaign_child.state == "FAILED"
+    assert fail_run.campaign_child.reason_code == "BUILD_FAILED"
+    assert fail_run.state == "COMPLETED"
+    assert fail_run.reason_code is None
+    assert fail_run.stop_reason_code == "BUILD_FAILED"
+    assert fail_run.round_children == ()
+
+    # 1 candidate seed with max_rounds=3 must stop after 1 round instead of
+    # repeating the same seed, with stop_reason_code="NO_REMAINING_SEEDS".
+    one_seed_clock = FakeClock()
+    one_seed_runner = runner_cls(
+        sandbox=FakeSandbox(clock=one_seed_clock, replay_faults=("timeout",)),
+        clock=one_seed_clock,
+        review_gate=FakeReviewGate(clock=one_seed_clock, decision="approve"),
+        envelope_policy=FakeEnvelopePolicy(clock=one_seed_clock, default_admit=True),
+    )
+    one_seed_run = one_seed_runner.run_family_guided(
+        family_id=str(uuid4()),
+        candidate_seeds=[b"only-seed"],
+        max_rounds=3,
+    )
+    assert len(one_seed_run.round_children) == 1
+    assert one_seed_run.state == "COMPLETED"
+    assert one_seed_run.reason_code is None
+    assert one_seed_run.stop_reason_code == "NO_REMAINING_SEEDS"
+
+    # DefaultIterationGate callers omitting remaining_seeds stay unaffected.
+    gate_decision = one_seed_runner.iteration_gate.check_capacity(
+        family_id=one_seed_run.family_id,
+        completed_round_no=1,
+        max_rounds=3,
+        last_verdict="INCONCLUSIVE",
+    )
+    assert gate_decision.should_continue is True
+    assert gate_decision.reason_code is None
 
 
 def test_family_children_execute_serially():

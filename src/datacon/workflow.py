@@ -34,6 +34,7 @@ from datacon.orchestration import (
     BuildDiagnosis as BuildDiagnosis,
     CampaignResult as CampaignResult,
     CampaignRunner as CampaignRunner,
+    ChargeArchiveStore as ChargeArchiveStore,
     ChildExecutionWindow as ChildExecutionWindow,
     ChildRunOutcome as ChildRunOutcome,
     ClockProtocol as ClockProtocol,

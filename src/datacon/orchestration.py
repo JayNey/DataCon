@@ -876,12 +876,12 @@ class IterationGate(Protocol):
         last_verdict: str | None,
         remaining_budget_seconds: float | None = None,
         remaining_fuzz_seconds: float | None = None,
-        remaining_seeds: int = 0,
+        remaining_seeds: int | None = None,
     ) -> IterationDecision: ...
 
 
 class DefaultIterationGate:
-    """Checks verdict conclusiveness, ``max_rounds``, and remaining budget capacity."""
+    """Checks verdict conclusiveness, ``max_rounds``, budget, and seed capacity."""
 
     def check_capacity(
         self,
@@ -892,9 +892,9 @@ class DefaultIterationGate:
         last_verdict: str | None,
         remaining_budget_seconds: float | None = None,
         remaining_fuzz_seconds: float | None = None,
-        remaining_seeds: int = 0,
+        remaining_seeds: int | None = None,
     ) -> IterationDecision:
-        del family_id, remaining_fuzz_seconds, remaining_seeds
+        del family_id, remaining_fuzz_seconds
         remaining_rounds = max(0, max_rounds - completed_round_no)
         if last_verdict in ("REPRODUCED", "NOT_REPRODUCED"):
             return IterationDecision(
@@ -923,6 +923,13 @@ class DefaultIterationGate:
                 reason_code="BUDGET_EXHAUSTED",
                 remaining_rounds=remaining_rounds,
                 remaining_budget_seconds=0.0,
+            )
+        if remaining_seeds is not None and remaining_seeds <= 0:
+            return IterationDecision(
+                should_continue=False,
+                reason_code="NO_REMAINING_SEEDS",
+                remaining_rounds=remaining_rounds,
+                remaining_budget_seconds=remaining_budget_seconds,
             )
         return IterationDecision(
             should_continue=True,
@@ -965,12 +972,53 @@ class ArchiveRecord:
     recorded_at: str
 
 
+@runtime_checkable
+class ChargeArchiveStore(Protocol):
+    """Minimal persistence contract for budget charge and archive accounting."""
+
+    def record_charge(
+        self,
+        *,
+        job_id: str,
+        family_id: str,
+        step_key: str,
+        attempt_no: int,
+        seconds: float,
+        recorded_at: str,
+        fuzz_seconds: float = 0.0,
+        charge_kind: str = "general",
+    ) -> bool: ...
+
+    def charge_count(self, job_id: str) -> int: ...
+
+    def total_charged_seconds(self, family_id: str) -> float: ...
+
+    def total_fuzz_seconds(self, family_id: str) -> float: ...
+
+    def record_archive(
+        self,
+        *,
+        job_id: str,
+        family_id: str,
+        job_kind: str,
+        state: str,
+        verdict: str | None,
+        reason_code: str | None,
+        archive_digest: str,
+        recorded_at: str,
+    ) -> ArchiveRecord: ...
+
+    def archive_count(self, job_id: str) -> int: ...
+
+
 class NodeReentryLedger:
     """In-memory persistence ledger enforcing node re-entry no-op semantics.
 
+    Satisfies both :class:`AttemptStore` and :class:`ChargeArchiveStore`.
     Node outcomes are keyed by ``(job_id, stage, step_key, attempt_no, generation)``
     per ``test-plan-delta.md`` §3. Budget charges are additionally deduplicated on
-    ``(job_id, step_key, attempt_no)`` per ``README.md`` §7 invariant 7.
+    ``(job_id, step_key, attempt_no)`` per ``README.md`` §7 invariant 7, and
+    archive writes are first-write-wins per ``job_id``.
     """
 
     def __init__(self) -> None:
@@ -997,6 +1045,9 @@ class NodeReentryLedger:
         step_key = key if isinstance(key, StepKey) else StepKey(*key)
         snapshot = copy.deepcopy(dict(result))
         with self._lock:
+            existing = self._node_results.get(step_key)
+            if existing is not None:
+                return copy.deepcopy(existing)
             self._node_results[step_key] = snapshot
         return copy.deepcopy(snapshot)
 
@@ -1081,7 +1132,10 @@ class NodeReentryLedger:
             recorded_at=recorded_at,
         )
         with self._lock:
-            self._archives_by_job.setdefault(job_id, []).append(entry)
+            existing = self._archives_by_job.get(job_id)
+            if existing:
+                return existing[0]
+            self._archives_by_job[job_id] = [entry]
         return entry
 
     def archive_count(self, job_id: str) -> int:
@@ -1153,7 +1207,7 @@ class NodeContext:
     build_diagnoser: BuildDiagnoser
     campaign_runner: CampaignRunner
     verdict_policy: verdict_mod.VerdictPolicy
-    ledger: NodeReentryLedger
+    ledger: ChargeArchiveStore
     attempt_store: AttemptStore
 
 
@@ -1422,6 +1476,23 @@ def _node_source(ctx: NodeContext, state: OrchestrationState) -> dict[str, Any]:
     return run_idempotent(ctx.attempt_store, key, _action)
 
 
+def _compute_first_plan_digest(
+    *,
+    family_id: str,
+    job_kind: str,
+    envelope_digest: str,
+    experiment_digest: str | None,
+) -> str:
+    return jsonutil.digest_json(
+        {
+            "family_id": family_id,
+            "job_kind": job_kind,
+            "envelope_digest": envelope_digest,
+            "experiment_digest": experiment_digest,
+        }
+    )
+
+
 def _node_hypothesis_aggregator(
     ctx: NodeContext,
     state: OrchestrationState,
@@ -1445,13 +1516,11 @@ def _node_hypothesis_aggregator(
         envelope_digest = state.get("envelope_digest") or jsonutil.digest_json(
             {"family_id": state["family_id"], "kind": "envelope"}
         )
-        first_plan_digest = state.get("first_plan_digest") or jsonutil.digest_json(
-            {
-                "family_id": state["family_id"],
-                "job_kind": state.get("job_kind", "round"),
-                "envelope_digest": envelope_digest,
-                "experiment_digest": aggregated.experiment_digest,
-            }
+        first_plan_digest = state.get("first_plan_digest") or _compute_first_plan_digest(
+            family_id=state["family_id"],
+            job_kind=state.get("job_kind", "round"),
+            envelope_digest=envelope_digest,
+            experiment_digest=aggregated.experiment_digest,
         )
         return {
             "experiment_spec": dict(aggregated.experiment_spec),
@@ -1464,17 +1533,36 @@ def _node_hypothesis_aggregator(
 
     result = run_idempotent(ctx.attempt_store, key, _action)
     # Preserve explicit caller-provided digests on cache hit (e.g. corrected
-    # envelope_digest after a D42 REVIEW_ENVELOPE_MISMATCH retry).
-    if state.get("envelope_digest") or state.get("first_plan_digest"):
+    # envelope_digest after a D42 REVIEW_ENVELOPE_MISMATCH retry), and keep
+    # derived first_plan_digest consistent with the updated envelope_digest.
+    explicit_envelope = state.get("envelope_digest")
+    explicit_first_plan = state.get("first_plan_digest")
+    if explicit_envelope or explicit_first_plan:
         result = dict(result)
-        if state.get("envelope_digest"):
-            result["envelope_digest"] = state["envelope_digest"]
-        if state.get("first_plan_digest"):
-            result["first_plan_digest"] = state["first_plan_digest"]
+        cached_envelope = result.get("envelope_digest")
+        if explicit_envelope:
+            result["envelope_digest"] = explicit_envelope
+        if explicit_first_plan:
+            result["first_plan_digest"] = explicit_first_plan
+        elif explicit_envelope and explicit_envelope != cached_envelope:
+            result["first_plan_digest"] = _compute_first_plan_digest(
+                family_id=state["family_id"],
+                job_kind=state.get("job_kind", "round"),
+                envelope_digest=explicit_envelope,
+                experiment_digest=result.get("experiment_digest"),
+            )
     return result
 
 
 def _node_review(ctx: NodeContext, state: OrchestrationState) -> dict[str, Any]:
+    """Evaluate human first-plan approval (#15/#17) or policy admission (#16/#17).
+
+    In v2 unit-level graph execution, non-terminal review parking (e.g.
+    ``REVIEW_ENVELOPE_MISMATCH``) routes ``await_review -> END`` without caching
+    in :class:`AttemptStore` so a later invocation replays from persisted node
+    outcomes. PostgreSQL ``PostgresSaver`` / ``run_worker`` integration will
+    bridge review parking via LangGraph ``interrupt()``.
+    """
     key = _node_key(state, "review", default_step_key="review")
 
     def _action() -> dict[str, Any]:
@@ -1570,14 +1658,11 @@ def _node_review(ctx: NodeContext, state: OrchestrationState) -> dict[str, Any]:
 
 def _node_build(ctx: NodeContext, state: OrchestrationState) -> dict[str, Any]:
     retry_count = state.get("build_retry_count", 0)
-    attempt_no = state.get("attempt_no_override")
-    if attempt_no is None:
-        attempt_no = retry_count + 1
     key = _node_key(
         state,
         "build",
         default_step_key="build",
-        default_attempt_no=attempt_no,
+        default_attempt_no=retry_count + 1,
     )
 
     def _action() -> dict[str, Any]:
@@ -1637,14 +1722,11 @@ def _node_build(ctx: NodeContext, state: OrchestrationState) -> dict[str, Any]:
 
 def _node_build_diagnose(ctx: NodeContext, state: OrchestrationState) -> dict[str, Any]:
     retry_count = state.get("build_retry_count", 0)
-    attempt_no = state.get("attempt_no_override")
-    if attempt_no is None:
-        attempt_no = retry_count + 1
     key = _node_key(
         state,
         "build_diagnose",
         default_step_key="build_diagnose",
-        default_attempt_no=attempt_no,
+        default_attempt_no=retry_count + 1,
     )
 
     def _action() -> dict[str, Any]:
@@ -1819,7 +1901,7 @@ def _node_archive(ctx: NodeContext, state: OrchestrationState) -> dict[str, Any]
             "family_summary": state.get("family_summary"),
         }
         archive_digest = jsonutil.digest_json(archive_payload)
-        ctx.ledger.record_archive(
+        recorded = ctx.ledger.record_archive(
             job_id=state["job_id"],
             family_id=state["family_id"],
             job_kind=job_kind,
@@ -1830,11 +1912,11 @@ def _node_archive(ctx: NodeContext, state: OrchestrationState) -> dict[str, Any]
             recorded_at=ctx.clock.timestamp(),
         )
         return {
-            "state": final_state,
-            "verdict": final_verdict,
-            "reason_code": final_reason,
+            "state": recorded.state,
+            "verdict": recorded.verdict,
+            "reason_code": recorded.reason_code,
             "terminal_node": "archive",
-            "archive_digest": archive_digest,
+            "archive_digest": recorded.archive_digest,
             "next_route": "done",
             "visited_nodes": _append_visited(state, "archive"),
         }
@@ -1868,12 +1950,26 @@ def _bind_v2_node_map(ctx: NodeContext) -> dict[str, NodeFn]:
     }
 
 
+# Non-terminal parking routes that exit the compiled unit-level graph to END
+# without introducing extra inter-node edges beyond IN_JOB_ORCHESTRATION_EDGES.
+_NON_TERMINAL_PARK_ROUTES: Mapping[str, Mapping[str, Any]] = {
+    "review": {"await_review": END},
+}
+
+
+def _default_branch_fallback(branch_map: Mapping[str, Any]) -> str:
+    for route_key, target in branch_map.items():
+        if target == "archive":
+            return route_key
+    return next(iter(branch_map))
+
+
 def _compile_v2_graph(
     nodes: Mapping[str, NodeFn],
     *,
     checkpointer: Any = None,
 ) -> Any:
-    """Compile the v0.2 14-node LangGraph ``StateGraph`` from pre-bound ``nodes``."""
+    """Compile the v0.2 14-node LangGraph ``StateGraph`` from ``IN_JOB_ORCHESTRATION_EDGES``."""
 
     def _route_from_state(default: str) -> Callable[[OrchestrationState], str]:
         def _router(state: OrchestrationState) -> str:
@@ -1889,67 +1985,31 @@ def _compile_v2_graph(
         builder.add_node(name, nodes[name])
 
     builder.add_edge(START, "prepare")
-    builder.add_conditional_edges(
-        "prepare",
-        _route_from_state("archive"),
-        {
-            "intel": "intel",
-            "AGGREGATING": "AGGREGATING",
-            "archive": "archive",
-        },
-    )
-    builder.add_edge("AGGREGATING", "archive")
-    builder.add_conditional_edges(
-        "intel",
-        _route_from_state("archive"),
-        {
-            "version": "version",
-            "archive": "archive",
-        },
-    )
-    builder.add_conditional_edges(
-        "version",
-        _route_from_state("archive"),
-        {
-            "route": "route",
-            "archive": "archive",
-        },
-    )
-    builder.add_conditional_edges(
-        "route",
-        _route_from_state("archive"),
-        {
-            "patch": "patch",
-            "source": "source",
-            "archive": "archive",
-        },
-    )
-    builder.add_edge("patch", "hypothesis_aggregator")
-    builder.add_edge("source", "hypothesis_aggregator")
-    builder.add_edge("hypothesis_aggregator", "review")
-    builder.add_conditional_edges(
-        "review",
-        _route_from_state("review_blocked"),
-        {
-            "human_approve": "build",
-            "policy_admit": "build",
-            "review_blocked": "archive",
-            "await_review": END,
-        },
-    )
-    builder.add_edge("build", "build_diagnose")
-    builder.add_conditional_edges(
-        "build_diagnose",
-        _route_from_state("archive"),
-        {
-            "build": "build",
-            "campaign": "campaign",
-            "verify": "verify",
-            "archive": "archive",
-        },
-    )
-    builder.add_edge("campaign", "archive")
-    builder.add_edge("verify", "archive")
+
+    edges_by_source: dict[str, list[OrchestrationEdge]] = {}
+    for edge in IN_JOB_ORCHESTRATION_EDGES:
+        edges_by_source.setdefault(edge.source, []).append(edge)
+
+    for source, outgoing in edges_by_source.items():
+        park_routes = _NON_TERMINAL_PARK_ROUTES.get(source, {})
+        if len(outgoing) == 1 and not park_routes:
+            builder.add_edge(source, outgoing[0].target)
+            continue
+
+        targets = [edge.target for edge in outgoing]
+        has_duplicate_targets = len(targets) != len(set(targets))
+        branch_map: dict[str, Any] = {
+            (edge.kind if has_duplicate_targets else edge.target): edge.target
+            for edge in outgoing
+        }
+        branch_map.update(park_routes)
+        fallback = _default_branch_fallback(branch_map)
+        builder.add_conditional_edges(
+            source,
+            _route_from_state(fallback),
+            branch_map,
+        )
+
     builder.add_edge("archive", END)
     return builder.compile(checkpointer=checkpointer)
 
@@ -1968,16 +2028,33 @@ def build_v2_graph(
     build_diagnoser: BuildDiagnoser | None = None,
     campaign_runner: CampaignRunner | None = None,
     verdict_policy: verdict_mod.VerdictPolicy | None = None,
-    ledger: NodeReentryLedger | None = None,
+    ledger: ChargeArchiveStore | None = None,
     attempt_store: AttemptStore | None = None,
     node_map: Mapping[str, NodeFn] | None = None,
 ) -> Any:
-    """Compile the v0.2 14-node LangGraph ``StateGraph`` (24 in-job edges)."""
+    """Compile the v0.2 14-node LangGraph ``StateGraph`` (24 in-job edges).
+
+    In v2 unit-level execution, review parking routes ``await_review -> END``
+    and relies on :class:`AttemptStore` for re-entry replay on subsequent
+    invocations. PostgreSQL ``PostgresSaver`` / ``run_worker`` integration will
+    bridge review parking via LangGraph ``interrupt()``.
+    """
     del dsn, case_root
     if node_map is not None:
         return _compile_v2_graph(node_map, checkpointer=checkpointer)
     active_clock = clock or DeterministicClock()
-    active_ledger = ledger or NodeReentryLedger()
+    active_ledger: ChargeArchiveStore = (
+        ledger if ledger is not None else NodeReentryLedger()
+    )
+    active_attempt_store: AttemptStore = (
+        attempt_store
+        if attempt_store is not None
+        else (
+            active_ledger
+            if isinstance(active_ledger, AttemptStore)
+            else NodeReentryLedger()
+        )
+    )
     ctx = NodeContext(
         sandbox=sandbox,
         clock=active_clock,
@@ -1989,7 +2066,7 @@ def build_v2_graph(
         campaign_runner=campaign_runner or DefaultCampaignRunner(clock=active_clock),
         verdict_policy=verdict_policy or DEFAULT_VERDICT_POLICY,
         ledger=active_ledger,
-        attempt_store=attempt_store if attempt_store is not None else active_ledger,
+        attempt_store=active_attempt_store,
     )
     return _compile_v2_graph(_bind_v2_node_map(ctx), checkpointer=checkpointer)
 
@@ -2051,6 +2128,7 @@ class FamilyRunOutcome:
     max_concurrent_children: int
     child_execution_windows: tuple[ChildExecutionWindow, ...]
     family_index_digest: str | None = None
+    stop_reason_code: str | None = None
 
 
 class OrchestrationRunner:
@@ -2069,7 +2147,7 @@ class OrchestrationRunner:
         campaign_runner: CampaignRunner | None = None,
         iteration_gate: IterationGate | None = None,
         verdict_policy: verdict_mod.VerdictPolicy | None = None,
-        ledger: NodeReentryLedger | None = None,
+        ledger: ChargeArchiveStore | None = None,
         attempt_store: AttemptStore | None = None,
         max_build_retries: int = 1,
     ) -> None:
@@ -2094,9 +2172,17 @@ class OrchestrationRunner:
             verdict_policy or DEFAULT_VERDICT_POLICY
         )
         self.max_build_retries = _validate_max_build_retries(max_build_retries)
-        self.ledger: NodeReentryLedger = ledger or NodeReentryLedger()
+        self.ledger: ChargeArchiveStore = (
+            ledger if ledger is not None else NodeReentryLedger()
+        )
         self.attempt_store: AttemptStore = (
-            attempt_store if attempt_store is not None else self.ledger
+            attempt_store
+            if attempt_store is not None
+            else (
+                self.ledger
+                if isinstance(self.ledger, AttemptStore)
+                else NodeReentryLedger()
+            )
         )
         self._slot_table_lock = threading.Lock()
         self._family_locks: dict[str, threading.Lock] = {}
@@ -2343,6 +2429,8 @@ class OrchestrationRunner:
                 return None
             return max(0.0, max_fuzz_seconds - self.ledger.total_fuzz_seconds(family_id))
 
+        stop_reason_code: str | None = None
+
         # Step 2: Edge #23 (campaign -> hypothesis_aggregator) and edge #26
         # (verify -> hypothesis_aggregator) spawn serial round children after
         # each predecessor has archived itself.
@@ -2350,119 +2438,148 @@ class OrchestrationRunner:
         if (
             campaign_child.state == "COMPLETED"
             and campaign_child.terminal_node == "archive"
-            and seeds
-            and max_rounds > 0
-            and (_remaining_total() is None or (_remaining_total() or 0.0) > 0.0)
         ):
-            round_no = 1
-            transitions.append(
-                {
-                    "edge_no": 23,
-                    "source": "campaign",
-                    "target": "hypothesis_aggregator",
-                    "from_job_id": campaign_child.job_id,
-                    "next_round_no": round_no,
-                }
-            )
-            while True:
-                seed_index = min(round_no - 1, len(seeds) - 1)
-                seed_bytes = seeds[seed_index]
-                round_job_id = str(uuid4())
-                active_children += 1
-                max_concurrent = max(max_concurrent, active_children)
-                try:
-                    round_outcome = self.run_child(
-                        job_id=round_job_id,
-                        family_id=family_id,
-                        parent_job_id=family_id,
-                        job_kind="round",
-                        round_no=round_no,
-                        target_kind=target_kind,
-                        is_first_plan=False,
-                        envelope_digest=resolved_envelope,
-                        parent_approval_digest=campaign_child.approval_digest,
-                        build_ref=campaign_child.build_ref,
-                        seed_bytes=seed_bytes,
-                        request=request,
-                    )
-                finally:
-                    active_children -= 1
-                assert round_outcome.started_at is not None
-                assert round_outcome.finished_at is not None
-                windows.append(
-                    ChildExecutionWindow(
-                        job_id=round_outcome.job_id,
-                        job_kind="round",
-                        round_no=round_no,
-                        started_at=round_outcome.started_at,
-                        finished_at=round_outcome.finished_at,
-                    )
-                )
-                round_children.append(round_outcome)
-
-                decision = self.iteration_gate.check_capacity(
-                    family_id=family_id,
-                    completed_round_no=round_no,
-                    max_rounds=max_rounds,
-                    last_verdict=round_outcome.verdict,
-                    remaining_budget_seconds=_remaining_total(),
-                    remaining_fuzz_seconds=_remaining_fuzz(),
-                    remaining_seeds=max(0, len(seeds) - round_no),
-                )
-                if not decision.should_continue:
-                    break
-
-                round_no += 1
+            remaining_total = _remaining_total()
+            if not seeds:
+                stop_reason_code = "NO_REMAINING_SEEDS"
+            elif max_rounds == 0 or (
+                remaining_total is not None and remaining_total <= 0.0
+            ):
+                stop_reason_code = "BUDGET_EXHAUSTED"
+            else:
+                round_no = 1
                 transitions.append(
                     {
-                        "edge_no": 26,
-                        "source": "verify",
+                        "edge_no": 23,
+                        "source": "campaign",
                         "target": "hypothesis_aggregator",
-                        "from_job_id": round_outcome.job_id,
+                        "from_job_id": campaign_child.job_id,
                         "next_round_no": round_no,
                     }
                 )
+                while True:
+                    seed_bytes = seeds[round_no - 1]
+                    round_job_id = str(uuid4())
+                    active_children += 1
+                    max_concurrent = max(max_concurrent, active_children)
+                    try:
+                        round_outcome = self.run_child(
+                            job_id=round_job_id,
+                            family_id=family_id,
+                            parent_job_id=family_id,
+                            job_kind="round",
+                            round_no=round_no,
+                            target_kind=target_kind,
+                            is_first_plan=False,
+                            envelope_digest=resolved_envelope,
+                            parent_approval_digest=campaign_child.approval_digest,
+                            build_ref=campaign_child.build_ref,
+                            seed_bytes=seed_bytes,
+                            request=request,
+                        )
+                    finally:
+                        active_children -= 1
+                    assert round_outcome.started_at is not None
+                    assert round_outcome.finished_at is not None
+                    windows.append(
+                        ChildExecutionWindow(
+                            job_id=round_outcome.job_id,
+                            job_kind="round",
+                            round_no=round_no,
+                            started_at=round_outcome.started_at,
+                            finished_at=round_outcome.finished_at,
+                        )
+                    )
+                    round_children.append(round_outcome)
 
-        # Step 3: Run the family job itself through prepare -> AGGREGATING -> archive.
+                    remaining_seeds = max(0, len(seeds) - round_no)
+                    decision = self.iteration_gate.check_capacity(
+                        family_id=family_id,
+                        completed_round_no=round_no,
+                        max_rounds=max_rounds,
+                        last_verdict=round_outcome.verdict,
+                        remaining_budget_seconds=_remaining_total(),
+                        remaining_fuzz_seconds=_remaining_fuzz(),
+                        remaining_seeds=remaining_seeds,
+                    )
+                    if not decision.should_continue:
+                        stop_reason_code = decision.reason_code
+                        if stop_reason_code is None and round_outcome.state in (
+                            "BLOCKED",
+                            "FAILED",
+                        ):
+                            stop_reason_code = round_outcome.reason_code
+                        break
+                    if remaining_seeds <= 0:
+                        stop_reason_code = "NO_REMAINING_SEEDS"
+                        break
+
+                    round_no += 1
+                    transitions.append(
+                        {
+                            "edge_no": 26,
+                            "source": "verify",
+                            "target": "hypothesis_aggregator",
+                            "from_job_id": round_outcome.job_id,
+                            "next_round_no": round_no,
+                        }
+                    )
+
+        # Step 3: Run the family job itself through prepare -> AGGREGATING -> archive
+        # under the family slot lock so no concurrent child can interleave.
         family_final_state = "COMPLETED"
         family_final_reason: str | None = None
-        if campaign_child.state == "BLOCKED" and campaign_child.reason_code in (
-            "REVIEW_REJECTED",
-            "REVIEW_EXPIRED",
-        ):
+        if campaign_child.state == "BLOCKED":
             family_final_state = "BLOCKED"
             family_final_reason = campaign_child.reason_code
+            stop_reason_code = campaign_child.reason_code
+        elif campaign_child.state == "FAILED":
+            # v2 families have no FAILED state (AGGREGATING/COMPLETED/BLOCKED/CANCELLED);
+            # converge to COMPLETED while recording campaign_state & stop_reason_code.
+            family_final_state = "COMPLETED"
+            family_final_reason = None
+            stop_reason_code = campaign_child.reason_code
+        elif campaign_child.state != "COMPLETED":
+            stop_reason_code = campaign_child.reason_code
 
-        family_graph_state: Mapping[str, Any] = self.graph.invoke(
-            {
-                "job_id": family_id,
-                "family_id": family_id,
-                "parent_job_id": None,
-                "job_kind": "family",
-                "round_no": None,
-                "generation": 1,
-                "request": dict(request or {}),
-                "family_summary": {
-                    "kind": "family_index",
+        family_request = {
+            key: value
+            for key, value in (request or {}).items()
+            if key != "prepare_blocked_reason"
+        }
+        with self._family_slot_lock(family_id):
+            family_graph_state: Mapping[str, Any] = self.graph.invoke(
+                {
+                    "job_id": family_id,
                     "family_id": family_id,
-                    "campaign_job_id": campaign_child.job_id,
-                    "rounds": [
-                        {
-                            "job_id": child.job_id,
-                            "round_no": child.round_no,
-                            "state": child.state,
-                            "verdict": child.verdict,
-                            "reason_code": child.reason_code,
-                        }
-                        for child in round_children
-                    ],
-                    "family_approval_digest": campaign_child.approval_digest,
-                    "final_state": family_final_state,
-                    "final_reason_code": family_final_reason,
-                },
-                "visited_nodes": [],
-            }
-        )
+                    "parent_job_id": None,
+                    "job_kind": "family",
+                    "round_no": None,
+                    "generation": 1,
+                    "request": family_request,
+                    "family_summary": {
+                        "kind": "family_index",
+                        "family_id": family_id,
+                        "campaign_job_id": campaign_child.job_id,
+                        "campaign_state": campaign_child.state,
+                        "rounds": [
+                            {
+                                "job_id": child.job_id,
+                                "round_no": child.round_no,
+                                "state": child.state,
+                                "verdict": child.verdict,
+                                "reason_code": child.reason_code,
+                            }
+                            for child in round_children
+                        ],
+                        "family_approval_digest": campaign_child.approval_digest,
+                        "final_state": family_final_state,
+                        "final_reason_code": family_final_reason,
+                        "stop_reason_code": stop_reason_code,
+                    },
+                    "visited_nodes": [],
+                }
+            )
         terminal_family_state = str(family_graph_state.get("state", family_final_state))
         family_states.append(terminal_family_state)
 
@@ -2481,6 +2598,7 @@ class OrchestrationRunner:
             max_concurrent_children=max_concurrent,
             child_execution_windows=tuple(windows),
             family_index_digest=family_graph_state.get("archive_digest"),
+            stop_reason_code=stop_reason_code,
         )
 
 
@@ -2493,6 +2611,7 @@ __all__ = [
     "BuildDiagnosis",
     "CampaignResult",
     "CampaignRunner",
+    "ChargeArchiveStore",
     "ChildExecutionWindow",
     "ChildRunOutcome",
     "ClockProtocol",
