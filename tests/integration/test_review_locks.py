@@ -2404,6 +2404,127 @@ def test_freeze_non_first_plan_rejects_envelope_mismatch_with_approval_tail(
     _assert_no_freeze_rows(isolated_database, family_id, child_id)
 
 
+def test_real_reapproval_unlocks_the_next_plan_with_the_new_chain_tail(
+    isolated_database, tmp_path, monkeypatch
+):
+    """§9.1 end-to-end: approve -> propose -> re-approve -> next freeze.
+
+    Unlike the chain-tail fixtures above, this drives the real
+    ``propose_envelope`` and ``record_review`` write paths instead of inserting
+    ``family_approvals`` rows by hand.
+    """
+    monkeypatch.setenv("DATACON_EVIDENCE_ROOT", str(tmp_path / "evidence"))
+    seed = _seed_family(
+        isolated_database,
+        first_approval=True,
+        pending_envelope=None,
+    )
+    family_id = seed["family_id"]
+
+    # A changed (tightened) envelope is proposed through the real path.
+    new_body = deepcopy(GUIDED_ENVELOPE_BODY)
+    new_body["max_total_seconds"] = 90
+    new_envelope_digest = jsonutil.digest_json(new_body)
+    proposed = state.propose_envelope(
+        isolated_database.dsn, family_id, new_body
+    )
+    assert proposed["envelope_digest"] == new_envelope_digest
+
+    outcome = state.record_review(
+        isolated_database.dsn,
+        family_id,
+        plan_digest=FIRST_PLAN_DIGEST,
+        decision="approve",
+        reviewer_id=REVIEWER_2,
+        envelope_digest=new_envelope_digest,
+    )
+    assert outcome.status == "applied"
+    assert _row(
+        isolated_database,
+        "SELECT status FROM family_envelopes WHERE family_id = %s "
+        "AND envelope_digest = %s",
+        (family_id, new_envelope_digest),
+    )[0] == "approved"
+
+    tails = isolated_database.connection.execute(
+        "SELECT approval_digest, envelope_digest "
+        "FROM family_approvals AS prior "
+        "WHERE prior.family_id = %s AND NOT EXISTS ("
+        "SELECT 1 FROM family_approvals AS later "
+        "WHERE later.supersedes = prior.approval_id)",
+        (family_id,),
+    ).fetchall()
+    assert len(tails) == 1, "re-approval left more than one chain tail"
+    tail_approval_digest, tail_envelope_digest = tails[0]
+    assert tail_envelope_digest == new_envelope_digest
+    assert _row(
+        isolated_database,
+        "SELECT count(*) FROM reviews WHERE job_id = %s",
+        (family_id,),
+    )[0] == 1, "re-approval rewrote the first-round reviews row"
+
+    def _insert_guided_round_child(round_no=1):
+        child = uuid4()
+        _insert_plain_job(
+            isolated_database,
+            child,
+            request=_family_request("guided"),
+            state_name="PREPARING",
+            family_id=family_id,
+            job_kind="round",
+            parent_job_id=family_id,
+            round_no=round_no,
+            lease=True,
+        )
+        return child
+
+    # A later guided round plan bound to the new tail freezes successfully.
+    good_child = _insert_guided_round_child()
+    good_plan = _v2_plan(
+        family_id,
+        round_no=1,
+        envelope_digest=tail_envelope_digest,
+        parent_approval_digest=tail_approval_digest,
+    )
+    assert state.freeze_plan(
+        isolated_database.dsn,
+        good_child,
+        generation=1,
+        plan=good_plan,
+        plan_digest=contracts.plan_digest(good_plan),
+        summary={},
+    ) is True
+
+    # The old (superseded) approval is rejected even though the envelope is
+    # the new one, and no plan row is written.
+    bad_child = _insert_guided_round_child(round_no=2)
+    stale_plan = _v2_plan(
+        family_id,
+        round_no=2,
+        envelope_digest=tail_envelope_digest,
+        parent_approval_digest=APPROVAL_1,
+    )
+    with pytest.raises(state.StateError, match="parent_approval_digest"):
+        state.freeze_plan(
+            isolated_database.dsn,
+            bad_child,
+            generation=1,
+            plan=stale_plan,
+            plan_digest=contracts.plan_digest(stale_plan),
+            summary={},
+        )
+    assert _row(
+        isolated_database,
+        "SELECT count(*) FROM plans WHERE job_id = %s",
+        (bad_child,),
+    )[0] == 0
+    assert _row(
+        isolated_database,
+        "SELECT state FROM jobs WHERE job_id = %s",
+        (bad_child,),
+    )[0] == "PREPARING"
+
+
 def test_freeze_plan_locks_family_then_child(isolated_database):
     family_id, child_id = _freeze_seed(
         isolated_database, _family_request("guided")
