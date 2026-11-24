@@ -10,10 +10,21 @@ from __future__ import annotations
 import copy
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from functools import partial
 import hashlib
 import math
 import threading
-from typing import Any, Callable, Literal, Mapping, Protocol, Sequence, TypedDict, runtime_checkable
+from typing import (
+    Any,
+    Callable,
+    Literal,
+    Mapping,
+    NamedTuple,
+    Protocol,
+    Sequence,
+    TypedDict,
+    runtime_checkable,
+)
 from uuid import uuid4
 
 from langgraph.graph import END, START, StateGraph
@@ -279,7 +290,51 @@ FAMILY_ORCHESTRATION_EDGES: tuple[OrchestrationEdge, ...] = tuple(
     edge for edge in ORCHESTRATION_EDGES if edge.scope == "family"
 )
 
+class StepKey(NamedTuple):
+    """Idempotency key ``(job_id, stage, step_key, attempt_no, generation)``.
+
+    As a ``NamedTuple``, ``StepKey`` is value- and hash-equal to the legacy
+    5-tuple ``IdempotencyKey`` while exposing named fields for readability.
+    """
+
+    job_id: str
+    stage: str
+    step_key: str
+    attempt_no: int
+    generation: int
+
+
 IdempotencyKey = tuple[str, str, str, int, int]
+
+
+@runtime_checkable
+class AttemptStore(Protocol):
+    """Minimal persistence contract for completed node outcomes keyed by :class:`StepKey`."""
+
+    def get_completed(self, key: StepKey) -> dict[str, Any] | None: ...
+
+    def record_completed(
+        self,
+        key: StepKey,
+        result: Mapping[str, Any],
+    ) -> dict[str, Any]: ...
+
+
+def run_idempotent(
+    store: AttemptStore,
+    key: StepKey,
+    action: Callable[[], dict[str, Any]],
+    *,
+    should_cache: Callable[[dict[str, Any]], bool] | None = None,
+) -> dict[str, Any]:
+    """Return cached outcome for ``key``, or run ``action`` and persist if cacheable."""
+    cached = store.get_completed(key)
+    if cached is not None:
+        return cached
+    result = action()
+    if should_cache is None or should_cache(result):
+        return store.record_completed(key, result)
+    return result
 
 
 def _sha256_bytes(data: bytes) -> str:
@@ -920,24 +975,39 @@ class NodeReentryLedger:
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._node_results: dict[IdempotencyKey, dict[str, Any]] = {}
+        self._node_results: dict[StepKey, dict[str, Any]] = {}
         self._charge_keys: set[tuple[str, str, int]] = set()
         self._charges_by_job: dict[str, list[BudgetChargeRecord]] = {}
         self._charges_by_family: dict[str, list[BudgetChargeRecord]] = {}
         self._archives_by_job: dict[str, list[ArchiveRecord]] = {}
 
-    def get(self, key: IdempotencyKey) -> dict[str, Any] | None:
+    def get_completed(self, key: StepKey) -> dict[str, Any] | None:
+        step_key = key if isinstance(key, StepKey) else StepKey(*key)
         with self._lock:
-            cached = self._node_results.get(key)
+            cached = self._node_results.get(step_key)
             if cached is None:
                 return None
             return copy.deepcopy(cached)
 
-    def record(self, key: IdempotencyKey, result: Mapping[str, Any]) -> dict[str, Any]:
+    def record_completed(
+        self,
+        key: StepKey,
+        result: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        step_key = key if isinstance(key, StepKey) else StepKey(*key)
         snapshot = copy.deepcopy(dict(result))
         with self._lock:
-            self._node_results[key] = snapshot
+            self._node_results[step_key] = snapshot
         return copy.deepcopy(snapshot)
+
+    def get(self, key: IdempotencyKey) -> dict[str, Any] | None:
+        return self.get_completed(key if isinstance(key, StepKey) else StepKey(*key))
+
+    def record(self, key: IdempotencyKey, result: Mapping[str, Any]) -> dict[str, Any]:
+        return self.record_completed(
+            key if isinstance(key, StepKey) else StepKey(*key),
+            result,
+        )
 
     def record_charge(
         self,
@@ -1070,7 +1140,25 @@ class OrchestrationState(TypedDict, total=False):
     attempt_no_override: int | None
 
 
+@dataclass(frozen=True)
+class NodeContext:
+    """Immutable dependency bundle injected into all 14 v0.2 LangGraph nodes."""
+
+    sandbox: SandboxProtocol | None
+    clock: ClockProtocol
+    intel_provider: IntelProvider
+    hypothesis_aggregator: HypothesisAggregator
+    review_gate: ReviewGate
+    envelope_policy: EnvelopePolicy
+    build_diagnoser: BuildDiagnoser
+    campaign_runner: CampaignRunner
+    verdict_policy: verdict_mod.VerdictPolicy
+    ledger: NodeReentryLedger
+    attempt_store: AttemptStore
+
+
 NodeFn = Callable[[OrchestrationState], dict[str, Any]]
+NodeHandler = Callable[[NodeContext, OrchestrationState], dict[str, Any]]
 
 
 def _append_visited(state: OrchestrationState, node_name: str) -> list[str]:
@@ -1085,14 +1173,14 @@ def _node_key(
     *,
     default_step_key: str,
     default_attempt_no: int = 1,
-) -> IdempotencyKey:
+) -> StepKey:
     job_id = state["job_id"]
     step_key = state.get("step_key_override") or default_step_key
     attempt_no = state.get("attempt_no_override")
     if attempt_no is None:
         attempt_no = default_attempt_no
     generation = state.get("generation", 1)
-    return (job_id, stage, step_key, attempt_no, generation)
+    return StepKey(job_id, stage, step_key, attempt_no, generation)
 
 
 def _validate_max_build_retries(value: Any) -> int:
@@ -1139,88 +1227,68 @@ def _observation_from_replay(result: ReplayResult) -> verdict_mod.RunObservation
     )
 
 
-def _build_v2_node_map(
-    *,
-    sandbox: SandboxProtocol | None,
-    clock: ClockProtocol,
-    intel_provider: IntelProvider,
-    hypothesis_aggregator: HypothesisAggregator,
-    review_gate: ReviewGate,
-    envelope_policy: EnvelopePolicy,
-    build_diagnoser: BuildDiagnoser,
-    campaign_runner: CampaignRunner,
-    verdict_policy: verdict_mod.VerdictPolicy,
-    ledger: NodeReentryLedger,
-) -> dict[str, NodeFn]:
-    """Construct the 14 LangGraph v2 node callables backed by ``ledger``."""
+def _node_prepare(ctx: NodeContext, state: OrchestrationState) -> dict[str, Any]:
+    key = _node_key(state, "prepare", default_step_key="prepare")
 
-    def prepare(state: OrchestrationState) -> dict[str, Any]:
-        key = _node_key(state, "prepare", default_step_key="prepare")
-        cached = ledger.get(key)
-        if cached is not None:
-            return cached
-
+    def _action() -> dict[str, Any]:
         request = state.get("request") or {}
         job_kind = state.get("job_kind", "round")
         blocked_reason = request.get("prepare_blocked_reason")
         if isinstance(blocked_reason, str) and blocked_reason:
-            update: dict[str, Any] = {
+            return {
                 "state": "BLOCKED",
                 "reason_code": blocked_reason,
                 "next_route": "archive",
                 "visited_nodes": _append_visited(state, "prepare"),
             }
-        elif job_kind not in ("family", "campaign", "round"):
-            update = {
+        if job_kind not in ("family", "campaign", "round"):
+            return {
                 "state": "BLOCKED",
                 "reason_code": "INVALID_REQUEST",
                 "next_route": "archive",
                 "visited_nodes": _append_visited(state, "prepare"),
             }
-        elif job_kind == "family":
-            update = {
+        if job_kind == "family":
+            return {
                 "state": "AGGREGATING",
                 "next_route": "AGGREGATING",
                 "visited_nodes": _append_visited(state, "prepare"),
             }
-        else:
-            update = {
-                "state": "PREPARING",
-                "next_route": "intel",
-                "visited_nodes": _append_visited(state, "prepare"),
-            }
-        return ledger.record(key, update)
+        return {
+            "state": "PREPARING",
+            "next_route": "intel",
+            "visited_nodes": _append_visited(state, "prepare"),
+        }
 
-    def aggregating(state: OrchestrationState) -> dict[str, Any]:
-        key = _node_key(state, "AGGREGATING", default_step_key="aggregating")
-        cached = ledger.get(key)
-        if cached is not None:
-            return cached
+    return run_idempotent(ctx.attempt_store, key, _action)
 
+
+def _node_aggregating(ctx: NodeContext, state: OrchestrationState) -> dict[str, Any]:
+    key = _node_key(state, "AGGREGATING", default_step_key="aggregating")
+
+    def _action() -> dict[str, Any]:
         summary = dict(state.get("family_summary") or {})
         summary.setdefault("kind", "family_index")
         summary.setdefault("family_id", state["family_id"])
-        final_state = summary.get("final_state", "COMPLETED")
-        final_reason = summary.get("final_reason_code")
-        update: dict[str, Any] = {
-            "state": final_state,
+        return {
+            "state": summary.get("final_state", "COMPLETED"),
             "verdict": None,
-            "reason_code": final_reason,
+            "reason_code": summary.get("final_reason_code"),
             "family_summary": summary,
             "next_route": "archive",
             "visited_nodes": _append_visited(state, "AGGREGATING"),
         }
-        return ledger.record(key, update)
 
-    def intel(state: OrchestrationState) -> dict[str, Any]:
-        key = _node_key(state, "intel", default_step_key="intel")
-        cached = ledger.get(key)
-        if cached is not None:
-            return cached
+    return run_idempotent(ctx.attempt_store, key, _action)
 
+
+def _node_intel(ctx: NodeContext, state: OrchestrationState) -> dict[str, Any]:
+    key = _node_key(state, "intel", default_step_key="intel")
+
+    def _action() -> dict[str, Any]:
         request = state.get("request") or {}
         try:
-            result = intel_provider.resolve_intel(
+            result = ctx.intel_provider.resolve_intel(
                 job_id=state["job_id"],
                 family_id=state["family_id"],
                 request=request,
@@ -1252,7 +1320,7 @@ def _build_v2_node_map(
                 error_message = (
                     result.message or "intel snapshot_digest is missing or blank"
                 )
-            update: dict[str, Any] = {
+            return {
                 "state": "BLOCKED",
                 "reason_code": reason_code,
                 "error_message": error_message,
@@ -1260,80 +1328,73 @@ def _build_v2_node_map(
                 "next_route": "archive",
                 "visited_nodes": _append_visited(state, "intel"),
             }
-        else:
-            summary = dict(result.summary)
-            summary["snapshot_digest"] = snapshot_digest
-            update = {
-                "intel_summary": summary,
-                "next_route": "version",
-                "visited_nodes": _append_visited(state, "intel"),
-            }
-        return ledger.record(key, update)
 
-    def version(state: OrchestrationState) -> dict[str, Any]:
-        key = _node_key(state, "version", default_step_key="version")
-        cached = ledger.get(key)
-        if cached is not None:
-            return cached
+        summary = dict(result.summary)
+        summary["snapshot_digest"] = snapshot_digest
+        return {
+            "intel_summary": summary,
+            "next_route": "version",
+            "visited_nodes": _append_visited(state, "intel"),
+        }
 
+    return run_idempotent(ctx.attempt_store, key, _action)
+
+
+def _node_version(ctx: NodeContext, state: OrchestrationState) -> dict[str, Any]:
+    key = _node_key(state, "version", default_step_key="version")
+
+    def _action() -> dict[str, Any]:
         request = state.get("request") or {}
         blocked_reason = request.get("version_blocked_reason")
         if isinstance(blocked_reason, str) and blocked_reason:
-            update: dict[str, Any] = {
+            return {
                 "state": "BLOCKED",
                 "reason_code": blocked_reason,
                 "next_route": "archive",
                 "visited_nodes": _append_visited(state, "version"),
             }
-        else:
-            vulnerable_commit = str(
-                request.get("vulnerable_commit", DEFAULT_VULNERABLE_COMMIT)
-            )
-            fixed_commit = str(request.get("fixed_commit", DEFAULT_FIXED_COMMIT))
-            update = {
-                "version_pair": {
-                    "vulnerable": vulnerable_commit,
-                    "fixed": fixed_commit,
-                },
-                "next_route": "route",
-                "visited_nodes": _append_visited(state, "version"),
-            }
-        return ledger.record(key, update)
+        vulnerable_commit = str(
+            request.get("vulnerable_commit", DEFAULT_VULNERABLE_COMMIT)
+        )
+        fixed_commit = str(request.get("fixed_commit", DEFAULT_FIXED_COMMIT))
+        return {
+            "version_pair": {
+                "vulnerable": vulnerable_commit,
+                "fixed": fixed_commit,
+            },
+            "next_route": "route",
+            "visited_nodes": _append_visited(state, "version"),
+        }
 
-    def route(state: OrchestrationState) -> dict[str, Any]:
-        key = _node_key(state, "route", default_step_key="route")
-        cached = ledger.get(key)
-        if cached is not None:
-            return cached
+    return run_idempotent(ctx.attempt_store, key, _action)
 
+
+def _node_route(ctx: NodeContext, state: OrchestrationState) -> dict[str, Any]:
+    key = _node_key(state, "route", default_step_key="route")
+
+    def _action() -> dict[str, Any]:
         target_kind = state.get("target_kind", "source")
-        if target_kind == "patch":
-            update: dict[str, Any] = {
-                "next_route": "patch",
+        if target_kind in ("patch", "source"):
+            return {
+                "next_route": target_kind,
                 "visited_nodes": _append_visited(state, "route"),
             }
-        elif target_kind == "source":
-            update = {
-                "next_route": "source",
-                "visited_nodes": _append_visited(state, "route"),
-            }
-        else:
-            # Edge #11: reverse placeholder / binary target archives immediately.
-            update = {
-                "state": "BLOCKED",
-                "reason_code": "UNSUPPORTED_TARGET",
-                "next_route": "archive",
-                "visited_nodes": _append_visited(state, "route"),
-            }
-        return ledger.record(key, update)
+        # Edge #11: reverse placeholder / binary target archives immediately.
+        return {
+            "state": "BLOCKED",
+            "reason_code": "UNSUPPORTED_TARGET",
+            "next_route": "archive",
+            "visited_nodes": _append_visited(state, "route"),
+        }
 
-    def patch(state: OrchestrationState) -> dict[str, Any]:
-        key = _node_key(state, "patch", default_step_key="patch")
-        cached = ledger.get(key)
-        if cached is not None:
-            return cached
+    return run_idempotent(ctx.attempt_store, key, _action)
 
-        update = {
+
+def _node_patch(ctx: NodeContext, state: OrchestrationState) -> dict[str, Any]:
+    key = _node_key(state, "patch", default_step_key="patch")
+
+    def _action() -> dict[str, Any]:
+        return {
             "route_facts": {
                 "target_kind": "patch",
                 "evidence_refs": ["patch:diff#L1"],
@@ -1341,15 +1402,15 @@ def _build_v2_node_map(
             "next_route": "hypothesis_aggregator",
             "visited_nodes": _append_visited(state, "patch"),
         }
-        return ledger.record(key, update)
 
-    def source(state: OrchestrationState) -> dict[str, Any]:
-        key = _node_key(state, "source", default_step_key="source")
-        cached = ledger.get(key)
-        if cached is not None:
-            return cached
+    return run_idempotent(ctx.attempt_store, key, _action)
 
-        update = {
+
+def _node_source(ctx: NodeContext, state: OrchestrationState) -> dict[str, Any]:
+    key = _node_key(state, "source", default_step_key="source")
+
+    def _action() -> dict[str, Any]:
+        return {
             "route_facts": {
                 "target_kind": "source",
                 "evidence_refs": ["source:target.c#L1"],
@@ -1357,23 +1418,22 @@ def _build_v2_node_map(
             "next_route": "hypothesis_aggregator",
             "visited_nodes": _append_visited(state, "source"),
         }
-        return ledger.record(key, update)
 
-    def hypothesis_aggregator_node(state: OrchestrationState) -> dict[str, Any]:
-        key = _node_key(
-            state,
-            "hypothesis_aggregator",
-            default_step_key="hypothesis_aggregator",
-        )
-        cached = ledger.get(key)
-        if cached is not None:
-            if state.get("envelope_digest"):
-                cached["envelope_digest"] = state["envelope_digest"]
-            if state.get("first_plan_digest"):
-                cached["first_plan_digest"] = state["first_plan_digest"]
-            return cached
+    return run_idempotent(ctx.attempt_store, key, _action)
 
-        aggregated = hypothesis_aggregator.aggregate(
+
+def _node_hypothesis_aggregator(
+    ctx: NodeContext,
+    state: OrchestrationState,
+) -> dict[str, Any]:
+    key = _node_key(
+        state,
+        "hypothesis_aggregator",
+        default_step_key="hypothesis_aggregator",
+    )
+
+    def _action() -> dict[str, Any]:
+        aggregated = ctx.hypothesis_aggregator.aggregate(
             job_id=state["job_id"],
             family_id=state["family_id"],
             job_kind=state.get("job_kind", "round"),
@@ -1393,7 +1453,7 @@ def _build_v2_node_map(
                 "experiment_digest": aggregated.experiment_digest,
             }
         )
-        update = {
+        return {
             "experiment_spec": dict(aggregated.experiment_spec),
             "experiment_digest": aggregated.experiment_digest,
             "envelope_digest": envelope_digest,
@@ -1401,14 +1461,23 @@ def _build_v2_node_map(
             "next_route": "review",
             "visited_nodes": _append_visited(state, "hypothesis_aggregator"),
         }
-        return ledger.record(key, update)
 
-    def review(state: OrchestrationState) -> dict[str, Any]:
-        key = _node_key(state, "review", default_step_key="review")
-        cached = ledger.get(key)
-        if cached is not None:
-            return cached
+    result = run_idempotent(ctx.attempt_store, key, _action)
+    # Preserve explicit caller-provided digests on cache hit (e.g. corrected
+    # envelope_digest after a D42 REVIEW_ENVELOPE_MISMATCH retry).
+    if state.get("envelope_digest") or state.get("first_plan_digest"):
+        result = dict(result)
+        if state.get("envelope_digest"):
+            result["envelope_digest"] = state["envelope_digest"]
+        if state.get("first_plan_digest"):
+            result["first_plan_digest"] = state["first_plan_digest"]
+    return result
 
+
+def _node_review(ctx: NodeContext, state: OrchestrationState) -> dict[str, Any]:
+    key = _node_key(state, "review", default_step_key="review")
+
+    def _action() -> dict[str, Any]:
         family_id = state["family_id"]
         job_id = state["job_id"]
         job_kind = state.get("job_kind", "round")
@@ -1431,13 +1500,13 @@ def _build_v2_node_map(
             )
 
         if is_first_plan:
-            decision = review_gate.evaluate_first_plan(
+            decision = ctx.review_gate.evaluate_first_plan(
                 family_id=family_id,
                 first_plan_digest=first_plan_digest,
                 envelope_digest=envelope_digest,
             )
             if decision.edge == "build":
-                update: dict[str, Any] = {
+                return {
                     "state": "READY",
                     "approval_digest": decision.approval_digest,
                     "admission_kind": "human",
@@ -1445,10 +1514,7 @@ def _build_v2_node_map(
                     "next_route": "human_approve",
                     "visited_nodes": _append_visited(state, "review"),
                 }
-            elif decision.edge == "await_review":
-                # D42: REVIEW_ENVELOPE_MISMATCH stays non-terminal and must not
-                # be cached in NodeReentryLedger so a subsequent review with a
-                # corrected envelope_digest under the same generation can proceed.
+            if decision.edge == "await_review":
                 return {
                     "state": "AWAITING_REVIEW",
                     "reason_code": decision.reason_code,
@@ -1456,60 +1522,65 @@ def _build_v2_node_map(
                     "next_route": "await_review",
                     "visited_nodes": _append_visited(state, "review"),
                 }
-            else:
-                update = {
-                    "state": "BLOCKED",
-                    "reason_code": decision.reason_code or "REVIEW_REJECTED",
-                    "next_route": "review_blocked",
-                    "visited_nodes": _append_visited(state, "review"),
-                }
-        else:
-            seed_bytes = state.get("seed_bytes")
-            seed_digest = (
-                state.get("seed_digest")
-                or (_sha256_bytes(seed_bytes) if seed_bytes is not None else _sha256_bytes(b""))
-            )
-            admission = envelope_policy.admit_round(
-                family_id=family_id,
-                job_id=job_id,
-                round_no=round_no or 1,
-                envelope_digest=envelope_digest,
-                parent_approval_digest=parent_approval_digest,
-                seed_digest=seed_digest,
-            )
-            if admission.edge == "build" and admission.admitted:
-                update = {
-                    "state": "READY",
-                    "admission_id": admission.admission_id,
-                    "admission_kind": "policy",
-                    "reason_code": None,
-                    "next_route": "policy_admit",
-                    "visited_nodes": _append_visited(state, "review"),
-                }
-            else:
-                update = {
-                    "state": "BLOCKED",
-                    "reason_code": admission.reason_code or "ADMISSION_DENIED",
-                    "next_route": "review_blocked",
-                    "visited_nodes": _append_visited(state, "review"),
-                }
-        return ledger.record(key, update)
+            return {
+                "state": "BLOCKED",
+                "reason_code": decision.reason_code or "REVIEW_REJECTED",
+                "next_route": "review_blocked",
+                "visited_nodes": _append_visited(state, "review"),
+            }
 
-    def build(state: OrchestrationState) -> dict[str, Any]:
-        retry_count = state.get("build_retry_count", 0)
-        attempt_no = state.get("attempt_no_override")
-        if attempt_no is None:
-            attempt_no = retry_count + 1
-        key = _node_key(
-            state,
-            "build",
-            default_step_key="build",
-            default_attempt_no=attempt_no,
+        seed_bytes = state.get("seed_bytes")
+        seed_digest = state.get("seed_digest") or (
+            _sha256_bytes(seed_bytes) if seed_bytes is not None else _sha256_bytes(b"")
         )
-        cached = ledger.get(key)
-        if cached is not None:
-            return cached
+        admission = ctx.envelope_policy.admit_round(
+            family_id=family_id,
+            job_id=job_id,
+            round_no=round_no or 1,
+            envelope_digest=envelope_digest,
+            parent_approval_digest=parent_approval_digest,
+            seed_digest=seed_digest,
+        )
+        if admission.edge == "build" and admission.admitted:
+            return {
+                "state": "READY",
+                "admission_id": admission.admission_id,
+                "admission_kind": "policy",
+                "reason_code": None,
+                "next_route": "policy_admit",
+                "visited_nodes": _append_visited(state, "review"),
+            }
+        return {
+            "state": "BLOCKED",
+            "reason_code": admission.reason_code or "ADMISSION_DENIED",
+            "next_route": "review_blocked",
+            "visited_nodes": _append_visited(state, "review"),
+        }
 
+    # D42: Non-terminal parked review (await_review / REVIEW_ENVELOPE_MISMATCH)
+    # is not cached so a subsequent review with a corrected envelope_digest
+    # under the same generation can proceed.
+    return run_idempotent(
+        ctx.attempt_store,
+        key,
+        _action,
+        should_cache=lambda u: u.get("next_route") != "await_review",
+    )
+
+
+def _node_build(ctx: NodeContext, state: OrchestrationState) -> dict[str, Any]:
+    retry_count = state.get("build_retry_count", 0)
+    attempt_no = state.get("attempt_no_override")
+    if attempt_no is None:
+        attempt_no = retry_count + 1
+    key = _node_key(
+        state,
+        "build",
+        default_step_key="build",
+        default_attempt_no=attempt_no,
+    )
+
+    def _action() -> dict[str, Any]:
         reused_ref = state.get("build_ref")
         if reused_ref is not None:
             # Validation round reusing campaign build artifacts: never rebuild.
@@ -1518,15 +1589,14 @@ def _build_v2_node_map(
                 for version in verdict_mod.VERSIONS
                 if isinstance(reused_ref.get(version), Mapping)
             }
-            update: dict[str, Any] = {
+            return {
                 "state": "RUNNING",
                 "build_artifacts": reused_artifacts,
                 "next_route": "build_diagnose",
                 "visited_nodes": _append_visited(state, "build"),
             }
-            return ledger.record(key, update)
 
-        if sandbox is None:
+        if ctx.sandbox is None:
             raise RuntimeError("sandbox is required to execute the build node")
 
         artifacts: dict[str, dict[str, Any]] = {
@@ -1539,48 +1609,48 @@ def _build_v2_node_map(
             existing = artifacts.get(version)
             if existing is not None and existing.get("status") == "completed":
                 continue
-            built = sandbox.build(version)
+            built = ctx.sandbox.build(version)
             total_duration += built.duration_seconds
             artifacts[version] = _serialize_build_result(built)
             if built.status != "completed":
                 # Fail fast on this attempt so build_diagnose decides retry vs archive.
                 break
 
-        ledger.record_charge(
+        ctx.ledger.record_charge(
             job_id=state["job_id"],
             family_id=state["family_id"],
-            step_key=key[2],
-            attempt_no=key[3],
+            step_key=key.step_key,
+            attempt_no=key.attempt_no,
             seconds=total_duration,
-            recorded_at=clock.timestamp(),
+            recorded_at=ctx.clock.timestamp(),
             charge_kind="general",
         )
-        update = {
+        return {
             "state": "RUNNING",
             "build_artifacts": artifacts,
             "next_route": "build_diagnose",
             "visited_nodes": _append_visited(state, "build"),
         }
-        return ledger.record(key, update)
 
-    def build_diagnose(state: OrchestrationState) -> dict[str, Any]:
-        retry_count = state.get("build_retry_count", 0)
-        attempt_no = state.get("attempt_no_override")
-        if attempt_no is None:
-            attempt_no = retry_count + 1
-        key = _node_key(
-            state,
-            "build_diagnose",
-            default_step_key="build_diagnose",
-            default_attempt_no=attempt_no,
-        )
-        cached = ledger.get(key)
-        if cached is not None:
-            return cached
+    return run_idempotent(ctx.attempt_store, key, _action)
 
+
+def _node_build_diagnose(ctx: NodeContext, state: OrchestrationState) -> dict[str, Any]:
+    retry_count = state.get("build_retry_count", 0)
+    attempt_no = state.get("attempt_no_override")
+    if attempt_no is None:
+        attempt_no = retry_count + 1
+    key = _node_key(
+        state,
+        "build_diagnose",
+        default_step_key="build_diagnose",
+        default_attempt_no=attempt_no,
+    )
+
+    def _action() -> dict[str, Any]:
         max_retries = _validate_max_build_retries(state.get("max_build_retries", 1))
         job_kind = state.get("job_kind", "round")
-        diagnosis = build_diagnoser.diagnose(
+        diagnosis = ctx.build_diagnoser.diagnose(
             job_id=state["job_id"],
             job_kind=job_kind,
             build_artifacts=state.get("build_artifacts") or {},
@@ -1589,59 +1659,58 @@ def _build_v2_node_map(
             reused_build_ref=state.get("build_ref"),
         )
         if diagnosis.outcome == "retry" and retry_count < max_retries:
-            update: dict[str, Any] = {
+            return {
                 "build_retry_count": retry_count + 1,
                 "next_route": "build",
                 "visited_nodes": _append_visited(state, "build_diagnose"),
             }
-        elif diagnosis.outcome == "ok":
+        if diagnosis.outcome == "ok":
             next_node = "campaign" if job_kind == "campaign" else "verify"
-            update = {
+            return {
                 "next_route": next_node,
                 "visited_nodes": _append_visited(state, "build_diagnose"),
             }
-        elif diagnosis.outcome == "provenance_missing":
-            update = {
+        if diagnosis.outcome == "provenance_missing":
+            return {
                 "state": "FAILED",
                 "reason_code": diagnosis.reason_code or "BUILD_PROVENANCE_MISSING",
                 "error_message": diagnosis.message,
                 "next_route": "archive",
                 "visited_nodes": _append_visited(state, "build_diagnose"),
             }
-        else:
-            update = {
-                "state": "FAILED",
-                "reason_code": diagnosis.reason_code or "BUILD_FAILED",
-                "error_message": diagnosis.message,
-                "next_route": "archive",
-                "visited_nodes": _append_visited(state, "build_diagnose"),
-            }
-        return ledger.record(key, update)
+        return {
+            "state": "FAILED",
+            "reason_code": diagnosis.reason_code or "BUILD_FAILED",
+            "error_message": diagnosis.message,
+            "next_route": "archive",
+            "visited_nodes": _append_visited(state, "build_diagnose"),
+        }
 
-    def campaign(state: OrchestrationState) -> dict[str, Any]:
-        key = _node_key(state, "campaign", default_step_key="campaign")
-        cached = ledger.get(key)
-        if cached is not None:
-            return cached
+    return run_idempotent(ctx.attempt_store, key, _action)
 
+
+def _node_campaign(ctx: NodeContext, state: OrchestrationState) -> dict[str, Any]:
+    key = _node_key(state, "campaign", default_step_key="campaign")
+
+    def _action() -> dict[str, Any]:
         build_artifacts = state.get("build_artifacts") or {}
-        result = campaign_runner.run_campaign(
+        result = ctx.campaign_runner.run_campaign(
             job_id=state["job_id"],
             family_id=state["family_id"],
             build_artifacts=build_artifacts,
             candidate_seeds=state.get("candidate_seeds", ()),
         )
-        ledger.record_charge(
+        ctx.ledger.record_charge(
             job_id=state["job_id"],
             family_id=state["family_id"],
-            step_key=key[2],
-            attempt_no=key[3],
+            step_key=key.step_key,
+            attempt_no=key.attempt_no,
             seconds=result.fuzz_seconds_used,
             fuzz_seconds=result.fuzz_seconds_used,
-            recorded_at=clock.timestamp(),
+            recorded_at=ctx.clock.timestamp(),
             charge_kind="fuzz",
         )
-        update = {
+        return {
             "candidate_seeds": tuple(result.candidate_seeds),
             "campaign_bundle_digest": result.campaign_bundle_digest,
             "build_ref": copy.deepcopy(build_artifacts),
@@ -1651,25 +1720,22 @@ def _build_v2_node_map(
             "next_route": "archive",
             "visited_nodes": _append_visited(state, "campaign"),
         }
-        return ledger.record(key, update)
 
-    def verify(state: OrchestrationState) -> dict[str, Any]:
-        key = _node_key(state, "verify", default_step_key="verify")
-        cached = ledger.get(key)
-        if cached is not None:
-            return cached
+    return run_idempotent(ctx.attempt_store, key, _action)
 
-        if sandbox is None:
+
+def _node_verify(ctx: NodeContext, state: OrchestrationState) -> dict[str, Any]:
+    key = _node_key(state, "verify", default_step_key="verify")
+
+    def _action() -> dict[str, Any]:
+        if ctx.sandbox is None:
             raise RuntimeError("sandbox is required to execute the verify node")
 
         seed_bytes = state.get("seed_bytes")
-        candidate_digest = (
-            state.get("seed_digest")
-            or (
-                _sha256_bytes(seed_bytes)
-                if seed_bytes is not None
-                else _sha256_bytes(b"default-candidate")
-            )
+        candidate_digest = state.get("seed_digest") or (
+            _sha256_bytes(seed_bytes)
+            if seed_bytes is not None
+            else _sha256_bytes(b"default-candidate")
         )
         normal_digest = _sha256_bytes(b"default-normal")
         build_artifacts = state.get("build_artifacts") or {}
@@ -1681,7 +1747,7 @@ def _build_v2_node_map(
                 input_digest = (
                     normal_digest if phase == "normal" else candidate_digest
                 )
-                replay_result = sandbox.replay(
+                replay_result = ctx.sandbox.replay(
                     version,
                     phase,
                     expected_artifact_digest=artifact_digest,
@@ -1695,7 +1761,7 @@ def _build_v2_node_map(
             comparable_builds = build_artifacts
 
         decision = verdict_mod.decide_verdict(
-            verdict_policy,
+            ctx.verdict_policy,
             observations,
             builds=comparable_builds,
             expected_inputs={
@@ -1703,30 +1769,30 @@ def _build_v2_node_map(
                 "fixed": candidate_digest,
             },
         )
-        ledger.record_charge(
+        ctx.ledger.record_charge(
             job_id=state["job_id"],
             family_id=state["family_id"],
-            step_key=key[2],
-            attempt_no=key[3],
+            step_key=key.step_key,
+            attempt_no=key.attempt_no,
             seconds=total_duration,
-            recorded_at=clock.timestamp(),
+            recorded_at=ctx.clock.timestamp(),
             charge_kind="general",
         )
-        update = {
+        return {
             "state": decision.verdict,
             "verdict": decision.verdict,
             "reason_code": decision.reason_code,
             "next_route": "archive",
             "visited_nodes": _append_visited(state, "verify"),
         }
-        return ledger.record(key, update)
 
-    def archive(state: OrchestrationState) -> dict[str, Any]:
-        key = _node_key(state, "archive", default_step_key="archive")
-        cached = ledger.get(key)
-        if cached is not None:
-            return cached
+    return run_idempotent(ctx.attempt_store, key, _action)
 
+
+def _node_archive(ctx: NodeContext, state: OrchestrationState) -> dict[str, Any]:
+    key = _node_key(state, "archive", default_step_key="archive")
+
+    def _action() -> dict[str, Any]:
         job_kind = state.get("job_kind", "round")
         final_state = state.get("state")
         if not final_state:
@@ -1753,7 +1819,7 @@ def _build_v2_node_map(
             "family_summary": state.get("family_summary"),
         }
         archive_digest = jsonutil.digest_json(archive_payload)
-        ledger.record_archive(
+        ctx.ledger.record_archive(
             job_id=state["job_id"],
             family_id=state["family_id"],
             job_kind=job_kind,
@@ -1761,9 +1827,9 @@ def _build_v2_node_map(
             verdict=final_verdict,
             reason_code=final_reason,
             archive_digest=archive_digest,
-            recorded_at=clock.timestamp(),
+            recorded_at=ctx.clock.timestamp(),
         )
-        update = {
+        return {
             "state": final_state,
             "verdict": final_verdict,
             "reason_code": final_reason,
@@ -1772,58 +1838,42 @@ def _build_v2_node_map(
             "next_route": "done",
             "visited_nodes": _append_visited(state, "archive"),
         }
-        return ledger.record(key, update)
 
+    return run_idempotent(ctx.attempt_store, key, _action)
+
+
+_V2_NODE_HANDLERS: Mapping[str, NodeHandler] = {
+    "prepare": _node_prepare,
+    "AGGREGATING": _node_aggregating,
+    "intel": _node_intel,
+    "version": _node_version,
+    "route": _node_route,
+    "patch": _node_patch,
+    "source": _node_source,
+    "hypothesis_aggregator": _node_hypothesis_aggregator,
+    "review": _node_review,
+    "build": _node_build,
+    "build_diagnose": _node_build_diagnose,
+    "campaign": _node_campaign,
+    "verify": _node_verify,
+    "archive": _node_archive,
+}
+
+
+def _bind_v2_node_map(ctx: NodeContext) -> dict[str, NodeFn]:
+    """Bind the 14 module-level v2 node handlers to an immutable ``NodeContext``."""
     return {
-        "prepare": prepare,
-        "AGGREGATING": aggregating,
-        "intel": intel,
-        "version": version,
-        "route": route,
-        "patch": patch,
-        "source": source,
-        "hypothesis_aggregator": hypothesis_aggregator_node,
-        "review": review,
-        "build": build,
-        "build_diagnose": build_diagnose,
-        "campaign": campaign,
-        "verify": verify,
-        "archive": archive,
+        name: partial(_V2_NODE_HANDLERS[name], ctx)
+        for name in ORCHESTRATION_NODES
     }
 
 
-def build_v2_graph(
-    dsn: str | None = None,
-    checkpointer: Any = None,
+def _compile_v2_graph(
+    nodes: Mapping[str, NodeFn],
     *,
-    case_root: str | None = None,
-    sandbox: SandboxProtocol | None = None,
-    clock: ClockProtocol | None = None,
-    intel_provider: IntelProvider | None = None,
-    hypothesis_aggregator: HypothesisAggregator | None = None,
-    review_gate: ReviewGate | None = None,
-    envelope_policy: EnvelopePolicy | None = None,
-    build_diagnoser: BuildDiagnoser | None = None,
-    campaign_runner: CampaignRunner | None = None,
-    verdict_policy: verdict_mod.VerdictPolicy | None = None,
-    ledger: NodeReentryLedger | None = None,
+    checkpointer: Any = None,
 ) -> Any:
-    """Compile the v0.2 14-node LangGraph ``StateGraph`` (24 in-job edges)."""
-    del dsn, case_root
-    active_clock = clock or DeterministicClock()
-    active_ledger = ledger or NodeReentryLedger()
-    nodes = _build_v2_node_map(
-        sandbox=sandbox,
-        clock=active_clock,
-        intel_provider=intel_provider or DefaultIntelProvider(),
-        hypothesis_aggregator=hypothesis_aggregator or DefaultHypothesisAggregator(),
-        review_gate=review_gate or DefaultReviewGate(clock=active_clock),
-        envelope_policy=envelope_policy or DefaultEnvelopePolicy(clock=active_clock),
-        build_diagnoser=build_diagnoser or DefaultBuildDiagnoser(),
-        campaign_runner=campaign_runner or DefaultCampaignRunner(clock=active_clock),
-        verdict_policy=verdict_policy or DEFAULT_VERDICT_POLICY,
-        ledger=active_ledger,
-    )
+    """Compile the v0.2 14-node LangGraph ``StateGraph`` from pre-bound ``nodes``."""
 
     def _route_from_state(default: str) -> Callable[[OrchestrationState], str]:
         def _router(state: OrchestrationState) -> str:
@@ -1904,6 +1954,46 @@ def build_v2_graph(
     return builder.compile(checkpointer=checkpointer)
 
 
+def build_v2_graph(
+    dsn: str | None = None,
+    checkpointer: Any = None,
+    *,
+    case_root: str | None = None,
+    sandbox: SandboxProtocol | None = None,
+    clock: ClockProtocol | None = None,
+    intel_provider: IntelProvider | None = None,
+    hypothesis_aggregator: HypothesisAggregator | None = None,
+    review_gate: ReviewGate | None = None,
+    envelope_policy: EnvelopePolicy | None = None,
+    build_diagnoser: BuildDiagnoser | None = None,
+    campaign_runner: CampaignRunner | None = None,
+    verdict_policy: verdict_mod.VerdictPolicy | None = None,
+    ledger: NodeReentryLedger | None = None,
+    attempt_store: AttemptStore | None = None,
+    node_map: Mapping[str, NodeFn] | None = None,
+) -> Any:
+    """Compile the v0.2 14-node LangGraph ``StateGraph`` (24 in-job edges)."""
+    del dsn, case_root
+    if node_map is not None:
+        return _compile_v2_graph(node_map, checkpointer=checkpointer)
+    active_clock = clock or DeterministicClock()
+    active_ledger = ledger or NodeReentryLedger()
+    ctx = NodeContext(
+        sandbox=sandbox,
+        clock=active_clock,
+        intel_provider=intel_provider or DefaultIntelProvider(),
+        hypothesis_aggregator=hypothesis_aggregator or DefaultHypothesisAggregator(),
+        review_gate=review_gate or DefaultReviewGate(clock=active_clock),
+        envelope_policy=envelope_policy or DefaultEnvelopePolicy(clock=active_clock),
+        build_diagnoser=build_diagnoser or DefaultBuildDiagnoser(),
+        campaign_runner=campaign_runner or DefaultCampaignRunner(clock=active_clock),
+        verdict_policy=verdict_policy or DEFAULT_VERDICT_POLICY,
+        ledger=active_ledger,
+        attempt_store=attempt_store if attempt_store is not None else active_ledger,
+    )
+    return _compile_v2_graph(_bind_v2_node_map(ctx), checkpointer=checkpointer)
+
+
 # ---------------------------------------------------------------------------
 # Graph-driven OrchestrationRunner
 # ---------------------------------------------------------------------------
@@ -1979,6 +2069,8 @@ class OrchestrationRunner:
         campaign_runner: CampaignRunner | None = None,
         iteration_gate: IterationGate | None = None,
         verdict_policy: verdict_mod.VerdictPolicy | None = None,
+        ledger: NodeReentryLedger | None = None,
+        attempt_store: AttemptStore | None = None,
         max_build_retries: int = 1,
     ) -> None:
         self.clock: ClockProtocol = clock or DeterministicClock()
@@ -2002,12 +2094,15 @@ class OrchestrationRunner:
             verdict_policy or DEFAULT_VERDICT_POLICY
         )
         self.max_build_retries = _validate_max_build_retries(max_build_retries)
-        self.ledger = NodeReentryLedger()
+        self.ledger: NodeReentryLedger = ledger or NodeReentryLedger()
+        self.attempt_store: AttemptStore = (
+            attempt_store if attempt_store is not None else self.ledger
+        )
         self._slot_table_lock = threading.Lock()
         self._family_locks: dict[str, threading.Lock] = {}
         self._active_children_by_family: dict[str, int] = {}
         self._max_concurrent_by_family: dict[str, int] = {}
-        self._node_map = _build_v2_node_map(
+        self._context = NodeContext(
             sandbox=self.sandbox,
             clock=self.clock,
             intel_provider=self.intel_provider,
@@ -2018,19 +2113,10 @@ class OrchestrationRunner:
             campaign_runner=self.campaign_runner,
             verdict_policy=self.verdict_policy,
             ledger=self.ledger,
+            attempt_store=self.attempt_store,
         )
-        self.graph = build_v2_graph(
-            sandbox=self.sandbox,
-            clock=self.clock,
-            intel_provider=self.intel_provider,
-            hypothesis_aggregator=self.hypothesis_aggregator,
-            review_gate=self.review_gate,
-            envelope_policy=self.envelope_policy,
-            build_diagnoser=self.build_diagnoser,
-            campaign_runner=self.campaign_runner,
-            verdict_policy=self.verdict_policy,
-            ledger=self.ledger,
-        )
+        self._node_map = _bind_v2_node_map(self._context)
+        self.graph = build_v2_graph(node_map=self._node_map)
 
     def charge_count(self, job_id: str) -> int:
         return self.ledger.charge_count(job_id)
@@ -2401,6 +2487,7 @@ class OrchestrationRunner:
 __all__ = [
     "AdmissionDecision",
     "ArchiveRecord",
+    "AttemptStore",
     "BudgetChargeRecord",
     "BuildDiagnoser",
     "BuildDiagnosis",
@@ -2431,6 +2518,7 @@ __all__ = [
     "IntelResult",
     "IterationDecision",
     "IterationGate",
+    "NodeContext",
     "NodeReentryLedger",
     "ORCHESTRATION_EDGES",
     "ORCHESTRATION_NODES",
@@ -2440,5 +2528,7 @@ __all__ = [
     "ReviewDecision",
     "ReviewGate",
     "SandboxProtocol",
+    "StepKey",
     "build_v2_graph",
+    "run_idempotent",
 ]

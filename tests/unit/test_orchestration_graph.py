@@ -492,6 +492,77 @@ def test_node_reentry_is_a_noop():
     assert parked_review_gate.review_writes == 1
     assert len(parked_sandbox.build_calls) == builds_after_approval
 
+    # StepKey NamedTuple compatibility + injectable AttemptStore protocol.
+    step_key = workflow.StepKey(job_id, "prepare", "custom_prepare", 1, 1)
+    assert step_key == (job_id, "prepare", "custom_prepare", 1, 1)
+    assert hash(step_key) == hash((job_id, "prepare", "custom_prepare", 1, 1))
+
+    class _CustomAttemptStore:
+        def __init__(self) -> None:
+            self.records: dict[workflow.StepKey, dict[str, object]] = {}
+            self.get_calls: list[workflow.StepKey] = []
+            self.record_calls: list[workflow.StepKey] = []
+
+        def get_completed(self, key: workflow.StepKey) -> dict[str, object] | None:
+            self.get_calls.append(key)
+            cached = self.records.get(key)
+            return dict(cached) if cached is not None else None
+
+        def record_completed(
+            self,
+            key: workflow.StepKey,
+            result: dict[str, object],
+        ) -> dict[str, object]:
+            self.record_calls.append(key)
+            self.records[key] = dict(result)
+            return dict(result)
+
+    custom_store = _CustomAttemptStore()
+    assert isinstance(custom_store, workflow.AttemptStore)
+    assert isinstance(runner.ledger, workflow.AttemptStore)
+
+    custom_sandbox = FakeSandbox(clock=FakeClock())
+    custom_runner = runner_cls(
+        sandbox=custom_sandbox,
+        clock=FakeClock(),
+        attempt_store=custom_store,
+    )
+    first_custom = custom_runner.execute_node(
+        family_id=family_id,
+        idempotency_key=step_key,
+    )
+    second_custom = custom_runner.execute_node(
+        family_id=family_id,
+        idempotency_key=(job_id, "prepare", "custom_prepare", 1, 1),
+    )
+    assert second_custom == first_custom
+    assert custom_store.record_calls == [step_key]
+    assert custom_store.get_calls == [step_key, step_key]
+
+    # Verify run_idempotent skips record_completed when should_cache returns False.
+    ephemeral_key = workflow.StepKey(job_id, "review", "ephemeral", 1, 1)
+    action_runs = 0
+
+    def _ephemeral_action() -> dict[str, object]:
+        nonlocal action_runs
+        action_runs += 1
+        return {"next_route": "await_review", "run": action_runs}
+
+    first_ephemeral = workflow.run_idempotent(
+        custom_store,
+        ephemeral_key,
+        _ephemeral_action,
+        should_cache=lambda u: u.get("next_route") != "await_review",
+    )
+    second_ephemeral = workflow.run_idempotent(
+        custom_store,
+        ephemeral_key,
+        _ephemeral_action,
+        should_cache=lambda u: u.get("next_route") != "await_review",
+    )
+    assert first_ephemeral["run"] == 1 and second_ephemeral["run"] == 2
+    assert ephemeral_key not in custom_store.records
+
 
 def test_reverse_route_archives_as_unsupported():
     clock = FakeClock()
