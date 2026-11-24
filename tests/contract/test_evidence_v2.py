@@ -997,3 +997,158 @@ def test_v2_blocked_verify_checks_plan_and_review_consistency(tmp_path):
     with pytest.raises(BundleError, match="case_id") as raised:
         verify_bundle(bad_root)
     assert raised.value.reason_code == "INVALID_MANIFEST"
+
+
+# ---------------------------------------------------------------------------
+# S-1: the verify side must enforce the blocked plan/review binding itself,
+# not only the writer. Each case below would pass verification if
+# ``_verify_v2_blocked_semantics`` stopped calling ``_validate_blocked_artifacts``.
+# ---------------------------------------------------------------------------
+
+
+def _review_binding(review):
+    return {
+        "reviewer_id": review["reviewer_id"],
+        "decision": review["decision"],
+        "plan_digest": review["plan_digest"],
+        "decided_at": review["decided_at"],
+    }
+
+
+def _blocked_plan_review_files(
+    manifest, *, plan_doc, review_doc, report_review, include_plan=True
+):
+    extra_files = {
+        "review.json": (
+            "review",
+            json.dumps(review_doc).encode("utf-8") + b"\n",
+        )
+    }
+    if include_plan:
+        extra_files["plan.json"] = (
+            "plan",
+            json.dumps(plan_doc).encode("utf-8") + b"\n",
+        )
+    return _blocked_files(
+        manifest,
+        report_overrides={
+            "case_id": plan_doc.get("case_id"),
+            "cve_id": plan_doc.get("cve_id"),
+            "review": report_review,
+        },
+        extra_files=extra_files,
+    )
+
+
+def _blocked_plan_review_manifest():
+    from test_evidence import PLAN_DIGEST
+
+    manifest = _manifest("blocked")
+    manifest["plan_digest"] = PLAN_DIGEST
+    return manifest
+
+
+def test_v2_blocked_verify_rejects_plan_content_not_matching_digest(tmp_path):
+    from test_evidence import PLAN, REVIEW
+
+    manifest = _blocked_plan_review_manifest()
+    # Same case_id/cve_id, different body: only a recomputation of the plan
+    # digest can catch this.
+    tampered_plan = dict(PLAN, policy_version="policy-v2")
+    review = dict(REVIEW, decision="reject")
+    files = _blocked_plan_review_files(
+        manifest,
+        plan_doc=tampered_plan,
+        review_doc=review,
+        report_review=_review_binding(review),
+    )
+    root = _write_v2_bundle(
+        tmp_path, manifest, files, name="blocked-plan-digest-mismatch"
+    )
+    with pytest.raises(BundleError) as raised:
+        verify_bundle(root)
+    assert raised.value.reason_code == "INVALID_MANIFEST"
+    assert "plan_digest" in raised.value.message
+
+
+def test_v2_blocked_verify_rejects_a_plan_digest_without_plan_json(tmp_path):
+    from test_evidence import PLAN, REVIEW
+
+    manifest = _blocked_plan_review_manifest()
+    review = dict(REVIEW, decision="reject")
+    files = _blocked_plan_review_files(
+        manifest,
+        plan_doc=PLAN,
+        review_doc=review,
+        report_review=_review_binding(review),
+        include_plan=False,
+    )
+    root = _write_v2_bundle(
+        tmp_path, manifest, files, name="blocked-plan-missing"
+    )
+    with pytest.raises(BundleError) as raised:
+        verify_bundle(root)
+    assert raised.value.reason_code == "INVALID_MANIFEST"
+    assert "must ship plan.json" in raised.value.message
+
+
+def test_v2_blocked_verify_rejects_review_bound_to_a_different_plan(tmp_path):
+    from test_evidence import PLAN, REVIEW
+
+    manifest = _blocked_plan_review_manifest()
+    review = dict(REVIEW, decision="reject", plan_digest=OTHER_DIGEST)
+    files = _blocked_plan_review_files(
+        manifest,
+        plan_doc=PLAN,
+        review_doc=review,
+        report_review=_review_binding(review),
+    )
+    root = _write_v2_bundle(
+        tmp_path, manifest, files, name="blocked-review-plan-mismatch"
+    )
+    with pytest.raises(BundleError) as raised:
+        verify_bundle(root)
+    assert raised.value.reason_code == "INVALID_MANIFEST"
+    assert "different plan" in raised.value.message
+
+
+def test_v2_blocked_verify_rejects_report_review_not_matching_review_json(tmp_path):
+    from test_evidence import PLAN, REVIEW
+
+    manifest = _blocked_plan_review_manifest()
+    review = dict(REVIEW, decision="reject")
+    report_review = _review_binding(review)
+    report_review["reviewer_id"] = "reviewer-other"
+    files = _blocked_plan_review_files(
+        manifest,
+        plan_doc=PLAN,
+        review_doc=review,
+        report_review=report_review,
+    )
+    root = _write_v2_bundle(
+        tmp_path, manifest, files, name="blocked-report-review-mismatch"
+    )
+    with pytest.raises(BundleError) as raised:
+        verify_bundle(root)
+    assert raised.value.reason_code == "INVALID_MANIFEST"
+    assert "report review" in raised.value.message
+
+
+def test_v2_blocked_verify_rejects_an_unknown_review_decision(tmp_path):
+    from test_evidence import PLAN, REVIEW
+
+    manifest = _blocked_plan_review_manifest()
+    review = dict(REVIEW, decision="maybe")
+    files = _blocked_plan_review_files(
+        manifest,
+        plan_doc=PLAN,
+        review_doc=review,
+        report_review=_review_binding(review),
+    )
+    root = _write_v2_bundle(
+        tmp_path, manifest, files, name="blocked-review-decision"
+    )
+    with pytest.raises(BundleError) as raised:
+        verify_bundle(root)
+    assert raised.value.reason_code == "INVALID_MANIFEST"
+    assert "approve or reject" in raised.value.message
