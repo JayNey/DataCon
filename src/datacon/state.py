@@ -6,6 +6,7 @@ from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
+import math
 from pathlib import Path, PurePosixPath
 import re
 import threading
@@ -90,6 +91,35 @@ class AdmissionOutcome:
     # record_admission adds already_admitted without writing a row or event.
     status: str | None = None
     sub_reason: str | None = None
+
+
+BUDGET_EXHAUSTED = "BUDGET_EXHAUSTED"
+
+
+@dataclass(frozen=True)
+class BudgetDecision:
+    """Deterministic answer to "may the next step/round start?"."""
+
+    allowed: bool
+    reason_code: str | None
+    hard_timeout_seconds: int
+    next_round_no: int | None = None
+
+
+@dataclass(frozen=True)
+class BudgetChargeOutcome:
+    """One idempotent charge attempt against the family ledger.
+
+    ``recovered`` returns the existing charge without touching the ledger;
+    ``budget_exhausted`` means the start gate refused or the conditional
+    update found no affordable balance. ``charge`` is None only when the
+    refusal happened before a charge could be written.
+    """
+
+    status: str
+    reason_code: str | None
+    charge: dict[str, Any] | None
+    ledger: dict[str, Any]
 
 
 def _connect(dsn: str):
@@ -2501,6 +2531,429 @@ def record_admission(
                 detail=outcome.event_detail,
             )
             return outcome
+
+
+def _ceil_seconds(value: Any, label: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise StateError(f"{label} must be a number")
+    if value < 0:
+        raise StateError(f"{label} must not be negative")
+    return int(math.ceil(value))
+
+
+def _validate_charge_input(
+    *,
+    step_key: str,
+    attempt_no: int,
+    charge_kind: str,
+    elapsed_seconds: Any,
+    elapsed_fuzz_seconds: Any,
+) -> tuple[str, int, int, int]:
+    if not isinstance(step_key, str) or not step_key.strip():
+        raise StateError("step_key must be a non-empty string")
+    if type(attempt_no) is not int or attempt_no < 1:
+        raise StateError("attempt_no must be a positive integer")
+    if charge_kind not in ("general", "fuzz"):
+        raise StateError("charge_kind must be general or fuzz")
+    elapsed = _ceil_seconds(elapsed_seconds, "elapsed_seconds")
+    fuzz_elapsed = _ceil_seconds(elapsed_fuzz_seconds, "elapsed_fuzz_seconds")
+    return charge_kind, attempt_no, elapsed, fuzz_elapsed
+
+
+def budget_gate(ledger: Mapping[str, Any], *, fuzz: bool = False) -> BudgetDecision:
+    """Return whether a step may start and the hard-timeout ceiling.
+
+    ``general`` needs one second of total budget. ``fuzz`` additionally needs
+    one second of fuzz sub-budget, so its ceiling is the smaller of the two.
+    """
+    remaining_total = max(0, int(ledger["remaining_total_seconds"]))
+    available = remaining_total
+    if fuzz:
+        remaining_fuzz = max(0, int(ledger["remaining_fuzz_seconds"]))
+        available = min(remaining_total, remaining_fuzz)
+    if available < 1:
+        return BudgetDecision(False, BUDGET_EXHAUSTED, 0)
+    return BudgetDecision(True, None, available)
+
+
+def decide_next_round(
+    ledger: Mapping[str, Any], *, round_no: int, max_rounds: int
+) -> BudgetDecision:
+    """Decide whether a further round may be derived.
+
+    Budget exhaustion returns ``BUDGET_EXHAUSTED`` and no ``next_round_no``;
+    the orchestration layer must not create a round from a denied decision.
+    """
+    if type(round_no) is not int or round_no < 0:
+        raise StateError("round_no must be a non-negative integer")
+    if type(max_rounds) is not int or max_rounds < 1:
+        raise StateError("max_rounds must be a positive integer")
+    if round_no >= max_rounds:
+        return BudgetDecision(False, "ROUND_BEYOND_MAX_ROUNDS", 0)
+    gate = budget_gate(ledger)
+    if not gate.allowed:
+        return BudgetDecision(False, BUDGET_EXHAUSTED, 0)
+    return BudgetDecision(
+        True, None, gate.hard_timeout_seconds, next_round_no=round_no + 1
+    )
+
+
+def compute_budget_charge(
+    ledger: Mapping[str, Any],
+    *,
+    charge_kind: str,
+    elapsed_seconds: int,
+    elapsed_fuzz_seconds: int = 0,
+) -> tuple[int, int]:
+    """Apply the normative charge formula without touching storage.
+
+    ``seconds = min(ceil(elapsed), remaining_total_seconds)``; a fuzz step
+    additionally charges ``min(max(1, ceil(fuzz_elapsed)), remaining_fuzz,
+    seconds)``. The fuzz amount never exceeds the total amount.
+    """
+    if charge_kind not in ("general", "fuzz"):
+        raise StateError("charge_kind must be general or fuzz")
+    remaining_total = max(0, int(ledger["remaining_total_seconds"]))
+    charged = min(int(elapsed_seconds), remaining_total)
+    if charge_kind == "general":
+        return charged, 0
+    remaining_fuzz = max(0, int(ledger["remaining_fuzz_seconds"]))
+    charged_fuzz = min(
+        max(1, int(elapsed_fuzz_seconds)), remaining_fuzz, charged
+    )
+    return charged, charged_fuzz
+
+
+def charge_budget_local(
+    ledger: dict[str, Any],
+    charges: list[dict[str, Any]],
+    *,
+    family_id: UUID | str,
+    job_id: UUID | str,
+    step_key: str,
+    attempt_no: int,
+    charge_kind: str,
+    elapsed_seconds: Any,
+    elapsed_fuzz_seconds: Any = 0,
+) -> BudgetChargeOutcome:
+    """Idempotent in-memory charge used as the contract-test reference.
+
+    It shares the formula with the PostgreSQL adapter and mirrors the atomic
+    ``UPDATE ... WHERE remaining >= charged`` decision so recovery, retry and
+    exhaustion semantics stay identical without a database.
+    """
+    charge_kind, attempt_no, elapsed, fuzz_elapsed = _validate_charge_input(
+        step_key=step_key,
+        attempt_no=attempt_no,
+        charge_kind=charge_kind,
+        elapsed_seconds=elapsed_seconds,
+        elapsed_fuzz_seconds=elapsed_fuzz_seconds,
+    )
+    family_text = str(family_id)
+    job_text = str(job_id)
+    for charge in charges:
+        if (
+            str(charge["job_id"]) == job_text
+            and charge["step_key"] == step_key
+            and charge["attempt_no"] == attempt_no
+        ):
+            return BudgetChargeOutcome(
+                "recovered", None, dict(charge), dict(ledger)
+            )
+
+    gate = budget_gate(ledger, fuzz=charge_kind == "fuzz")
+    if not gate.allowed:
+        return BudgetChargeOutcome(
+            "budget_exhausted", BUDGET_EXHAUSTED, None, dict(ledger)
+        )
+
+    charged, charged_fuzz = compute_budget_charge(
+        ledger,
+        charge_kind=charge_kind,
+        elapsed_seconds=elapsed,
+        elapsed_fuzz_seconds=fuzz_elapsed,
+    )
+    if charge_kind == "fuzz" and charged_fuzz < 1:
+        return BudgetChargeOutcome(
+            "budget_exhausted", BUDGET_EXHAUSTED, None, dict(ledger)
+        )
+    if int(ledger["remaining_total_seconds"]) < charged or (
+        int(ledger["remaining_fuzz_seconds"]) < charged_fuzz
+    ):
+        return BudgetChargeOutcome(
+            "budget_exhausted", BUDGET_EXHAUSTED, None, dict(ledger)
+        )
+
+    ledger["remaining_total_seconds"] -= charged
+    ledger["remaining_fuzz_seconds"] -= charged_fuzz
+    charge = {
+        "charge_id": str(uuid.uuid4()),
+        "family_id": family_text,
+        "job_id": job_text,
+        "step_key": step_key,
+        "attempt_no": attempt_no,
+        "charge_kind": charge_kind,
+        "seconds": charged,
+        "fuzz_seconds": charged_fuzz,
+    }
+    charges.append(charge)
+    exhausted = ledger["remaining_total_seconds"] == 0 or (
+        charge_kind == "fuzz" and ledger["remaining_fuzz_seconds"] == 0
+    )
+    return BudgetChargeOutcome(
+        "budget_exhausted" if exhausted else "charged",
+        BUDGET_EXHAUSTED if exhausted else None,
+        charge,
+        dict(ledger),
+    )
+
+
+def budget_summary(
+    ledger: Mapping[str, Any], charges: list[Mapping[str, Any]]
+) -> dict[str, int]:
+    """Build the six-field report/status/family.json budget object.
+
+    ``budget_ledger.remaining_total_seconds`` is exposed as
+    ``remaining_seconds``; the other five fields keep their DB names. Spending
+    is always rebuilt from ``budget_charges`` so evidence can be reconciled.
+    """
+    return {
+        "max_total_seconds": int(ledger["max_total_seconds"]),
+        "max_fuzz_seconds": int(ledger["max_fuzz_seconds"]),
+        "spent_seconds": sum(int(charge["seconds"]) for charge in charges),
+        "spent_fuzz_seconds": sum(
+            int(charge["fuzz_seconds"]) for charge in charges
+        ),
+        "remaining_seconds": int(ledger["remaining_total_seconds"]),
+        "remaining_fuzz_seconds": int(ledger["remaining_fuzz_seconds"]),
+    }
+
+
+_BUDGET_LEDGER_COLUMNS = (
+    "family_id, max_total_seconds, max_fuzz_seconds, "
+    "remaining_total_seconds, remaining_fuzz_seconds, updated_at"
+)
+_BUDGET_CHARGE_COLUMNS = (
+    "charge_id, family_id, job_id, step_key, attempt_no, charge_kind, "
+    "seconds, fuzz_seconds, created_at"
+)
+
+
+def initialize_budget_ledger(
+    dsn: str,
+    family_id: UUID | str,
+    *,
+    max_total_seconds: int,
+    max_fuzz_seconds: int,
+) -> dict[str, Any]:
+    """Create the family ledger once, or return the existing row unchanged."""
+    if type(max_total_seconds) is not int or max_total_seconds < 1:
+        raise StateError("max_total_seconds must be a positive integer")
+    if (
+        type(max_fuzz_seconds) is not int
+        or max_fuzz_seconds < 0
+        or max_fuzz_seconds > max_total_seconds
+    ):
+        raise StateError(
+            "max_fuzz_seconds must be between 0 and max_total_seconds"
+        )
+    try:
+        family_id = uuid.UUID(str(family_id))
+    except (TypeError, ValueError) as error:
+        raise StateError("family_id must be a UUID") from error
+
+    with _connect(dsn) as connection:
+        with connection.transaction():
+            row = connection.execute(
+                "INSERT INTO budget_ledger "
+                "(family_id, max_total_seconds, max_fuzz_seconds, "
+                "remaining_total_seconds, remaining_fuzz_seconds) "
+                "VALUES (%s, %s, %s, %s, %s) "
+                "ON CONFLICT (family_id) DO NOTHING "
+                f"RETURNING {_BUDGET_LEDGER_COLUMNS}",
+                (
+                    family_id,
+                    max_total_seconds,
+                    max_fuzz_seconds,
+                    max_total_seconds,
+                    max_fuzz_seconds,
+                ),
+            ).fetchone()
+            if row is None:
+                row = connection.execute(
+                    "SELECT " + _BUDGET_LEDGER_COLUMNS +
+                    " FROM budget_ledger WHERE family_id = %s",
+                    (family_id,),
+                ).fetchone()
+            if row is None:
+                raise StateError("budget ledger could not be initialized")
+            return dict(row)
+
+
+def load_budget_ledger(
+    dsn: str, family_id: UUID | str
+) -> dict[str, Any] | None:
+    try:
+        family_id = uuid.UUID(str(family_id))
+    except (TypeError, ValueError) as error:
+        raise StateError("family_id must be a UUID") from error
+    with _connect(dsn) as connection:
+        row = connection.execute(
+            "SELECT " + _BUDGET_LEDGER_COLUMNS +
+            " FROM budget_ledger WHERE family_id = %s",
+            (family_id,),
+        ).fetchone()
+    return dict(row) if row is not None else None
+
+
+def charge_step_budget(
+    dsn: str,
+    *,
+    family_id: UUID | str,
+    job_id: UUID | str,
+    step_key: str,
+    attempt_no: int,
+    charge_kind: str,
+    elapsed_seconds: Any,
+    elapsed_fuzz_seconds: Any = 0,
+) -> BudgetChargeOutcome:
+    """Charge one step in an independent short transaction.
+
+    The container runs outside this transaction. The ledger row is locked, the
+    idempotency key is checked before any write, and the conditional
+    ``UPDATE ... WHERE remaining >= charged`` is the only mutation, so a
+    concurrent or timed-out charge can never overdraw the family budget.
+    """
+    charge_kind, attempt_no, elapsed, fuzz_elapsed = _validate_charge_input(
+        step_key=step_key,
+        attempt_no=attempt_no,
+        charge_kind=charge_kind,
+        elapsed_seconds=elapsed_seconds,
+        elapsed_fuzz_seconds=elapsed_fuzz_seconds,
+    )
+    try:
+        family_id = uuid.UUID(str(family_id))
+        job_id = uuid.UUID(str(job_id))
+    except (TypeError, ValueError) as error:
+        raise StateError("budget charge ids must be UUIDs") from error
+
+    with _connect(dsn) as connection:
+        with connection.transaction():
+            ledger = connection.execute(
+                "SELECT " + _BUDGET_LEDGER_COLUMNS +
+                " FROM budget_ledger WHERE family_id = %s FOR UPDATE",
+                (family_id,),
+            ).fetchone()
+            if ledger is None:
+                raise StateError("budget ledger does not exist")
+            existing = connection.execute(
+                "SELECT " + _BUDGET_CHARGE_COLUMNS +
+                " FROM budget_charges WHERE job_id = %s AND step_key = %s "
+                "AND attempt_no = %s",
+                (job_id, step_key, attempt_no),
+            ).fetchone()
+            if existing is not None:
+                return BudgetChargeOutcome(
+                    "recovered", None, dict(existing), dict(ledger)
+                )
+
+            gate = budget_gate(ledger, fuzz=charge_kind == "fuzz")
+            if not gate.allowed:
+                return BudgetChargeOutcome(
+                    "budget_exhausted", BUDGET_EXHAUSTED, None, dict(ledger)
+                )
+            charged, charged_fuzz = compute_budget_charge(
+                ledger,
+                charge_kind=charge_kind,
+                elapsed_seconds=elapsed,
+                elapsed_fuzz_seconds=fuzz_elapsed,
+            )
+            if charge_kind == "fuzz" and charged_fuzz < 1:
+                return BudgetChargeOutcome(
+                    "budget_exhausted", BUDGET_EXHAUSTED, None, dict(ledger)
+                )
+
+            updated = connection.execute(
+                "UPDATE budget_ledger SET "
+                "remaining_total_seconds = remaining_total_seconds - %s, "
+                "remaining_fuzz_seconds = remaining_fuzz_seconds - %s, "
+                "updated_at = clock_timestamp() "
+                "WHERE family_id = %s "
+                "AND remaining_total_seconds >= %s "
+                "AND remaining_fuzz_seconds >= %s "
+                "RETURNING " + _BUDGET_LEDGER_COLUMNS,
+                (
+                    charged,
+                    charged_fuzz,
+                    family_id,
+                    charged,
+                    charged_fuzz,
+                ),
+            ).fetchone()
+            if updated is None:
+                return BudgetChargeOutcome(
+                    "budget_exhausted", BUDGET_EXHAUSTED, None, dict(ledger)
+                )
+
+            charge_id = uuid.uuid4()
+            connection.execute(
+                "INSERT INTO budget_charges "
+                "(charge_id, family_id, job_id, step_key, attempt_no, "
+                "charge_kind, seconds, fuzz_seconds) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+                (
+                    charge_id,
+                    family_id,
+                    job_id,
+                    step_key,
+                    attempt_no,
+                    charge_kind,
+                    charged,
+                    charged_fuzz,
+                ),
+            )
+            charge = {
+                "charge_id": str(charge_id),
+                "family_id": str(family_id),
+                "job_id": str(job_id),
+                "step_key": step_key,
+                "attempt_no": attempt_no,
+                "charge_kind": charge_kind,
+                "seconds": charged,
+                "fuzz_seconds": charged_fuzz,
+            }
+            exhausted = updated["remaining_total_seconds"] == 0 or (
+                charge_kind == "fuzz"
+                and updated["remaining_fuzz_seconds"] == 0
+            )
+            return BudgetChargeOutcome(
+                "budget_exhausted" if exhausted else "charged",
+                BUDGET_EXHAUSTED if exhausted else None,
+                charge,
+                dict(updated),
+            )
+
+
+def family_budget_summary(dsn: str, family_id: UUID | str) -> dict[str, int]:
+    """Return the six report fields from the ledger and family charges."""
+    try:
+        family_id = uuid.UUID(str(family_id))
+    except (TypeError, ValueError) as error:
+        raise StateError("family_id must be a UUID") from error
+    with _connect(dsn) as connection:
+        ledger = connection.execute(
+            "SELECT " + _BUDGET_LEDGER_COLUMNS +
+            " FROM budget_ledger WHERE family_id = %s",
+            (family_id,),
+        ).fetchone()
+        if ledger is None:
+            raise StateError("budget ledger does not exist")
+        charges = connection.execute(
+            "SELECT seconds, fuzz_seconds FROM budget_charges "
+            "WHERE family_id = %s",
+            (family_id,),
+        ).fetchall()
+    return budget_summary(ledger, charges)
 
 
 # A decided family envelope maps back to the review decision it recorded. The

@@ -654,3 +654,76 @@ def test_rollback_gate_fails_closed_when_013_is_not_registered(
             current_version=migrations[-1].name,
             applied=applied,
         )
+
+
+def test_budget_ledger_has_no_cross_remaining_check(isolated_database):
+    """D41: bounds and max_fuzz <= max_total exist; no remaining cross CHECK.
+
+    A general build/replay charge drains only the total budget, so a valid
+    ledger can have remaining_fuzz_seconds > remaining_total_seconds. Adding
+    that cross CHECK would reject legitimate rows.
+    """
+    from datacon import state
+
+    family_id = _insert_family(isolated_database)
+    try:
+        ledger = state.initialize_budget_ledger(
+            isolated_database.dsn,
+            family_id,
+            max_total_seconds=100,
+            max_fuzz_seconds=60,
+        )
+    except psycopg.errors.CheckViolation as error:
+        pytest.fail(f"cross remaining check rejected a valid ledger: {error}")
+
+    assert ledger["remaining_total_seconds"] == 100
+    assert ledger["remaining_fuzz_seconds"] == 60
+
+    try:
+        isolated_database.connection.execute(
+            "UPDATE budget_ledger SET remaining_total_seconds = 20, "
+            "remaining_fuzz_seconds = 50 WHERE family_id = %s",
+            (family_id,),
+        )
+    except psycopg.errors.CheckViolation as error:
+        pytest.fail(f"cross remaining check rejected a valid ledger: {error}")
+
+    outcome = state.charge_step_budget(
+        isolated_database.dsn,
+        family_id=family_id,
+        job_id=family_id,
+        step_key="build",
+        attempt_no=1,
+        charge_kind="general",
+        elapsed_seconds=5,
+    )
+    assert outcome.status == "charged", outcome.status
+
+    summary = state.family_budget_summary(isolated_database.dsn, family_id)
+    assert summary["remaining_seconds"] == 15
+    assert summary["remaining_fuzz_seconds"] == 50
+
+    checks = isolated_database.connection.execute(
+        "SELECT conname, pg_get_constraintdef(oid) FROM pg_constraint "
+        "WHERE conrelid = 'budget_ledger'::regclass AND contype = 'c'"
+    ).fetchall()
+    definitions = {name: definition for name, definition in checks}
+    expected = {
+        "budget_ledger_max_total_positive",
+        "budget_ledger_max_fuzz_non_negative",
+        "budget_ledger_total_non_negative",
+        "budget_ledger_fuzz_non_negative",
+        "budget_ledger_remaining_within_max_total",
+        "budget_ledger_remaining_within_max_fuzz",
+        "budget_ledger_fuzz_within_total",
+    }
+    assert expected <= set(definitions), sorted(set(definitions))
+    for name, definition in definitions.items():
+        if (
+            "remaining_fuzz_seconds" in definition
+            and "remaining_total_seconds" in definition
+        ):
+            pytest.fail(
+                "cross remaining check rejected a valid ledger: "
+                f"{name} {definition}"
+            )

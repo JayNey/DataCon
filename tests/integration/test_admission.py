@@ -109,6 +109,7 @@ def _admit(
     experiment: dict | None = None,
     recomputable: bool = True,
     campaign_bundle_digest: str | None = None,
+    budget_snapshot: dict | None = None,
 ):
     family_id, child_id, envelope = seed
     return state.record_admission(
@@ -118,7 +119,7 @@ def _admit(
         round_no=round_no,
         envelope=envelope,
         seed_digest=seed_digest,
-        budget_snapshot=BUDGET_SNAPSHOT,
+        budget_snapshot=BUDGET_SNAPSHOT if budget_snapshot is None else budget_snapshot,
         experiment=experiment,
         recomputable=recomputable,
         campaign_bundle_digest=campaign_bundle_digest,
@@ -275,3 +276,37 @@ def test_conflicting_readmission_is_denied(isolated_database):
         "round_admission_denied",
     ]
     assert events[-1][2]["sub_reason"] == "ROUND_ALREADY_ADMITTED"
+
+
+def test_conflicting_budget_snapshot_is_denied(isolated_database):
+    seed = _seed_family(isolated_database)
+    family_id, child_id, _envelope_value = seed
+
+    first = _admit(isolated_database, seed)
+    assert first.admitted
+
+    second = _admit(
+        isolated_database,
+        seed,
+        budget_snapshot={
+            "remaining_total_seconds": 899,
+            "remaining_fuzz_seconds": 300,
+        },
+    )
+
+    assert not second.admitted
+    assert second.status == "denied"
+    assert second.reason_code == "ADMISSION_DENIED"
+    assert second.sub_reason == "ROUND_ALREADY_ADMITTED"
+    assert second.admission is None
+
+    rows = _admissions(isolated_database, family_id, 2)
+    assert len(rows) == 1, "conflicting budget snapshot wrote a second admissions row"
+    events = _events(isolated_database, child_id)
+    assert [event[0] for event in events] == [
+        "round_admitted",
+        "round_admission_denied",
+    ]
+    assert events[-1][2]["budget_snapshot_digest"] != first.event_detail[
+        "budget_snapshot_digest"
+    ]
