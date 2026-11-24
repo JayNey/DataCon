@@ -90,6 +90,8 @@ T11 只验证图结构与节点幂等；policy 准入、轮次与预算容量的
 
 审核状态机与锁序的四条 D36 坐标及 D42 的四条信封坐标见 T10 的 `tests/integration/test_review_locks.py`；T12 复用它们验证重批后的 approval 链尾与 policy 边界，不重复创建测试。T12 另登记 D43 的 family 归档索引坐标与 `budget_ledger` 交叉 CHECK 坐标。
 
+改7 准入持久化三路径：`admitted` 写一行 `admissions` 与一条 `round_admitted`；`denied`（谓词拒绝或同 `(parent_job_id, round_no)` 异参冲突）不写 `admissions`、写一条 `round_admission_denied`；`already_admitted`（同参幂等重入）不写行、不写事件并返回既有 admission。`ROUND_ALREADY_ADMITTED` 只作为 outcome 的 `sub_reason` 与异参冲突的审计 `detail.sub_reason`，不进入 `jobs.reason_code`。以下 4 条准入持久化坐标均标 `postgres`（`tests/integration/test_admission.py`），不叠 `docker`/`asan`。
+
 | 测试坐标 | 断言点 | 首次运行的预期失败信息 |
 | --- | --- | --- |
 | `tests/contract/test_envelope.py::test_policy_admission_never_writes_review` | policy 准入后 `reviews` 无新行，`admissions` 恰一行 | `AssertionError: reviews row created for policy admission` |
@@ -103,6 +105,10 @@ T11 只验证图结构与节点幂等；policy 准入、轮次与预算容量的
 | `tests/contract/test_admission.py::test_policy_admission_appends_round_admitted_event` | 准入成功追加 `round_admitted`，拒绝追加 `round_admission_denied` | `KeyError: 'round_admitted'` |
 | `tests/unit/test_orchestration_graph.py::test_verify_iteration_requires_round_and_budget_capacity` | 无剩余轮次或余额时不回到 `hypothesis_aggregator`（由 T12 验收） | `AssertionError: new round created after max_rounds` |
 | `tests/contract/test_admission.py::test_round_beyond_max_rounds_is_denied` | `round_no > max_rounds` 由 predicate 拒绝，不依赖唯一约束 | `AssertionError: round beyond max_rounds was created` |
+| `tests/integration/test_admission.py::test_policy_admission_persists_one_row_and_one_event`（`postgres`） | 首次准入写一行 `admissions(approval_kind='policy')` 与一条 `round_admitted`，不写 `reviews`/`family_approvals` | `AssertionError: policy admission did not persist one row and one event` |
+| `tests/integration/test_admission.py::test_predicate_denial_writes_round_admission_denied_event`（`postgres`） | 谓词拒绝（如 `round_no > max_rounds`）不写 `admissions`，写一条 `round_admission_denied` | `AssertionError: predicate denial did not persist a denied event` |
+| `tests/integration/test_admission.py::test_idempotent_readmission_writes_no_second_event`（`postgres`） | 同参重入返回 `already_admitted`，不新增行、不写事件，返回既有 admission | `AssertionError: idempotent readmission wrote a second event` |
+| `tests/integration/test_admission.py::test_conflicting_readmission_is_denied`（`postgres`） | 同 `(parent_job_id, round_no)` 异参冲突返回 `ADMISSION_DENIED` + `sub_reason=ROUND_ALREADY_ADMITTED`，写一条 denied 事件 | `AssertionError: conflicting readmission was accepted` |
 | `tests/contract/test_budget_ledger.py::test_concurrent_charge_cannot_overdraw_family_budget` | 两个数据库连接模拟竞争，最多一笔成功，余额不为负 | `AssertionError: remaining_total_seconds is negative` |
 | `tests/contract/test_budget_ledger.py::test_recovery_does_not_charge_twice` | 同一 `(job_id, step_key, attempt_no)` 恢复后只扣一次 | `AssertionError: budget charged twice after recovery` |
 | `tests/contract/test_budget_ledger.py::test_retry_with_new_attempt_charges_again` | 重试产生新 `attempt_no` 并再次扣费 | `AssertionError: retry was free` |
