@@ -888,11 +888,84 @@ def test_v2_review_reject_archives_schema_2_blocked_bundles(
     child_bundle = verified_by_job[seed["child_id"]]
     child_report = json.loads(child_bundle.file_data["report.json"])
     assert child_report["plan_digest"] == real_digest
-    # A v2 review is recorded against the family row, so the child's blocked
-    # bundle binds the frozen plan but has no review.json of its own.
-    assert child_report["review"] is None
+    # D36/§8: human reviews live on the family row, and the first child's
+    # bundle carries a copy of review.json bound by plan_digest so offline
+    # verification retains who rejected the plan and when.
     assert "plan.json" in child_bundle.file_data
-    assert "review.json" not in child_bundle.file_data
+    assert "review.json" in child_bundle.file_data
+    child_review = json.loads(child_bundle.file_data["review.json"])
+    assert child_review["decision"] == "reject"
+    assert child_review["reviewer_id"] == REVIEWER_2
+    assert child_review["plan_digest"] == real_digest
+    jsonutil.require_rfc3339(child_review["decided_at"], "review.decided_at")
+    assert child_report["review"] == child_review
+
+    family_bundle = verified_by_job[seed["family_id"]]
+    family_report = json.loads(family_bundle.file_data["report.json"])
+    assert family_report["plan_digest"] is None
+    assert family_report["review"] is None
+    assert "plan.json" not in family_bundle.file_data
+    assert "review.json" not in family_bundle.file_data
+
+
+def test_v2_later_round_blocked_does_not_attach_first_round_review(
+    isolated_database, tmp_path, monkeypatch
+):
+    """A later round's blocked bundle must never inherit the first-round review.
+
+    ``reviews`` stores only the first human decision against ``family_id``. A
+    subsequent round has its own ``plan_digest``, so ``record_blocked`` must
+    keep ``review.json`` and ``report.review`` absent even though it consults
+    the family's review row.
+    """
+    monkeypatch.setenv("DATACON_EVIDENCE_ROOT", str(tmp_path / "evidence"))
+    seed = _seed_family(
+        isolated_database, first_approval=True, pending_envelope=None
+    )
+    family_id = seed["family_id"]
+    later_child = uuid4()
+    _insert_plain_job(
+        isolated_database,
+        later_child,
+        request=_family_request("guided"),
+        state_name="BLOCKED",
+        family_id=family_id,
+        job_kind="round",
+        parent_job_id=family_id,
+        round_no=1,
+    )
+    isolated_database.connection.execute(
+        "UPDATE jobs SET stage = 'blocked', reason_code = 'ENVELOPE_VIOLATION' "
+        "WHERE job_id = %s",
+        (later_child,),
+    )
+    later_plan = _v2_plan(
+        family_id,
+        round_no=1,
+        envelope_digest=ENVELOPE_1,
+        parent_approval_digest=APPROVAL_1,
+    )
+    later_digest = contracts.plan_digest(later_plan)
+    isolated_database.connection.execute(
+        "INSERT INTO plans (plan_id, job_id, plan_digest, plan, summary) "
+        "VALUES (%s, %s, %s, %s, %s)",
+        (uuid4(), later_child, later_digest, Jsonb(later_plan), Jsonb({})),
+    )
+
+    assert execution.record_blocked(
+        isolated_database.dsn,
+        later_child,
+        reason_code="ENVELOPE_VIOLATION",
+        message="round exceeded envelope mutation limits",
+    )
+    verified = _assert_v2_blocked_evidence(isolated_database, later_child)
+    assert verified.manifest["reason_code"] == "ENVELOPE_VIOLATION"
+    assert verified.manifest["plan_digest"] == later_digest
+    report = json.loads(verified.file_data["report.json"])
+    assert report["plan_digest"] == later_digest
+    assert report["review"] is None
+    assert "plan.json" in verified.file_data
+    assert "review.json" not in verified.file_data
 
 
 def test_v2_review_expiry_archives_schema_2_blocked_bundles(
@@ -1226,6 +1299,11 @@ def test_expire_pending_envelopes_still_expires_reapproval(
         "SELECT state, reason_code FROM jobs WHERE job_id = %s",
         (seed["family_id"],),
     ) == ("BLOCKED", "REVIEW_EXPIRED")
+    verified = _assert_v2_blocked_evidence(isolated_database, seed["family_id"])
+    assert verified.manifest["reason_code"] == "REVIEW_EXPIRED"
+    family_report = json.loads(verified.file_data["report.json"])
+    assert family_report["review"] is None
+    assert "review.json" not in verified.file_data
 
 
 FIXED_ENVELOPE_BODY = {

@@ -3141,7 +3141,22 @@ def record_blocked(
             plan = plan_row["plan"]
             expected_plan_digest = plan_row["plan_digest"]
     if review is None:
-        review = state.get_review(dsn, job_id)
+        review_job_id = job_id
+        family_id = job.get("family_id")
+        if (
+            job.get("job_contract_version") == 2
+            and job.get("job_kind") in ("campaign", "round")
+            and family_id is not None
+        ):
+            # D36/§8: human reviews live on the family row while the first plan
+            # lives on the first child. Look up the family's review so a
+            # rejected first child archives review.json and report.review bound
+            # by plan_digest; later rounds carry a different plan_digest, so
+            # _blocked_report ignores the first-round review automatically.
+            review_job_id = (
+                UUID(family_id) if isinstance(family_id, str) else family_id
+            )
+        review = state.get_review(dsn, review_job_id)
     digest, path, error = archive_blocked(
         job,
         generation=expected_generation,

@@ -340,8 +340,14 @@ def _normalize_file_path(value: Any) -> str:
     return pure.as_posix()
 
 
-def _entry(path: str, role: str, data: bytes) -> dict[str, Any]:
-    if role not in _ROLE_NAMES:
+def _entry(
+    path: str,
+    role: str,
+    data: bytes,
+    *,
+    role_names: frozenset[str] = _ROLE_NAMES,
+) -> dict[str, Any]:
+    if role not in role_names:
         raise BundleError("INVALID_MANIFEST", f"unknown evidence role: {role}")
     return {
         "path": _normalize_file_path(path),
@@ -644,6 +650,11 @@ def write_bundle(
                 "FILE_TOO_LARGE", "bundle exceeds the total evidence size cap"
             )
 
+        allowed_roles = (
+            _V2_ROLE_NAMES
+            if schema_version == contracts.SCHEMA_VERSION_V2
+            else _ROLE_NAMES
+        )
         for path, data in payloads.items():
             destination = temporary / PurePosixPath(path)
             destination.parent.mkdir(parents=True, exist_ok=True)
@@ -656,7 +667,7 @@ def write_bundle(
                 if path == "report.md"
                 else artifacts[path][0]  # type: ignore[index]
             )
-            entries.append(_entry(path, role, data))
+            entries.append(_entry(path, role, data, role_names=allowed_roles))
         entries.sort(key=lambda item: item["path"])
 
         roles = {entry["role"] for entry in entries}
@@ -678,11 +689,13 @@ def write_bundle(
         if schema_version == contracts.SCHEMA_VERSION_V2:
             if bundle_kind == "blocked":
                 _require_blocked_paths(listed)
+                _verify_v2_layout(listed, bundle_kind)
                 _validate_blocked_artifacts(
                     payloads, plan_digest=plan_digest, report=report
                 )
             else:
                 _require_required_paths(listed, _V2_REQUIRED_PATHS[bundle_kind])
+                _verify_v2_layout(listed, bundle_kind)
         elif bundle_kind == "execution":
             _require_required_paths(listed, _REQUIRED_PATHS)
         else:
