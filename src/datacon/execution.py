@@ -2903,7 +2903,12 @@ def _blocked_report(
     expiry can leave only a plan, and submit-time rejection has neither).
     """
     if type(schema_version) is not int or schema_version not in (1, 2):
-        raise ValueError("blocked report schema_version must be 1 or 2")
+        # A report-shape error is a bundle error, not a programming ValueError:
+        # it must surface with the same typed reason as the rest of the
+        # blocked archive path.
+        raise BundleError(
+            "INVALID_MANIFEST", "blocked report schema_version must be 1 or 2"
+        )
     plan_doc: dict[str, Any] | None = dict(plan) if isinstance(plan, Mapping) else None
     plan_digest: str | None = None
     if plan_doc is not None:

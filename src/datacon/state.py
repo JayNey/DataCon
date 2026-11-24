@@ -529,6 +529,11 @@ def freeze_plan(
                     )
                 # The family row is already locked FOR UPDATE above, so the
                 # approval chain tail cannot move while this check runs.
+                # first_plan_digest is intentionally not re-checked here: every
+                # family_approvals row is written by record_review against the
+                # family's first plan and the column is otherwise immutable,
+                # so the tail cannot name a different plan than the chain
+                # root. The plan body is still bound to the family/round above.
                 tails = connection.execute(
                     "SELECT prior.approval_digest, prior.envelope_digest "
                     "FROM family_approvals AS prior "
@@ -1143,6 +1148,14 @@ def finish_execution(
         if state == "COMPLETED":
             if job["job_contract_version"] != 2:
                 raise StateError("COMPLETED is only valid for a v2 job")
+            # TODO(T11): the spec wording is "child job (including campaign
+            # child) lands COMPLETED" (README invariant / tasks.md T10-T11),
+            # while this implementation deliberately narrows it to the
+            # campaign child. A fixed/guided round currently always produces a
+            # verdict, so no round child needs a verdict-less COMPLETED today.
+            # If T11 needs one, widen this together with claim_next/drain and
+            # finish_execution and add the matching tests; do not relax it to
+            # "any child" on an assumption.
             if job.get("job_kind") != "campaign":
                 raise StateError(
                     "COMPLETED is only valid for a v2 campaign child; "

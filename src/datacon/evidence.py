@@ -135,6 +135,15 @@ V2_ROLE_NAMES = _V2_ROLE_NAMES
 # by _V2_ROLE_NAMES but are not required yet, so T12/T13 work is not blocked.
 # crash_seed is conditionally required only when a campaign records at least
 # one candidate seed; a zero-crash campaign legitimately has none.
+# TODO(T12/T13): this unconditional role table cannot express the §8 campaign
+# rule ("when a candidate crash seed is recorded, crash_seed + its
+# fuzz_provenance are required; zero crashes may omit them"). Do not add
+# crash_seed to _V2_CAMPAIGN_REQUIRED_ROLES: that would reject a legitimate
+# zero-crash campaign (test_campaign_bundle_allows_zero_crash_seed).
+# - T12, when it writes the campaign archive, must require crash_seed +
+#   fuzz_provenance whenever it records at least one candidate seed.
+# - T13, when it verifies a campaign, must reject "candidate seed(s) present
+#   but crash_seed missing" and keep zero-crash bundles valid.
 _V2_EXECUTION_REQUIRED_ROLES = frozenset(
     {
         "report_json",
@@ -200,7 +209,9 @@ _V2_REQUIRED_PATHS = {
 _ENTRY_FIELDS = frozenset({"path", "role", "size_bytes", "sha256"})
 # Closed top-level key set for Manifest v2 (§8 / §12.5). Blocked bundles may
 # omit nullable identity keys (§12.2), but unknown top-level keys are always
-# rejected.
+# rejected. TODO(T12/T13): a new manifest field (for example execution_kind)
+# must be added here in the same change as its writer/verifier; otherwise the
+# verifier would reject every bundle that carries it.
 _V2_MANIFEST_FIELDS = frozenset(
     {
         "schema_version",
@@ -1001,6 +1012,15 @@ def _validate_v2_manifest_header(
                     "INVALID_MANIFEST",
                     "a non-reuse execution must not carry build_ref",
                 )
+            # TODO(T13): a fixed execution must carry experiment_digest=null
+            # (§8 manifest / §12.3 report). A non-reuse manifest cannot tell a
+            # fixed run from a guided validation-only run: both omit build_ref
+            # and both may carry a non-null experiment_digest here. Deciding it
+            # needs the report/plan semantic replay (execution mode + report
+            # experiment_digest), which belongs to T13. Do not add a new
+            # manifest field (for example execution_kind) to shortcut it; that
+            # would be a spec change. T13 must reject fixed + non-null
+            # experiment_digest and add the fixed/validation matrix tests.
         else:
             if build_ref_value is None:
                 raise BundleError(
@@ -3783,11 +3803,13 @@ def _verify_bundle_v2(
     manifest: dict[str, Any],
     manifest_bytes: bytes,
 ) -> BundleVerification:
-    """Verify the v2 manifest skeleton and its role/path surface.
+    """Verify the v2 manifest skeleton, the blocked semantics and roles.
 
-    T10 only owns dispatch and the campaign error surface: the header and role
-    checks are version-specific, while the v2 report/plan semantic replay is
-    filled in by the later evidence-v2 tasks. The generic inventory walk and
+    T10 owns dispatch, the v2 manifest header/role surface and the blocked
+    bundle semantics: blocked bundles are replayed here by
+    ``_verify_v2_blocked_semantics`` (report shape, plan/review binding and
+    markdown digest). Execution/campaign report replay is still filled in by
+    the later evidence-v2 tasks (T13/T14). The generic inventory walk and
     digest checks are shared with v1 so path traversal, symlinks, extra/missing
     files and digest tampering keep the same guarantees.
     """
