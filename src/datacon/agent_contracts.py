@@ -266,3 +266,21 @@ class AgentOutput:
             raise
         except ValueError as error:
             raise ContractError(str(error)) from error
+
+
+def parse_model_output(payload: dict[str, Any]) -> AgentOutput:
+    """Parse a v0.2 model AgentOutput; model findings must be hypotheses.
+
+    The v0.1 parser (``AgentOutput.from_mapping``) keeps its frozen
+    read-only semantics for stored v1 records, including ``kind=fact``.
+    The v2 model outlet is stricter: a model may only propose hypotheses,
+    so a model-sourced fact is an invalid output and is blocked here.
+    """
+    parsed = AgentOutput.from_mapping(payload)
+    for finding in parsed.findings:
+        if finding.kind == "fact":
+            raise ContractError(
+                "a model finding must be a hypothesis; facts are produced "
+                "deterministically"
+            )
+    return parsed

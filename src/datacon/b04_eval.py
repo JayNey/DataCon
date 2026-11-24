@@ -14,12 +14,13 @@ import json
 from pathlib import Path
 import shutil
 import tempfile
-from typing import Any, Callable, Iterable, cast
+from typing import Any, Callable, Iterable, Mapping, Sequence, cast
 
 from datacon import jsonutil
 from datacon.agent_contracts import AnalysisModel, AgentOutput, ModelContext, ModelSuggestion
 from datacon.agents.analysis import AnalysisBlocked, analyze_case
 from datacon.contracts import DEFAULT_LIMITS
+from datacon.experiment_spec import signature_matches
 
 ALLOWED_ANALYSIS_TOOLS = frozenset({"git.resolve", "git.diff", "tree_sitter.extract"})
 REQUIRED_CATEGORIES = frozenset(
@@ -413,3 +414,149 @@ def run_b04_evaluation(
             metrics=summary,
         )
     return summary
+
+
+def load_annotation_set(path: Path) -> dict[str, Any]:
+    """Load a frozen B04-H annotation set (REQ-13, TC-13).
+
+    The annotation set is written once and frozen, so every load of the
+    same file reports the same ``annotation_version`` and historical
+    B04-H quality reports stay reproducible. A document without a
+    non-empty ``annotation_version`` string is not an annotation set.
+    """
+    document = json.loads(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(document, dict):
+        raise B04GateError(
+            "annotation set must be a JSON object",
+            reason_code="ANNOTATION_INVALID",
+        )
+    version = document.get("annotation_version")
+    if not isinstance(version, str) or not version:
+        raise B04GateError(
+            "annotation set requires a non-empty annotation_version string",
+            reason_code="ANNOTATION_INVALID",
+        )
+    source = document.get("source")
+    if not isinstance(source, str) or not source:
+        raise B04GateError(
+            "annotation set requires a non-empty source string",
+            reason_code="ANNOTATION_INVALID",
+        )
+    samples = document.get("samples")
+    if not isinstance(samples, list):
+        raise B04GateError(
+            "annotation set samples must be a list",
+            reason_code="ANNOTATION_INVALID",
+        )
+    return {
+        "annotation_version": version,
+        "source": source,
+        "samples": samples,
+    }
+
+
+# A hypothesis line counts as on-target when it falls inside the annotated
+# range or within three lines of it (test-plan delta 4.2).
+_HYPOTHESIS_LINE_TOLERANCE = 3
+
+
+def _hypothesis_hits_annotation(
+    hypothesis: Mapping[str, Any], sample: Mapping[str, Any]
+) -> bool:
+    """Whether one hypothesis hits one annotation (test-plan delta 4.2).
+
+    Symbol, path and input family must match exactly; the hypothesis line
+    must fall inside the annotated range (plus or minus the tolerance); the
+    signature must match as a full signature through
+    ``experiment_spec.signature_matches`` - optional fields participate
+    through their presence, never through defaults. A hypothesis outside
+    every annotated file is a miss.
+    """
+    for field in ("target_symbol", "target_path", "input_family"):
+        if hypothesis.get(field) != sample.get(field):
+            return False
+    line = hypothesis.get("target_line")
+    start = sample.get("target_line_start")
+    end = sample.get("target_line_end")
+    if type(line) is not int or type(start) is not int or type(end) is not int:
+        return False
+    if not (
+        start - _HYPOTHESIS_LINE_TOLERANCE
+        <= line
+        <= end + _HYPOTHESIS_LINE_TOLERANCE
+    ):
+        return False
+    expected_signature = hypothesis.get("expected_signature")
+    accepted_signature = sample.get("accepted_signature")
+    if not isinstance(expected_signature, dict) or not isinstance(
+        accepted_signature, dict
+    ):
+        return False
+    return signature_matches(expected_signature, accepted_signature)
+
+
+def evaluate_hypothesis_quality(
+    annotation_set_path: Path,
+    *,
+    hypotheses: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Report B04-H hypothesis quality against a frozen annotation set.
+
+    An additive quality report beside the B04-A gate, never its
+    replacement: the vocabulary here (end-to-end and accepted precision,
+    recall, rejection rate) never feeds a ``REPRODUCED`` decision. The
+    admission-rejected entries stay in the end-to-end denominator so
+    rejecting cannot inflate the score, and never count as hits; recall
+    counts each annotation at most once no matter how many hypotheses hit
+    it. The frozen ``annotation_version`` passes through unchanged so
+    historical reports stay reproducible.
+    """
+    annotation_set = load_annotation_set(Path(annotation_set_path))
+    samples: list[Any] = annotation_set["samples"]
+
+    admitted: list[Mapping[str, Any]] = []
+    rejection_reasons: dict[str, int] = {}
+    for hypothesis in hypotheses:
+        admission = hypothesis.get("admission")
+        status = (
+            admission.get("status") if isinstance(admission, Mapping) else None
+        )
+        if status == "rejected":
+            reason = (
+                admission.get("reason_code")
+                if isinstance(admission, Mapping)
+                else None
+            )
+            token = str(reason) if isinstance(reason, str) and reason else "UNKNOWN"
+            rejection_reasons[token] = rejection_reasons.get(token, 0) + 1
+            continue
+        admitted.append(hypothesis)
+
+    hits = sum(
+        1
+        for hypothesis in admitted
+        if any(_hypothesis_hits_annotation(hypothesis, sample) for sample in samples)
+    )
+    hit_annotations = sum(
+        1
+        for sample in samples
+        if any(_hypothesis_hits_annotation(hypothesis, sample) for hypothesis in admitted)
+    )
+    total = len(hypotheses)
+    identified_cases = {
+        sample.get("case_id") for sample in samples if isinstance(sample, Mapping)
+    } - {None}
+
+    return {
+        "end_to_end_precision": hits / total if total else 0.0,
+        "accepted_precision": hits / len(admitted) if admitted else 0.0,
+        "recall": (
+            hit_annotations / len(samples) if samples else 0.0
+        ),
+        "rejection_rate": (total - len(admitted)) / total if total else 0.0,
+        "hypothesis_total": total,
+        "annotation_count": len(samples),
+        "case_count": len(identified_cases) if identified_cases else len(samples),
+        "rejection_reasons": rejection_reasons,
+        "annotation_version": annotation_set["annotation_version"],
+    }
