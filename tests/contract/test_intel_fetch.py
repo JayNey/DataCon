@@ -2,10 +2,11 @@
 
 Contract tests for T15 (D44). Each coordinate imports the contract face
 inside the test function, so a missing entry point fails its own test
-instead of producing one shared module-level collection error. The graph
-coordinate ``test_intel_node_archives_missing_or_conflicting_snapshot``
-(README section 5 edge #6) needs the T11 ``intel`` node and ships with the
-T15 closeout change once #43 lands.
+instead of producing one shared module-level collection error. The last
+five coordinates freeze ``datacon.tools.intel_provider``: three drive the
+real T11 ``intel`` node (README section 5, edges #5 and #6) through
+``workflow.OrchestrationRunner`` with that provider injected, two pin the
+provider itself. None of them needs PostgreSQL or Docker.
 
 Every HTTP interaction goes through the recording fake transport defined
 below: no test opens a socket, resolves DNS or sleeps. Simulated time is
@@ -45,9 +46,7 @@ class FakeHop:
         self.status = status
         self.location = location
         self.elapsed_seconds = elapsed_seconds
-        self.headers = {
-            key.lower(): value for key, value in (headers or {}).items()
-        }
+        self.headers = {key.lower(): value for key, value in (headers or {}).items()}
         if chunks is None:
             chunks = [
                 body[index : index + CHUNK_BYTES]
@@ -95,9 +94,7 @@ class TimeoutTransport(FakeTransport):
     def fetch(self, url, *, connect_timeout, read_timeout):
         self.requested.append(url)
         self.timeout_requests.append((connect_timeout, read_timeout))
-        raise TimeoutError(
-            f"{self._stage} timeout after {self._budget} seconds"
-        )
+        raise TimeoutError(f"{self._stage} timeout after {self._budget} seconds")
 
 
 REJECTED_ADDRESSES = (
@@ -125,9 +122,7 @@ def test_domain_allowlist_and_address_recheck_reject_private_networks():
 
     # a registered https source passes the pre-flight validation
     assert (
-        validate_source(
-            "https://advisory.example.com/cve-2099-0001.txt", ALLOWLIST
-        )
+        validate_source("https://advisory.example.com/cve-2099-0001.txt", ALLOWLIST)
         is None
     )
 
@@ -137,9 +132,7 @@ def test_domain_allowlist_and_address_recheck_reject_private_networks():
 
     # subdomains must be listed explicitly; there is no wildcard allowlist
     with pytest.raises(Exception, match=r"(?i)allowlist"):
-        validate_source(
-            "https://corp.advisory.example.com/advisory.txt", ALLOWLIST
-        )
+        validate_source("https://corp.advisory.example.com/advisory.txt", ALLOWLIST)
 
     # literal private, loopback, link-local, metadata, CGNAT, multicast,
     # unspecified and IPv4-mapped IPv6 hosts are all rejected by the
@@ -158,8 +151,7 @@ def test_each_redirect_hop_is_revalidated():
 
     # five redirects are followed while every hop stays https + allowlisted
     hops = [
-        FakeHop(urls[index], status=302, location=urls[index + 1])
-        for index in range(5)
+        FakeHop(urls[index], status=302, location=urls[index + 1]) for index in range(5)
     ]
     hops.append(FakeHop(urls[5], status=200, body=b"advisory text\n"))
     transport = FakeTransport(*hops)
@@ -172,8 +164,7 @@ def test_each_redirect_hop_is_revalidated():
 
     # the sixth redirect is rejected and the hop count is recorded
     hops = [
-        FakeHop(urls[index], status=302, location=urls[index + 1])
-        for index in range(6)
+        FakeHop(urls[index], status=302, location=urls[index + 1]) for index in range(6)
     ]
     hops.append(FakeHop(urls[6], status=200, body=b"never reached\n"))
     transport = FakeTransport(*hops)
@@ -243,13 +234,8 @@ def test_https_only_with_size_and_timeout_limits():
     assert transport.requested == []
 
     # a wire body above 8 MiB is cut while it is still streaming in
-    chunks = [
-        b"a" * CHUNK_BYTES
-        for _ in range(MAX_WIRE_BYTES // CHUNK_BYTES + 2)
-    ]
-    hop = FakeHop(
-        "https://advisory.example.com/big.bin", status=200, chunks=chunks
-    )
+    chunks = [b"a" * CHUNK_BYTES for _ in range(MAX_WIRE_BYTES // CHUNK_BYTES + 2)]
+    hop = FakeHop("https://advisory.example.com/big.bin", status=200, chunks=chunks)
     transport = FakeTransport(hop)
     with pytest.raises(Exception, match="SIZE_LIMIT_EXCEEDED"):
         fetch_intel(
@@ -268,9 +254,7 @@ def test_https_only_with_size_and_timeout_limits():
         ("read", READ_TIMEOUT_SECONDS),
     ):
         transport = TimeoutTransport(stage=stage, budget=budget)
-        with pytest.raises(
-            Exception, match=f"{stage} timeout after {budget} seconds"
-        ):
+        with pytest.raises(Exception, match=f"{stage} timeout after {budget} seconds"):
             fetch_intel(
                 "https://advisory.example.com/slow.txt",
                 allowlist=ALLOWLIST,
@@ -283,12 +267,9 @@ def test_https_only_with_size_and_timeout_limits():
     # the whole fetch may not outlive the 60 second total budget: three
     # declared 25 second hops add up to 75 seconds
     slow_urls = [
-        f"https://slow{index}.advisory.example.com/advisory.txt"
-        for index in range(3)
+        f"https://slow{index}.advisory.example.com/advisory.txt" for index in range(3)
     ]
-    slow_allowlist = tuple(
-        f"slow{index}.advisory.example.com" for index in range(3)
-    )
+    slow_allowlist = tuple(f"slow{index}.advisory.example.com" for index in range(3))
     transport = FakeTransport(
         FakeHop(
             slow_urls[0],
@@ -305,9 +286,7 @@ def test_https_only_with_size_and_timeout_limits():
         FakeHop(slow_urls[2], status=200, body=b"x\n", elapsed_seconds=25.0),
     )
     with pytest.raises(Exception, match="FETCH_TIMEOUT"):
-        fetch_intel(
-            slow_urls[0], allowlist=slow_allowlist, transport=transport
-        )
+        fetch_intel(slow_urls[0], allowlist=slow_allowlist, transport=transport)
     assert transport.requested == slow_urls
 
 
@@ -339,9 +318,7 @@ def test_decompression_is_bounded():
     # decompressing can catch it
     bomb = gzip.compress(b"\0" * (MAX_DECOMPRESSED_BYTES + 1))
     assert len(bomb) < MAX_WIRE_BYTES
-    hop = FakeHop(
-        url, status=200, body=bomb, headers={"Content-Encoding": "gzip"}
-    )
+    hop = FakeHop(url, status=200, body=bomb, headers={"Content-Encoding": "gzip"})
     with pytest.raises(Exception, match="DECOMPRESSION_BOMB"):
         fetch_intel(url, allowlist=ALLOWLIST, transport=FakeTransport(hop))
 
@@ -445,9 +422,7 @@ def test_missing_or_disallowed_license_is_rejected():
             "permitted_uses": ["reproduction"],
         }
     }
-    assert (
-        check_license(snapshot, registry_allows_reproduction) is None
-    )
+    assert check_license(snapshot, registry_allows_reproduction) is None
 
     # a snapshot without license information is rejected before any of its
     # material can enter the reproduction workflow
@@ -465,3 +440,515 @@ def test_missing_or_disallowed_license_is_rejected():
     }
     with pytest.raises(Exception, match="LICENSE_REJECTED"):
         check_license(snapshot, registry_human_review_only)
+
+
+# ---------------------------------------------------------------------------
+# T11 ``intel`` node fed by T15 snapshots (README section 5, edges #5 and #6)
+#
+# The coordinates below freeze ``datacon.tools.intel_provider``, the provider
+# that hands pinned snapshots and the license gate to the ``intel`` node
+# through its injectable ``IntelProvider`` port. Everything stays offline:
+# snapshots are bytes served by an in-memory loader, time is a step clock and
+# the sandbox only records calls, so no PostgreSQL, Docker, socket or sleep is
+# involved. The doubles live here on purpose; ``tests/unit/fakes.py`` is only
+# importable once pytest has put ``tests/unit`` on ``sys.path``.
+# ---------------------------------------------------------------------------
+
+# A request names its case at ``target.case_id`` (examples/request.json,
+# contracts._validate_request); registered sources are looked up by it.
+INTEL_CASE_ID = "fixture-c-parser"
+INTEL_SOURCE_ID = "vendor-advisory"
+INTEL_SOURCE_URL = f"https://{ALLOWLIST[0]}/cve-2099-0001.txt"
+INTEL_LICENSE = "CC-BY-4.0"
+INTEL_JOB_ID = "job-intel-node"
+INTEL_FAMILY_ID = "family-intel-node"
+# A block the T11 ``version`` node honors from the request (edge #8): it ends
+# the run right after ``version`` without resolving commits or using a sandbox.
+VERSION_STOP = "DEADLINE_EXCEEDED"
+# Only the snapshot body carries this marker. A summary reports digests and
+# identifiers, never advisory text, so the marker must never reach one.
+INTEL_BODY_MARKER = "SNAPSHOT-BODY-ONLY-MARKER-7Kq4"
+PINNED_ADVISORY = (
+    b'{"cve_id": "CVE-2099-0001", "summary": "heap overflow; '
+    + INTEL_BODY_MARKER.encode("ascii")
+    + b'"}\n'
+)
+# A pinned snapshot whose content was changed after registration: still
+# well-formed, but its digest no longer matches the registered one.
+TAMPERED_ADVISORY = PINNED_ADVISORY.replace(b"CVE-2099-0001", b"CVE-2099-0002")
+
+
+def _intel_source(**overrides: object) -> object:
+    """Return one intel source registered for ``INTEL_CASE_ID``.
+
+    Its snapshot is pinned as ``PINNED_ADVISORY`` under a license that permits
+    ``reproduction``, the only use this system makes of advisories. Keyword
+    ``overrides`` replace single fields.
+    """
+    from datacon.tools.intel_provider import IntelSource
+
+    fields: dict[str, object] = {
+        "source_id": INTEL_SOURCE_ID,
+        "case_id": INTEL_CASE_ID,
+        "snapshot_path": "advisory.json",
+        "snapshot_digest": _digest(PINNED_ADVISORY),
+        "source_url": INTEL_SOURCE_URL,
+        "license": INTEL_LICENSE,
+        "permitted_uses": ("reproduction",),
+    }
+    return IntelSource(**{**fields, **overrides})
+
+
+class _SourceRegistry:
+    """Case registry double: ``sources_for`` answers whatever it was given.
+
+    It deliberately does not filter by case: the registry port is only as
+    trustworthy as its data, and the provider must refuse a source that is
+    registered for a different case. An empty registry answers ``()``.
+    """
+
+    def __init__(self, *sources: object) -> None:
+        self._sources = tuple(sources)
+        self.asked: list[str] = []
+
+    def sources_for(self, case_id: str) -> tuple[object, ...]:
+        self.asked.append(case_id)
+        return self._sources
+
+
+class _SnapshotLoader:
+    """Pinned-snapshot reader double that records every read.
+
+    An ``(case_id, source_id)`` without an entry answers ``None``, the port's
+    result for a pinned snapshot that cannot be read.
+    """
+
+    def __init__(self, *entries: tuple[str, str, bytes]) -> None:
+        self._snapshots = {
+            (case_id, source_id): body for case_id, source_id, body in entries
+        }
+        self.calls: list[tuple[str, str]] = []
+
+    def __call__(self, case_id: str, source: object) -> bytes | None:
+        self.calls.append((case_id, source.source_id))
+        return self._snapshots.get((case_id, source.source_id))
+
+
+class _RecordingSandbox:
+    """Sandbox double that only records calls; it starts no container.
+
+    No node before ``build`` may talk to a sandbox, so any call is recorded
+    and answered with an assertion instead of a probe, build or replay result.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def _record(self, operation: str) -> None:
+        self.calls.append(operation)
+        raise AssertionError(
+            f"no node on the intel path may use the sandbox, got {operation}()"
+        )
+
+    def probe(self, **kwargs: object) -> None:
+        self._record("probe")
+
+    def build(self, *args: object, **kwargs: object) -> None:
+        self._record("build")
+
+    def replay(self, *args: object, **kwargs: object) -> None:
+        self._record("replay")
+
+
+def _request(**control: object) -> dict[str, object]:
+    """Return a job request in the ``examples/request.json`` shape plus controls."""
+    return {
+        "cve_id": "CVE-2099-0001",
+        "target": {"kind": "source", "case_id": INTEL_CASE_ID, "goal": "reproduce"},
+        **control,
+    }
+
+
+def _step_clock() -> object:
+    """Return a UTC clock double that only moves through ``advance``."""
+    from datetime import datetime, timedelta, timezone
+
+    class _StepClock:
+        def __init__(self) -> None:
+            self._now = datetime(2099, 1, 1, tzinfo=timezone.utc)
+
+        def now(self) -> datetime:
+            return self._now
+
+        def advance(self, seconds: float) -> datetime:
+            self._now = self._now + timedelta(seconds=float(seconds))
+            return self._now
+
+        def timestamp(self, *, microseconds: bool = False) -> str:
+            if microseconds:
+                return self._now.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+            return self._now.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+    return _StepClock()
+
+
+def _recording_ledger() -> object:
+    """Return the production re-entry ledger, also listing node outcomes in order."""
+    from datacon import workflow
+
+    class _RecordingLedger(workflow.NodeReentryLedger):
+        def __init__(self) -> None:
+            super().__init__()
+            self.node_outcomes: list[tuple[object, dict]] = []
+
+        def record_completed(self, key, result):
+            recorded = super().record_completed(key, result)
+            self.node_outcomes.append((key, recorded))
+            return recorded
+
+    return _RecordingLedger()
+
+
+def _run_intel_child(
+    provider: object, request: dict[str, object]
+) -> tuple[object, dict, _RecordingSandbox, object]:
+    """Run one round child through the real 14-node graph with ``provider``.
+
+    Returns ``(outcome, intel_node, sandbox, runner)``. ``outcome`` is the
+    ``ChildRunOutcome`` of the run. ``intel_node`` is the outcome the ``intel``
+    node persisted, whose ``intel_summary`` is what that node handed to the
+    graph; ``ChildRunOutcome`` itself does not carry it.
+    """
+    from datacon import workflow
+
+    sandbox = _RecordingSandbox()
+    ledger = _recording_ledger()
+    runner = workflow.OrchestrationRunner(
+        sandbox=sandbox,
+        clock=_step_clock(),
+        intel_provider=provider,
+        ledger=ledger,
+    )
+    outcome = runner.run_child(
+        job_id=INTEL_JOB_ID,
+        family_id=INTEL_FAMILY_ID,
+        job_kind="round",
+        round_no=1,
+        target_kind="source",
+        request=request,
+    )
+    intel_nodes = [
+        result for key, result in ledger.node_outcomes if key.stage == "intel"
+    ]
+    assert len(intel_nodes) == 1, (
+        f"expected the intel node to run exactly once, got {intel_nodes!r}"
+    )
+    return outcome, intel_nodes[0], sandbox, runner
+
+
+def test_intel_node_archives_missing_or_conflicting_snapshot():
+    from datacon.tools.intel_provider import SnapshotIntelProvider
+
+    # (label, registered source, loader, expected reason code, reads allowed)
+    blocked = (
+        (
+            "pinned snapshot cannot be read",
+            _intel_source(),
+            _SnapshotLoader(),
+            "MATERIAL_MISSING",
+            [(INTEL_CASE_ID, INTEL_SOURCE_ID)],
+        ),
+        (
+            "pinned snapshot does not match its registered digest",
+            # v0.1 files a snapshot that fails its registered digest under
+            # MATERIAL_MISSING: the material exists but cannot be verified.
+            _intel_source(),
+            _SnapshotLoader((INTEL_CASE_ID, INTEL_SOURCE_ID, TAMPERED_ADVISORY)),
+            "MATERIAL_MISSING",
+            [(INTEL_CASE_ID, INTEL_SOURCE_ID)],
+        ),
+        (
+            "source is registered for a different case",
+            # A source conflict is a factual mismatch (v0.1: a record filed
+            # for another case), so its content is never even read.
+            _intel_source(case_id="another-case"),
+            _SnapshotLoader((INTEL_CASE_ID, INTEL_SOURCE_ID, PINNED_ADVISORY)),
+            "SOURCE_CONFLICT",
+            [],
+        ),
+    )
+    for label, source, loader, reason_code, expected_reads in blocked:
+        provider = SnapshotIntelProvider(
+            registry=_SourceRegistry(source), snapshot_loader=loader
+        )
+        outcome, _intel_node, sandbox, runner = _run_intel_child(provider, _request())
+
+        assert outcome.terminal_node == "archive", (label, outcome)
+        assert outcome.state == "BLOCKED", (label, outcome)
+        assert outcome.reason_code == reason_code, (label, outcome)
+        # Edge #6 is intel -> archive: no node runs in between, and version is
+        # never entered with a missing, altered or foreign snapshot.
+        assert outcome.visited_nodes == ("prepare", "intel", "archive"), (
+            f"{label}: missing or conflicting intel snapshot reached version"
+            f" node, visited_nodes={outcome.visited_nodes}"
+        )
+        assert runner.archive_count(INTEL_JOB_ID) == 1, label
+        assert sandbox.calls == [], (label, sandbox.calls)
+        # Only this case's own registered source is read, exactly once; a
+        # source filed for another case is not opened at all.
+        assert loader.calls == expected_reads, (label, loader.calls)
+
+
+def test_intel_node_ready_snapshot_reaches_version():
+    from datacon.tools.intel_provider import SnapshotIntelProvider
+
+    source = _intel_source()
+    loader = _SnapshotLoader((INTEL_CASE_ID, INTEL_SOURCE_ID, PINNED_ADVISORY))
+    provider = SnapshotIntelProvider(
+        registry=_SourceRegistry(source), snapshot_loader=loader
+    )
+    # The request stops the run inside the version node (edge #8), so an
+    # archive after intel proves the run took intel -> version (edge #5)
+    # without resolving commits or touching a sandbox.
+    outcome, intel_node, sandbox, _runner = _run_intel_child(
+        provider, _request(version_blocked_reason=VERSION_STOP)
+    )
+
+    assert outcome.visited_nodes == ("prepare", "intel", "version", "archive"), (
+        f"verified intel snapshot did not reach the version node,"
+        f" visited_nodes={outcome.visited_nodes}"
+    )
+    assert outcome.terminal_node == "archive", outcome
+    # The only block is the one this test asked for; intel did not block.
+    assert outcome.reason_code == VERSION_STOP, outcome
+    assert sandbox.calls == [], sandbox.calls
+
+    assert loader.calls == [(INTEL_CASE_ID, INTEL_SOURCE_ID)], loader.calls
+    # The summary that reached the graph names the snapshot by digest and
+    # carries the license and the source, never the snapshot text itself.
+    intel_summary = intel_node["intel_summary"]
+    assert intel_summary["snapshot_digest"] == source.snapshot_digest, intel_summary
+    assert intel_summary["license"] == INTEL_LICENSE, intel_summary
+    assert intel_summary["source_url"] == INTEL_SOURCE_URL, intel_summary
+    assert intel_summary["redirect_chain_digest"] is None, intel_summary
+    assert INTEL_BODY_MARKER not in repr(intel_summary), (
+        "intel summary leaked the snapshot body"
+    )
+
+
+def test_intel_node_rejects_unlicensed_or_unregistered_source():
+    from datacon.tools.intel_provider import SnapshotIntelProvider
+
+    rejected = (
+        ("source without a license", _intel_source(license=None)),
+        (
+            "license that does not permit reproduction",
+            _intel_source(permitted_uses=("human-review",)),
+        ),
+    )
+    for label, source in rejected:
+        # The snapshot itself is intact: only the license gate can block it.
+        loader = _SnapshotLoader((INTEL_CASE_ID, INTEL_SOURCE_ID, PINNED_ADVISORY))
+        provider = SnapshotIntelProvider(
+            registry=_SourceRegistry(source), snapshot_loader=loader
+        )
+        outcome, intel_node, sandbox, _runner = _run_intel_child(provider, _request())
+
+        assert outcome.terminal_node == "archive", (label, outcome)
+        assert outcome.state == "BLOCKED", (label, outcome)
+        assert outcome.reason_code == "POLICY_DENIED", (label, outcome)
+        assert outcome.visited_nodes == ("prepare", "intel", "archive"), (
+            f"{label}: material without an allowed license reached the version"
+            f" node, visited_nodes={outcome.visited_nodes}"
+        )
+        assert sandbox.calls == [], (label, sandbox.calls)
+        # The fine-grained reason travels in the summary's ``sub_reason``.
+        assert intel_node["intel_summary"]["sub_reason"] == "LICENSE_REJECTED", (
+            label,
+            intel_node,
+        )
+
+    # A case without a registered source has nothing to read, even though the
+    # loader could serve the bytes: an unregistered source is never fetched.
+    registry = _SourceRegistry()
+    loader = _SnapshotLoader((INTEL_CASE_ID, INTEL_SOURCE_ID, PINNED_ADVISORY))
+    provider = SnapshotIntelProvider(registry=registry, snapshot_loader=loader)
+    outcome, _intel_node, sandbox, _runner = _run_intel_child(provider, _request())
+
+    assert INTEL_CASE_ID in registry.asked, registry.asked
+    assert loader.calls == [], loader.calls
+    assert outcome.terminal_node == "archive", outcome
+    assert outcome.state == "BLOCKED", outcome
+    assert outcome.reason_code == "MATERIAL_MISSING", outcome
+    assert outcome.visited_nodes == ("prepare", "intel", "archive"), outcome
+    assert sandbox.calls == [], sandbox.calls
+
+
+def test_snapshot_provider_maps_failures_to_reason_codes():
+    from datacon import workflow
+    from datacon.tools.intel_provider import SnapshotIntelProvider
+
+    source = _intel_source()
+    # A registered source is an immutable record: its license cannot be swapped.
+    with pytest.raises(AttributeError, match="license"):
+        source.license = "CC0-1.0"
+
+    class _BrokenLoader:
+        """A snapshot store that fails instead of answering."""
+
+        def __call__(self, case_id: str, source: object) -> bytes | None:
+            raise OSError("snapshot store is unavailable")
+
+    def _loader(body: bytes) -> "_SnapshotLoader":
+        return _SnapshotLoader((INTEL_CASE_ID, INTEL_SOURCE_ID, body))
+
+    # (label, registered source, loader, reason code, fine reason, reads
+    #  allowed; ``None`` leaves the number of reads to the implementation)
+    untrusted = [
+        (
+            "snapshot cannot be read",
+            source,
+            _SnapshotLoader(),
+            "MATERIAL_MISSING",
+            "SNAPSHOT_MISSING",
+            [(INTEL_CASE_ID, INTEL_SOURCE_ID)],
+        ),
+        (
+            "snapshot store raises instead of answering",
+            source,
+            _BrokenLoader(),
+            "MATERIAL_MISSING",
+            "SNAPSHOT_UNREADABLE",
+            None,
+        ),
+        (
+            "registered digest is not a sha256 digest",
+            _intel_source(snapshot_digest="sha256:not-a-digest"),
+            _loader(PINNED_ADVISORY),
+            "MATERIAL_MISSING",
+            "SNAPSHOT_DIGEST_INVALID",
+            # Whether a snapshot with an unusable pin is read first or refused
+            # outright is left to the implementation.
+            None,
+        ),
+        (
+            "altered snapshot without a license: integrity is decided first",
+            _intel_source(license=None),
+            _loader(TAMPERED_ADVISORY),
+            "MATERIAL_MISSING",
+            "DIGEST_MISMATCH",
+            [(INTEL_CASE_ID, INTEL_SOURCE_ID)],
+        ),
+        (
+            "source is registered for a different case",
+            _intel_source(case_id="another-case"),
+            _loader(PINNED_ADVISORY),
+            # A factual mismatch between the source and the case.
+            "SOURCE_CONFLICT",
+            "SOURCE_CASE_MISMATCH",
+            [],
+        ),
+    ]
+    for change, body in (
+        ("altered", TAMPERED_ADVISORY),
+        ("truncated", PINNED_ADVISORY[:-6]),
+        ("extended", PINNED_ADVISORY + b"\n"),
+    ):
+        # Every altered variant really differs from the registered bytes, and
+        # a snapshot that fails its registered digest cannot be verified,
+        # which v0.1 files under MATERIAL_MISSING.
+        assert _digest(body) != source.snapshot_digest, change
+        untrusted.append(
+            (
+                f"snapshot content was {change}",
+                source,
+                _loader(body),
+                "MATERIAL_MISSING",
+                "DIGEST_MISMATCH",
+                [(INTEL_CASE_ID, INTEL_SOURCE_ID)],
+            )
+        )
+
+    for label, registered, loader, reason_code, sub_reason, expected_reads in untrusted:
+        provider = SnapshotIntelProvider(
+            registry=_SourceRegistry(registered), snapshot_loader=loader
+        )
+        # A failure is an answer, never an exception: nothing here raises.
+        result = provider.resolve_intel(
+            job_id=INTEL_JOB_ID, family_id=INTEL_FAMILY_ID, request=_request()
+        )
+
+        assert isinstance(result, workflow.IntelResult), (label, result)
+        assert result.status == "blocked", (label, result)
+        assert result.reason_code == reason_code, (label, result)
+        assert dict(result.summary).get("sub_reason") == sub_reason, (label, result)
+        # Nothing unverified is offered as the snapshot digest.
+        assert result.snapshot_digest is None, (label, result)
+        assert INTEL_BODY_MARKER not in repr(dict(result.summary)), (label, result)
+        # Only this case's own registered source is read, at most once; a
+        # source filed for another case is a conflict before it is content
+        # and is never opened.
+        if expected_reads is not None:
+            assert loader.calls == expected_reads, (label, loader.calls)
+
+    # A case without any registered source has no snapshot to offer, and the
+    # loader is never asked for one.
+    registry = _SourceRegistry()
+    loader = _loader(PINNED_ADVISORY)
+    provider = SnapshotIntelProvider(registry=registry, snapshot_loader=loader)
+    result = provider.resolve_intel(
+        job_id=INTEL_JOB_ID, family_id=INTEL_FAMILY_ID, request=_request()
+    )
+
+    assert INTEL_CASE_ID in registry.asked, registry.asked
+    assert loader.calls == [], loader.calls
+    assert isinstance(result, workflow.IntelResult), result
+    assert result.status == "blocked", result
+    assert result.reason_code == "MATERIAL_MISSING", result
+    assert dict(result.summary).get("sub_reason") == "SNAPSHOT_MISSING", result
+    assert result.snapshot_digest is None, result
+    # The provider is a drop-in for the orchestration port.
+    assert isinstance(provider, workflow.IntelProvider)
+
+
+def test_snapshot_provider_reads_pinned_snapshots_without_network(monkeypatch):
+    import socket
+
+    from datacon.tools import intel_fetch, safe_http
+    from datacon.tools.intel_provider import SnapshotIntelProvider
+
+    def _no_network(*args: object, **kwargs: object) -> None:
+        raise AssertionError(
+            f"offline cases read pinned snapshots only, never the network: {args!r}"
+        )
+
+    monkeypatch.setattr(intel_fetch, "fetch_intel", _no_network)
+    monkeypatch.setattr(safe_http, "connect_guarded", _no_network)
+    # Backstops for any other route to the wire: no socket, no name lookup.
+    monkeypatch.setattr(socket, "socket", _no_network)
+    monkeypatch.setattr(socket, "getaddrinfo", _no_network)
+
+    source = _intel_source()
+    loader = _SnapshotLoader((INTEL_CASE_ID, INTEL_SOURCE_ID, PINNED_ADVISORY))
+    provider = SnapshotIntelProvider(
+        registry=_SourceRegistry(source), snapshot_loader=loader
+    )
+
+    result = provider.resolve_intel(
+        job_id=INTEL_JOB_ID, family_id=INTEL_FAMILY_ID, request=_request()
+    )
+
+    assert result.status == "ready", result
+    assert result.snapshot_digest == source.snapshot_digest, result
+    assert result.reason_code is None, result
+    # The bytes came from the pinned snapshot, read once by case and source.
+    assert loader.calls == [(INTEL_CASE_ID, INTEL_SOURCE_ID)], loader.calls
+    # The summary names the snapshot by digest and carries the license, the
+    # source and the (offline: absent) redirect chain, never the snapshot text.
+    assert result.summary["snapshot_digest"] == source.snapshot_digest, result.summary
+    assert result.summary["license"] == INTEL_LICENSE, result.summary
+    assert result.summary["source_url"] == INTEL_SOURCE_URL, result.summary
+    assert result.summary["redirect_chain_digest"] is None, result.summary
+    assert INTEL_BODY_MARKER not in repr(dict(result.summary)), (
+        "intel summary leaked the snapshot body"
+    )
