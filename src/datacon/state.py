@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timezone
 import hashlib
 import math
 from pathlib import Path, PurePosixPath
@@ -2169,10 +2168,10 @@ def policy_admit_round(
 
     if not callable(clock):
         raise StateError("clock must be callable")
-    decided_at = clock()
-    if not isinstance(decided_at, datetime) or decided_at.tzinfo is None:
-        raise StateError("clock must return a timezone-aware datetime")
-    decided_at_text = jsonutil.timestamp(decided_at.astimezone(timezone.utc))
+    try:
+        decided_at_text = jsonutil.timestamp(clock())
+    except ValueError as error:
+        raise StateError(str(error)) from error
 
     try:
         budget_snapshot = dict(budget_snapshot)
@@ -2475,8 +2474,11 @@ def record_admission(
                     sub_reason="ROUND_ALREADY_ADMITTED",
                 )
 
+            decided_at = connection.execute(
+                "SELECT clock_timestamp() AS now"
+            ).fetchone()["now"]
             outcome = policy_admit_round(
-                clock=lambda: datetime.now(timezone.utc),
+                clock=lambda: decided_at,
                 job_id=job_id,
                 parent_job_id=family_id,
                 envelope=normalized_envelope,
