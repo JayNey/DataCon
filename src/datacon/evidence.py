@@ -1014,6 +1014,23 @@ def _validate_v2_manifest_header(
                 )
             build_ref = _v2_build_ref(build_ref_value, "build_ref")
             _v2_reuse_origin(reuse_origin_value, "reuse_origin", build_ref)
+    elif bundle_kind == "blocked":
+        # §12.2 relaxes the *identity* fields a blocked bundle must carry; it
+        # does not make a present build_ref/reuse_origin unvalidated. Apply
+        # the same schema checks as an execution bundle when they appear, so
+        # a malformed or inconsistent provenance record fails closed instead
+        # of riding along on a blocked archive. (T12 must still decide whether
+        # it may write blocked+build_ref at all; T10 only refuses garbage.)
+        if reuse_origin_value is not None:
+            if build_ref_value is None:
+                raise BundleError(
+                    "INVALID_MANIFEST",
+                    "a blocked bundle with reuse_origin requires build_ref",
+                )
+            build_ref = _v2_build_ref(build_ref_value, "build_ref")
+            _v2_reuse_origin(reuse_origin_value, "reuse_origin", build_ref)
+        elif build_ref_value is not None:
+            _v2_build_ref(build_ref_value, "build_ref")
 
     verdict = manifest.get("verdict")
     if bundle_kind == "campaign":

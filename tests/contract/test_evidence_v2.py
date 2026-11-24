@@ -367,6 +367,86 @@ def test_blocked_bundle_only_requires_the_two_reports(tmp_path):
     )
     verified = verify_bundle(root)
     assert verified.manifest["bundle_kind"] == "blocked"
+    # The fixture ships only the two reports. Pinning the absence of the
+    # execution-only artifacts keeps this coordinate from silently growing
+    # into a bundle that requires them.
+    assert set(verified.file_data) == {"report.json", "report.md"}
+    for absent in ("plan.json", "review.json", "envelope.json", "budget/snapshot.json"):
+        assert absent not in verified.file_data
+
+
+def _build_artifacts():
+    return {
+        "vulnerable": {
+            "artifact_digest": DIGEST,
+            "build_log_digest": OTHER_DIGEST,
+        },
+        "fixed": {
+            "artifact_digest": OTHER_DIGEST,
+            "build_log_digest": DIGEST,
+        },
+    }
+
+
+def _build_ref():
+    return {
+        "source_job_id": str(uuid4()),
+        "generation": 3,
+        "build_inputs_digest": DIGEST,
+        "artifacts": _build_artifacts(),
+    }
+
+
+def test_v2_blocked_accepts_a_schema_valid_build_ref_and_reuse_origin(tmp_path):
+    manifest = _manifest("blocked")
+    build_ref = _build_ref()
+    reuse_origin = {
+        "source_job_id": build_ref["source_job_id"],
+        "generation": build_ref["generation"],
+        "campaign_bundle_digest": OTHER_DIGEST,
+        "artifacts": _build_artifacts(),
+    }
+    manifest["build_ref"] = build_ref
+    manifest["reuse_origin"] = reuse_origin
+    root = _write_v2_bundle(
+        tmp_path, manifest, _blocked_files(manifest), name="blocked-provenance"
+    )
+    verified = verify_bundle(root)
+    assert verified.manifest["build_ref"] == build_ref
+
+
+@pytest.mark.parametrize(
+    "build_ref,reuse_origin,reason_code",
+    [
+        ({"bad": 1}, None, "INVALID_MANIFEST"),
+        (None, {"bad": 1}, "INVALID_MANIFEST"),
+        # A reuse_origin whose source/generation/artifacts disagree with the
+        # build_ref is a reuse mismatch, not silent provenance.
+        (
+            "valid",
+            {
+                "source_job_id": str(uuid4()),
+                "generation": 9,
+                "campaign_bundle_digest": OTHER_DIGEST,
+                "artifacts": _build_artifacts(),
+            },
+            "REUSE_MISMATCH",
+        ),
+    ],
+    ids=["bad-build-ref", "reuse-without-build-ref", "inconsistent-reuse"],
+)
+def test_v2_blocked_rejects_malformed_or_inconsistent_provenance(
+    tmp_path, build_ref, reuse_origin, reason_code
+):
+    manifest = _manifest("blocked")
+    manifest["build_ref"] = _build_ref() if build_ref == "valid" else build_ref
+    manifest["reuse_origin"] = reuse_origin
+    root = _write_v2_bundle(
+        tmp_path, manifest, _blocked_files(manifest), name="blocked-bad-provenance"
+    )
+    with pytest.raises(BundleError) as raised:
+        verify_bundle(root)
+    assert raised.value.reason_code == reason_code
 
 
 @pytest.mark.parametrize(
