@@ -15,8 +15,10 @@ from uuid import uuid4
 from fakes import FakeClock, FakeEnvelopePolicy, FakeReviewGate, FakeSandbox
 import pytest
 
+from datacon import contracts
 from datacon import jsonutil
 from datacon import state as state_store
+from datacon import verdict as verdict_mod
 from datacon import workflow
 from datacon.tools.sandbox import SandboxPolicyError
 
@@ -1164,6 +1166,189 @@ def test_family_level_transitions_create_next_round_child():
     )
     assert gate_decision.should_continue is True
     assert gate_decision.reason_code is None
+
+    # P1 #2: campaign_child.build_ref must match T10's exact closed 4-key
+    # contracts._build_ref schema and pass contracts._build_ref validation.
+    assert campaign_child.build_ref is not None
+    assert set(campaign_child.build_ref.keys()) == {
+        "source_job_id",
+        "generation",
+        "build_inputs_digest",
+        "artifacts",
+    }
+    assert campaign_child.build_ref["source_job_id"] == campaign_child.job_id
+    assert campaign_child.build_ref["generation"] == 1
+    assert set(campaign_child.build_ref["artifacts"].keys()) == {"vulnerable", "fixed"}
+    for version in ("vulnerable", "fixed"):
+        assert set(campaign_child.build_ref["artifacts"][version].keys()) == {
+            "artifact_digest",
+            "build_log_digest",
+        }
+    validated_build_ref = contracts._build_ref(campaign_child.build_ref)
+    assert validated_build_ref == campaign_child.build_ref
+
+    # Pure T10-shaped build_ref (only artifact_digest + build_log_digest, no
+    # status key) passed directly into run_child must reach verify -> archive
+    # with 0 sandbox.build calls and reproduce cleanly (no REUSE_MISMATCH or
+    # INCONCLUSIVE "build did not complete").
+    asan_stderr = (
+        b"==1==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x602000000014\n"
+        b"WRITE of size 4 at 0x602000000014 thread T0\n"
+        b"    #0 0x401234 in parse_frame parser.c:42\n"
+    )
+    t10_clock = FakeClock()
+    t10_sandbox = FakeSandbox(
+        clock=t10_clock,
+        asan_stderr_by_version_phase={
+            ("vulnerable", "candidate_1"): asan_stderr,
+            ("vulnerable", "candidate_2"): asan_stderr,
+        },
+    )
+    t10_runner = runner_cls(
+        sandbox=t10_sandbox,
+        clock=t10_clock,
+        review_gate=FakeReviewGate(clock=t10_clock, decision="approve"),
+        envelope_policy=FakeEnvelopePolicy(clock=t10_clock, default_admit=True),
+        verdict_policy=verdict_mod.VerdictPolicy(
+            signature={
+                "error": "heap-buffer-overflow",
+                "function": "parse_frame",
+                "source": "parser.c",
+            },
+            expected_exit={"normal": 0, "candidate_clean": 0, "candidate_asan": 86},
+            expected_stdout={"normal": "OK\n", "candidate_clean": "OK\n"},
+        ),
+    )
+    pure_t10_build_ref: dict[str, Any] = {
+        "source_job_id": str(uuid4()),
+        "generation": 1,
+        "build_inputs_digest": "sha256:" + "1" * 64,
+        "artifacts": {
+            "vulnerable": {
+                "artifact_digest": "sha256:" + "2" * 64,
+                "build_log_digest": "sha256:" + "3" * 64,
+            },
+            "fixed": {
+                "artifact_digest": "sha256:" + "4" * 64,
+                "build_log_digest": "sha256:" + "5" * 64,
+            },
+        },
+    }
+    assert contracts._build_ref(pure_t10_build_ref) == pure_t10_build_ref
+    t10_reuse_outcome = t10_runner.run_child(
+        job_id=str(uuid4()),
+        family_id=str(uuid4()),
+        job_kind="round",
+        round_no=1,
+        is_first_plan=False,
+        parent_approval_digest="sha256:" + "6" * 64,
+        build_ref=pure_t10_build_ref,
+        seed_bytes=b"t10-seed",
+    )
+    assert len(t10_sandbox.build_calls) == 0
+    assert len(t10_sandbox.replay_calls) == 6
+    assert "verify" in t10_reuse_outcome.visited_nodes
+    assert t10_reuse_outcome.terminal_node == "archive"
+    assert t10_reuse_outcome.state == "REPRODUCED"
+    assert t10_reuse_outcome.verdict == "REPRODUCED"
+    assert t10_reuse_outcome.reason_code == "ASAN_SIGNATURE_MATCHED"
+
+    # Malformed T10 build_ref with empty artifact_digest must be rejected by
+    # DefaultBuildDiagnoser with REUSE_MISMATCH (0 builds, 0 replays).
+    bad_t10_build_ref = {
+        "source_job_id": str(uuid4()),
+        "generation": 1,
+        "build_inputs_digest": "sha256:" + "1" * 64,
+        "artifacts": {
+            "vulnerable": {
+                "artifact_digest": "",
+                "build_log_digest": "sha256:" + "3" * 64,
+            },
+            "fixed": {
+                "artifact_digest": "sha256:" + "4" * 64,
+                "build_log_digest": "sha256:" + "5" * 64,
+            },
+        },
+    }
+    bad_reuse_outcome = t10_runner.run_child(
+        job_id=str(uuid4()),
+        family_id=str(uuid4()),
+        job_kind="round",
+        round_no=1,
+        is_first_plan=False,
+        parent_approval_digest="sha256:" + "6" * 64,
+        build_ref=bad_t10_build_ref,
+        seed_bytes=b"t10-bad-seed",
+    )
+    assert len(t10_sandbox.build_calls) == 0
+    assert "verify" not in bad_reuse_outcome.visited_nodes
+    assert bad_reuse_outcome.terminal_node == "archive"
+    assert bad_reuse_outcome.state == "FAILED"
+    assert bad_reuse_outcome.reason_code == "REUSE_MISMATCH"
+
+    # P1 #1: Parked non-terminal campaign child (await_review /
+    # REVIEW_ENVELOPE_MISMATCH) must keep family in AGGREGATING without
+    # invoking prepare -> AGGREGATING -> archive or converging to COMPLETED.
+    parked_fam_clock = FakeClock()
+    parked_fam_sandbox = FakeSandbox(clock=parked_fam_clock)
+    parked_fam_review = FakeReviewGate(
+        clock=parked_fam_clock,
+        decision="approve",
+        expected_envelope_digest="sha256:" + "a" * 64,
+        review_deadline_at=parked_fam_clock.now() + timedelta(hours=24),
+    )
+    parked_fam_runner = runner_cls(
+        sandbox=parked_fam_sandbox,
+        clock=parked_fam_clock,
+        review_gate=parked_fam_review,
+        envelope_policy=FakeEnvelopePolicy(clock=parked_fam_clock, default_admit=True),
+    )
+    parked_fam_id = str(uuid4())
+    parked_fam_run = parked_fam_runner.run_family_guided(
+        family_id=parked_fam_id,
+        candidate_seeds=[b"seed-parked"],
+        max_rounds=2,
+        envelope_digest="sha256:" + "b" * 64,
+    )
+    assert parked_fam_run.campaign_child.state == "AWAITING_REVIEW"
+    assert parked_fam_run.campaign_child.terminal_node is None
+    assert parked_fam_run.campaign_child.reason_code == "REVIEW_ENVELOPE_MISMATCH"
+    assert parked_fam_run.state == "AGGREGATING"
+    assert parked_fam_run.verdict is None
+    assert parked_fam_run.reason_code is None
+    assert parked_fam_run.terminal_node is None
+    assert parked_fam_run.visited_nodes == ()
+    assert parked_fam_run.family_states_observed == ("AGGREGATING",)
+    assert parked_fam_run.family_index_digest is None
+    assert parked_fam_run.stop_reason_code == "REVIEW_ENVELOPE_MISMATCH"
+    assert parked_fam_run.round_children == ()
+    assert parked_fam_run.max_concurrent_children == 1
+    assert len(parked_fam_run.child_execution_windows) == 1
+    assert parked_fam_runner.archive_count(parked_fam_id) == 0
+    assert len(parked_fam_sandbox.build_calls) == 0
+
+    # Minor #3: run_family_guided rejects invalid max_rounds, max_total_seconds,
+    # and max_fuzz_seconds (negative, NaN, inf, -inf, bool, non-numeric).
+    for invalid_rounds in (-1, True, False, 1.5):
+        with pytest.raises(ValueError, match="max_rounds"):
+            parked_fam_runner.run_family_guided(
+                family_id=str(uuid4()),
+                candidate_seeds=[b"seed-invalid"],
+                max_rounds=invalid_rounds,  # type: ignore[arg-type]
+            )
+    for invalid_budget in (-0.1, -1, float("nan"), float("inf"), float("-inf"), True, False):
+        with pytest.raises(ValueError, match="max_total_seconds"):
+            parked_fam_runner.run_family_guided(
+                family_id=str(uuid4()),
+                candidate_seeds=[b"seed-invalid"],
+                max_total_seconds=invalid_budget,  # type: ignore[arg-type]
+            )
+        with pytest.raises(ValueError, match="max_fuzz_seconds"):
+            parked_fam_runner.run_family_guided(
+                family_id=str(uuid4()),
+                candidate_seeds=[b"seed-invalid"],
+                max_fuzz_seconds=invalid_budget,  # type: ignore[arg-type]
+            )
 
 
 def test_family_children_execute_serially():

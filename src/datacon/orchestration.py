@@ -738,9 +738,39 @@ class DefaultBuildDiagnoser:
     ) -> BuildDiagnosis:
         del job_id, job_kind
         if reused_build_ref is not None:
+            if "artifacts" in reused_build_ref and not isinstance(
+                reused_build_ref.get("artifacts"), Mapping
+            ):
+                return BuildDiagnosis(
+                    outcome="failed",
+                    reason_code="REUSE_MISMATCH",
+                    message="reused build_ref.artifacts must be a mapping",
+                )
+            ref_source: Mapping[str, Any] = (
+                reused_build_ref["artifacts"]
+                if isinstance(reused_build_ref.get("artifacts"), Mapping)
+                else reused_build_ref
+            )
             for version in verdict_mod.VERSIONS:
                 entry = build_artifacts.get(version)
-                if not isinstance(entry, Mapping) or not entry.get("artifact_digest"):
+                ref_entry = ref_source.get(version)
+                entry_digest = (
+                    entry.get("artifact_digest")
+                    if isinstance(entry, Mapping)
+                    else None
+                )
+                ref_digest = (
+                    ref_entry.get("artifact_digest")
+                    if isinstance(ref_entry, Mapping)
+                    else None
+                )
+                if (
+                    not isinstance(entry_digest, str)
+                    or not entry_digest.strip()
+                    or not isinstance(ref_digest, str)
+                    or not ref_digest.strip()
+                    or entry_digest != ref_digest
+                ):
                     return BuildDiagnosis(
                         outcome="failed",
                         reason_code="REUSE_MISMATCH",
@@ -1246,6 +1276,76 @@ def _validate_max_build_retries(value: Any) -> int:
     return value
 
 
+def _validate_non_negative_budget(
+    name: str,
+    value: float | int | None,
+) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{name} must be a finite non-negative number")
+    if not math.isfinite(value) or value < 0:
+        raise ValueError(f"{name} must be a finite non-negative number")
+    return float(value)
+
+
+def _extract_reused_build_artifacts(
+    reused_ref: Mapping[str, Any],
+) -> dict[str, dict[str, Any]]:
+    """Unpack T10 nested ``build_ref['artifacts']`` (or flat legacy map) for verify."""
+    if "artifacts" in reused_ref:
+        nested_artifacts = reused_ref.get("artifacts")
+        if not isinstance(nested_artifacts, Mapping):
+            return {}
+        source_map: Mapping[str, Any] = nested_artifacts
+    else:
+        source_map = reused_ref
+
+    reused_artifacts: dict[str, dict[str, Any]] = {}
+    for version in verdict_mod.VERSIONS:
+        raw_entry = source_map.get(version)
+        if isinstance(raw_entry, Mapping):
+            entry = dict(raw_entry)
+            entry.setdefault("status", "completed")
+            reused_artifacts[version] = entry
+    return reused_artifacts
+
+
+def _build_ref_from_campaign_state(
+    state: OrchestrationState,
+    build_artifacts: Mapping[str, Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Construct a closed 4-key T10 ``build_ref`` matching ``contracts._build_ref``."""
+    artifacts: dict[str, dict[str, Any]] = {}
+    inputs_summary: dict[str, Any] = {
+        "family_id": state["family_id"],
+        "version_pair": dict(state.get("version_pair") or {}),
+        "builds": {},
+    }
+    for version in verdict_mod.VERSIONS:
+        entry = build_artifacts.get(version) or {}
+        artifact_digest = entry.get("artifact_digest")
+        build_log_digest = entry.get("build_log_digest")
+        if not isinstance(build_log_digest, str) or not build_log_digest:
+            build_log_digest = jsonutil.digest_json(
+                {"version": version, "artifact_digest": artifact_digest}
+            )
+        artifacts[version] = {
+            "artifact_digest": artifact_digest,
+            "build_log_digest": build_log_digest,
+        }
+        inputs_summary["builds"][version] = {
+            "image_digest": entry.get("image_digest"),
+            "compile_args": list(entry.get("compile_args") or ()),
+        }
+    return {
+        "source_job_id": state["job_id"],
+        "generation": state.get("generation", 1),
+        "build_inputs_digest": jsonutil.digest_json(inputs_summary),
+        "artifacts": artifacts,
+    }
+
+
 def _serialize_build_result(result: BuildResult) -> dict[str, Any]:
     return {
         "version": result.version,
@@ -1256,6 +1356,7 @@ def _serialize_build_result(result: BuildResult) -> dict[str, Any]:
         "image_digest": result.image_digest,
         "compile_args": list(result.compile_args),
         "artifact_digest": result.artifact_digest,
+        "build_log_digest": _sha256_bytes(result.log),
         "log_truncated": result.log_truncated,
         "capture_error": result.capture_error,
         "retryable": bool(result.metadata.get("retryable", False)),
@@ -1669,11 +1770,7 @@ def _node_build(ctx: NodeContext, state: OrchestrationState) -> dict[str, Any]:
         reused_ref = state.get("build_ref")
         if reused_ref is not None:
             # Validation round reusing campaign build artifacts: never rebuild.
-            reused_artifacts = {
-                version: dict(reused_ref[version])
-                for version in verdict_mod.VERSIONS
-                if isinstance(reused_ref.get(version), Mapping)
-            }
+            reused_artifacts = _extract_reused_build_artifacts(reused_ref)
             return {
                 "state": "RUNNING",
                 "build_artifacts": reused_artifacts,
@@ -1795,7 +1892,7 @@ def _node_campaign(ctx: NodeContext, state: OrchestrationState) -> dict[str, Any
         return {
             "candidate_seeds": tuple(result.candidate_seeds),
             "campaign_bundle_digest": result.campaign_bundle_digest,
-            "build_ref": copy.deepcopy(build_artifacts),
+            "build_ref": _build_ref_from_campaign_state(state, build_artifacts),
             "state": "COMPLETED",
             "verdict": None,
             "reason_code": None,
@@ -2375,8 +2472,14 @@ class OrchestrationRunner:
         executes at any point in time, and every child finishes ``archive``
         before the next child is spawned via family-level transition #23 or #26.
         """
-        if max_rounds < 0:
-            raise ValueError("max_rounds must be non-negative")
+        if type(max_rounds) is not int or max_rounds < 0:
+            raise ValueError("max_rounds must be a non-negative integer")
+        validated_max_total = _validate_non_negative_budget(
+            "max_total_seconds", max_total_seconds
+        )
+        validated_max_fuzz = _validate_non_negative_budget(
+            "max_fuzz_seconds", max_fuzz_seconds
+        )
 
         family_states: list[str] = ["AGGREGATING"]
         transitions: list[dict[str, Any]] = []
@@ -2420,14 +2523,18 @@ class OrchestrationRunner:
         )
 
         def _remaining_total() -> float | None:
-            if max_total_seconds is None:
+            if validated_max_total is None:
                 return None
-            return max(0.0, max_total_seconds - self.ledger.total_charged_seconds(family_id))
+            return max(
+                0.0, validated_max_total - self.ledger.total_charged_seconds(family_id)
+            )
 
         def _remaining_fuzz() -> float | None:
-            if max_fuzz_seconds is None:
+            if validated_max_fuzz is None:
                 return None
-            return max(0.0, max_fuzz_seconds - self.ledger.total_fuzz_seconds(family_id))
+            return max(
+                0.0, validated_max_fuzz - self.ledger.total_fuzz_seconds(family_id)
+            )
 
         stop_reason_code: str | None = None
 
@@ -2492,6 +2599,12 @@ class OrchestrationRunner:
                     )
                     round_children.append(round_outcome)
 
+                    if (
+                        round_outcome.state == "AWAITING_REVIEW"
+                        or round_outcome.terminal_node is None
+                    ):
+                        break
+
                     remaining_seeds = max(0, len(seeds) - round_no)
                     decision = self.iteration_gate.check_capacity(
                         family_id=family_id,
@@ -2524,6 +2637,39 @@ class OrchestrationRunner:
                             "next_round_no": round_no,
                         }
                     )
+
+        # Parked / non-terminal child keeps the family in AGGREGATING without
+        # invoking prepare -> AGGREGATING -> archive or converging to COMPLETED.
+        parked_child: ChildRunOutcome | None = None
+        if (
+            campaign_child.state == "AWAITING_REVIEW"
+            or campaign_child.terminal_node is None
+        ):
+            parked_child = campaign_child
+        else:
+            for child in round_children:
+                if child.state == "AWAITING_REVIEW" or child.terminal_node is None:
+                    parked_child = child
+                    break
+
+        if parked_child is not None:
+            max_concurrent = max(max_concurrent, self.max_concurrent_children(family_id))
+            return FamilyRunOutcome(
+                family_id=family_id,
+                state="AGGREGATING",
+                verdict=None,
+                reason_code=None,
+                terminal_node=None,
+                visited_nodes=(),
+                campaign_child=campaign_child,
+                round_children=tuple(round_children),
+                family_transitions=tuple(transitions),
+                family_states_observed=("AGGREGATING",),
+                max_concurrent_children=max_concurrent,
+                child_execution_windows=tuple(windows),
+                family_index_digest=None,
+                stop_reason_code=parked_child.reason_code,
+            )
 
         # Step 3: Run the family job itself through prepare -> AGGREGATING -> archive
         # under the family slot lock so no concurrent child can interleave.
