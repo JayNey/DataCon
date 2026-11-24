@@ -83,8 +83,13 @@ class AdmissionOutcome:
     admitted: bool
     reason_code: str | None
     admission: dict[str, Any] | None
-    event_type: str
+    event_type: str | None
     event_detail: dict[str, Any]
+    # Persistence-aware callers distinguish an admitted round, a real denial
+    # and an idempotent re-entry. The predicate-only path sets admitted/denied;
+    # record_admission adds already_admitted without writing a row or event.
+    status: str | None = None
+    sub_reason: str | None = None
 
 
 def _connect(dsn: str):
@@ -2250,7 +2255,252 @@ def policy_admit_round(
         admission=admission,
         event_type=event_type,
         event_detail=detail,
+        status="admitted" if admission is not None else "denied",
+        sub_reason=sub_reason,
     )
+
+
+def _family_approval_chain_tail(connection, family_id: UUID) -> str | None:
+    """Return the approval digest no later approval supersedes, if any."""
+    row = connection.execute(
+        "SELECT prior.approval_digest FROM family_approvals AS prior "
+        "WHERE prior.family_id = %s AND NOT EXISTS ("
+        "SELECT 1 FROM family_approvals AS later "
+        "WHERE later.supersedes = prior.approval_id) "
+        "LIMIT 1",
+        (family_id,),
+    ).fetchone()
+    return row["approval_digest"] if row is not None else None
+
+
+def _admission_record(row: Mapping[str, Any]) -> dict[str, Any]:
+    """Render an ``admissions`` row exactly like the predicate's admission."""
+    return {
+        "admission_id": str(row["admission_id"]),
+        "job_id": str(row["job_id"]),
+        "parent_job_id": str(row["parent_job_id"]),
+        "round_no": row["round_no"],
+        "approval_kind": row["approval_kind"],
+        "envelope_digest": row["envelope_digest"],
+        "parent_approval_digest": row["parent_approval_digest"],
+        "seed_digest": row["seed_digest"],
+        "predicate_version": row["predicate_version"],
+        "recomputable": row["recomputable"],
+        "supporting_bundle_digest": row["supporting_bundle_digest"],
+        "decided_at": jsonutil.timestamp(row["decided_at"]),
+    }
+
+
+def _admitted_audit_detail(
+    connection, job_id: UUID | str, round_no: int
+) -> dict[str, Any] | None:
+    """Read the round_admitted detail that carries the budget snapshot digest.
+
+    ``admissions`` has no budget_snapshot_digest column and step 1.5 must not
+    add one. The round_admitted event is written in the same transaction as the
+    admission row, so it is the persisted half of the idempotency comparison.
+    """
+    row = connection.execute(
+        "SELECT detail FROM audit_events WHERE job_id = %s "
+        "AND event_type = 'round_admitted' "
+        "AND detail->>'round_no' = %s ORDER BY event_id DESC LIMIT 1",
+        (job_id, str(round_no)),
+    ).fetchone()
+    return dict(row["detail"]) if row is not None and row["detail"] else None
+
+
+def record_admission(
+    dsn: str,
+    *,
+    family_id: UUID | str,
+    job_id: UUID | str,
+    round_no: int,
+    envelope: Mapping[str, Any],
+    seed_digest: str,
+    budget_snapshot: Mapping[str, Any],
+    experiment: Mapping[str, Any] | None = None,
+    recomputable: bool = True,
+    campaign_bundle_digest: str | None = None,
+) -> AdmissionOutcome:
+    """Persist one policy-admission decision with a three-path outcome.
+
+    ``admitted`` writes one ``admissions`` row and one ``round_admitted`` event;
+    a predicate denial writes only ``round_admission_denied``; re-entering the
+    same decision inputs for the same ``(parent_job_id, round_no)`` is an
+    ``already_admitted`` no-op that returns the persisted admission. A different
+    decision for that round is a real ``ADMISSION_DENIED`` whose audit detail
+    carries ``sub_reason=ROUND_ALREADY_ADMITTED``. The comparison includes the
+    budget snapshot digest read from the existing round_admitted detail.
+    """
+    if not isinstance(envelope, Mapping):
+        raise StateError("envelope must be a JSON object")
+    try:
+        normalized_envelope = contracts.normalize_envelope(envelope)
+        envelope_digest = contracts.envelope_digest(normalized_envelope)
+        family_id = uuid.UUID(str(family_id))
+        job_id = uuid.UUID(str(job_id))
+        seed_digest = jsonutil.require_digest(seed_digest, "seed_digest")
+    except (TypeError, ValueError) as error:
+        raise StateError(str(error)) from error
+    if type(round_no) is not int or round_no < 1:
+        raise StateError("round_no must be a positive integer")
+    if type(recomputable) is not bool:
+        raise StateError("recomputable must be a boolean")
+    if campaign_bundle_digest is not None:
+        try:
+            campaign_bundle_digest = jsonutil.require_digest(
+                campaign_bundle_digest, "campaign_bundle_digest"
+            )
+        except ValueError as error:
+            raise StateError(str(error)) from error
+    try:
+        budget_snapshot = dict(budget_snapshot)
+        budget_snapshot_digest = jsonutil.digest_json(budget_snapshot)
+    except (TypeError, ValueError) as error:
+        raise StateError(
+            f"budget_snapshot must be canonical JSON: {error}"
+        ) from error
+    if not budget_snapshot:
+        raise StateError("budget_snapshot must not be empty")
+
+    supporting_bundle_digest = (
+        None if recomputable else campaign_bundle_digest
+    )
+    predicate_version = normalized_envelope["admission_predicate_version"]
+
+    with _connect(dsn) as connection:
+        with connection.transaction():
+            family = connection.execute(
+                "SELECT job_id FROM jobs WHERE job_id = %s FOR UPDATE",
+                (family_id,),
+            ).fetchone()
+            if family is None:
+                raise StateError("admission family does not exist")
+            approval_tail = _family_approval_chain_tail(connection, family_id)
+            existing = connection.execute(
+                "SELECT admission_id, job_id, parent_job_id, round_no, "
+                "approval_kind, envelope_digest, parent_approval_digest, "
+                "seed_digest, predicate_version, recomputable, "
+                "supporting_bundle_digest, decided_at FROM admissions "
+                "WHERE parent_job_id = %s AND round_no = %s FOR UPDATE",
+                (family_id, round_no),
+            ).fetchone()
+
+            if existing is not None:
+                existing_detail = _admitted_audit_detail(
+                    connection, existing["job_id"], round_no
+                ) or {}
+                same_inputs = (
+                    str(existing["job_id"]) == str(job_id)
+                    and existing["envelope_digest"] == envelope_digest
+                    and existing["parent_approval_digest"] == approval_tail
+                    and existing["seed_digest"] == seed_digest
+                    and existing["predicate_version"] == predicate_version
+                    and existing["recomputable"] is recomputable
+                    and existing["supporting_bundle_digest"]
+                    == supporting_bundle_digest
+                    and existing_detail.get("budget_snapshot_digest")
+                    == budget_snapshot_digest
+                )
+                if same_inputs:
+                    return AdmissionOutcome(
+                        admitted=False,
+                        reason_code=None,
+                        admission=_admission_record(existing),
+                        event_type=None,
+                        event_detail=existing_detail,
+                        status="already_admitted",
+                        sub_reason="ROUND_ALREADY_ADMITTED",
+                    )
+                denied_detail = {
+                    "job_id": str(job_id),
+                    "parent_job_id": str(family_id),
+                    "round_no": round_no,
+                    "approval_kind": "policy",
+                    "envelope_digest": envelope_digest,
+                    "parent_approval_digest": approval_tail,
+                    "seed_digest": seed_digest,
+                    "predicate_version": predicate_version,
+                    "recomputable": recomputable,
+                    "supporting_bundle_digest": supporting_bundle_digest,
+                    "budget_snapshot_digest": budget_snapshot_digest,
+                    "reason_code": "ADMISSION_DENIED",
+                    "sub_reason": "ROUND_ALREADY_ADMITTED",
+                }
+                _audit(
+                    connection,
+                    job_id,
+                    "round_admission_denied",
+                    stage="admission",
+                    reason_code="ADMISSION_DENIED",
+                    detail=denied_detail,
+                )
+                return AdmissionOutcome(
+                    admitted=False,
+                    reason_code="ADMISSION_DENIED",
+                    admission=None,
+                    event_type="round_admission_denied",
+                    event_detail=denied_detail,
+                    status="denied",
+                    sub_reason="ROUND_ALREADY_ADMITTED",
+                )
+
+            outcome = policy_admit_round(
+                clock=lambda: datetime.now(timezone.utc),
+                job_id=job_id,
+                parent_job_id=family_id,
+                envelope=normalized_envelope,
+                parent_approval_digest=approval_tail,
+                approval_chain_tail_digest=approval_tail,
+                seed_digest=seed_digest,
+                round_no=round_no,
+                budget_snapshot=budget_snapshot,
+                experiment=experiment,
+                recomputable=recomputable,
+                campaign_bundle_digest=campaign_bundle_digest,
+            )
+
+            if outcome.admission is not None:
+                inserted = connection.execute(
+                    "INSERT INTO admissions "
+                    "(admission_id, job_id, parent_job_id, round_no, "
+                    "approval_kind, envelope_digest, parent_approval_digest, "
+                    "seed_digest, predicate_version, recomputable, "
+                    "supporting_bundle_digest, decided_at) "
+                    "VALUES (%s, %s, %s, %s, 'policy', %s, %s, %s, %s, %s, "
+                    "%s, %s) "
+                    "ON CONFLICT (parent_job_id, round_no) DO NOTHING "
+                    "RETURNING admission_id",
+                    (
+                        uuid.UUID(outcome.admission["admission_id"]),
+                        job_id,
+                        family_id,
+                        round_no,
+                        envelope_digest,
+                        approval_tail,
+                        seed_digest,
+                        predicate_version,
+                        recomputable,
+                        supporting_bundle_digest,
+                        outcome.admission["decided_at"],
+                    ),
+                ).fetchone()
+                if inserted is None:
+                    # The unique constraint is only a backstop: the family row
+                    # lock serializes this path, but fail closed if it fires.
+                    raise StateError(
+                        "admission was recorded concurrently for this round"
+                    )
+
+            _audit(
+                connection,
+                job_id,
+                outcome.event_type,
+                stage="admission",
+                reason_code=outcome.reason_code,
+                detail=outcome.event_detail,
+            )
+            return outcome
 
 
 # A decided family envelope maps back to the review decision it recorded. The
