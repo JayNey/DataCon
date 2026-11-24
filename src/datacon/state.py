@@ -2522,10 +2522,15 @@ def record_admission(
                         "admission was recorded concurrently for this round"
                     )
 
+            event_type = outcome.event_type
+            if event_type is None:
+                # A fresh decision always carries an event; only the
+                # already_admitted no-op path returns no event type.
+                raise StateError("admission decision has no audit event type")
             _audit(
                 connection,
                 job_id,
-                outcome.event_type,
+                event_type,
                 stage="admission",
                 reason_code=outcome.reason_code,
                 detail=outcome.event_detail,
