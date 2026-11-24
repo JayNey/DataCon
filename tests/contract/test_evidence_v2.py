@@ -564,6 +564,78 @@ def test_write_bundle_v2_blocked_requires_report_bundle_kind_and_created_at(
     assert not (tmp_path / "blocked-report").exists()
 
 
+def test_write_bundle_v2_blocked_accepts_v2_roles_and_enforces_layout(tmp_path):
+    report = _v2_blocked_report()
+    markdown = (
+        "# DataCon evidence report\n\n"
+        "- Verdict: **BLOCKED**\n"
+        "- Reason: `ADMISSION_DENIED`\n"
+    )
+    info = evidence.write_bundle(
+        tmp_path / "v2-with-envelope",
+        job_id=report["job_id"],
+        plan_digest=None,
+        bundle_kind="blocked",
+        report=report,
+        report_markdown=markdown,
+        artifacts={"envelope.json": ("envelope", b'{"mode":"fixed"}\n')},
+        verdict="BLOCKED",
+        verify=verify_bundle,
+        schema_version=2,
+    )
+    verified = verify_bundle(info.root)
+    roles_by_path = {
+        entry["path"]: entry["role"] for entry in verified.manifest["files"]
+    }
+    assert roles_by_path["envelope.json"] == "envelope"
+
+    # v2 layout rules must also reject misplaced v2 roles and admission.json at
+    # write time, even when verify=None.
+    for name, artifacts in (
+        ("wrong-path", {"other.json": ("envelope", b'{"mode":"fixed"}\n')}),
+        ("blocked-admission", {"admission.json": ("admission", b"{}\n")}),
+    ):
+        with pytest.raises(BundleError) as raised:
+            evidence.write_bundle(
+                tmp_path / name,
+                job_id=report["job_id"],
+                plan_digest=None,
+                bundle_kind="blocked",
+                report=report,
+                report_markdown=markdown,
+                artifacts=artifacts,
+                verdict="BLOCKED",
+                schema_version=2,
+            )
+        assert raised.value.reason_code == "INVALID_MANIFEST"
+        assert not (tmp_path / name).exists()
+
+    # v1 boundary: schema_version=1 must still reject v2-only roles.
+    v1_report = dict(report)
+    v1_report["schema_version"] = 1
+    v1_report["reason_code"] = "POLICY_DENIED"
+    v1_report.pop("bundle_kind")
+    v1_markdown = (
+        "# DataCon evidence report\n\n"
+        "- Verdict: **BLOCKED**\n"
+        "- Reason: `POLICY_DENIED`\n"
+    )
+    with pytest.raises(BundleError, match="unknown evidence role: envelope") as v1_err:
+        evidence.write_bundle(
+            tmp_path / "v1-rejects-v2-role",
+            job_id=v1_report["job_id"],
+            plan_digest=None,
+            bundle_kind="blocked",
+            report=v1_report,
+            report_markdown=v1_markdown,
+            artifacts={"envelope.json": ("envelope", b'{"mode":"fixed"}\n')},
+            verdict="BLOCKED",
+            schema_version=1,
+        )
+    assert v1_err.value.reason_code == "INVALID_MANIFEST"
+    assert not (tmp_path / "v1-rejects-v2-role").exists()
+
+
 @pytest.mark.parametrize(
     "verdict,reason",
     [
