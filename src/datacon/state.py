@@ -160,6 +160,7 @@ def load_job(dsn: str, job_id: UUID) -> dict[str, Any] | None:
         return connection.execute(
             "SELECT job_id, request, state, stage, reason_code, last_error, "
             "state_version, generation, workflow_synced, operator_id, "
+            "job_contract_version, "
             "lease_owner, lease_expires_at, "
             "prepare_deadline_at, review_deadline_at, execute_deadline_at, "
             "approved_at, submitted_at, updated_at, verdict, verdict_reason, "

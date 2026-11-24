@@ -11,6 +11,8 @@ from __future__ import annotations
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 import hashlib
+import json
+from pathlib import Path
 import threading
 import time
 from uuid import uuid4
@@ -19,7 +21,7 @@ import psycopg
 import pytest
 from psycopg.types.json import Jsonb
 
-from datacon import contracts, jsonutil, state
+from datacon import contracts, evidence, execution, jsonutil, state
 
 pytestmark = pytest.mark.postgres
 
@@ -828,6 +830,113 @@ def test_review_reject_marks_pending_envelope_rejected(
         "SELECT state, reason_code FROM jobs WHERE job_id = %s",
         (expired_seed["family_id"],),
     ) == ("BLOCKED", "REVIEW_EXPIRED")
+
+
+def _assert_v2_blocked_evidence(database, job_id):
+    """Assert a job archived a verifiable v2 blocked bundle."""
+    status_name, error, path, verdict = _row(
+        database,
+        "SELECT evidence_status, evidence_error, evidence_path, verdict "
+        "FROM jobs WHERE job_id = %s",
+        (job_id,),
+    )
+    assert status_name == "archived", (status_name, error)
+    assert error is None
+    assert verdict is None
+    assert path is not None and Path(path).is_dir()
+    verified = evidence.verify_bundle(path)
+    assert verified.manifest["schema_version"] == 2
+    assert verified.manifest["bundle_kind"] == "blocked"
+    report = json.loads(verified.file_data["report.json"])
+    assert report["schema_version"] == 2
+    assert report["bundle_kind"] == "blocked"
+    assert report["verdict"] == "BLOCKED"
+    return verified
+
+
+def test_v2_review_reject_archives_schema_2_blocked_bundles(
+    isolated_database, tmp_path, monkeypatch
+):
+    monkeypatch.setenv("DATACON_EVIDENCE_ROOT", str(tmp_path / "evidence"))
+    seed = _seed_family(isolated_database)
+    # Replace the opaque first-plan row with a complete Plan v2 body and its
+    # real digest so the blocked archiver can bind plan.json to the manifest.
+    # The shared seed uses a constant digest for tests that never exercise the
+    # archive path.
+    complete_plan = _v2_plan(
+        seed["family_id"], round_no=None, envelope_digest=ENVELOPE_1
+    )
+    real_digest = contracts.plan_digest(complete_plan)
+    isolated_database.connection.execute(
+        "UPDATE plans SET plan = %s, plan_digest = %s WHERE job_id = %s",
+        (Jsonb(complete_plan), real_digest, seed["child_id"]),
+    )
+
+    outcome = _review(
+        isolated_database, seed, decision="reject", plan_digest=real_digest
+    )
+    assert outcome.status == "applied"
+
+    # The family and its first child are each BLOCKED by the reject; every
+    # blocked row must own a v2 bundle, not a v1-shaped archive.
+    verified_by_job = {
+        job_id: _assert_v2_blocked_evidence(isolated_database, job_id)
+        for job_id in (seed["family_id"], seed["child_id"])
+    }
+    for verified in verified_by_job.values():
+        assert verified.manifest["reason_code"] == "REVIEW_REJECTED"
+    child_bundle = verified_by_job[seed["child_id"]]
+    child_report = json.loads(child_bundle.file_data["report.json"])
+    assert child_report["plan_digest"] == real_digest
+    # A v2 review is recorded against the family row, so the child's blocked
+    # bundle binds the frozen plan but has no review.json of its own.
+    assert child_report["review"] is None
+    assert "plan.json" in child_bundle.file_data
+    assert "review.json" not in child_bundle.file_data
+
+
+def test_v2_review_expiry_archives_schema_2_blocked_bundles(
+    isolated_database, tmp_path, monkeypatch
+):
+    monkeypatch.setenv("DATACON_EVIDENCE_ROOT", str(tmp_path / "evidence"))
+    seed = _seed_family(
+        isolated_database,
+        review_deadline_at=_now() - timedelta(minutes=1),
+    )
+
+    outcome = _review(isolated_database, seed, decision="approve")
+    assert outcome.status == "expired"
+
+    for job_id in (seed["family_id"], seed["child_id"]):
+        verified = _assert_v2_blocked_evidence(isolated_database, job_id)
+        assert verified.manifest["reason_code"] == "REVIEW_EXPIRED"
+
+
+def test_v2_record_blocked_accepts_a_v2_only_reason(
+    isolated_database, tmp_path, monkeypatch
+):
+    """A real v2 job must use the v2 reason table and write schema 2.
+
+    ``record_blocked`` reads ``job_contract_version`` from the row; before the
+    fix it always saw the default 1 and rejected v2-only terminal codes (or
+    wrote a schema-1 bundle).
+    """
+    monkeypatch.setenv("DATACON_EVIDENCE_ROOT", str(tmp_path / "evidence"))
+    seed = _seed_family(isolated_database)
+    isolated_database.connection.execute(
+        "UPDATE jobs SET state = 'BLOCKED', stage = 'blocked', "
+        "reason_code = 'ENVELOPE_VIOLATION' WHERE job_id = %s",
+        (seed["family_id"],),
+    )
+
+    assert execution.record_blocked(
+        isolated_database.dsn,
+        seed["family_id"],
+        reason_code="ENVELOPE_VIOLATION",
+        message="envelope exceeded the request ceiling",
+    )
+    verified = _assert_v2_blocked_evidence(isolated_database, seed["family_id"])
+    assert verified.manifest["reason_code"] == "ENVELOPE_VIOLATION"
 
 
 def test_review_idempotency_key_includes_envelope_digest(isolated_database):

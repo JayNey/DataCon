@@ -9,7 +9,7 @@ import time
 import psycopg
 import pytest
 
-from datacon import contracts, state, store
+from datacon import contracts, evidence, state, store
 
 pytestmark = pytest.mark.postgres
 
@@ -71,6 +71,14 @@ def test_submit_v2_binary_family_is_archived_blocked(isolated_database, tmp_path
     assert row[2:4] == ("BLOCKED", "UNSUPPORTED_TARGET")
     assert row[4] == "archived", "binary v2 family was left without evidence"
     assert row[5] and row[6]
+    # Submit-time rejection shares the blocked archiver: a v2 family must
+    # archive a schema-2 blocked bundle, not the v1 shape.
+    verified = evidence.verify_bundle(row[5])
+    assert verified.manifest["schema_version"] == 2
+    assert verified.manifest["bundle_kind"] == "blocked"
+    report = json.loads(verified.file_data["report.json"])
+    assert report["schema_version"] == 2
+    assert report["bundle_kind"] == "blocked"
 
 
 def _wait_for_a_shared_release_lock_wait(database, timeout=10.0):
