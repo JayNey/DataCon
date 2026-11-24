@@ -346,6 +346,7 @@ def _blocked_files(
         "missing": ["execution did not complete"],
         "error": f"{reason}: blocked" if reason else None,
         "evidence_complete": False,
+        "created_at": "2099-01-01T00:00:00Z",
         "report_markdown_sha256": hashlib.sha256(markdown_bytes).hexdigest(),
     }
     if report_overrides:
@@ -390,6 +391,97 @@ def test_v2_blocked_bundle_accepts_new_blocked_reason(tmp_path, reason):
     verified = verify_bundle(root)
     assert verified.manifest["reason_code"] == reason
     assert verified.manifest["verdict"] == "BLOCKED"
+
+
+def _mutate_blocked_report(files, mutate):
+    updated = dict(files)
+    report = json.loads(updated["report.json"][1])
+    mutate(report)
+    updated["report.json"] = (
+        "report_json",
+        json.dumps(report).encode("utf-8") + b"\n",
+    )
+    return updated
+
+
+def _without_bundle_kind(report):
+    del report["bundle_kind"]
+
+
+def _without_created_at(report):
+    del report["created_at"]
+
+
+def _invalid_created_at(report):
+    report["created_at"] = "not-a-timestamp"
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [_without_bundle_kind, _without_created_at, _invalid_created_at],
+    ids=["no-bundle-kind", "no-created-at", "bad-created-at"],
+)
+def test_v2_blocked_verify_requires_report_bundle_kind_and_created_at(
+    tmp_path, mutate
+):
+    manifest = _manifest("blocked")
+    files = _mutate_blocked_report(_blocked_files(manifest), mutate)
+    root = _write_v2_bundle(tmp_path, manifest, files, name="blocked-report")
+
+    with pytest.raises(BundleError) as raised:
+        verify_bundle(root)
+    assert raised.value.reason_code == "INVALID_MANIFEST"
+
+
+def _write_blocked_report(tmp_path, report, name):
+    return evidence.write_bundle(
+        tmp_path / name,
+        job_id=report["job_id"],
+        plan_digest=None,
+        bundle_kind="blocked",
+        report=report,
+        report_markdown=(
+            "# DataCon evidence report\n\n"
+            "- Verdict: **BLOCKED**\n"
+            "- Reason: `ADMISSION_DENIED`\n"
+        ),
+        verdict="BLOCKED",
+        schema_version=2,
+    )
+
+
+def _v2_blocked_report():
+    return {
+        "schema_version": 2,
+        "bundle_kind": "blocked",
+        "job_id": str(uuid4()),
+        "plan_digest": None,
+        "state": "BLOCKED",
+        "verdict": "BLOCKED",
+        "reason_code": "ADMISSION_DENIED",
+        "review": None,
+        "missing": ["execution did not complete"],
+        "error": "ADMISSION_DENIED: denied",
+        "evidence_complete": False,
+        "created_at": "2099-01-01T00:00:00Z",
+    }
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [_without_bundle_kind, _without_created_at, _invalid_created_at],
+    ids=["no-bundle-kind", "no-created-at", "bad-created-at"],
+)
+def test_write_bundle_v2_blocked_requires_report_bundle_kind_and_created_at(
+    tmp_path, mutate
+):
+    report = _v2_blocked_report()
+    mutate(report)
+
+    with pytest.raises(BundleError) as raised:
+        _write_blocked_report(tmp_path, report, "blocked-report")
+    assert raised.value.reason_code == "INVALID_MANIFEST"
+    assert not (tmp_path / "blocked-report").exists()
 
 
 @pytest.mark.parametrize(
@@ -618,6 +710,7 @@ def test_write_bundle_v2_blocked_enforces_schema_version_and_plan_artifacts(tmp_
         "missing": ["execution did not complete"],
         "error": "ADMISSION_DENIED: denied",
         "evidence_complete": False,
+        "created_at": "2099-01-01T00:00:00Z",
     }
 
     with pytest.raises(BundleError, match="schema_version") as raised:

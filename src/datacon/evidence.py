@@ -547,6 +547,22 @@ def write_bundle(
                 "INVALID_MANIFEST",
                 "a review requires a plan digest in a blocked bundle",
             )
+        if schema_version == contracts.SCHEMA_VERSION_V2:
+            # A v2 blocked report carries the bundle kind and the created_at
+            # the verifier binds (§8 report table, §12.2). Read them as
+            # required here too so the writer cannot emit a bundle its own
+            # strict verifier would reject.
+            if report.get("bundle_kind") != "blocked":
+                raise BundleError(
+                    "INVALID_MANIFEST",
+                    "a v2 blocked report requires bundle_kind=blocked",
+                )
+            try:
+                jsonutil.require_rfc3339(
+                    report.get("created_at"), "report.created_at"
+                )
+            except ValueError as error:
+                raise BundleError("INVALID_MANIFEST", str(error)) from error
     if report_verdict in ("REPRODUCED", "NOT_REPRODUCED"):
         if evidence_complete is False:
             raise BundleError(
@@ -3636,17 +3652,20 @@ def _verify_v2_blocked_semantics(
 ) -> None:
     """Verify report.json, report.md and optional plan/review on v2 blocked bundles."""
     report = _parse_json_file(data, "report.json")
-    if (
-        type(report.get("schema_version")) is not int
-        or report.get("schema_version") != contracts.SCHEMA_VERSION_V2
-    ):
+    if type(report.get("schema_version")) is not int or report.get(
+        "schema_version"
+    ) != contracts.SCHEMA_VERSION_V2:
         raise BundleError(
             "INVALID_MANIFEST", "report schema_version must be 2"
         )
-    if "bundle_kind" in report and report.get("bundle_kind") != "blocked":
+    if report.get("bundle_kind") != "blocked":
         raise BundleError(
             "INVALID_MANIFEST", "report bundle_kind must be blocked"
         )
+    try:
+        jsonutil.require_rfc3339(report.get("created_at"), "report.created_at")
+    except ValueError as error:
+        raise BundleError("INVALID_MANIFEST", str(error)) from error
     if report.get("job_id") != job_id:
         raise BundleError(
             "INVALID_MANIFEST", "report job_id does not match manifest"
