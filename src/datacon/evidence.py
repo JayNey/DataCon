@@ -572,8 +572,10 @@ def write_bundle(
                 jsonutil.require_rfc3339(
                     report.get("created_at"), "report.created_at"
                 )
-            except ValueError as error:
-                raise BundleError("INVALID_MANIFEST", str(error)) from error
+            except ValueError as invalid_created_at:
+                raise BundleError(
+                    "INVALID_MANIFEST", str(invalid_created_at)
+                ) from invalid_created_at
     if report_verdict in ("REPRODUCED", "NOT_REPRODUCED"):
         if evidence_complete is False:
             raise BundleError(
