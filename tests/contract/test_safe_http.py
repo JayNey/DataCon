@@ -348,3 +348,232 @@ def test_environment_proxies_are_not_honored(monkeypatch):
     assert b"host: " + HOST.encode() in wire
     assert b"proxy.corp.example" not in wire
     assert b"connect " not in wire
+
+
+# Response framing coordinates added by the T15 self-review. The doubles
+# below replay a scripted wire the way a real socket delivers it: ``recv``
+# never hands out more bytes than the caller asked for, and the wire is cut
+# into *segments* -- bursts that arrive separately, so a coordinate can say
+# whether body bytes rode along with the head in one chunk or turned up
+# later. Once every burst is spent ``recv`` answers ``b""``: the peer closed
+# the connection (EOF). No TCP, TLS or DNS happens here either.
+
+
+class FakeWireSocket(FakeSocket):
+    """A ``FakeSocket`` whose ``recv`` serves a scripted wire.
+
+    ``segments`` are the bursts of bytes the peer sends, in order. Each is
+    handed out in pieces of at most ``size`` bytes -- never more than the
+    caller asked for, as on a real socket -- and a burst is never merged
+    into the one before it. Once every burst is spent ``recv`` answers
+    ``b""`` for good: the peer closed the connection.
+    """
+
+    def __init__(self, segments):
+        super().__init__()
+        self._segments = [bytes(segment) for segment in segments]
+
+    def recv(self, size):
+        assert size > 0
+        while self._segments and not self._segments[0]:
+            self._segments.pop(0)
+        if not self._segments:
+            return b""
+        piece = self._segments[0][:size]
+        self._segments[0] = self._segments[0][len(piece) :]
+        return piece
+
+
+class FakeWireSocketFactory:
+    """Injected socket_factory(): every socket replays the same wire."""
+
+    def __init__(self, *segments):
+        self.segments = [bytes(segment) for segment in segments]
+        self.sockets = []
+
+    def __call__(self):
+        sock = FakeWireSocket(self.segments)
+        self.sockets.append(sock)
+        return sock
+
+
+def _read_response_over(*segments):
+    """Send the fixture request over a wire of ``segments``; read the response.
+
+    The connection stays open, so a returned response can still stream its
+    body.
+    """
+    from datacon.tools.safe_http import connect_guarded
+
+    connection = connect_guarded(
+        f"https://{HOST}/advisory.txt",
+        resolver=FakeResolver({HOST: [PUBLIC_V4_PRIMARY]}),
+        socket_factory=FakeWireSocketFactory(*segments),
+    )
+    connection.send_request("GET", "/advisory.txt", {})
+    return connection.read_response()
+
+
+# Size of one ``X-Pad-NNNNNN`` filler header line in a padded response head.
+PAD_LINE_BYTES = 1024
+
+
+def _pad_line(index, size):
+    """One ``size``-byte header line whose name carries ``index``."""
+    name = f"X-Pad-{index:06d}: "
+    return name.encode("ascii") + b"a" * (size - len(name) - 2) + b"\r\n"
+
+
+def _padded_head(total, *, blank_line=True):
+    """A response head of exactly ``total`` bytes, padded with header lines.
+
+    The head is every byte from the status line through the blank line,
+    both inclusive -- what a reader must buffer before it can parse. It
+    declares a 10-byte body and pads with ``X-Pad-NNNNNN`` lines of about
+    ``PAD_LINE_BYTES`` each, none of them oversized. With ``blank_line``
+    turned off the head is left unterminated: it just runs on.
+    """
+    prefix = b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n"
+    budget = total - len(prefix) - (2 if blank_line else 0)
+    count = (budget + PAD_LINE_BYTES - 1) // PAD_LINE_BYTES
+    base, wider = divmod(budget, count)
+    lines = [
+        _pad_line(index, base + 1 if index < wider else base) for index in range(count)
+    ]
+    head = prefix + b"".join(lines) + (b"\r\n" if blank_line else b"")
+    assert len(head) == total
+    return head
+
+
+def test_response_head_is_capped():
+    import datacon.tools.safe_http as safe_http
+    from datacon.tools.safe_http import SafeHttpError
+
+    head_limit = safe_http.MAX_RESPONSE_HEAD_BYTES
+    body = b"0123456789"
+
+    # one byte over the cap, blank line included, is refused before any of
+    # the head is parsed or its body streamed
+    with pytest.raises(SafeHttpError) as excinfo:
+        _read_response_over(_padded_head(head_limit + 1) + body)
+    assert excinfo.value.reason == "RESPONSE_HEAD_TOO_LARGE"
+
+    # a head that never reaches its blank line is cut off at the cap too:
+    # the reader must not keep buffering a runaway head until the peer closes
+    with pytest.raises(SafeHttpError) as excinfo:
+        _read_response_over(_padded_head(2 * head_limit, blank_line=False))
+    assert excinfo.value.reason == "RESPONSE_HEAD_TOO_LARGE"
+
+    # exactly at the cap is still a legal head: every padded line parses
+    # and the body behind it streams undisturbed
+    head = _padded_head(head_limit)
+    response = _read_response_over(head + body)
+    assert response.status == 200
+    padded = sum(name.startswith("x-pad-") for name in response.headers)
+    assert padded == head.count(b"X-Pad-")
+    assert b"".join(response.body_chunks) == body
+
+
+def test_duplicate_or_conflicting_content_length_is_rejected():
+    from datacon.tools.safe_http import SafeHttpError
+
+    # two Content-Length fields that disagree, spelled alike or with
+    # different case (field names are case-insensitive on the wire): there
+    # is no single declared length, so the response has no trustworthy frame
+    for header_block in (
+        b"Content-Length: 5\r\nContent-Length: 10\r\n",
+        b"Content-Length: 5\r\ncontent-length: 10\r\n",
+    ):
+        with pytest.raises(SafeHttpError) as excinfo:
+            _read_response_over(
+                b"HTTP/1.1 200 OK\r\n" + header_block + b"\r\n0123456789"
+            )
+        assert excinfo.value.reason == "RESPONSE_UNFRAMED"
+
+
+def test_body_stream_reports_truncation_at_eof():
+    from datacon.tools.safe_http import SafeHttpError
+
+    head = b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n"
+    body = b"0123456789" * 10
+    short = body[:10]
+
+    # the peer closes with 90 of the 100 declared bytes still undelivered:
+    # after 10 bytes, whether they rode along with the head or arrived on
+    # their own, or before a single one. The stream must report the
+    # truncation instead of just ending.
+    for segments in ((head + short,), (head, short), (head,)):
+        response = _read_response_over(*segments)
+        with pytest.raises(SafeHttpError) as excinfo:
+            b"".join(response.body_chunks)
+        assert excinfo.value.reason == "CONTENT_TRUNCATED"
+
+    # the mirrored sanity case: exactly the declared 100 bytes, in one
+    # burst or split across several, end the stream normally and are its
+    # whole content
+    for segments in ((head + body,), (head, body[:30], body[30:])):
+        response = _read_response_over(*segments)
+        assert response.content_length == 100
+        assert b"".join(response.body_chunks) == body
+
+
+def test_missing_content_length_leaves_body_unframed_and_empty():
+    head = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\n"
+    body = b"0123456789"
+
+    # no Content-Length on the wire: nothing frames the body, so not one of
+    # its bytes may be handed out as a body -- neither the bytes that
+    # arrived together with the head in the very same chunk, nor the bytes
+    # of a later burst. The head itself still parses.
+    for segments in ((head + body,), (head, body)):
+        response = _read_response_over(*segments)
+        assert response.status == 200
+        assert response.content_length is None
+        assert list(response.body_chunks) == []
+
+
+def test_safe_http_errors_carry_a_reason_code():
+    from datacon.tools.safe_http import (
+        SafeHttpError,
+        connect_guarded,
+        resolve_validated,
+    )
+
+    # the typed error stays a ValueError subclass, so existing handlers hold
+    assert issubclass(SafeHttpError, ValueError)
+
+    # a poisoned answer -- inside the shared rejection set, or not a
+    # literal IP at all -- is reported as an address denial, from the
+    # resolver step and from the public entry point alike
+    poisoned = [answer for answer, _why in REJECTED_ANSWERS]
+    poisoned += ["advisory.example.com", "93.184.216.34:443"]
+    for answer in poisoned:
+        resolver = FakeResolver({HOST: [PUBLIC_V4_PRIMARY, answer]})
+        with pytest.raises(SafeHttpError) as excinfo:
+            resolve_validated(HOST, resolver=resolver)
+        assert excinfo.value.reason == "ADDRESS_DENIED", answer
+
+        factory = FakeSocketFactory()
+        with pytest.raises(SafeHttpError) as excinfo:
+            connect_guarded(
+                f"https://{HOST}/advisory.txt",
+                resolver=resolver,
+                socket_factory=factory,
+            )
+        assert excinfo.value.reason == "ADDRESS_DENIED", answer
+        assert factory.sockets == []
+
+    # the pre-existing failures carry the default code: a non-https URL is
+    # refused before any lookup (the resolver here fails on any query)...
+    with pytest.raises(SafeHttpError) as excinfo:
+        connect_guarded(
+            f"http://{HOST}/advisory.txt",
+            resolver=FakeResolver({}),
+            socket_factory=FakeSocketFactory(),
+        )
+    assert excinfo.value.reason == "FETCH_FAILED"
+
+    # ...and so is an empty resolution
+    with pytest.raises(SafeHttpError) as excinfo:
+        resolve_validated(HOST, resolver=FakeResolver({HOST: []}))
+    assert excinfo.value.reason == "FETCH_FAILED"

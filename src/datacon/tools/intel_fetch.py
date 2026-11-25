@@ -19,6 +19,16 @@ this module only unwraps literal-IP hosts far enough to ask it. Validation
 always runs before the transport is touched (fail closed, pre-connect), and
 bodies are counted while they stream so an over-limit payload is cut
 mid-flight instead of being buffered first.
+
+Framing and status hardening on top of that: a hop must declare exactly one
+integer ``Content-Length`` and deliver exactly that many wire bytes (more is
+``RESPONSE_UNFRAMED``, fewer is ``CONTENT_TRUNCATED``), a final status
+outside 2xx is ``HTTP_STATUS_REJECTED`` before a single body byte is read,
+gzip is inflated step by step under a hard per-step output cap, and the
+total budget is re-checked against the hop's final elapsed time once its
+body has streamed. Every ``safe_http.SafeHttpError`` the guarded transport
+raises surfaces here as ``IntelFetchError`` carrying the transport's reason
+token, so callers only ever see this module's error type.
 """
 
 from __future__ import annotations
@@ -37,6 +47,7 @@ from datacon.tools.safe_http import (
     GuardedConnection,
     GuardedResponse,
     Resolver,
+    SafeHttpError,
     SocketFactory,
     connect_guarded,
     is_rejected_address,
@@ -203,12 +214,48 @@ def _enforce_decompression_budget(
 def _read_body(hop: Hop) -> bytes:
     """Stream one hop's body under the wire and decompression budgets.
 
-    Chunks are counted as they arrive; an over-limit body raises before the
-    next chunk is pulled, so the stream is cut mid-flight and never fully
-    buffered. Only ``identity`` and ``gzip`` encodings are accepted; anything
-    else fails closed.
+    The checks run in a fixed order, all while the body streams so an
+    over-limit payload is cut mid-flight instead of being buffered first:
+
+    1. the hop must declare exactly one integer ``content-length``: absent
+       or malformed leaves the response ``RESPONSE_UNFRAMED`` (the declared
+       length is never pre-rejected against the wire cap -- the stream
+       itself gets cut mid-flight instead);
+    2. wire bytes are counted as they arrive: past the declared length is
+       ``RESPONSE_UNFRAMED``, fewer than declared once the stream ends is
+       ``CONTENT_TRUNCATED``, and past ``MAX_WIRE_BYTES`` is
+       ``SIZE_LIMIT_EXCEEDED``;
+    3. only ``identity`` and ``gzip`` encodings are accepted; gzip is
+       inflated one capped step at a time (``max_length`` never above
+       ``MAX_DECOMPRESSED_BYTES + 1``) with the decompressor's own errors
+       mapped to ``RESPONSE_UNFRAMED``, an incomplete member to
+       ``CONTENT_TRUNCATED``, trailing bytes behind the member to
+       ``RESPONSE_UNFRAMED``, and the accumulated output to the
+       decompressed-size and ratio caps;
+    4. a body that survives with zero decoded bytes is ``EMPTY_CONTENT``.
     """
+    declared_raw = hop.headers.get("content-length")
+    if declared_raw is None:
+        raise IntelFetchError(
+            "RESPONSE_UNFRAMED",
+            "RESPONSE_UNFRAMED: response declares no content-length, so"
+            " nothing says where its body ends",
+        )
+    declared = declared_raw.strip()
+    if not declared.isascii() or not declared.isdigit():
+        raise IntelFetchError(
+            "RESPONSE_UNFRAMED",
+            f"RESPONSE_UNFRAMED: content-length {declared_raw!r} is not a"
+            " single decimal integer",
+        )
+    content_length = int(declared)
     encoding = (hop.headers.get("content-encoding") or "").strip().lower()
+    if encoding not in ("", "identity", "gzip"):
+        raise IntelFetchError(
+            "CONTENT_ENCODING_REJECTED",
+            f"unsupported content-encoding {encoding!r}: only identity and"
+            " gzip are accepted for intel sources",
+        )
     wire_bytes = 0
     parts: list[bytes] = []
     if encoding in ("", "identity"):
@@ -220,36 +267,104 @@ def _read_body(hop: Hop) -> bytes:
                     f"SIZE_LIMIT_EXCEEDED: wire body reached {wire_bytes}"
                     f" bytes, above the {MAX_WIRE_BYTES} byte cap",
                 )
+            if wire_bytes > content_length:
+                raise IntelFetchError(
+                    "RESPONSE_UNFRAMED",
+                    f"RESPONSE_UNFRAMED: wire body reached {wire_bytes}"
+                    f" bytes, above the declared content-length"
+                    f" {content_length}",
+                )
             parts.append(chunk)
-        return b"".join(parts)
-    if encoding != "gzip":
-        raise IntelFetchError(
-            "CONTENT_ENCODING_REJECTED",
-            f"unsupported content-encoding {encoding!r}: only identity and"
-            " gzip are accepted for intel sources",
-        )
-    decompressor = zlib.decompressobj(16 + zlib.MAX_WBITS)
-    decompressed_bytes = 0
-    for chunk in hop.body_stream():
-        wire_bytes += len(chunk)
-        if wire_bytes > MAX_WIRE_BYTES:
+        if wire_bytes < content_length:
             raise IntelFetchError(
-                "SIZE_LIMIT_EXCEEDED",
-                f"SIZE_LIMIT_EXCEEDED: wire body reached {wire_bytes} bytes,"
-                f" above the {MAX_WIRE_BYTES} byte cap",
+                "CONTENT_TRUNCATED",
+                f"CONTENT_TRUNCATED: stream ended after {wire_bytes} of the"
+                f" {content_length} declared body bytes",
             )
-        piece = decompressor.decompress(chunk)
-        if not piece:
-            continue
-        parts.append(piece)
-        decompressed_bytes += len(piece)
-        _enforce_decompression_budget(wire_bytes, decompressed_bytes)
-    tail = decompressor.flush()
-    if tail:
-        parts.append(tail)
-        decompressed_bytes += len(tail)
-        _enforce_decompression_budget(wire_bytes, decompressed_bytes)
-    return b"".join(parts)
+        body = b"".join(parts)
+    else:
+        decompressor = zlib.decompressobj(16 + zlib.MAX_WBITS)
+        decompressed_bytes = 0
+        member_finished = False
+
+        def _count_output(piece: bytes) -> None:
+            nonlocal decompressed_bytes
+            if not piece:
+                return
+            parts.append(piece)
+            decompressed_bytes += len(piece)
+            _enforce_decompression_budget(wire_bytes, decompressed_bytes)
+
+        for chunk in hop.body_stream():
+            wire_bytes += len(chunk)
+            if wire_bytes > MAX_WIRE_BYTES:
+                raise IntelFetchError(
+                    "SIZE_LIMIT_EXCEEDED",
+                    f"SIZE_LIMIT_EXCEEDED: wire body reached {wire_bytes}"
+                    f" bytes, above the {MAX_WIRE_BYTES} byte cap",
+                )
+            if wire_bytes > content_length:
+                raise IntelFetchError(
+                    "RESPONSE_UNFRAMED",
+                    f"RESPONSE_UNFRAMED: wire body reached {wire_bytes}"
+                    f" bytes, above the declared content-length"
+                    f" {content_length}",
+                )
+            if member_finished:
+                raise IntelFetchError(
+                    "RESPONSE_UNFRAMED",
+                    "RESPONSE_UNFRAMED: wire bytes arrived behind the end of"
+                    " the gzip member",
+                )
+            # One inflate step may hand out at most MAX_DECOMPRESSED_BYTES+1
+            # bytes; whatever the cap held back stays in unconsumed_tail and
+            # is fed through the following rounds of this loop. Any of the
+            # decompressor's own errors (a failed CRC, non-gzip garbage) is
+            # an intact frame carrying the wrong payload, never this
+            # module's error type: catch and translate.
+            pending: bytes = chunk
+            while pending:
+                try:
+                    piece = decompressor.decompress(
+                        pending, MAX_DECOMPRESSED_BYTES + 1
+                    )
+                except zlib.error as error:
+                    raise IntelFetchError(
+                        "RESPONSE_UNFRAMED",
+                        "RESPONSE_UNFRAMED: body promised content-encoding"
+                        f" gzip but failed to decode ({error})",
+                    ) from error
+                _count_output(piece)
+                if decompressor.eof:
+                    if decompressor.unused_data:
+                        raise IntelFetchError(
+                            "RESPONSE_UNFRAMED",
+                            "RESPONSE_UNFRAMED:"
+                            f" {len(decompressor.unused_data)} trailing"
+                            " bytes behind the end of the gzip member",
+                        )
+                    member_finished = True
+                    break
+                pending = decompressor.unconsumed_tail
+        if wire_bytes < content_length:
+            raise IntelFetchError(
+                "CONTENT_TRUNCATED",
+                f"CONTENT_TRUNCATED: stream ended after {wire_bytes} of the"
+                f" {content_length} declared body bytes",
+            )
+        if not decompressor.eof:
+            raise IntelFetchError(
+                "CONTENT_TRUNCATED",
+                "CONTENT_TRUNCATED: the gzip stream ended before its final"
+                " member was complete",
+            )
+        body = b"".join(parts)
+    if not body:
+        raise IntelFetchError(
+            "EMPTY_CONTENT",
+            "EMPTY_CONTENT: the response body decoded to zero bytes",
+        )
+    return body
 
 
 def fetch_intel(
@@ -260,11 +375,17 @@ def fetch_intel(
     The URL is validated before the first transport call, every redirect hop
     is revalidated before it is fetched, at most ``MAX_REDIRECT_HOPS``
     redirects are followed, declared per-hop ``elapsed_seconds`` accumulate
-    against the total budget, and the body is streamed through the wire and
-    decompression caps. Transport-raised connect/read timeouts propagate
-    unchanged. A transport whose hops own a connection (``close`` attr) has
-    every hop released exactly once: after its redirect is followed, after
-    its body is consumed, or when a raised limit abandons it mid-flight.
+    against the total budget -- re-checked against the final hop's latest
+    ``elapsed_seconds`` once its body has streamed, so the time a body takes
+    to arrive counts too -- and the body is streamed through the wire and
+    decompression caps. A final status outside 2xx is rejected on its status
+    line without reading one byte of its body. ``SafeHttpError`` raised by a
+    guarded transport surfaces as ``IntelFetchError`` carrying the
+    transport's reason token; transport-raised connect/read timeouts
+    propagate unchanged. A transport whose hops own a connection (``close``
+    attr) has every hop released exactly once: after its redirect is
+    followed, after its body is consumed, or when a raised limit abandons it
+    mid-flight.
     """
     validate_source(url, allowlist)
     visited: list[str] = []
@@ -273,16 +394,20 @@ def fetch_intel(
     current = url
     while True:
         visited.append(current)
-        hop = transport.fetch(
-            current,
-            connect_timeout=CONNECT_TIMEOUT_SECONDS,
-            read_timeout=READ_TIMEOUT_SECONDS,
-        )
+        try:
+            hop = transport.fetch(
+                current,
+                connect_timeout=CONNECT_TIMEOUT_SECONDS,
+                read_timeout=READ_TIMEOUT_SECONDS,
+            )
+        except SafeHttpError as error:
+            raise IntelFetchError(error.reason, str(error)) from error
         # Pure fake hops have no close(); connection-owning hops (e.g.
         # GuardedTransport's) are released here on every exit path.
         hop_close = getattr(hop, "close", None)
         try:
-            elapsed_seconds += hop.elapsed_seconds
+            head_elapsed = hop.elapsed_seconds
+            elapsed_seconds += head_elapsed
             if elapsed_seconds > TOTAL_TIMEOUT_SECONDS:
                 raise IntelFetchError(
                     "FETCH_TIMEOUT",
@@ -311,9 +436,29 @@ def fetch_intel(
                 validate_source(target, allowlist)
                 current = target
                 continue
+            if not 200 <= hop.status < 300:
+                raise IntelFetchError(
+                    "HTTP_STATUS_REJECTED",
+                    f"HTTP_STATUS_REJECTED: hop {current!r} answered"
+                    f" {hop.status}, neither a 2xx success nor a redirect to"
+                    " follow; its body was not read",
+                )
+            body = _read_body(hop)
+            elapsed_seconds += hop.elapsed_seconds - head_elapsed
+            if elapsed_seconds > TOTAL_TIMEOUT_SECONDS:
+                raise IntelFetchError(
+                    "FETCH_TIMEOUT",
+                    f"FETCH_TIMEOUT: {elapsed_seconds:.1f} seconds across"
+                    f" {len(visited)} hops exceed the"
+                    f" {TOTAL_TIMEOUT_SECONDS} second total budget"
+                    f" (the final hop's body streamed for"
+                    f" {hop.elapsed_seconds:.1f} seconds)",
+                )
             return FetchResult(
-                body=_read_body(hop), status=hop.status, hops=tuple(visited)
+                body=body, status=hop.status, hops=tuple(visited)
             )
+        except SafeHttpError as error:
+            raise IntelFetchError(error.reason, str(error)) from error
         finally:
             if callable(hop_close):
                 hop_close()
@@ -327,6 +472,12 @@ class _GuardedHop:
     stream runs dry (the success path), or through ``close()`` when the
     fetch loop abandons the hop early -- a redirect whose body is never
     read, or a limit that cuts the stream mid-flight.
+
+    ``elapsed_seconds`` is measured once when the response head arrives and
+    re-measured (against the injected clock and the hop's start time,
+    keeping the larger value) when the body stream ends or the hop is
+    closed, so the time a body takes to stream counts against the total
+    budget instead of vanishing at the head.
     """
 
     def __init__(
@@ -334,10 +485,15 @@ class _GuardedHop:
         connection: GuardedConnection,
         response: GuardedResponse,
         elapsed_seconds: float,
+        *,
+        clock: Callable[[], float] | None = None,
+        started_at: float | None = None,
     ) -> None:
         self._connection = connection
         self._response = response
         self._elapsed_seconds = elapsed_seconds
+        self._clock = clock
+        self._started_at = started_at
         self._closed = False
 
     @property
@@ -357,6 +513,21 @@ class _GuardedHop:
     def elapsed_seconds(self) -> float:
         return self._elapsed_seconds
 
+    def _remeasure_elapsed(self) -> None:
+        """Re-measure against the clock, keeping the larger value.
+
+        A clock that itself fails is never allowed to add a new exception
+        onto whatever path is unwinding: the last good measurement stays.
+        """
+        if self._clock is None or self._started_at is None:
+            return
+        try:
+            measured = self._clock() - self._started_at
+        except Exception:
+            return
+        if measured > self._elapsed_seconds:
+            self._elapsed_seconds = measured
+
     def body_stream(self) -> Iterator[bytes]:
         try:
             for chunk in self._response.body_chunks:
@@ -368,6 +539,7 @@ class _GuardedHop:
         """Close the hop's connection; deliberately idempotent."""
         if not self._closed:
             self._closed = True
+            self._remeasure_elapsed()
             self._connection.close()
 
 
@@ -380,9 +552,10 @@ class GuardedTransport:
     directly with TLS SNI and the HTTP ``Host`` header pinned to the
     hostname, and the parsed response is wrapped into a ``Hop`` whose body
     streams wire chunk by wire chunk. ``elapsed_seconds`` is the difference
-    of two ``clock`` calls taken around the hop, so an injected step clock
-    measures pure fake time while the default ``time.monotonic`` measures
-    real wall time.
+    of two ``clock`` calls taken around the response head, re-measured when
+    the hop's body finishes streaming so an injected step clock measures
+    pure fake time while the default ``time.monotonic`` measures real wall
+    time.
     """
 
     def __init__(
@@ -424,6 +597,8 @@ class GuardedTransport:
             connection=connection,
             response=response,
             elapsed_seconds=self._clock() - started,
+            clock=self._clock,
+            started_at=started,
         )
 
 
@@ -471,7 +646,9 @@ def check_license(
     ``case_registry`` maps each registered source host to
     ``{"license": str, "permitted_uses": [str]}``. A snapshot without license
     information, an unregistered host, a license that conflicts with the
-    registry, or a registered license that does not cover this system's use
+    registry, a ``permitted_uses`` grant that is not a list/tuple/set of use
+    names (a bare string would let a substring pose as a permission), or a
+    registered license that does not cover this system's use
     (``reproduction``) is rejected with ``LICENSE_REJECTED`` (POLICY_DENIED
     with that ``detail.sub_reason``) before any material can enter the
     reproduction workflow.
@@ -500,7 +677,18 @@ def check_license(
             f" with the registered license {registered_license!r} for"
             f" {host!r}",
         )
-    permitted_uses = entry.get("permitted_uses") or ()
+    permitted_uses = entry.get("permitted_uses")
+    if permitted_uses is None:
+        permitted_uses = ()
+    if not isinstance(permitted_uses, (list, tuple, set, frozenset)):
+        raise IntelFetchError(
+            "LICENSE_REJECTED",
+            f"LICENSE_REJECTED: registry entry for {host!r} carries"
+            f" permitted_uses of type"
+            f" {type(permitted_uses).__name__}; a permission grant must be"
+            " a list, tuple, set or frozenset of use names, never a bare"
+            " string or number",
+        )
     if SYSTEM_USE not in permitted_uses:
         raise IntelFetchError(
             "LICENSE_REJECTED",
@@ -510,11 +698,50 @@ def check_license(
         )
 
 
-def as_data(text: str) -> str:
-    """Mark external ``text`` as inert data for model, log and report channels.
+# CR, LF and TAB are escaped in place so they stay visible in the text as
+# two-character sequences instead of control bytes.
+_ESCAPED_CHARACTERS: dict[str, str] = {
+    "\r": "\\r",
+    "\n": "\\n",
+    "\t": "\\t",
+}
+# Every other C0 control (0x00-0x1F), DEL (0x7F) and the C1 range
+# (0x80-0x9F), plus the bidi overrides and isolates (U+202A-U+202E,
+# U+2066-U+2069) and the zero-width characters (U+200B-U+200F,
+# U+2060-U+2064) that could reorder displayed text or silently split a word
+# a log search looks for: all deleted on the way through ``as_data``.
+_DELETED_CODE_POINTS = frozenset(
+    code
+    for low, high in (
+        (0x00, 0x1F),
+        (0x7F, 0x9F),
+        (0x200B, 0x200F),
+        (0x202A, 0x202E),
+        (0x2060, 0x2064),
+        (0x2066, 0x2069),
+    )
+    for code in range(low, high + 1)
+)
 
-    The wrapped payload no longer begins with any directive marker, so it
-    cannot change routing, tool authorization or verdicts, while the original
-    content survives verbatim inside the marker.
+
+def as_data(text: str) -> str:
+    """Mark external ``text`` as inert data for the log, report and terminal channels.
+
+    That is the extent of what this can be held to: the text stays inert
+    *there*. CR, LF and TAB are escaped inline and every other control
+    character is deleted, so a payload cannot break out into a line of its
+    own in a log, drive a terminal through an escape sequence, or hide a
+    spoof behind bidi and zero-width characters, while its facts survive
+    verbatim behind the marker. It does not make an instruction unreadable
+    to a model -- the directive itself travels through verbatim -- so
+    nothing here claims that; the guarantee against it belongs to the
+    downstream egress allowlist and output validation.
     """
-    return DATA_CHANNEL_MARKER + text
+    pieces: list[str] = []
+    for char in text:
+        escaped = _ESCAPED_CHARACTERS.get(char)
+        if escaped is not None:
+            pieces.append(escaped)
+        elif ord(char) not in _DELETED_CODE_POINTS:
+            pieces.append(char)
+    return DATA_CHANNEL_MARKER + "".join(pieces)
