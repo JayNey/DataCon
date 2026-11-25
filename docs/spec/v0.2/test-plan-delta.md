@@ -172,9 +172,9 @@ T14 实现新增坐标（P3）。下列 38 条不在原计划表内，是实现�
 
 - **两处规范的解释**（已定，写在实现里）：
   - security-design-delta §2.5「脱敏规则命中禁止字段 → 阻止发送」：按「先遮蔽，再对整个请求体扫一遍，仍有密钥类内容才阻止发送并记录原因」执行（`REDACTION_REJECTED`）。可遮蔽的形态遮蔽后照发；只有遮蔽覆盖不到的位置（例如字典的键名）残留密钥时才阻断。
-  - §2.3「任何自由文本命令、shell 片段……视为非法输出并阻断」：T14 **不按文本特征阻断**。封闭的 `AgentOutput` 结构里没有命令或工具调用的落点；命令注入类缺陷的假设本身就会含 shell 文本，按文本阻断会误伤。此点待评审确认。
+  - §2.3「任何自由文本命令、shell 片段……视为非法输出并阻断」：T14 **不按文本特征阻断**。封闭的 `AgentOutput` 结构里没有命令或工具调用的落点；命令注入类缺陷的假设本身就会含 shell 文本，按文本阻断会误伤。此点已获 Sasuke0723 在 #48 评审中确认（同意以结构封闭为门禁边界）。
 - **签名规则与信封一致**：`experiment_spec.validate_signature` 对值与类型的规则跟 `state._envelope_signature_set` 相同（`operation` 为 `READ` 或 `WRITE`，`access_size` 为 1 到 2^31-1），由 `test_signature_rules_agree_with_the_envelope_validator` 防漂移；文本字段另加两条更严的规则（无控制字符、不超过 200 字符）。
-- **标注集版本格式**：`b04-annotations-v1`、一个冒号、`sha256:` 加 samples 的规范化摘要（`b04_eval.annotation_set_version`），加载时核对摘要。
+- **标注集版本格式**：`b04-annotations-v1`、一个加号、`sha256:` 加 samples 的规范化摘要（`b04_eval.annotation_set_version`），加载时核对摘要。评审修正（#48，Sasuke0723 指出）：实现与本登记曾误写为冒号，ADR-003 第 12 条与 `tasks.md` 冻结的是 `<label>+<digest>`。
 - **尚未由坐标验证的几点**（要求不变）：连接与读取超时、重定向目标与证书校验的强制属于传输适配层，T14 的出口只把校验过的 endpoint 与脱敏后的请求体交给注入的传输层；B04 报告的分桶维度（按 family、模式、confidence）与证据引用有效率、契约拒绝率尚未实现，等真实标注集；信封交叉校验（`mutation_constraints` 是否为 `mutation_limits` 的子集、`input_family` 是否在允许集合内、目标是否落在版本与源码范围内）不在 T14 本轮。
 - **最后防线的范围**：出口体按结构逐个字符串扫描（键名也算），不扫序列化后的 JSON 文本——JSON 的结构本身（`token": "`）会被读成键值形式的口令，曾使 `parse_token` 这样的普通键名阻断整次请求。以凭据词结尾的字典键名（`auth_token`、`DB_PASSWORD`，也包括 `max_token`）其值被遮蔽而不是阻断；空值保持原样。
 - **已知限制**：12 位十六进制的容器短 ID 不遮蔽（与 git 短提交号无法区分）；不带账号口令的内部 URL 不遮蔽；以凭据词结尾的键名下的值一律遮蔽，无法区分凭据与同名配置（`max_token: 4096`）；`sort -u names.txt`、`psql -U admin` 这类命令会被多遮蔽紧随其后的一个词；散文里 `token:`、`password:` 后面紧随的一个词会被遮蔽。
@@ -219,7 +219,10 @@ T14 实现新增坐标（P3）。下列 38 条不在原计划表内，是实现�
 | `tests/contract/test_experiment_spec.py::test_experiment_spec_bounds_lengths_and_control_characters`（自审加固） | C1 控制字符被拒；文本与列表字段有上界 | ※ `Failed: DID NOT RAISE ExperimentSpecError` |
 | `tests/contract/test_b04_hypothesis_quality.py::test_annotation_set_rejects_malformed_samples`（自审加固） | 样本不是对象、缺字段、行号无序、签名不合法、文件不是 JSON → `ANNOTATION_INVALID` | `Failed: DID NOT RAISE B04GateError` |
 | `tests/contract/test_b04_hypothesis_quality.py::test_annotation_version_binds_the_annotation_digest`（自审加固） | 版本串符合格式且摘要与 samples 一致；改样本不升版本被拒 | `Failed: DID NOT RAISE B04GateError` |
-| `tests/contract/test_b04_hypothesis_quality.py::test_annotation_version_requires_the_canonical_separator`（自审加固） | 版本串只认 `b04-annotations-v1:sha256:…` 一种写法 | ※ `Failed: DID NOT RAISE B04GateError` |
+| `tests/contract/test_b04_hypothesis_quality.py::test_annotation_version_requires_the_canonical_separator`（自审加固） | 版本串只认 `b04-annotations-v1+sha256:…` 一种写法；评审修正后冒号也是被拒的分隔符 | ※ `Failed: DID NOT RAISE B04GateError` |
+| `tests/contract/test_experiment_spec.py::test_experiment_spec_requires_at_least_one_evidence_ref`（评审加固） | `evidence_refs` 空列表 → `ExperimentSpecError`（非空要求，与 finding 层 `agent_contracts` 一致） | ※ `Failed: DID NOT RAISE ExperimentSpecError` |
+| `tests/contract/test_experiment_spec.py::test_experiment_spec_checks_log_reference_grammar`（评审加固） | `log/build:`/`log/fuzz:` 引用按 §11 冻结语法（`contracts.parse_log_evidence_ref`）校验：降序区间、非法 selector、fuzz 带区间被拒，v0.1 形式照常通过 | ※ `Failed: DID NOT RAISE ExperimentSpecError` |
+| `tests/contract/test_b04_hypothesis_quality.py::test_a_hit_requires_the_same_case`（评审加固） | 命中要求 `case_id` 一致：同一上游文件被其他 case 复用时不得交叉命中 | ※ `assert 1.0 == 0` |
 
 ### T15 在线情报
 

@@ -424,12 +424,13 @@ def run_b04_evaluation(
     return summary
 
 
-_ANNOTATION_VERSION_PREFIX = "b04-annotations-v1:"
-# The version label: ``b04-annotations-v1``, one colon, then the ``sha256``
-# digest of the samples (64 lower-case hex digits). One annotation set has
-# exactly one label, which is what ``annotation_set_version`` builds.
+_ANNOTATION_VERSION_PREFIX = "b04-annotations-v1+"
+# The version label: ``b04-annotations-v1``, one plus sign, then the
+# ``sha256`` digest of the samples (64 lower-case hex digits), per the
+# ``<label>+<digest>`` format frozen in ADR-003 item 12. One annotation set
+# has exactly one label, which is what ``annotation_set_version`` builds.
 _ANNOTATION_VERSION = re.compile(
-    r"b04-annotations-v1:(?P<digest>sha256:[0-9a-f]{64})"
+    r"b04-annotations-v1\+(?P<digest>sha256:[0-9a-f]{64})"
 )
 # The same ceiling as an ExperimentSpec target line.
 _ANNOTATION_MAX_LINE = 2**31 - 1
@@ -529,7 +530,7 @@ def load_annotation_set(path: Path) -> dict[str, Any]:
     if match is None:
         raise _annotation_invalid(
             "annotation set requires an annotation_version of the form "
-            "b04-annotations-v1:sha256:<64 lower-case hex digits>"
+            "b04-annotations-v1+sha256:<64 lower-case hex digits>"
         )
     source = document.get("source")
     if not isinstance(source, str) or not source:
@@ -569,14 +570,16 @@ def _hypothesis_hits_annotation(
 ) -> bool:
     """Whether one hypothesis hits one annotation (test-plan delta 4.2).
 
-    Symbol, path and input family must match exactly; the hypothesis line
+    Case, symbol, path and input family must match exactly - annotations
+    belong to their case, so the same upstream file reused by another case
+    never cross-matches; the hypothesis line
     must fall inside the annotated range (plus or minus the tolerance); the
     signature must match as a full signature through
     ``experiment_spec.signature_matches`` - optional fields participate
     through their presence, never through defaults. A hypothesis outside
     every annotated file is a miss.
     """
-    for field in ("target_symbol", "target_path", "input_family"):
+    for field in ("case_id", "target_symbol", "target_path", "input_family"):
         if hypothesis.get(field) != sample.get(field):
             return False
     line = hypothesis.get("target_line")

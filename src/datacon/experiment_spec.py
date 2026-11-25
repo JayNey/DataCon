@@ -25,7 +25,7 @@ import re
 from dataclasses import dataclass
 from typing import Any, Callable
 
-from datacon import jsonutil
+from datacon import contracts, jsonutil
 from datacon.agent_contracts import CONFIDENCE_LEVELS, MAX_REF, MAX_STATEMENT
 
 SPEC_FIELDS = (
@@ -89,6 +89,17 @@ def _ref(value: Any) -> str:
     text = _plain_text(value, "evidence_ref", MAX_REF)
     if any(character.isspace() for character in text):
         raise ExperimentSpecError("evidence_ref must not contain whitespace")
+    if text.startswith(("log/build:", "log/fuzz:")):
+        # The log/ namespace follows the §11 grammar frozen in
+        # ``contracts.parse_log_evidence_ref``; v0.1-style references
+        # (``git:diff/...``, ``patch:...``) pass through verbatim.
+        try:
+            contracts.parse_log_evidence_ref(text)
+        except ValueError as error:
+            raise ExperimentSpecError(
+                f"evidence_ref {text!r} violates the frozen log reference"
+                f" grammar: {error}"
+            ) from error
     return text
 
 
@@ -286,10 +297,14 @@ def parse_experiment_spec(payload: dict[str, Any]) -> ExperimentSpec:
             document["rationale"], "ExperimentSpec.rationale", MAX_STATEMENT
         )
         refs = document["evidence_refs"]
-        if not isinstance(refs, list) or len(refs) > _MAX_LIST_ITEMS:
+        if (
+            not isinstance(refs, list)
+            or not refs
+            or len(refs) > _MAX_LIST_ITEMS
+        ):
             raise ExperimentSpecError(
-                "ExperimentSpec.evidence_refs must be a list of at most"
-                f" {_MAX_LIST_ITEMS} references"
+                "ExperimentSpec.evidence_refs must be a non-empty list of at"
+                f" most {_MAX_LIST_ITEMS} references"
             )
         evidence_refs = tuple(_ref(ref) for ref in refs)
         confidence = document["confidence"]

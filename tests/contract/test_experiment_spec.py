@@ -538,3 +538,51 @@ def test_experiment_spec_bounds_lengths_and_control_characters():
     assert spec.input_family == "f" * 64
     assert len(spec.evidence_refs) == 64
     assert spec.expected_signature["access_size"] == 2**31 - 1
+
+
+def test_experiment_spec_requires_at_least_one_evidence_ref():
+    from datacon.experiment_spec import (
+        ExperimentSpecError,
+        parse_experiment_spec,
+    )
+
+    # A spec is an experiment plan grounded in evidence; with no reference
+    # at all there is nothing to resolve and the payload is not a spec.
+    payload = _valid_spec_payload()
+    payload["evidence_refs"] = []
+    with pytest.raises(ExperimentSpecError) as excinfo:
+        parse_experiment_spec(payload)
+    assert "non-empty" in str(excinfo.value)
+
+
+def test_experiment_spec_checks_log_reference_grammar():
+    from datacon.experiment_spec import (
+        ExperimentSpecError,
+        parse_experiment_spec,
+    )
+
+    # The log/ namespace follows the frozen §11 grammar delegated to
+    # contracts.parse_log_evidence_ref: a descending build range, an
+    # unknown build selector and a ranged fuzz line are rejected, while
+    # well-formed log refs and v0.1-style refs pass through verbatim.
+    for bad_ref in (
+        "log/build:fixed#L12-10",
+        "log/build:other#L1",
+        "log/fuzz:0#L1-5",
+    ):
+        payload = _valid_spec_payload()
+        payload["evidence_refs"] = [bad_ref]
+        with pytest.raises(ExperimentSpecError) as excinfo:
+            parse_experiment_spec(payload)
+        assert "log" in str(excinfo.value), bad_ref
+
+    payload = _valid_spec_payload()
+    payload["evidence_refs"] = [
+        "log/build:vulnerable#L3",
+        "log/build:fixed#L10-12",
+        "log/fuzz:0#L1",
+        "patch:fix.patch#hunk-2",
+        "git:diff/upstream--fixed",
+    ]
+    spec = parse_experiment_spec(payload)
+    assert spec.evidence_refs == tuple(payload["evidence_refs"])

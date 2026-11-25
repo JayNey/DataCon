@@ -25,10 +25,10 @@ def _annotation_version(samples) -> str:
     """The b04-annotations-v1 label that binds ``samples`` by digest.
 
     Spelled out from the test side: a frozen set carries exactly
-    ``b04-annotations-v1:`` plus the canonical digest of its samples, and it
+    ``b04-annotations-v1+`` plus the canonical digest of its samples, and it
     is the loader under test that has to check this binding.
     """
-    return "b04-annotations-v1:" + jsonutil.digest_json(samples)
+    return "b04-annotations-v1+" + jsonutil.digest_json(samples)
 
 
 def _annotation_sample():
@@ -271,6 +271,25 @@ def test_b04_reports_end_to_end_and_accepted_precision(tmp_path):
     assert report["annotation_version"] == document["annotation_version"]
 
 
+def test_a_hit_requires_the_same_case(tmp_path):
+    from datacon.b04_eval import evaluate_hypothesis_quality
+
+    # h1 hits annotation 1 under case cve-2099-0001. The same symbol, path,
+    # line and signature under a different case id is a miss: annotations
+    # belong to their case, and the same upstream file reused by another
+    # case must not cross-match.
+    h1 = dict(_quality_hypotheses()[0])
+    h1["case_id"] = "cve-2099-0099"
+    document = _quality_annotation_document()
+    path = _write_annotation_set(tmp_path, document, "annotations-case.json")
+
+    report = evaluate_hypothesis_quality(path, hypotheses=(h1,))
+
+    assert report["hypothesis_total"] == 1
+    assert report["end_to_end_precision"] == 0
+    assert report["recall"] == 0
+
+
 def test_b04_agent_scenarios_remain_release_gate(tmp_path):
     from datacon import b04_eval
     from datacon.b04_eval import evaluate_hypothesis_quality
@@ -470,17 +489,17 @@ def test_annotation_version_binds_the_annotation_digest(tmp_path):
     # or shortened hex, a missing sha256 prefix, a missing label.
     for version in (
         "v1",
-        "b04-annotations-v2:sha256:" + hex_digest,
-        "b04-annotations-v1:sha256:" + hex_digest.upper(),
-        "b04-annotations-v1:sha256:" + hex_digest[:-1],
-        "b04-annotations-v1:" + hex_digest,
+        "b04-annotations-v2+sha256:" + hex_digest,
+        "b04-annotations-v1+sha256:" + hex_digest.upper(),
+        "b04-annotations-v1+sha256:" + hex_digest[:-1],
+        "b04-annotations-v1+" + hex_digest,
         "sha256:" + hex_digest,
     ):
         assert_rejected(labelled(version))
 
     # The right format does not suffice: the digest has to belong to the
     # samples actually in the file.
-    assert_rejected(labelled("b04-annotations-v1:sha256:" + "0" * 64))
+    assert_rejected(labelled("b04-annotations-v1+sha256:" + "0" * 64))
 
     # A frozen version does not cover a changed annotation set: editing one
     # sample, or adding one, without raising the version is rejected. Both
@@ -502,7 +521,7 @@ def test_annotation_version_binds_the_annotation_digest(tmp_path):
 
     # The version built from the samples' own digest loads and passes through
     # unchanged.
-    version = "b04-annotations-v1:" + jsonutil.digest_json(samples)
+    version = "b04-annotations-v1+" + jsonutil.digest_json(samples)
     loaded = load_annotation_set(write(labelled(version)))
     assert loaded["annotation_version"] == version
     assert loaded["samples"] == samples
@@ -519,14 +538,14 @@ def test_annotation_version_binds_the_annotation_digest(tmp_path):
     assert report["annotation_count"] == 3
     assert report["case_count"] == 2
     assert report["annotation_version"] == (
-        "b04-annotations-v1:" + jsonutil.digest_json(two_cases)
+        "b04-annotations-v1+" + jsonutil.digest_json(two_cases)
     )
 
     # annotation_set_version hands annotation authors exactly the label the
     # loader accepts for these samples.
     from datacon.b04_eval import annotation_set_version
 
-    assert annotation_set_version(samples) == "b04-annotations-v1:" + digest
+    assert annotation_set_version(samples) == "b04-annotations-v1+" + digest
 
 
 def test_annotation_version_requires_the_canonical_separator(tmp_path):
@@ -534,12 +553,14 @@ def test_annotation_version_requires_the_canonical_separator(tmp_path):
 
     digest = jsonutil.digest_json(_quality_annotation_document()["samples"])
     # One annotation set, one label: the digest follows the label behind a
-    # single colon. Another separator, none at all, or a trailing newline
-    # is not the version of anything.
+    # single plus sign (ADR-003 item 12). The pre-review colon spelling,
+    # another separator, none at all, or a trailing newline is not the
+    # version of anything.
     for version in (
+        "b04-annotations-v1:" + digest,
         "b04-annotations-v1-" + digest,
         "b04-annotations-v1" + digest,
-        "b04-annotations-v1:" + digest + "\n",
+        "b04-annotations-v1+" + digest + "\n",
     ):
         document = _quality_annotation_document() | {"annotation_version": version}
         with pytest.raises(B04GateError) as excinfo:
