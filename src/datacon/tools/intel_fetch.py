@@ -40,7 +40,7 @@ import ipaddress
 import time
 from types import MappingProxyType
 from typing import Any, Callable, Iterator, Mapping, Protocol, Sequence
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import urljoin, urlsplit, urlunsplit
 import zlib
 
 from datacon.tools.safe_http import (
@@ -606,16 +606,41 @@ def _sha256_digest(payload: bytes) -> str:
     return "sha256:" + hashlib.sha256(payload).hexdigest()
 
 
+def strip_url_credentials(url: str) -> str:
+    """Return ``url`` without any ``user:password@`` part.
+
+    Source URLs end up in snapshot records and in summaries that reach
+    reports and audits. Credentials embedded in a URL carry nothing worth
+    keeping there: the guarded transport never sends them (the ``Host``
+    header is pinned to the hostname and no ``Authorization`` is derived
+    from the URL), so only the disclosure would survive. Everything else
+    -- scheme, host, port, path, query and fragment -- is kept as written.
+    Raises ``ValueError`` when ``url`` cannot be split.
+    """
+    parts = urlsplit(url)
+    return urlunsplit(
+        (
+            parts.scheme,
+            parts.netloc.rpartition("@")[2],
+            parts.path,
+            parts.query,
+            parts.fragment,
+        )
+    )
+
+
 def build_snapshot(
     fetch_result: FetchResult, license_info: str | None
 ) -> Mapping[str, Any]:
-    """Freeze a fetch into a read-only, content-addressed snapshot mapping.
+    """Freeze a fetch into a read-only snapshot record keyed by content digest.
 
-    The snapshot records the original source URL, HTTP status, content
-    digest, license identifier (kept ``None`` when unknown so the gap stays
-    visible), redirect chain digest, fetch timestamp and tool version. The
-    returned mapping is a ``MappingProxyType``: later writes cannot reshape
-    the record; a new fetch produces a new snapshot.
+    The snapshot records the original source URL (without any embedded
+    credentials), HTTP status, content digest, license identifier (kept
+    ``None`` when unknown so the gap stays visible), redirect chain digest,
+    fetch timestamp and tool version. The returned mapping is a
+    ``MappingProxyType``: later writes cannot reshape the record; a new
+    fetch produces a new snapshot. This is the record only: persisting it
+    in a content-addressed store belongs to the snapshot-store adapter.
     """
     chain = tuple(fetch_result.hops)
     if not chain:
@@ -624,7 +649,7 @@ def build_snapshot(
             "cannot snapshot a fetch result without hops",
         )
     snapshot: dict[str, Any] = {
-        "source_url": chain[0],
+        "source_url": strip_url_credentials(chain[0]),
         "http_status": fetch_result.status,
         "content_digest": _sha256_digest(fetch_result.body),
         "license": license_info,

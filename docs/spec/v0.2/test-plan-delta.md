@@ -239,6 +239,48 @@ T15 可以先独立实现采集，但最终验收依赖 T10 的 `intel_snapshot`
 | `tests/contract/test_intel_fetch.py::test_missing_or_disallowed_license_is_rejected` | 缺许可或用途不符的材料以 `POLICY_DENIED`（审计 `detail.sub_reason=LICENSE_REJECTED`）拒绝，不得进入复现流程 | `AssertionError: material without allowed license entered workflow` |
 | `tests/contract/test_intel_fetch.py::test_intel_node_archives_missing_or_conflicting_snapshot`（编排图边 #6 `intel → archive`，依赖 T11 `intel` 节点） | `intel` 节点遇到快照缺失返回 `MATERIAL_MISSING`、来源冲突返回 `SOURCE_CONFLICT` 并转入 `archive` 阻断，不使用未验证内容 | `AssertionError: missing or conflicting intel snapshot reached version node` |
 
+T15 实现新增坐标（P3）。下列坐标不在原计划表内，是实现与自审过程中为钉住边界补上的，与上表同属 T15 验收。标注「自审加固」的坐标来自对 #44 与快照 provider 的逐行自审：每条都先用探针复现缺陷，再写成 RED，修复后转绿。
+
+- **归类**沿用 v0.1：固定快照的内容摘要与登记值不符属材料无法校验，归 `MATERIAL_MISSING`；来源登记给了别的案例才属事实矛盾，归 `SOURCE_CONFLICT`。
+- **尚未由坐标验证的两点**（要求不变，留待后续）：连接 10s / 读取 30s 超时的施加属于传输适配层，当前坐标以替身抛出的超时验证传播与 60 秒总预算；`test_external_text_does_not_change_routing_or_tools` 现钉住的是 `as_data` 的转义属性，路由与工具授权不读取外部文本这一点由编排图按目标类型路由保证，其断言留到集成阶段。
+
+| 测试坐标 | 断言点 | 首次运行的预期失败信息 |
+| --- | --- | --- |
+| `tests/contract/test_safe_http.py::test_dns_answers_are_validated_before_any_socket_opens` | 解析结果含私网、回环、元数据、IPv4-mapped、CGNAT 任一即拒；空解析失败关闭；都发生在创建 socket 之前 | `ModuleNotFoundError: No module named 'datacon.tools.safe_http'` |
+| `tests/contract/test_safe_http.py::test_rebind_to_metadata_ip_is_aborted_before_http_bytes` | 对端 `getpeername()` 为元数据地址时，在发送任何 HTTP 字节前中止 | 同上 |
+| `tests/contract/test_safe_http.py::test_connection_pins_sni_and_host_to_the_hostname` | 直连已校验 IP；TLS SNI 与 HTTP `Host` 钉住原域名，调用方伪造的 `Host` 被覆盖 | 同上 |
+| `tests/contract/test_safe_http.py::test_peer_must_match_a_validated_address` | 对端地址必须属于已校验地址集合，公网但未校验同样拒绝 | 同上 |
+| `tests/contract/test_safe_http.py::test_each_hop_opens_a_new_validated_connection` | 每跳新建连接，各自解析并校验 | 同上 |
+| `tests/contract/test_safe_http.py::test_environment_proxies_are_not_honored` | 设置 `http_proxy` 等环境变量后仍直连已校验 IP | 同上 |
+| `tests/contract/test_safe_http.py::test_response_head_is_capped`（自审加固） | 响应头超过 64 KiB 即拒绝，空行未到也拒绝 | `AttributeError: module 'datacon.tools.safe_http' has no attribute 'MAX_RESPONSE_HEAD_BYTES'` |
+| `tests/contract/test_safe_http.py::test_duplicate_or_conflicting_content_length_is_rejected`（自审加固） | 取值不一致的重复 `Content-Length` 被拒 | `Failed: DID NOT RAISE SafeHttpError` |
+| `tests/contract/test_safe_http.py::test_body_stream_reports_truncation_at_eof`（自审加固） | 正文未传满声明长度就 EOF 时报 `CONTENT_TRUNCATED` | `Failed: DID NOT RAISE SafeHttpError` |
+| `tests/contract/test_safe_http.py::test_missing_content_length_leaves_body_unframed_and_empty`（自审加固） | 无 `Content-Length` 的响应不产出任何正文字节 | `AttributeError: 'GuardedResponse' object has no attribute 'content_length'` |
+| `tests/contract/test_safe_http.py::test_safe_http_errors_carry_a_reason_code`（自审加固） | 连接层错误携带稳定原因码，拒绝集与非字面量 IP 为 `ADDRESS_DENIED` | `AttributeError: 'SafeHttpError' object has no attribute 'reason'` |
+| `tests/contract/test_guarded_transport.py::test_guarded_transport_serves_fetch_intel_end_to_end` | 经真实 safe_http 流完成一次抓取 | `ImportError: cannot import name 'GuardedTransport'` |
+| `tests/contract/test_guarded_transport.py::test_guarded_transport_propagates_redirect_location_per_hop` | 每跳新 socket，重定向目标逐跳传递 | 同上 |
+| `tests/contract/test_guarded_transport.py::test_guarded_transport_enforces_redirect_limit_through_safe_http` | 第 6 次重定向被拒，第 7 跳从未触达解析器 | 同上 |
+| `tests/contract/test_guarded_transport.py::test_guarded_transport_streams_gzip_body_for_budget_counting` | gzip 正文边流边解压并受预算约束 | 同上 |
+| `tests/contract/test_guarded_transport.py::test_guarded_transport_elapsed_comes_from_injected_clock` | 耗时取注入时钟的差值，而非绝对值 | 同上 |
+| `tests/contract/test_guarded_transport.py::test_guarded_transport_never_leaks_sockets_on_success` | 成功路径上每个连接恰好关闭一次 | 同上 |
+| `tests/contract/test_guarded_transport.py::test_guarded_transport_surfaces_safe_http_failures_as_intel_errors`（自审加固） | 连接层失败统一为 `IntelFetchError` 并带原因码，连接零泄漏 | `Failed: DID NOT RAISE IntelFetchError` |
+| `tests/contract/test_guarded_transport.py::test_guarded_elapsed_includes_body_streaming`（自审加固） | 正文传输的耗时计入 60 秒总预算 | `Failed: DID NOT RAISE IntelFetchError` |
+| `tests/contract/test_intel_fetch.py::test_fetch_rejects_truncated_body`（自审加固） | 线上字节少于声明为 `CONTENT_TRUNCATED`，多于声明为 `RESPONSE_UNFRAMED` | `Failed: DID NOT RAISE IntelFetchError` |
+| `tests/contract/test_intel_fetch.py::test_fetch_rejects_response_without_content_length`（自审加固） | 缺 `Content-Length` 或其值非整数为 `RESPONSE_UNFRAMED` | 同上 |
+| `tests/contract/test_intel_fetch.py::test_fetch_rejects_non_2xx_status`（自审加固） | 最终状态不在 200–299 为 `HTTP_STATUS_REJECTED`，正文不读 | 同上 |
+| `tests/contract/test_intel_fetch.py::test_fetch_rejects_empty_content`（自审加固） | 解码后为空的正文为 `EMPTY_CONTENT` | 同上 |
+| `tests/contract/test_intel_fetch.py::test_fetch_rejects_truncated_or_trailing_gzip`（自审加固） | 不完整的 gzip 为 `CONTENT_TRUNCATED`，成员之后带剩余字节为 `RESPONSE_UNFRAMED` | 同上 |
+| `tests/contract/test_intel_fetch.py::test_fetch_rejects_corrupt_gzip`（自审加固） | 校验和损坏或并非 gzip 的内容为 `RESPONSE_UNFRAMED`，不得漏出 `zlib.error` | `zlib.error: Error -3 while decompressing data: incorrect data check` |
+| `tests/contract/test_intel_fetch.py::test_total_budget_covers_body_streaming`（自审加固） | 正文流式传输的耗时计入总预算 | `Failed: DID NOT RAISE IntelFetchError` |
+| `tests/contract/test_intel_fetch.py::test_decompression_output_is_capped_per_inflate_step`（自审加固） | 单次解压的产出不超过 32 MiB + 1 字节 | `AssertionError: assert inf <= (33554432 + 1)` |
+| `tests/contract/test_intel_fetch.py::test_license_rejects_non_sequence_permitted_uses`（自审加固） | `permitted_uses` 是字符串时拒绝，防子串误命中 | `Failed: DID NOT RAISE IntelFetchError` |
+| `tests/contract/test_intel_fetch.py::test_snapshot_records_source_url_without_credentials`（自审加固） | 快照记录的来源 URL 不含账号口令 | `AssertionError: assert 'https://admi...0001.txt' == 'https://advi...0001.txt'` |
+| `tests/contract/test_intel_fetch.py::test_intel_node_ready_snapshot_reaches_version` | 已核验且许可通过的快照经边 #5 到达 `version`，摘要只含快照摘要、许可与来源 | `ModuleNotFoundError: No module named 'datacon.tools.intel_provider'` |
+| `tests/contract/test_intel_fetch.py::test_intel_node_rejects_unlicensed_or_unregistered_source` | 缺许可或用途不含复现为 `POLICY_DENIED`；案例无已登记来源时不读快照 | 同上 |
+| `tests/contract/test_intel_fetch.py::test_snapshot_provider_maps_failures_to_reason_codes` | 读不到、读取出错、摘要不符、登记摘要格式非法、登记给别的案例各归其原因码与细因；provider 不抛异常 | 同上 |
+| `tests/contract/test_intel_fetch.py::test_snapshot_provider_reads_pinned_snapshots_without_network` | 离线案例只读固定快照，不触达抓取、连接层或 socket | 同上 |
+| `tests/contract/test_intel_fetch.py::test_snapshot_provider_summary_never_carries_url_credentials`（自审加固） | 就绪摘要里的来源 URL 不含账号口令；URL 缺失或无法解析为 `POLICY_DENIED` | `AssertionError: assert 'https://admi...0001.txt' == 'https://advi...0001.txt'` |
+
 ## 3. 循环确定性策略
 
 1. **假时钟**。所有轮次、审核、预算与重试测试注入可控时钟，禁止 `sleep`；时限推进用显式 `advance()`。UTC 时间由假时钟产生，数据库时钟只在集成测试中作为独立断言。
