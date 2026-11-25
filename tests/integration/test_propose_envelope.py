@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 
+from datetime import datetime, timedelta, timezone
+from uuid import uuid4
+
 import pytest
 from psycopg.types.json import Jsonb
 
@@ -10,7 +13,10 @@ from datacon import jsonutil, state
 
 from test_review_locks import (
     ENVELOPE_2,
+    FIRST_PLAN_DIGEST,
+    REVIEWER_2,
     _family_request,
+    _insert_job,
     _row,
     _seed_family,
 )
@@ -316,3 +322,148 @@ def test_propose_envelope_blocks_budget_tightening_while_child_active(
         _envelope(max_total_seconds=600, max_fuzz_seconds=200),
     )
     assert proposed["status"] == "pending"
+
+
+def test_claim_next_v2_blocks_ready_child_while_pending_envelope_exists(
+    isolated_database, tmp_path, monkeypatch
+):
+    monkeypatch.setenv("DATACON_EVIDENCE_ROOT", str(tmp_path / "evidence"))
+    seed = _approved_family(isolated_database)
+    family_id = seed["family_id"]
+    child_id = seed["child_id"]
+    state.initialize_budget_ledger(
+        isolated_database.dsn,
+        family_id,
+        max_total_seconds=900,
+        max_fuzz_seconds=300,
+    )
+    isolated_database.connection.execute(
+        "UPDATE jobs SET state = 'READY', workflow_synced = true "
+        "WHERE job_id = %s",
+        (child_id,),
+    )
+
+    proposed = state.propose_envelope(
+        isolated_database.dsn,
+        family_id,
+        _envelope(max_total_seconds=100, max_fuzz_seconds=50),
+    )
+    assert proposed["status"] == "pending"
+
+    assert (
+        state.claim_next(
+            isolated_database.dsn, "v2-worker", job_contract_version=2
+        )
+        is None
+    ), "claim_next promoted READY child to RUNNING while envelope was pending"
+    assert (
+        _row(
+            isolated_database,
+            "SELECT state FROM jobs WHERE job_id = %s",
+            (child_id,),
+        )[0]
+        == "READY"
+    )
+
+    approved = state.record_review(
+        isolated_database.dsn,
+        family_id,
+        plan_digest=FIRST_PLAN_DIGEST,
+        decision="approve",
+        reviewer_id=REVIEWER_2,
+        envelope_digest=proposed["envelope_digest"],
+    )
+    assert approved.status == "applied", approved.message
+    ledger = state.load_budget_ledger(isolated_database.dsn, family_id)
+    assert ledger is not None
+    assert ledger["max_total_seconds"] == 100
+    assert ledger["max_fuzz_seconds"] == 50
+    assert ledger["remaining_total_seconds"] == 100
+    assert ledger["remaining_fuzz_seconds"] == 50
+
+    claimed = state.claim_next(
+        isolated_database.dsn, "v2-worker", job_contract_version=2
+    )
+    assert claimed is not None
+    assert claimed["job_id"] == child_id
+    assert claimed["state"] == "RUNNING"
+
+
+def test_claim_next_v2_keeps_sync_and_expiry_claimable_while_pending_envelope_exists(
+    isolated_database,
+):
+    seed = _approved_family(isolated_database, pending=ENVELOPE_2)
+    family_id = seed["family_id"]
+    child_id = seed["child_id"]
+
+    # 1. READY with workflow_synced=false still claims for sync (stays READY).
+    isolated_database.connection.execute(
+        "UPDATE jobs SET state = 'READY', workflow_synced = false, "
+        "lease_owner = NULL, lease_expires_at = NULL WHERE job_id = %s",
+        (child_id,),
+    )
+    claimed_ready_sync = state.claim_next(
+        isolated_database.dsn, "v2-worker", job_contract_version=2
+    )
+    assert claimed_ready_sync is not None
+    assert claimed_ready_sync["job_id"] == child_id
+    assert claimed_ready_sync["state"] == "READY"
+
+    # 2. AWAITING_REVIEW with workflow_synced=false still claims for sync.
+    isolated_database.connection.execute(
+        "UPDATE jobs SET state = 'AWAITING_REVIEW', workflow_synced = false, "
+        "review_deadline_at = %s, lease_owner = NULL, lease_expires_at = NULL "
+        "WHERE job_id = %s",
+        (datetime.now(timezone.utc) + timedelta(hours=24), child_id),
+    )
+    claimed_review_sync = state.claim_next(
+        isolated_database.dsn, "v2-worker", job_contract_version=2
+    )
+    assert claimed_review_sync is not None
+    assert claimed_review_sync["job_id"] == child_id
+    assert claimed_review_sync["state"] == "AWAITING_REVIEW"
+
+    # 3. AWAITING_REVIEW with expired deadline still claims for expiry.
+    isolated_database.connection.execute(
+        "UPDATE jobs SET state = 'AWAITING_REVIEW', workflow_synced = true, "
+        "review_deadline_at = %s, lease_owner = NULL, lease_expires_at = NULL "
+        "WHERE job_id = %s",
+        (datetime.now(timezone.utc) - timedelta(minutes=5), child_id),
+    )
+    claimed_review_expiry = state.claim_next(
+        isolated_database.dsn, "v2-worker", job_contract_version=2
+    )
+    assert claimed_review_expiry is not None
+    assert claimed_review_expiry["job_id"] == child_id
+    assert claimed_review_expiry["state"] == "AWAITING_REVIEW"
+
+    # 4. BLOCKED child with workflow_synced=false still claims for sync/drain.
+    blocked_child = uuid4()
+    _insert_job(
+        isolated_database,
+        blocked_child,
+        state_name="BLOCKED",
+        stage="blocked",
+        family_id=family_id,
+        job_kind="round",
+        parent_job_id=family_id,
+        round_no=1,
+        workflow_synced=False,
+    )
+    isolated_database.connection.execute(
+        "UPDATE jobs SET reason_code = 'REVIEW_REJECTED' WHERE job_id = %s",
+        (blocked_child,),
+    )
+    # Put the first child in READY (workflow_synced=true) so it is gated out
+    # and the BLOCKED child must be claimed.
+    isolated_database.connection.execute(
+        "UPDATE jobs SET state = 'READY', workflow_synced = true, "
+        "lease_owner = NULL, lease_expires_at = NULL WHERE job_id = %s",
+        (child_id,),
+    )
+    claimed_blocked = state.claim_next(
+        isolated_database.dsn, "v2-worker", job_contract_version=2
+    )
+    assert claimed_blocked is not None
+    assert claimed_blocked["job_id"] == blocked_child
+    assert claimed_blocked["state"] == "BLOCKED"

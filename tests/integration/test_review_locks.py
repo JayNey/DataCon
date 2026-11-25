@@ -3427,3 +3427,157 @@ def test_reapproval_tightens_budget_ledger_and_propose_rejects_below_spent(
         "AND status = 'pending'",
         (family_id,),
     )[0] == 0, "unapprovable envelope left a stuck pending row"
+
+
+def test_freeze_plan_rejects_unsupported_admission_predicate_version(
+    isolated_database,
+):
+    family_id, child_id = _freeze_seed(
+        isolated_database, _family_request("guided")
+    )
+    body = deepcopy(GUIDED_ENVELOPE_BODY)
+    body["admission_predicate_version"] = "admission-v999"
+    digest = jsonutil.digest_json(body)
+    plan = _v2_plan(family_id, round_no=None, envelope_digest=digest)
+    plan_digest = contracts.plan_digest(plan)
+
+    with pytest.raises(state.StateError, match="admission_predicate_version"):
+        state.freeze_plan(
+            isolated_database.dsn,
+            child_id,
+            generation=1,
+            plan=plan,
+            plan_digest=plan_digest,
+            summary={},
+            envelope=body,
+        )
+    _assert_no_freeze_rows(isolated_database, family_id, child_id)
+
+
+def test_charge_step_budget_concurrent_with_propose_envelope_and_record_review_no_deadlock(
+    isolated_database, tmp_path, monkeypatch
+):
+    monkeypatch.setenv("DATACON_EVIDENCE_ROOT", str(tmp_path / "evidence"))
+    seed = _seed_family(
+        isolated_database,
+        first_approval=True,
+        pending_envelope=None,
+        child_state="READY",
+    )
+    family_id = seed["family_id"]
+    child_id = seed["child_id"]
+    state.initialize_budget_ledger(
+        isolated_database.dsn,
+        family_id,
+        max_total_seconds=900,
+        max_fuzz_seconds=300,
+    )
+
+    for i in range(20):
+        next_total = 899 - i
+        next_fuzz = 299 - i
+        tightened = deepcopy(GUIDED_ENVELOPE_BODY)
+        tightened["max_total_seconds"] = next_total
+        tightened["max_fuzz_seconds"] = next_fuzz
+
+        # 1. Concurrent propose_envelope + charge_step_budget on the same family.
+        barrier = threading.Barrier(2)
+        results: dict[str, object] = {}
+        errors: list[BaseException] = []
+
+        def run_propose() -> None:
+            try:
+                barrier.wait(timeout=10)
+                results["propose"] = state.propose_envelope(
+                    isolated_database.dsn, family_id, tightened
+                )
+            except BaseException as error:  # pragma: no cover - surfaced below
+                errors.append(error)
+
+        def run_charge() -> None:
+            try:
+                barrier.wait(timeout=10)
+                results["charge"] = state.charge_step_budget(
+                    isolated_database.dsn,
+                    family_id=family_id,
+                    job_id=child_id,
+                    step_key=f"propose-race-{i}",
+                    attempt_no=1,
+                    charge_kind="general",
+                    elapsed_seconds=1,
+                )
+            except BaseException as error:  # pragma: no cover - surfaced below
+                errors.append(error)
+
+        threads = [
+            threading.Thread(target=run_propose),
+            threading.Thread(target=run_charge),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=30)
+
+        assert not errors, f"propose+charge iteration {i} failed: {errors!r}"
+        proposed = results["propose"]
+        assert isinstance(proposed, dict)
+        assert proposed["status"] == "pending"
+        assert results["charge"].status == "charged"  # type: ignore[attr-defined]
+        pending_digest = proposed["envelope_digest"]
+
+        # 2. Concurrent record_review(approve) + charge_step_budget on the same family.
+        barrier = threading.Barrier(2)
+        results = {}
+        errors = []
+
+        def run_approve() -> None:
+            try:
+                barrier.wait(timeout=10)
+                results["review"] = state.record_review(
+                    isolated_database.dsn,
+                    family_id,
+                    plan_digest=FIRST_PLAN_DIGEST,
+                    decision="approve",
+                    reviewer_id=REVIEWER_2,
+                    envelope_digest=pending_digest,
+                )
+            except BaseException as error:  # pragma: no cover - surfaced below
+                errors.append(error)
+
+        def run_charge_review() -> None:
+            try:
+                barrier.wait(timeout=10)
+                results["charge"] = state.charge_step_budget(
+                    isolated_database.dsn,
+                    family_id=family_id,
+                    job_id=child_id,
+                    step_key=f"review-race-{i}",
+                    attempt_no=1,
+                    charge_kind="general",
+                    elapsed_seconds=1,
+                )
+            except BaseException as error:  # pragma: no cover - surfaced below
+                errors.append(error)
+
+        threads = [
+            threading.Thread(target=run_approve),
+            threading.Thread(target=run_charge_review),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=30)
+
+        assert not errors, f"review+charge iteration {i} failed: {errors!r}"
+        assert results["review"].status == "applied"  # type: ignore[attr-defined]
+        assert results["charge"].status == "charged"  # type: ignore[attr-defined]
+        expected_spent = 2 * (i + 1)
+        summary = state.family_budget_summary(isolated_database.dsn, family_id)
+        assert summary == {
+            "max_total_seconds": next_total,
+            "max_fuzz_seconds": next_fuzz,
+            "spent_seconds": expected_spent,
+            "spent_fuzz_seconds": 0,
+            "remaining_seconds": next_total - expected_spent,
+            "remaining_fuzz_seconds": next_fuzz,
+        }

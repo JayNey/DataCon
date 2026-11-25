@@ -260,13 +260,14 @@ def test_predicate_denial_writes_round_admission_denied_event(isolated_database)
 
     assert not outcome.admitted
     assert outcome.status == "denied"
-    assert outcome.reason_code == "ADMISSION_DENIED"
+    assert outcome.reason_code == "BUDGET_EXHAUSTED"
     assert outcome.sub_reason == "ROUND_BEYOND_MAX_ROUNDS"
     assert outcome.admission is None
     assert _admissions(isolated_database, family_id, 9) == []
 
     events = _events(isolated_database, child_id)
     assert [event[0] for event in events] == ["round_admission_denied"]
+    assert events[0][1] == "BUDGET_EXHAUSTED"
     assert events[0][2]["sub_reason"] == "ROUND_BEYOND_MAX_ROUNDS"
 
 
@@ -872,3 +873,89 @@ def test_record_admission_validates_plan_round_no_and_candidate_seed(
     admitted = _admit(isolated_database, seed_ok)
     assert admitted.admitted
     assert len(_admissions(isolated_database, family_id_3, 2)) == 1
+
+
+def test_record_admission_rejects_non_mapping_budget_snapshot(isolated_database):
+    seed = _seed_family(isolated_database)
+    family_id, child_id, _ = seed
+
+    with pytest.raises(state.StateError):
+        _admit(
+            isolated_database,
+            seed,
+            budget_snapshot=[("remaining_total_seconds", 100)],  # type: ignore[arg-type]
+        )
+    assert _admissions(isolated_database, family_id, 2) == []
+    assert _events(isolated_database, child_id) == []
+
+
+def test_readmission_rejects_over_cap_budget_snapshot_without_dirty_event(
+    isolated_database,
+):
+    seed = _seed_family(isolated_database)
+    family_id, child_id, envelope = seed
+
+    first = _admit(isolated_database, seed)
+    assert first.admitted
+    assert [event[0] for event in _events(isolated_database, child_id)] == [
+        "round_admitted"
+    ]
+
+    for bad_snapshot in (
+        {
+            "remaining_total_seconds": envelope["max_total_seconds"] + 1,
+            "remaining_fuzz_seconds": 300,
+        },
+        {
+            "remaining_total_seconds": 900,
+            "remaining_fuzz_seconds": envelope["max_fuzz_seconds"] + 1,
+        },
+    ):
+        with pytest.raises(state.StateError, match="exceeds"):
+            _admit(isolated_database, seed, budget_snapshot=bad_snapshot)
+
+    assert len(_admissions(isolated_database, family_id, 2)) == 1
+    assert [event[0] for event in _events(isolated_database, child_id)] == [
+        "round_admitted"
+    ]
+
+
+def test_record_admission_validates_plan_family_id_and_parent_job_id_when_present(
+    isolated_database,
+):
+    other_id = str(uuid4())
+
+    for token, key, bad_value in (
+        ("1", "family_id", other_id),
+        ("2", "family_id", 123),
+        ("3", "parent_job_id", other_id),
+        ("4", "parent_job_id", 123),
+    ):
+        seed = _seed_family(isolated_database, approval_digest=_digest(token))
+        family_id, child_id, _ = seed
+        isolated_database.connection.execute(
+            "UPDATE plans SET plan = plan || %s::jsonb WHERE job_id = %s",
+            (jsonutil.canonical_bytes({key: bad_value}).decode("utf-8"), child_id),
+        )
+        with pytest.raises(state.StateError, match=key):
+            _admit(isolated_database, seed)
+        assert _admissions(isolated_database, family_id, 2) == []
+        assert _events(isolated_database, child_id) == []
+
+    good_seed = _seed_family(isolated_database, approval_digest=_digest("5"))
+    family_id, child_id, _ = good_seed
+    isolated_database.connection.execute(
+        "UPDATE plans SET plan = plan || %s::jsonb WHERE job_id = %s",
+        (
+            jsonutil.canonical_bytes(
+                {
+                    "family_id": str(family_id),
+                    "parent_job_id": str(family_id),
+                }
+            ).decode("utf-8"),
+            child_id,
+        ),
+    )
+    admitted = _admit(isolated_database, good_seed)
+    assert admitted.admitted
+    assert len(_admissions(isolated_database, family_id, 2)) == 1

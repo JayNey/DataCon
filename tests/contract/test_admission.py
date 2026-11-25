@@ -249,9 +249,11 @@ def test_round_beyond_max_rounds_is_denied():
     assert not outcome.admitted and not store.admissions, (
         "round beyond max_rounds was created"
     )
-    assert outcome.reason_code == "ADMISSION_DENIED"
+    assert outcome.reason_code == "BUDGET_EXHAUSTED"
+    assert outcome.sub_reason == "ROUND_BEYOND_MAX_ROUNDS"
     assert "record_admission" not in store.calls
     assert store.events[-1]["event_type"] == "round_admission_denied"
+    assert store.events[-1]["reason_code"] == "BUDGET_EXHAUSTED"
 
     # The bound is inclusive: the last allowed round still admits.
     last_allowed = _admit(
@@ -481,3 +483,35 @@ def test_admission_plan_seed_mismatch_is_denied():
     assert [event["event_type"] for event in store.events] == [
         "round_admission_denied"
     ]
+
+
+def test_policy_admit_round_rejects_non_mapping_snapshot_and_bad_existing_rounds():
+    with pytest.raises(state.StateError):
+        state.policy_admit_round(
+            clock=FakeClock(),
+            job_id=JOB_ID,
+            parent_job_id=FAMILY_ID,
+            envelope=_guided_envelope(),
+            parent_approval_digest=APPROVAL_DIGEST,
+            approval_chain_tail_digest=APPROVAL_DIGEST,
+            seed_digest=SEED_CORPUS_DIGEST,
+            round_no=2,
+            budget_snapshot=[("remaining_total_seconds", 100)],  # type: ignore[arg-type]
+            admission_id=ADMISSION_ID,
+        )
+
+    for bad_rounds in ([True], [False], [0], [-1], ["1"], [1.0]):
+        with pytest.raises(state.StateError):
+            state.policy_admit_round(
+                clock=FakeClock(),
+                job_id=JOB_ID,
+                parent_job_id=FAMILY_ID,
+                envelope=_guided_envelope(),
+                parent_approval_digest=APPROVAL_DIGEST,
+                approval_chain_tail_digest=APPROVAL_DIGEST,
+                seed_digest=SEED_CORPUS_DIGEST,
+                round_no=1,
+                budget_snapshot=_budget_snapshot(),
+                admission_id=ADMISSION_ID,
+                existing_rounds=bad_rounds,  # type: ignore[arg-type]
+            )

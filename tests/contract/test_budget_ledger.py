@@ -743,3 +743,225 @@ def test_postgres_charge_step_budget_ledger_is_canonical_json(budget_database):
     assert exhausted_at_gate.status == "budget_exhausted"
     assert exhausted_at_gate.ledger["family_id"] == str(family_id)
     assert jsonutil.canonical_bytes(exhausted_at_gate.ledger)
+
+
+@pytest.mark.postgres
+def test_postgres_budget_ledger_apis_return_consistent_json_safe_records(
+    budget_database,
+):
+    family_id = uuid.uuid4()
+    child_id = uuid.uuid4()
+    budget_database.connection.execute(
+        "INSERT INTO jobs (job_id, request, state, stage, submitted_at, "
+        "job_contract_version, family_id, job_kind, parent_job_id, round_no, "
+        "generation, workflow_synced) "
+        "VALUES (%s, %s, 'AGGREGATING', 'family', clock_timestamp(), 2, %s, "
+        "'family', NULL, NULL, 1, true)",
+        (family_id, Jsonb({"schema_version": 2}), family_id),
+    )
+    budget_database.connection.execute(
+        "INSERT INTO jobs (job_id, request, state, stage, submitted_at, "
+        "job_contract_version, family_id, job_kind, parent_job_id, round_no, "
+        "generation) "
+        "VALUES (%s, %s, 'RUNNING', 'build', clock_timestamp(), 2, %s, "
+        "'round', %s, 1, 1)",
+        (child_id, Jsonb({"schema_version": 2}), family_id, family_id),
+    )
+
+    assert state.load_budget_ledger(budget_database.dsn, uuid.uuid4()) is None
+
+    initialized = state.initialize_budget_ledger(
+        budget_database.dsn,
+        family_id,
+        max_total_seconds=100,
+        max_fuzz_seconds=60,
+    )
+    loaded = state.load_budget_ledger(budget_database.dsn, family_id)
+    assert loaded is not None
+    charged = state.charge_step_budget(
+        budget_database.dsn,
+        family_id=family_id,
+        job_id=child_id,
+        step_key="build",
+        attempt_no=1,
+        charge_kind="general",
+        elapsed_seconds=5,
+    )
+
+    for record in (initialized, loaded, charged.ledger):
+        assert type(record["family_id"]) is str
+        assert record["family_id"] == str(family_id)
+        assert type(record["updated_at"]) is str
+        assert jsonutil.canonical_bytes(record)
+    assert initialized["family_id"] == loaded["family_id"] == charged.ledger["family_id"]
+
+
+def test_budget_helpers_reject_non_mapping_bool_negative_and_cross_family_ledger():
+    for bad_ledger in (None, [("remaining_total_seconds", 10)], "bad"):
+        with pytest.raises(state.StateError):
+            state.budget_gate(bad_ledger)  # type: ignore[arg-type]
+        with pytest.raises(state.StateError):
+            state.compute_budget_charge(
+                bad_ledger,  # type: ignore[arg-type]
+                charge_kind="general",
+                elapsed_seconds=1,
+            )
+        with pytest.raises(state.StateError):
+            state.charge_budget_local(
+                bad_ledger,  # type: ignore[arg-type]
+                [],
+                family_id=FAMILY_ID,
+                job_id=JOB_ID,
+                step_key="build",
+                attempt_no=1,
+                charge_kind="general",
+                elapsed_seconds=1,
+            )
+
+    for bad_value in (True, False, -1):
+        with pytest.raises(state.StateError):
+            state.budget_gate(_ledger(remaining_total_seconds=bad_value))
+        with pytest.raises(state.StateError):
+            state.budget_gate(
+                _ledger(remaining_fuzz_seconds=bad_value), fuzz=True
+            )
+        with pytest.raises(state.StateError):
+            state.compute_budget_charge(
+                _ledger(remaining_total_seconds=bad_value),
+                charge_kind="general",
+                elapsed_seconds=1,
+            )
+        with pytest.raises(state.StateError):
+            state.compute_budget_charge(
+                _ledger(remaining_fuzz_seconds=bad_value),
+                charge_kind="fuzz",
+                elapsed_seconds=1,
+                elapsed_fuzz_seconds=1,
+            )
+
+    ledger = _ledger()
+    charges: list[dict] = []
+    other_family = str(uuid.uuid4())
+    with pytest.raises(state.StateError, match="different family"):
+        state.charge_budget_local(
+            ledger,
+            charges,
+            family_id=other_family,
+            job_id=JOB_ID,
+            step_key="build",
+            attempt_no=1,
+            charge_kind="general",
+            elapsed_seconds=5,
+        )
+    assert charges == []
+    assert ledger["remaining_total_seconds"] == 100
+
+
+@pytest.mark.postgres
+def test_postgres_charge_step_budget_rejects_awaiting_review_and_terminal_new_charges_but_recovers(
+    budget_database,
+):
+    family_id = uuid.uuid4()
+    child_id = uuid.uuid4()
+    budget_database.connection.execute(
+        "INSERT INTO jobs (job_id, request, state, stage, submitted_at, "
+        "job_contract_version, family_id, job_kind, parent_job_id, round_no, "
+        "generation, workflow_synced) "
+        "VALUES (%s, %s, 'AGGREGATING', 'family', clock_timestamp(), 2, %s, "
+        "'family', NULL, NULL, 1, true)",
+        (family_id, Jsonb({"schema_version": 2}), family_id),
+    )
+    budget_database.connection.execute(
+        "INSERT INTO jobs (job_id, request, state, stage, submitted_at, "
+        "job_contract_version, family_id, job_kind, parent_job_id, round_no, "
+        "generation) "
+        "VALUES (%s, %s, 'RUNNING', 'build', clock_timestamp(), 2, %s, "
+        "'round', %s, 1, 1)",
+        (child_id, Jsonb({"schema_version": 2}), family_id, family_id),
+    )
+    state.initialize_budget_ledger(
+        budget_database.dsn,
+        family_id,
+        max_total_seconds=100,
+        max_fuzz_seconds=60,
+    )
+
+    first = state.charge_step_budget(
+        budget_database.dsn,
+        family_id=family_id,
+        job_id=child_id,
+        step_key="build",
+        attempt_no=1,
+        charge_kind="general",
+        elapsed_seconds=10,
+    )
+    assert first.status == "charged"
+
+    budget_database.connection.execute(
+        "UPDATE jobs SET state = 'AWAITING_REVIEW' WHERE job_id = %s",
+        (child_id,),
+    )
+    with pytest.raises(state.StateError, match="AWAITING_REVIEW"):
+        state.charge_step_budget(
+            budget_database.dsn,
+            family_id=family_id,
+            job_id=child_id,
+            step_key="new-while-awaiting",
+            attempt_no=1,
+            charge_kind="general",
+            elapsed_seconds=5,
+        )
+
+    budget_database.connection.execute(
+        "UPDATE jobs SET state = 'BLOCKED' WHERE job_id = %s",
+        (child_id,),
+    )
+    with pytest.raises(state.StateError, match="BLOCKED"):
+        state.charge_step_budget(
+            budget_database.dsn,
+            family_id=family_id,
+            job_id=child_id,
+            step_key="new-while-blocked",
+            attempt_no=1,
+            charge_kind="general",
+            elapsed_seconds=5,
+        )
+    recovered_blocked = state.charge_step_budget(
+        budget_database.dsn,
+        family_id=family_id,
+        job_id=child_id,
+        step_key="build",
+        attempt_no=1,
+        charge_kind="general",
+        elapsed_seconds=10,
+    )
+    assert recovered_blocked.status == "recovered"
+    assert recovered_blocked.charge == first.charge
+
+    budget_database.connection.execute(
+        "UPDATE jobs SET state = 'COMPLETED', evidence_status = 'archived', "
+        "evidence_path = '/tmp/round.json', evidence_digest = %s "
+        "WHERE job_id = %s",
+        ("sha256:" + "a" * 64, child_id),
+    )
+    with pytest.raises(state.StateError, match="COMPLETED"):
+        state.charge_step_budget(
+            budget_database.dsn,
+            family_id=family_id,
+            job_id=child_id,
+            step_key="new-while-completed",
+            attempt_no=1,
+            charge_kind="general",
+            elapsed_seconds=5,
+        )
+    recovered_completed = state.charge_step_budget(
+        budget_database.dsn,
+        family_id=family_id,
+        job_id=child_id,
+        step_key="build",
+        attempt_no=1,
+        charge_kind="general",
+        elapsed_seconds=10,
+    )
+    assert recovered_completed.status == "recovered"
+    assert recovered_completed.charge == first.charge
