@@ -5,8 +5,9 @@ the control plane talks to an external analysis model through this one gate,
 which stays offline unless an endpoint allowlist is explicitly configured.
 Every outbound request carries only the allowed fields, is redacted by the
 fixed rule set - recursively, at every depth of an allowed field - and is
-scanned once more as a whole before it leaves, because dict keys are never
-rewritten. Every request produces the closed 11-field ``model_audit`` record
+scanned once more, string by string with the keys included, before it
+leaves, because dict keys are never rewritten. Every request produces the
+closed 11-field ``model_audit`` record
 (interface contract delta section 8) - offline runs included, with the
 provider pinned to ``offline`` - and nothing is sent before it is certain
 that this record can be written.
@@ -345,12 +346,14 @@ def redact(text: str) -> str:
 
 
 def _secret_hits(text: str) -> tuple[str, ...]:
-    """The secret rules that would alter ``text``, in rule order.
+    """The secret rules that would alter the string ``text``, in rule order.
 
-    This is the last line of defense over a whole serialized request body,
-    keys included: ``redact_value`` never rewrites a dict key, so a
-    secret-shaped key reaches this scan untouched. Only the secret rules
-    take part - a path or an email in a key is not a credential.
+    This is the last line of defense, applied to every string of a request
+    body one by one - dict keys included, because ``redact_value`` never
+    rewrites a key - and never to the body's serialized JSON: there, the
+    structure itself (``token": "``) reads like a key-value credential and
+    would block an ordinary key such as ``parse_token``. Only the secret
+    rules take part - a path or an email in a key is not a credential.
     """
     hits: list[str] = []
     scanned = text
@@ -362,13 +365,53 @@ def _secret_hits(text: str) -> tuple[str, ...]:
     return tuple(hits)
 
 
+def _body_secret_hits(value: Any) -> tuple[str, ...]:
+    """The secret rules that would alter any string of ``value``, keys included."""
+    hits: list[str] = []
+    if isinstance(value, str):
+        hits.extend(_secret_hits(value))
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            hits.extend(_secret_hits(key))
+            hits.extend(_body_secret_hits(item))
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            hits.extend(_body_secret_hits(item))
+    return tuple(dict.fromkeys(hits))
+
+
+# A dict key that ends in a credential word, whatever precedes it: the
+# value under such a key is a credential until shown otherwise, whatever
+# its type (``max_token: 4096`` is masked like ``auth_token: "..."``).
+_CREDENTIAL_KEY = re.compile(
+    r"(?i)(?:password|passwd|pwd|passphrase|secret|token|api[-_]?key"
+    r"|access[-_]?key|private[-_]?key)$"
+)
+
+
+def _is_credential_key(key: str) -> bool:
+    """Whether ``key`` ends in a credential word, whatever precedes it."""
+    return _CREDENTIAL_KEY.search(key) is not None
+
+
+def _carries_a_value(value: Any) -> bool:
+    """Whether ``value`` has content a credential could hide in."""
+    if value is None or value == "":
+        return False
+    return not (isinstance(value, (list, tuple, dict)) and len(value) == 0)
+
+
 def redact_value(value: Any) -> Any:
     """Apply ``redact`` to ``value`` recursively; containers keep their type.
 
     A string is redacted, a dict keeps its keys as written (they must be
     non-empty strings) with every value redacted, a list or a tuple redacts
-    each item and stays a list or a tuple. ``None``, a bool, an int and a
-    finite float pass through untouched.
+    each item and stays a list or a tuple. Under a key that ends in a
+    credential word (``auth_token``, ``DB_PASSWORD``) the value is replaced
+    by the placeholder, whatever its type: a credential split into a key
+    and its value is still a credential. An empty value - null, an empty
+    string, an empty container - stays as it is. ``None``, a bool, an int
+    and a finite float pass through untouched.
 
     Anything else is refused with ``FIELD_TYPE_REJECTED``: bytes, a set, an
     object no JSON encoder knows, a non-finite float, a non-string or empty
@@ -385,7 +428,10 @@ def redact_value(value: Any) -> Any:
                     f" not {type(key).__name__}",
                     sub_reason="FIELD_TYPE_REJECTED",
                 )
-            redacted[key] = redact_value(item)
+            if _is_credential_key(key) and _carries_a_value(item):
+                redacted[key] = _REDACTED
+            else:
+                redacted[key] = redact_value(item)
         return redacted
     if isinstance(value, list):
         return [redact_value(item) for item in value]
@@ -1008,11 +1054,12 @@ class ModelOutlet:
 
         The body is ``{"stage", "fields"}`` with only the allowed fields,
         each redacted at every depth and carried as JSON carries it. It is
-        then serialized to the canonical JSON text the digest is taken over
-        and that text is scanned once more with the secret rules: dict keys
-        are never rewritten, so this is the only place a secret-shaped key is
-        caught.
-        """
+        then scanned once more, string by string and keys included, with
+        the secret rules: ``redact_value`` never rewrites a dict key, so
+        this is the only place a secret-shaped key is caught. The scan
+        does not run over the serialized JSON - its structure would read
+        like a credential - but over the body's own strings.
+    """
         if not isinstance(fields, Mapping):
             raise OutletError(
                 "model outlet fields must be a mapping of field name to"
@@ -1032,7 +1079,11 @@ class ModelOutlet:
                     sub_reason="FIELD_TYPE_REJECTED",
                 ) from error
         body = {"stage": stage, "fields": filtered}
-        hits = _secret_hits(_canonical_text(body))
+        # The request digest is taken over the canonical JSON of the body:
+        # a value the strict encoder cannot carry is refused here, as a
+        # field type problem, before the digest is attempted.
+        _canonical_text(body)
+        hits = _body_secret_hits(body)
         if hits:
             raise OutletError(
                 "the request body still carries a secret shape after"

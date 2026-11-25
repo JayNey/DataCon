@@ -1381,3 +1381,80 @@ def test_model_finding_must_be_hypothesis():
     # accepts the same fact payload read-only.
     legacy = AgentOutput.from_mapping(_model_payload("fact"))
     assert legacy.findings[0].kind == "fact"
+
+
+def test_ordinary_key_names_do_not_block_a_structured_field():
+
+    # A symbol or setting whose name merely ends in a credential word is
+    # not a credential. Scanning the serialized JSON used to read the
+    # JSON structure around such a key - ``token": "`` - as a key-value
+    # credential and block the whole request.
+    transport = RecordingTransport(responses=[VALID_RESPONSE])
+    outlet = _online_outlet(transport)
+    value = {
+        "symbols": {"parse_token": "int parse_token(char *s);"},
+        "settings": {"password_policy": "minlen 12", "token_limit": 4096},
+    }
+    result = outlet.request(
+        stage="hypothesis_aggregator",
+        fields={"advisory_excerpt": value},
+        endpoint=ALLOWED_ENDPOINT,
+    )
+
+    assert result["outcome"] == "ok", result
+    assert len(transport.calls) == 1
+    # The keys survive as written; only the value under a key that ends in
+    # a credential word is masked, fail closed.
+    sent = transport.calls[0][1]["fields"]["advisory_excerpt"]
+    assert sent["symbols"] == {"parse_token": "[REDACTED]"}
+    assert sent["settings"] == {"password_policy": "minlen 12", "token_limit": 4096}
+
+
+def test_credential_named_keys_have_their_value_masked():
+
+    # A credential split into a key and its value is still a credential.
+    passphrase = "correct " + "horse " + "battery " + "staple"
+    for label, value, expected in (
+        ("token", {"auth_token": "abc123def456"}, {"auth_token": "[REDACTED]"}),
+        ("passphrase with spaces", {"password": passphrase}, {"password": "[REDACTED]"}),
+        ("numeric token", {"token": 12345678}, {"token": "[REDACTED]"}),
+        ("nested container", {"secret": ["a", "b"]}, {"secret": "[REDACTED]"}),
+        ("upper case and underscore", {"DB_PWD": "x" * 12}, {"DB_PWD": "[REDACTED]"}),
+        ("empty string", {"token": ""}, {"token": ""}),
+        ("null", {"password": None}, {"password": None}),
+        ("empty list", {"pwd": []}, {"pwd": []}),
+    ):
+        transport = RecordingTransport(responses=[VALID_RESPONSE])
+        outlet = _online_outlet(transport)
+        result = outlet.request(
+            stage="hypothesis_aggregator",
+            fields={"advisory_excerpt": value},
+            endpoint=ALLOWED_ENDPOINT,
+        )
+        assert result["outcome"] == "ok", (label, result)
+        sent = transport.calls[0][1]["fields"]["advisory_excerpt"]
+        assert sent == expected, label
+
+
+def test_outlet_rejects_values_the_strict_encoder_cannot_carry():
+    from datacon.tools.model_outlet import OutletError
+
+    # The request digest is taken over the canonical JSON of the body. A
+    # value that encoder cannot carry - a lone surrogate from a
+    # permissively decoded log, an integer beyond the conversion limit - is
+    # a field type problem, not an encoder exception escaping the outlet.
+    for label, value in (
+        ("lone surrogate", "log line \ud800 truncated"),
+        ("integer beyond the conversion limit", 10**5000),
+        ("nested", {"lines": ["ok", "bad \udcff"]}),
+    ):
+        transport = RecordingTransport(responses=[VALID_RESPONSE])
+        outlet = _online_outlet(transport)
+        with pytest.raises(OutletError) as excinfo:
+            outlet.request(
+                stage="hypothesis_aggregator",
+                fields={"advisory_excerpt": value},
+                endpoint=ALLOWED_ENDPOINT,
+            )
+        assert excinfo.value.sub_reason == "FIELD_TYPE_REJECTED", label
+        assert transport.calls == [], label
