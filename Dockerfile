@@ -47,13 +47,15 @@ WORKDIR /app
 # on the host side of this image, and it dragged in 71 linux-libc-dev findings.
 # `git` stays: the worker clones operator-provided local bare repositories.
 #
-# `zlib1g` is requested explicitly because the pinned base digest predates the
-# 1:1.3.dfsg+really1.3.1-1+deb13u1 security update. It is already installed, so
-# this only upgrades it to the fixed copy from trixie-security instead of
-# waiving CVE-2026-85091 (gz_vacate heap overflow).
+# `zlib1g` and `libzstd1` are requested explicitly because the pinned base
+# digest predates their trixie-security updates (`zlib1g`
+# 1:1.3.dfsg+really1.3.1-1+deb13u1 for CVE-2026-85091 / gz_vacate heap overflow,
+# and `libzstd1` 1.5.7+dfsg-1+deb13u1 for CVE-2026-124851). Both are already
+# installed, so this only upgrades them to the fixed copies from
+# trixie-security instead of waiving either vulnerability.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        ca-certificates docker-cli git zlib1g \
+        ca-certificates docker-cli git zlib1g libzstd1 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /app/.venv /app/.venv
