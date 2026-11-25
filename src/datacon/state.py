@@ -284,12 +284,23 @@ def claim_next(
                   OR (job_kind IN ('campaign', 'round')
                       AND (
                           state = 'BLOCKED'
-                          OR EXISTS (
-                              SELECT 1 FROM jobs parent_job
-                              WHERE parent_job.job_id = jobs.parent_job_id
-                                AND parent_job.job_contract_version = 2
-                                AND parent_job.job_kind = 'family'
-                                AND parent_job.state = 'AGGREGATING'
+                          OR (
+                              EXISTS (
+                                  SELECT 1 FROM jobs parent_job
+                                  WHERE parent_job.job_id = jobs.parent_job_id
+                                    AND parent_job.job_contract_version = 2
+                                    AND parent_job.job_kind = 'family'
+                                    AND parent_job.state = 'AGGREGATING'
+                              )
+                              AND NOT (
+                                  state = 'READY'
+                                  AND workflow_synced = true
+                                  AND EXISTS (
+                                      SELECT 1 FROM family_envelopes pending_env
+                                      WHERE pending_env.family_id = jobs.parent_job_id
+                                        AND pending_env.status = 'pending'
+                                  )
+                              )
                           )
                       ))
               )"""
@@ -622,6 +633,14 @@ def freeze_plan(
                 normalized_envelope = _validate_envelope(dict(envelope))
             except ValueError as error:
                 raise StateError(f"envelope is invalid: {error}") from error
+            if (
+                normalized_envelope["admission_predicate_version"]
+                not in SUPPORTED_ADMISSION_PREDICATE_VERSIONS
+            ):
+                raise StateError(
+                    "unsupported admission_predicate_version: "
+                    f"{normalized_envelope['admission_predicate_version']}"
+                )
             if jsonutil.digest_json(normalized_envelope) != plan.get(
                 "envelope_digest"
             ):
@@ -2173,6 +2192,8 @@ def policy_admit_round(
     except ValueError as error:
         raise StateError(str(error)) from error
 
+    if not isinstance(budget_snapshot, Mapping):
+        raise StateError("budget_snapshot must be a JSON object")
     try:
         budget_snapshot = dict(budget_snapshot)
         budget_snapshot_digest = jsonutil.digest_json(budget_snapshot)
@@ -2213,9 +2234,22 @@ def policy_admit_round(
 
     if type(recomputable) is not bool:
         raise StateError("recomputable must be a boolean")
-    if type(existing_rounds) not in (tuple, list, set, frozenset):
-        existing_rounds = tuple(existing_rounds)
-    admitted_rounds = set(existing_rounds)
+    if isinstance(existing_rounds, (str, bytes, Mapping)):
+        raise StateError(
+            "existing_rounds must be a collection of positive integers"
+        )
+    try:
+        existing_rounds_tuple = tuple(existing_rounds)
+    except TypeError as error:
+        raise StateError(
+            "existing_rounds must be a collection of positive integers"
+        ) from error
+    for item in existing_rounds_tuple:
+        if type(item) is not int or item < 1:
+            raise StateError(
+                "existing_rounds items must be positive integers"
+            )
+    admitted_rounds = set(existing_rounds_tuple)
 
     predicate_version = normalized_envelope["admission_predicate_version"]
     reason_code: str | None = None
@@ -2264,7 +2298,7 @@ def policy_admit_round(
         reason_code = "ADMISSION_DENIED"
         sub_reason = "INVALID_ROUND_NO"
     elif round_no > normalized_envelope["max_rounds"]:
-        reason_code = "ADMISSION_DENIED"
+        reason_code = BUDGET_EXHAUSTED
         sub_reason = "ROUND_BEYOND_MAX_ROUNDS"
     elif round_no in admitted_rounds:
         reason_code = "ADMISSION_DENIED"
@@ -2475,6 +2509,8 @@ def record_admission(
             raise StateError(
                 f"experiment must be canonical JSON: {error}"
             ) from error
+    if not isinstance(budget_snapshot, Mapping):
+        raise StateError("budget_snapshot must be a JSON object")
     try:
         budget_snapshot = dict(budget_snapshot)
         budget_snapshot_digest = jsonutil.digest_json(budget_snapshot)
@@ -2487,6 +2523,18 @@ def record_admission(
     snapshot_remaining_total, snapshot_remaining_fuzz = (
         _validate_budget_snapshot(budget_snapshot)
     )
+    if snapshot_remaining_total > normalized_envelope["max_total_seconds"]:
+        raise StateError(
+            "budget_snapshot remaining total exceeds envelope "
+            "max_total_seconds"
+        )
+    if (
+        snapshot_remaining_fuzz is not None
+        and snapshot_remaining_fuzz > normalized_envelope["max_fuzz_seconds"]
+    ):
+        raise StateError(
+            "budget_snapshot remaining fuzz exceeds envelope max_fuzz_seconds"
+        )
 
     supporting_bundle_digest = (
         None if recomputable else campaign_bundle_digest
@@ -2559,6 +2607,20 @@ def record_admission(
             ):
                 raise StateError(
                     "admission plan round_no does not match round_no"
+                )
+            if "family_id" in plan_body and (
+                not isinstance(plan_body["family_id"], str)
+                or plan_body["family_id"] != str(family_id)
+            ):
+                raise StateError(
+                    "admission plan family_id does not match family_id"
+                )
+            if "parent_job_id" in plan_body and (
+                not isinstance(plan_body["parent_job_id"], str)
+                or plan_body["parent_job_id"] != str(family_id)
+            ):
+                raise StateError(
+                    "admission plan parent_job_id does not match family_id"
                 )
             plan_envelope_digest = plan_body.get("envelope_digest")
             plan_parent_approval_digest = plan_body.get(
@@ -2835,10 +2897,20 @@ def budget_gate(ledger: Mapping[str, Any], *, fuzz: bool = False) -> BudgetDecis
     ``general`` needs one second of total budget. ``fuzz`` additionally needs
     one second of fuzz sub-budget, so its ceiling is the smaller of the two.
     """
-    remaining_total = max(0, int(ledger["remaining_total_seconds"]))
+    if not isinstance(ledger, Mapping):
+        raise StateError("budget ledger must be a mapping")
+    remaining_total = _require_budget_int(
+        ledger, "remaining_total_seconds", "remaining_total_seconds"
+    )
+    if remaining_total < 0:
+        raise StateError("remaining_total_seconds must be non-negative")
     available = remaining_total
     if fuzz:
-        remaining_fuzz = max(0, int(ledger["remaining_fuzz_seconds"]))
+        remaining_fuzz = _require_budget_int(
+            ledger, "remaining_fuzz_seconds", "remaining_fuzz_seconds"
+        )
+        if remaining_fuzz < 0:
+            raise StateError("remaining_fuzz_seconds must be non-negative")
         available = min(remaining_total, remaining_fuzz)
     if available < 1:
         return BudgetDecision(False, BUDGET_EXHAUSTED, 0)
@@ -2894,14 +2966,24 @@ def compute_budget_charge(
     charged_fuzz), remaining_total)`` so ``0 < fuzz_seconds <= seconds``
     without overdrawing either balance even when ``elapsed == 0``.
     """
+    if not isinstance(ledger, Mapping):
+        raise StateError("budget ledger must be a mapping")
     if charge_kind not in ("general", "fuzz"):
         raise StateError("charge_kind must be general or fuzz")
     elapsed = _ceil_seconds(elapsed_seconds, "elapsed_seconds")
     fuzz_elapsed = _ceil_seconds(elapsed_fuzz_seconds, "elapsed_fuzz_seconds")
-    remaining_total = max(0, int(ledger["remaining_total_seconds"]))
+    remaining_total = _require_budget_int(
+        ledger, "remaining_total_seconds", "remaining_total_seconds"
+    )
+    if remaining_total < 0:
+        raise StateError("remaining_total_seconds must be non-negative")
     if charge_kind == "general":
         return min(elapsed, remaining_total), 0
-    remaining_fuzz = max(0, int(ledger["remaining_fuzz_seconds"]))
+    remaining_fuzz = _require_budget_int(
+        ledger, "remaining_fuzz_seconds", "remaining_fuzz_seconds"
+    )
+    if remaining_fuzz < 0:
+        raise StateError("remaining_fuzz_seconds must be non-negative")
     charged_fuzz = min(max(1, fuzz_elapsed), remaining_fuzz, remaining_total)
     charged = min(max(elapsed, charged_fuzz), remaining_total)
     return charged, charged_fuzz
@@ -2925,6 +3007,8 @@ def charge_budget_local(
     ``UPDATE ... WHERE remaining >= charged`` decision so recovery, retry and
     exhaustion semantics stay identical without a database.
     """
+    if not isinstance(ledger, Mapping):
+        raise StateError("budget ledger must be a mapping")
     charge_kind, attempt_no, elapsed, fuzz_elapsed = _validate_charge_input(
         step_key=step_key,
         attempt_no=attempt_no,
@@ -2933,6 +3017,8 @@ def charge_budget_local(
         elapsed_fuzz_seconds=elapsed_fuzz_seconds,
     )
     family_text = str(family_id)
+    if "family_id" in ledger and str(ledger["family_id"]) != family_text:
+        raise StateError("budget ledger belongs to a different family")
     job_text = str(job_id)
     for charge in charges:
         if (
@@ -2964,9 +3050,17 @@ def charge_budget_local(
         return BudgetChargeOutcome(
             "budget_exhausted", BUDGET_EXHAUSTED, None, dict(ledger)
         )
-    if int(ledger["remaining_total_seconds"]) < charged or (
-        int(ledger["remaining_fuzz_seconds"]) < charged_fuzz
-    ):
+    remaining_total = _require_budget_int(
+        ledger, "remaining_total_seconds", "remaining_total_seconds"
+    )
+    if remaining_total < 0:
+        raise StateError("remaining_total_seconds must be non-negative")
+    remaining_fuzz = _require_budget_int(
+        ledger, "remaining_fuzz_seconds", "remaining_fuzz_seconds"
+    )
+    if remaining_fuzz < 0:
+        raise StateError("remaining_fuzz_seconds must be non-negative")
+    if remaining_total < charged or remaining_fuzz < charged_fuzz:
         return BudgetChargeOutcome(
             "budget_exhausted", BUDGET_EXHAUSTED, None, dict(ledger)
         )
@@ -3226,7 +3320,7 @@ def _initialize_budget_ledger_in_tx(
                 f"max_total_seconds={row['max_total_seconds']}, "
                 f"max_fuzz_seconds={row['max_fuzz_seconds']}"
             )
-    return dict(row)
+    return _budget_ledger_record(row)
 
 
 def _sync_budget_ledger_on_approval_in_tx(
@@ -3276,7 +3370,7 @@ def _sync_budget_ledger_on_approval_in_tx(
         ),
     ).fetchone()
     if row is not None:
-        return dict(row)
+        return _budget_ledger_record(row)
 
     existing = connection.execute(
         "SELECT " + _BUDGET_LEDGER_COLUMNS +
@@ -3311,7 +3405,7 @@ def _sync_budget_ledger_on_approval_in_tx(
         old_max_total == max_total_seconds
         and old_max_fuzz == max_fuzz_seconds
     ):
-        return dict(existing)
+        return _budget_ledger_record(existing)
 
     if max_total_seconds < spent_total:
         raise StateError(
@@ -3344,7 +3438,7 @@ def _sync_budget_ledger_on_approval_in_tx(
     ).fetchone()
     if updated is None:
         raise StateError("budget ledger could not be updated on re-approval")
-    return dict(updated)
+    return _budget_ledger_record(updated)
 
 
 def initialize_budget_ledger(
@@ -3378,7 +3472,7 @@ def load_budget_ledger(
             " FROM budget_ledger WHERE family_id = %s",
             (family_id,),
         ).fetchone()
-    return dict(row) if row is not None else None
+    return _budget_ledger_record(row) if row is not None else None
 
 
 def charge_step_budget(
@@ -3414,9 +3508,19 @@ def charge_step_budget(
 
     with _connect(dsn) as connection:
         with connection.transaction():
+            # Follow the global lock order jobs(family) -> jobs(child) ->
+            # budget_ledger(family). INSERT INTO budget_charges implicitly
+            # takes FOR KEY SHARE on both jobs(family_id) and jobs(job_id) via
+            # its foreign keys, so acquiring FOR KEY SHARE before locking
+            # budget_ledger FOR UPDATE prevents AB-BA deadlocks with
+            # propose_envelope / record_review / record_admission.
+            connection.execute(
+                "SELECT 1 FROM jobs WHERE job_id = %s FOR KEY SHARE",
+                (family_id,),
+            ).fetchone()
             job_row = connection.execute(
-                "SELECT job_id, job_contract_version, family_id, job_kind "
-                "FROM jobs WHERE job_id = %s",
+                "SELECT job_id, job_contract_version, family_id, job_kind, "
+                "state FROM jobs WHERE job_id = %s FOR KEY SHARE",
                 (job_id,),
             ).fetchone()
             if job_row is None:
@@ -3457,6 +3561,14 @@ def charge_step_budget(
                     None,
                     _budget_charge_record(existing),
                     _budget_ledger_record(ledger),
+                )
+            if (
+                job_row["state"] == "AWAITING_REVIEW"
+                or job_row["state"] in _TERMINAL_JOB_STATES
+            ):
+                raise StateError(
+                    "cannot charge budget while job is in state "
+                    f"{job_row['state']}"
                 )
 
             gate = budget_gate(ledger, fuzz=charge_kind == "fuzz")
