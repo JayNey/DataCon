@@ -15,27 +15,48 @@ from pathlib import Path
 
 import pytest
 
+from datacon import jsonutil
 
-def _annotation_document():
+_SINGLE_CASE_SOURCE = "manual:CVE-2099-0001 upstream patch annotations"
+_QUALITY_SOURCE = "manual:synthetic T14 quality annotations"
+
+
+def _annotation_version(samples) -> str:
+    """The b04-annotations-v1 label that binds ``samples`` by digest.
+
+    Spelled out from the test side: a frozen set carries exactly
+    ``b04-annotations-v1:`` plus the canonical digest of its samples, and it
+    is the loader under test that has to check this binding.
+    """
+    return "b04-annotations-v1:" + jsonutil.digest_json(samples)
+
+
+def _annotation_sample():
     return {
-        "annotation_version": "b04-annotations-v1:sha256:" + "0" * 64,
-        "source": "manual:CVE-2099-0001 upstream patch annotations",
-        "samples": [
-            {
-                "target_symbol": "parse_token",
-                "target_path": "src/parser.c",
-                "target_line_start": 40,
-                "target_line_end": 45,
-                "accepted_signature": {
-                    "error": "heap-buffer-overflow",
-                    "function": "parse_token",
-                    "source": "parser.c",
-                    "operation": "WRITE",
-                    "access_size": 1,
-                },
-                "input_family": "length_boundary",
-            }
-        ],
+        "case_id": "cve-2099-0001",
+        "target_symbol": "parse_token",
+        "target_path": "src/parser.c",
+        "target_line_start": 40,
+        "target_line_end": 45,
+        "accepted_signature": {
+            "error": "heap-buffer-overflow",
+            "function": "parse_token",
+            "source": "parser.c",
+            "operation": "WRITE",
+            "access_size": 1,
+        },
+        "input_family": "length_boundary",
+    }
+
+
+def _annotation_document(samples=None, source=_SINGLE_CASE_SOURCE):
+    """A frozen annotation document; its version binds ``samples`` by digest."""
+    if samples is None:
+        samples = [_annotation_sample()]
+    return {
+        "annotation_version": _annotation_version(samples),
+        "source": source,
+        "samples": samples,
     }
 
 
@@ -90,10 +111,8 @@ _A_FACE_GATE_METRICS = (
 
 def _quality_annotation_document():
     """A synthetic three-case annotation set (b04-annotations-v1 format)."""
-    return {
-        "annotation_version": "b04-annotations-v1:sha256:" + "3" * 64,
-        "source": "manual:synthetic T14 quality annotations",
-        "samples": [
+    return _annotation_document(
+        samples=[
             {
                 "case_id": "cve-2099-0001",
                 "target_symbol": "parse_token",
@@ -136,7 +155,8 @@ def _quality_annotation_document():
                 "input_family": "lifecycle",
             },
         ],
-    }
+        source=_QUALITY_SOURCE,
+    )
 
 
 def _quality_hypotheses():
@@ -296,3 +316,234 @@ def test_b04_agent_scenarios_remain_release_gate(tmp_path):
     assert h_report["annotation_version"] == document["annotation_version"]
     for key in _A_FACE_GATE_METRICS:
         assert key not in h_report
+
+
+# --- T14 self-review hardening: annotation set validation and digest binding ---
+
+_MISSING = object()
+
+
+def _document_for(sample) -> dict:
+    """A document carrying ``sample`` under the version that correctly binds it."""
+    return _annotation_document(samples=[sample])
+
+
+def _broken(**changes) -> dict:
+    """A document whose one sample breaks a single rule.
+
+    Each named field is set to the given value, or removed when the value is
+    ``_MISSING``. The document still carries the version that correctly binds
+    its samples, so the broken sample is its only defect.
+    """
+    sample = _annotation_sample()
+    for field, value in changes.items():
+        if value is _MISSING:
+            sample.pop(field)
+        else:
+            sample[field] = value
+    return _document_for(sample)
+
+
+def _malformed_annotation_files():
+    signature = _annotation_sample()["accepted_signature"]
+    return (
+        # Not an object, or no sample at all.
+        pytest.param(_document_for("parse_token"), id="sample-not-an-object"),
+        pytest.param(_annotation_document(samples=[]), id="samples-empty-list"),
+        # case_id must be a non-empty string.
+        pytest.param(_broken(case_id=_MISSING), id="case-id-missing"),
+        pytest.param(_broken(case_id=""), id="case-id-empty"),
+        pytest.param(_broken(case_id=20990001), id="case-id-not-string"),
+        pytest.param(_broken(case_id="c" * 201), id="case-id-too-long"),
+        pytest.param(_broken(case_id="cve\x9b"), id="case-id-has-control-character"),
+        # target_line_start / target_line_end: integers (not booleans),
+        # 1 <= start <= end. In the end-is-bool row the range still looks
+        # ordered (1 <= True as integers), so only the type of the end can
+        # reject it.
+        pytest.param(_broken(target_line_start=46), id="line-start-after-end"),
+        pytest.param(_broken(target_line_start=_MISSING), id="line-start-missing"),
+        pytest.param(_broken(target_line_start=0), id="line-start-below-one"),
+        pytest.param(_broken(target_line_start=True), id="line-start-is-bool"),
+        pytest.param(
+            _broken(target_line_start=1, target_line_end=True), id="line-end-is-bool"
+        ),
+        pytest.param(_broken(target_line_start=40.0), id="line-start-is-float"),
+        pytest.param(_broken(target_line_end=2**31), id="line-above-bound"),
+        # accepted_signature goes through the ExperimentSpec signature rules.
+        pytest.param(
+            _broken(
+                accepted_signature={
+                    "error": "heap-buffer-overflow",
+                    "function": "parse_token",
+                }
+            ),
+            id="signature-missing-required",
+        ),
+        pytest.param(
+            _broken(accepted_signature=signature | {"shell": "rm -rf /"}),
+            id="signature-unknown-key",
+        ),
+        pytest.param(
+            _broken(accepted_signature=signature | {"access_size": True}),
+            id="signature-access-size-is-bool",
+        ),
+        pytest.param(
+            _broken(accepted_signature=signature | {"operation": "EXEC"}),
+            id="signature-operation-not-read-or-write",
+        ),
+        pytest.param(
+            _broken(accepted_signature=signature | {"access_size": 2**31}),
+            id="signature-access-size-above-bound",
+        ),
+        pytest.param(
+            _broken(
+                accepted_signature=signature | {"error": "heap-buffer-overflow\x9b"}
+            ),
+            id="signature-error-has-control-character",
+        ),
+        # target_path, target_symbol and input_family follow the
+        # ExperimentSpec rules for the fields of the same name.
+        pytest.param(_broken(target_path="/etc/passwd"), id="target-path-absolute"),
+        pytest.param(
+            _broken(target_path="../../secrets.env"), id="target-path-traversing"
+        ),
+        pytest.param(
+            _broken(target_symbol="parse token"), id="target-symbol-has-whitespace"
+        ),
+        pytest.param(
+            _broken(input_family="Length-Boundary"), id="input-family-not-identifier"
+        ),
+        # Files that are not JSON at all.
+        pytest.param(b'{"annotation_version": ', id="file-not-json"),
+        pytest.param(b"\xff\xfe\x00annotations", id="file-not-utf8"),
+    )
+
+
+def _write_annotation_file(tmp_path: Path, content, name: str) -> Path:
+    """Write an annotation file: a document as JSON, raw bytes verbatim."""
+    if isinstance(content, dict):
+        return _write_annotation_set(tmp_path, content, name)
+    path = tmp_path / name
+    path.write_bytes(content)
+    return path
+
+
+@pytest.mark.parametrize("content", _malformed_annotation_files())
+def test_annotation_set_rejects_malformed_samples(tmp_path, content):
+    from datacon.b04_eval import B04GateError, load_annotation_set
+
+    path = _write_annotation_file(tmp_path, content, "annotations-malformed.json")
+
+    # Whatever is wrong with the file, the loader reports it as the one
+    # annotation reason code instead of leaking a decoder or attribute error.
+    with pytest.raises(B04GateError) as excinfo:
+        load_annotation_set(path)
+    assert excinfo.value.reason_code == "ANNOTATION_INVALID"
+
+
+def test_annotation_version_binds_the_annotation_digest(tmp_path):
+    from datacon import jsonutil
+    from datacon.b04_eval import (
+        B04GateError,
+        evaluate_hypothesis_quality,
+        load_annotation_set,
+    )
+
+    samples = _quality_annotation_document()["samples"]
+    digest = jsonutil.digest_json(samples)
+    hex_digest = digest.removeprefix("sha256:")
+
+    def labelled(version: str) -> dict:
+        """The quality annotation set under the given version label."""
+        return _quality_annotation_document() | {"annotation_version": version}
+
+    def write(document: dict) -> Path:
+        return _write_annotation_set(tmp_path, document, "annotations-version.json")
+
+    def assert_rejected(document: dict) -> None:
+        with pytest.raises(B04GateError) as excinfo:
+            load_annotation_set(write(document))
+        assert excinfo.value.reason_code == "ANNOTATION_INVALID"
+
+    # A label outside the b04-annotations-v1 format is no annotation version,
+    # even when it carries the right digest: another major version, upper-case
+    # or shortened hex, a missing sha256 prefix, a missing label.
+    for version in (
+        "v1",
+        "b04-annotations-v2:sha256:" + hex_digest,
+        "b04-annotations-v1:sha256:" + hex_digest.upper(),
+        "b04-annotations-v1:sha256:" + hex_digest[:-1],
+        "b04-annotations-v1:" + hex_digest,
+        "sha256:" + hex_digest,
+    ):
+        assert_rejected(labelled(version))
+
+    # The right format does not suffice: the digest has to belong to the
+    # samples actually in the file.
+    assert_rejected(labelled("b04-annotations-v1:sha256:" + "0" * 64))
+
+    # A frozen version does not cover a changed annotation set: editing one
+    # sample, or adding one, without raising the version is rejected. Both
+    # changed sets are valid annotation sets on their own.
+    edited = _quality_annotation_document()
+    edited["samples"][1] = edited["samples"][1] | {"target_line_start": 11}
+    assert_rejected(edited)
+
+    extended = _quality_annotation_document()
+    extended["samples"].append(
+        _annotation_sample()
+        | {
+            "target_symbol": "parse_header",
+            "target_line_start": 20,
+            "target_line_end": 24,
+        }
+    )
+    assert_rejected(extended)
+
+    # The version built from the samples' own digest loads and passes through
+    # unchanged.
+    version = "b04-annotations-v1:" + jsonutil.digest_json(samples)
+    loaded = load_annotation_set(write(labelled(version)))
+    assert loaded["annotation_version"] == version
+    assert loaded["samples"] == samples
+
+    # case_count counts distinct case_id values: three annotations over two
+    # cases, under the version that binds them, report three annotations and
+    # two cases.
+    two_cases = _quality_annotation_document()["samples"]
+    two_cases[1] = two_cases[1] | {"case_id": two_cases[0]["case_id"]}
+    report = evaluate_hypothesis_quality(
+        write(_annotation_document(samples=two_cases, source=_QUALITY_SOURCE)),
+        hypotheses=(),
+    )
+    assert report["annotation_count"] == 3
+    assert report["case_count"] == 2
+    assert report["annotation_version"] == (
+        "b04-annotations-v1:" + jsonutil.digest_json(two_cases)
+    )
+
+    # annotation_set_version hands annotation authors exactly the label the
+    # loader accepts for these samples.
+    from datacon.b04_eval import annotation_set_version
+
+    assert annotation_set_version(samples) == "b04-annotations-v1:" + digest
+
+
+def test_annotation_version_requires_the_canonical_separator(tmp_path):
+    from datacon.b04_eval import B04GateError, load_annotation_set
+
+    digest = jsonutil.digest_json(_quality_annotation_document()["samples"])
+    # One annotation set, one label: the digest follows the label behind a
+    # single colon. Another separator, none at all, or a trailing newline
+    # is not the version of anything.
+    for version in (
+        "b04-annotations-v1-" + digest,
+        "b04-annotations-v1" + digest,
+        "b04-annotations-v1:" + digest + "\n",
+    ):
+        document = _quality_annotation_document() | {"annotation_version": version}
+        with pytest.raises(B04GateError) as excinfo:
+            load_annotation_set(
+                _write_annotation_set(tmp_path, document, "annotations-separator.json")
+            )
+        assert excinfo.value.reason_code == "ANNOTATION_INVALID", version
