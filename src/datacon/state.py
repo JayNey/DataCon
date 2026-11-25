@@ -1898,6 +1898,23 @@ def propose_envelope(
         _assert_envelope_not_expanded(normalized, job["request"])
         _assert_envelope_within_case_registry(normalized, job["request"])
 
+        # Follow the global lock order jobs(family) -> jobs(child) ->
+        # budget_ledger(family). Share-locking READY/RUNNING/ARCHIVING
+        # children before locking budget_ledger closes the TOCTOU window with
+        # claim_next (which uses FOR UPDATE SKIP LOCKED): if claim_next locked
+        # a READY child first we wait and observe its committed RUNNING state;
+        # if we lock it first claim_next skips it until our pending envelope
+        # commits.
+        locked_children = connection.execute(
+            "SELECT job_id, state "
+            "FROM jobs "
+            "WHERE parent_job_id = %s "
+            "AND state IN ('READY', 'RUNNING', 'ARCHIVING') "
+            "ORDER BY job_id "
+            "FOR SHARE",
+            (family_id,),
+        ).fetchall()
+
         ledger = connection.execute(
             "SELECT max_total_seconds, max_fuzz_seconds, "
             "remaining_total_seconds, remaining_fuzz_seconds "
@@ -1940,12 +1957,10 @@ def propose_envelope(
                 or normalized["max_fuzz_seconds"]
                 < int(ledger["max_fuzz_seconds"])
             ):
-                active_child = connection.execute(
-                    "SELECT 1 FROM jobs WHERE parent_job_id = %s "
-                    "AND state IN ('RUNNING', 'ARCHIVING') LIMIT 1",
-                    (family_id,),
-                ).fetchone()
-                if active_child is not None:
+                if any(
+                    child["state"] in ("RUNNING", "ARCHIVING")
+                    for child in locked_children
+                ):
                     raise StateError(
                         "cannot tighten family budget while a child job is "
                         "RUNNING or ARCHIVING"
@@ -2075,6 +2090,7 @@ def policy_admit_round(
     plan_parent_approval_digest: Any = _ADMISSION_BINDING_UNSET,
     plan_envelope_digest: Any = _ADMISSION_BINDING_UNSET,
     plan_seed_digest: Any = _ADMISSION_BINDING_UNSET,
+    plan_experiment_digest: Any = _ADMISSION_BINDING_UNSET,
     ledger_remaining_total_seconds: int | None = None,
 ) -> AdmissionOutcome:
     """Decide one policy round and emit exactly one admission audit event.
@@ -2163,6 +2179,16 @@ def policy_admit_round(
         try:
             plan_seed_digest = jsonutil.require_digest(
                 plan_seed_digest, "plan_seed_digest"
+            )
+        except ValueError as error:
+            raise StateError(str(error)) from error
+    plan_experiment_checked = (
+        plan_experiment_digest is not _ADMISSION_BINDING_UNSET
+    )
+    if plan_experiment_checked and plan_experiment_digest is not None:
+        try:
+            plan_experiment_digest = jsonutil.require_digest(
+                plan_experiment_digest, "plan_experiment_digest"
             )
         except ValueError as error:
             raise StateError(str(error)) from error
@@ -2291,6 +2317,12 @@ def policy_admit_round(
     elif plan_seed_checked and plan_seed_digest != seed_digest:
         reason_code = "ADMISSION_DENIED"
         sub_reason = "PLAN_SEED_MISMATCH"
+    elif (
+        plan_experiment_checked
+        and plan_experiment_digest != experiment_digest
+    ):
+        reason_code = "ADMISSION_DENIED"
+        sub_reason = "PLAN_EXPERIMENT_MISMATCH"
     elif predicate_version not in SUPPORTED_ADMISSION_PREDICATE_VERSIONS:
         reason_code = "ADMISSION_DENIED"
         sub_reason = "UNSUPPORTED_PREDICATE_VERSION"
@@ -2345,6 +2377,9 @@ def policy_admit_round(
     elif sub_reason == "PLAN_SEED_MISMATCH":
         detail["expected_seed_digest"] = plan_seed_digest
         detail["actual_seed_digest"] = seed_digest
+    elif sub_reason == "PLAN_EXPERIMENT_MISMATCH":
+        detail["expected_experiment_digest"] = plan_experiment_digest
+        detail["actual_experiment_digest"] = experiment_digest
     elif (
         sub_reason == "PARENT_APPROVAL_NOT_CHAIN_TAIL"
         and plan_parent_approval_checked
@@ -2633,6 +2668,12 @@ def record_admission(
             else:
                 has_plan_seed = False
                 plan_seed_digest = _ADMISSION_BINDING_UNSET
+            if "experiment_digest" in plan_body:
+                has_plan_experiment = True
+                plan_experiment_digest: Any = plan_body["experiment_digest"]
+            else:
+                has_plan_experiment = False
+                plan_experiment_digest = _ADMISSION_BINDING_UNSET
             existing = connection.execute(
                 "SELECT admission_id, job_id, parent_job_id, round_no, "
                 "approval_kind, envelope_digest, parent_approval_digest, "
@@ -2672,6 +2713,10 @@ def record_admission(
                     and existing["envelope_digest"] == envelope_digest
                     and plan_envelope_digest == envelope_digest
                     and (not has_plan_seed or plan_seed_digest == seed_digest)
+                    and (
+                        not has_plan_experiment
+                        or plan_experiment_digest == experiment_digest
+                    )
                     and plan_approval_belongs_to_family
                     and existing["parent_approval_digest"]
                     == plan_parent_approval_digest
@@ -2811,6 +2856,7 @@ def record_admission(
                 plan_parent_approval_digest=plan_parent_approval_digest,
                 plan_envelope_digest=plan_envelope_digest,
                 plan_seed_digest=plan_seed_digest,
+                plan_experiment_digest=plan_experiment_digest,
                 ledger_remaining_total_seconds=ledger_remaining_total,
             )
 
@@ -3416,6 +3462,22 @@ def _sync_budget_ledger_on_approval_in_tx(
             "approved max_fuzz_seconds is below already spent family fuzz "
             "budget"
         )
+    if (
+        max_total_seconds < old_max_total
+        or max_fuzz_seconds < old_max_fuzz
+    ):
+        # §9.1: changed-envelope re-approval only locks the family row, so this
+        # recheck intentionally takes no row locks on child jobs.
+        active_child = connection.execute(
+            "SELECT 1 FROM jobs WHERE parent_job_id = %s "
+            "AND state IN ('RUNNING', 'ARCHIVING') LIMIT 1",
+            (family_id,),
+        ).fetchone()
+        if active_child is not None:
+            raise StateError(
+                "cannot tighten family budget while a child job is "
+                "RUNNING or ARCHIVING"
+            )
 
     new_rem_total = max_total_seconds - spent_total
     new_rem_fuzz = max_fuzz_seconds - spent_fuzz

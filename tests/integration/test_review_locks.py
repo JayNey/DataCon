@@ -3581,3 +3581,88 @@ def test_charge_step_budget_concurrent_with_propose_envelope_and_record_review_n
             "remaining_seconds": next_total - expected_spent,
             "remaining_fuzz_seconds": next_fuzz,
         }
+
+
+@pytest.mark.parametrize("active_state", ["RUNNING", "ARCHIVING"])
+@pytest.mark.parametrize(
+    ("tightened_total", "tightened_fuzz"),
+    [
+        (600, 300),
+        (900, 200),
+    ],
+)
+def test_reapproval_rejects_budget_tightening_while_child_active(
+    isolated_database,
+    tmp_path,
+    monkeypatch,
+    active_state,
+    tightened_total,
+    tightened_fuzz,
+):
+    monkeypatch.setenv("DATACON_EVIDENCE_ROOT", str(tmp_path / "evidence"))
+    seed = _seed_family(
+        isolated_database,
+        first_approval=True,
+        pending_envelope=None,
+        child_state=active_state,
+    )
+    family_id = seed["family_id"]
+    child_id = seed["child_id"]
+    state.initialize_budget_ledger(
+        isolated_database.dsn,
+        family_id,
+        max_total_seconds=900,
+        max_fuzz_seconds=300,
+    )
+    _insert_envelope(
+        isolated_database,
+        family_id,
+        ENVELOPE_2,
+        status_name="pending",
+        review_deadline_at=seed["deadline"],
+        max_total_seconds=tightened_total,
+        max_fuzz_seconds=tightened_fuzz,
+    )
+
+    # Hold FOR UPDATE on the active child on another connection to also verify
+    # §9.1: changed-envelope re-approval only locks the family row and must not
+    # lock child rows.
+    with psycopg.connect(isolated_database.dsn, connect_timeout=5) as holder:
+        holder.execute(
+            "SELECT job_id FROM jobs WHERE job_id = %s FOR UPDATE",
+            (child_id,),
+        )
+        with pytest.raises(state.StateError, match="RUNNING|ARCHIVING"):
+            state.record_review(
+                isolated_database.dsn,
+                family_id,
+                plan_digest=FIRST_PLAN_DIGEST,
+                decision="approve",
+                reviewer_id=REVIEWER_2,
+                envelope_digest=ENVELOPE_2,
+            )
+        holder.rollback()
+
+    ledger = state.load_budget_ledger(isolated_database.dsn, family_id)
+    assert ledger is not None
+    assert ledger["max_total_seconds"] == 900
+    assert ledger["max_fuzz_seconds"] == 300
+    assert ledger["remaining_total_seconds"] == 900
+    assert ledger["remaining_fuzz_seconds"] == 300
+    assert _row(
+        isolated_database,
+        "SELECT count(*) FROM family_approvals WHERE family_id = %s",
+        (family_id,),
+    )[0] == 1
+    assert _row(
+        isolated_database,
+        "SELECT status FROM family_envelopes "
+        "WHERE family_id = %s AND envelope_digest = %s",
+        (family_id, ENVELOPE_2),
+    )[0] == "pending"
+    assert _row(
+        isolated_database,
+        "SELECT count(*) FROM audit_events "
+        "WHERE job_id = %s AND event_type = 'review_recorded'",
+        (family_id,),
+    )[0] == 0

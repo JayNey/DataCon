@@ -4,6 +4,7 @@ from __future__ import annotations
 
 
 from datetime import datetime, timedelta, timezone
+import threading
 from uuid import uuid4
 
 import pytest
@@ -467,3 +468,112 @@ def test_claim_next_v2_keeps_sync_and_expiry_claimable_while_pending_envelope_ex
     assert claimed_blocked is not None
     assert claimed_blocked["job_id"] == blocked_child
     assert claimed_blocked["state"] == "BLOCKED"
+
+
+def test_propose_envelope_budget_tightening_races_claim_next_safely(
+    isolated_database,
+):
+    seed = _approved_family(isolated_database)
+    family_id = seed["family_id"]
+    child_id = seed["child_id"]
+    state.initialize_budget_ledger(
+        isolated_database.dsn,
+        family_id,
+        max_total_seconds=900,
+        max_fuzz_seconds=300,
+    )
+
+    for i in range(25):
+        isolated_database.connection.execute(
+            "DELETE FROM family_envelopes "
+            "WHERE family_id = %s AND status = 'pending'",
+            (family_id,),
+        )
+        isolated_database.connection.execute(
+            "UPDATE jobs SET state = 'READY', stage = 'ready', "
+            "workflow_synced = true, lease_owner = NULL, "
+            "lease_expires_at = NULL, execute_deadline_at = NULL "
+            "WHERE job_id = %s",
+            (child_id,),
+        )
+        tightened = _envelope(
+            max_total_seconds=899 - i,
+            max_fuzz_seconds=299 - i,
+        )
+
+        barrier = threading.Barrier(2)
+        propose_result: dict[str, object] = {}
+        claim_result: dict[str, object] = {}
+        propose_errors: list[BaseException] = []
+        claim_errors: list[BaseException] = []
+
+        def run_propose() -> None:
+            try:
+                barrier.wait(timeout=10)
+                propose_result["value"] = state.propose_envelope(
+                    isolated_database.dsn, family_id, tightened
+                )
+            except BaseException as error:  # noqa: BLE001 - asserted below
+                propose_errors.append(error)
+
+        def run_claim() -> None:
+            try:
+                barrier.wait(timeout=10)
+                claim_result["value"] = state.claim_next(
+                    isolated_database.dsn,
+                    f"v2-worker-{i}",
+                    job_contract_version=2,
+                )
+            except BaseException as error:  # noqa: BLE001 - asserted below
+                claim_errors.append(error)
+
+        threads = [
+            threading.Thread(target=run_propose),
+            threading.Thread(target=run_claim),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=30)
+            assert not thread.is_alive(), (
+                f"iteration {i}: thread deadlocked or timed out"
+            )
+
+        assert not claim_errors, (
+            f"iteration {i}: unexpected claim_next error: {claim_errors!r}"
+        )
+        child_state = _row(
+            isolated_database,
+            "SELECT state FROM jobs WHERE job_id = %s",
+            (child_id,),
+        )[0]
+        pending_count = _row(
+            isolated_database,
+            "SELECT count(*) FROM family_envelopes "
+            "WHERE family_id = %s AND status = 'pending'",
+            (family_id,),
+        )[0]
+
+        assert not (pending_count > 0 and child_state == "RUNNING"), (
+            f"iteration {i}: illegal combination of pending tightening "
+            "envelope and RUNNING child"
+        )
+
+        claimed = claim_result.get("value")
+        if "value" in propose_result:
+            assert not propose_errors
+            proposed = propose_result["value"]
+            assert isinstance(proposed, dict)
+            assert proposed["status"] == "pending"
+            assert pending_count == 1
+            assert claimed is None
+            assert child_state == "READY"
+        else:
+            assert len(propose_errors) == 1
+            assert isinstance(propose_errors[0], state.StateError)
+            assert "RUNNING" in str(propose_errors[0])
+            assert pending_count == 0
+            assert isinstance(claimed, dict)
+            assert claimed["job_id"] == child_id
+            assert claimed["state"] == "RUNNING"
+            assert child_state == "RUNNING"

@@ -13,7 +13,7 @@ import uuid
 
 import pytest
 
-from datacon import contracts, state
+from datacon import contracts, jsonutil, state
 
 
 def _digest(token: str) -> str:
@@ -514,4 +514,163 @@ def test_policy_admit_round_rejects_non_mapping_snapshot_and_bad_existing_rounds
                 budget_snapshot=_budget_snapshot(),
                 admission_id=ADMISSION_ID,
                 existing_rounds=bad_rounds,  # type: ignore[arg-type]
+            )
+
+
+def _valid_experiment(input_family: str = "length_boundary") -> dict:
+    return {
+        "input_family": input_family,
+        "mutation_constraints": {
+            "allowed_ops": ["append", "truncate"],
+            "max_input_bytes": 2048,
+        },
+        "expected_signature": dict(SIGNATURE),
+    }
+
+
+def test_admission_plan_experiment_digest_binding():
+    exp_a = _valid_experiment("length_boundary")
+    exp_b = _valid_experiment("byte_flip")
+    exp_a_digest = jsonutil.digest_json(exp_a)
+    exp_b_digest = jsonutil.digest_json(exp_b)
+    assert exp_a_digest != exp_b_digest
+
+    # 1. plan_experiment_digest non-null but experiment=None -> denied
+    store_missing = RecordingAdmissionStore()
+    missing = state.policy_admit_round(
+        store=store_missing,
+        clock=FakeClock(),
+        job_id=JOB_ID,
+        parent_job_id=FAMILY_ID,
+        envelope=_guided_envelope(),
+        parent_approval_digest=APPROVAL_DIGEST,
+        approval_chain_tail_digest=APPROVAL_DIGEST,
+        seed_digest=SEED_CORPUS_DIGEST,
+        round_no=2,
+        budget_snapshot=_budget_snapshot(),
+        experiment=None,
+        admission_id=ADMISSION_ID,
+        plan_experiment_digest=exp_a_digest,
+    )
+    assert not missing.admitted
+    assert missing.reason_code == "ADMISSION_DENIED"
+    assert missing.sub_reason == "PLAN_EXPERIMENT_MISMATCH"
+    assert missing.event_detail["expected_experiment_digest"] == exp_a_digest
+    assert missing.event_detail["actual_experiment_digest"] is None
+    assert not store_missing.admissions
+    assert [event["event_type"] for event in store_missing.events] == [
+        "round_admission_denied"
+    ]
+
+    # 2. plan_experiment_digest non-null but experiment digest differs -> denied
+    store_diff = RecordingAdmissionStore()
+    different = state.policy_admit_round(
+        store=store_diff,
+        clock=FakeClock(),
+        job_id=JOB_ID,
+        parent_job_id=FAMILY_ID,
+        envelope=_guided_envelope(),
+        parent_approval_digest=APPROVAL_DIGEST,
+        approval_chain_tail_digest=APPROVAL_DIGEST,
+        seed_digest=SEED_CORPUS_DIGEST,
+        round_no=2,
+        budget_snapshot=_budget_snapshot(),
+        experiment=exp_b,
+        admission_id=ADMISSION_ID,
+        plan_experiment_digest=exp_a_digest,
+    )
+    assert not different.admitted
+    assert different.reason_code == "ADMISSION_DENIED"
+    assert different.sub_reason == "PLAN_EXPERIMENT_MISMATCH"
+    assert different.event_detail["expected_experiment_digest"] == exp_a_digest
+    assert different.event_detail["actual_experiment_digest"] == exp_b_digest
+    assert not store_diff.admissions
+    assert [event["event_type"] for event in store_diff.events] == [
+        "round_admission_denied"
+    ]
+
+    # 3. plan_experiment_digest=None but non-null experiment passed -> denied
+    store_unexpected = RecordingAdmissionStore()
+    unexpected = state.policy_admit_round(
+        store=store_unexpected,
+        clock=FakeClock(),
+        job_id=JOB_ID,
+        parent_job_id=FAMILY_ID,
+        envelope=_guided_envelope(),
+        parent_approval_digest=APPROVAL_DIGEST,
+        approval_chain_tail_digest=APPROVAL_DIGEST,
+        seed_digest=SEED_CORPUS_DIGEST,
+        round_no=2,
+        budget_snapshot=_budget_snapshot(),
+        experiment=exp_a,
+        admission_id=ADMISSION_ID,
+        plan_experiment_digest=None,
+    )
+    assert not unexpected.admitted
+    assert unexpected.reason_code == "ADMISSION_DENIED"
+    assert unexpected.sub_reason == "PLAN_EXPERIMENT_MISMATCH"
+    assert unexpected.event_detail["expected_experiment_digest"] is None
+    assert unexpected.event_detail["actual_experiment_digest"] == exp_a_digest
+    assert not store_unexpected.admissions
+    assert [event["event_type"] for event in store_unexpected.events] == [
+        "round_admission_denied"
+    ]
+
+    # 4. plan_experiment_digest == digest(experiment) -> admitted
+    store_ok = RecordingAdmissionStore()
+    admitted = state.policy_admit_round(
+        store=store_ok,
+        clock=FakeClock(),
+        job_id=JOB_ID,
+        parent_job_id=FAMILY_ID,
+        envelope=_guided_envelope(),
+        parent_approval_digest=APPROVAL_DIGEST,
+        approval_chain_tail_digest=APPROVAL_DIGEST,
+        seed_digest=SEED_CORPUS_DIGEST,
+        round_no=2,
+        budget_snapshot=_budget_snapshot(),
+        experiment=exp_a,
+        admission_id=ADMISSION_ID,
+        plan_experiment_digest=exp_a_digest,
+    )
+    assert admitted.admitted
+    assert admitted.reason_code is None
+    assert len(store_ok.admissions) == 1
+    assert [event["event_type"] for event in store_ok.events] == [
+        "round_admitted"
+    ]
+
+    # 5. plan_experiment_digest=None and experiment=None -> admitted
+    admitted_none = state.policy_admit_round(
+        clock=FakeClock(),
+        job_id=JOB_ID,
+        parent_job_id=FAMILY_ID,
+        envelope=_guided_envelope(),
+        parent_approval_digest=APPROVAL_DIGEST,
+        approval_chain_tail_digest=APPROVAL_DIGEST,
+        seed_digest=SEED_CORPUS_DIGEST,
+        round_no=2,
+        budget_snapshot=_budget_snapshot(),
+        experiment=None,
+        admission_id=ADMISSION_ID,
+        plan_experiment_digest=None,
+    )
+    assert admitted_none.admitted
+
+    # 6. Malformed plan_experiment_digest fails closed with StateError
+    for bad_digest in ("not-a-digest", "", 123):
+        with pytest.raises(state.StateError, match="plan_experiment_digest"):
+            state.policy_admit_round(
+                clock=FakeClock(),
+                job_id=JOB_ID,
+                parent_job_id=FAMILY_ID,
+                envelope=_guided_envelope(),
+                parent_approval_digest=APPROVAL_DIGEST,
+                approval_chain_tail_digest=APPROVAL_DIGEST,
+                seed_digest=SEED_CORPUS_DIGEST,
+                round_no=2,
+                budget_snapshot=_budget_snapshot(),
+                experiment=exp_a,
+                admission_id=ADMISSION_ID,
+                plan_experiment_digest=bad_digest,
             )

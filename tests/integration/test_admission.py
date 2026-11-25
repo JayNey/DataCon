@@ -959,3 +959,124 @@ def test_record_admission_validates_plan_family_id_and_parent_job_id_when_presen
     admitted = _admit(isolated_database, good_seed)
     assert admitted.admitted
     assert len(_admissions(isolated_database, family_id, 2)) == 1
+
+
+def test_record_admission_validates_plan_experiment_digest_when_present(
+    isolated_database,
+):
+    exp_a = _valid_experiment("length_boundary")
+    exp_b = _valid_experiment("byte_flip")
+    exp_a_digest = jsonutil.digest_json(exp_a)
+    exp_b_digest = jsonutil.digest_json(exp_b)
+    assert exp_a_digest != exp_b_digest
+
+    # 1. Frozen plan binds exp_a_digest, caller supplies exp_b -> denied
+    seed_diff = _seed_family(isolated_database, approval_digest=_digest("1"))
+    family_id_1, child_id_1, _ = seed_diff
+    isolated_database.connection.execute(
+        "UPDATE plans SET plan = plan || %s::jsonb WHERE job_id = %s",
+        (
+            jsonutil.canonical_bytes(
+                {"experiment_digest": exp_a_digest}
+            ).decode("utf-8"),
+            child_id_1,
+        ),
+    )
+    denied_diff = _admit(isolated_database, seed_diff, experiment=exp_b)
+    assert not denied_diff.admitted
+    assert denied_diff.status == "denied"
+    assert denied_diff.reason_code == "ADMISSION_DENIED"
+    assert denied_diff.sub_reason == "PLAN_EXPERIMENT_MISMATCH"
+    assert _admissions(isolated_database, family_id_1, 2) == []
+    events_1 = _events(isolated_database, child_id_1)
+    assert [event[0] for event in events_1] == ["round_admission_denied"]
+    assert events_1[0][2]["sub_reason"] == "PLAN_EXPERIMENT_MISMATCH"
+    assert events_1[0][2]["expected_experiment_digest"] == exp_a_digest
+    assert events_1[0][2]["actual_experiment_digest"] == exp_b_digest
+
+    # 2. Frozen plan binds exp_a_digest, caller supplies experiment=None -> denied
+    seed_none = _seed_family(isolated_database, approval_digest=_digest("2"))
+    family_id_2, child_id_2, _ = seed_none
+    isolated_database.connection.execute(
+        "UPDATE plans SET plan = plan || %s::jsonb WHERE job_id = %s",
+        (
+            jsonutil.canonical_bytes(
+                {"experiment_digest": exp_a_digest}
+            ).decode("utf-8"),
+            child_id_2,
+        ),
+    )
+    denied_none = _admit(isolated_database, seed_none, experiment=None)
+    assert not denied_none.admitted
+    assert denied_none.status == "denied"
+    assert denied_none.reason_code == "ADMISSION_DENIED"
+    assert denied_none.sub_reason == "PLAN_EXPERIMENT_MISMATCH"
+    assert _admissions(isolated_database, family_id_2, 2) == []
+    events_2 = _events(isolated_database, child_id_2)
+    assert [event[0] for event in events_2] == ["round_admission_denied"]
+    assert events_2[0][2]["sub_reason"] == "PLAN_EXPERIMENT_MISMATCH"
+    assert events_2[0][2]["expected_experiment_digest"] == exp_a_digest
+    assert events_2[0][2]["actual_experiment_digest"] is None
+
+    # 3. Frozen plan binds experiment_digest=null, caller supplies exp_a -> denied
+    seed_null = _seed_family(isolated_database, approval_digest=_digest("3"))
+    family_id_3, child_id_3, _ = seed_null
+    isolated_database.connection.execute(
+        "UPDATE plans SET plan = plan || %s::jsonb WHERE job_id = %s",
+        (
+            jsonutil.canonical_bytes({"experiment_digest": None}).decode("utf-8"),
+            child_id_3,
+        ),
+    )
+    denied_null = _admit(isolated_database, seed_null, experiment=exp_a)
+    assert not denied_null.admitted
+    assert denied_null.status == "denied"
+    assert denied_null.reason_code == "ADMISSION_DENIED"
+    assert denied_null.sub_reason == "PLAN_EXPERIMENT_MISMATCH"
+    assert _admissions(isolated_database, family_id_3, 2) == []
+    events_3 = _events(isolated_database, child_id_3)
+    assert [event[0] for event in events_3] == ["round_admission_denied"]
+    assert events_3[0][2]["sub_reason"] == "PLAN_EXPERIMENT_MISMATCH"
+    assert events_3[0][2]["expected_experiment_digest"] is None
+    assert events_3[0][2]["actual_experiment_digest"] == exp_a_digest
+
+    # 4. Matching experiment -> admitted; identical retry -> already_admitted;
+    #    mutated plans.plan experiment_digest -> retry must NOT return already_admitted
+    seed_ok = _seed_family(isolated_database, approval_digest=_digest("4"))
+    family_id_4, child_id_4, _ = seed_ok
+    isolated_database.connection.execute(
+        "UPDATE plans SET plan = plan || %s::jsonb WHERE job_id = %s",
+        (
+            jsonutil.canonical_bytes(
+                {"experiment_digest": exp_a_digest}
+            ).decode("utf-8"),
+            child_id_4,
+        ),
+    )
+    first = _admit(isolated_database, seed_ok, experiment=exp_a)
+    assert first.admitted
+    assert len(_admissions(isolated_database, family_id_4, 2)) == 1
+    assert [event[0] for event in _events(isolated_database, child_id_4)] == [
+        "round_admitted"
+    ]
+
+    same = _admit(isolated_database, seed_ok, experiment=exp_a)
+    assert not same.admitted
+    assert same.status == "already_admitted"
+    assert len(_events(isolated_database, child_id_4)) == 1
+
+    isolated_database.connection.execute(
+        "UPDATE plans SET plan = jsonb_set(plan, '{experiment_digest}', "
+        "to_jsonb(%s::text)) WHERE job_id = %s",
+        (exp_b_digest, child_id_4),
+    )
+    tampered = _admit(isolated_database, seed_ok, experiment=exp_a)
+    assert not tampered.admitted
+    assert tampered.status == "denied"
+    assert tampered.status != "already_admitted"
+    assert tampered.reason_code == "ADMISSION_DENIED"
+    assert len(_admissions(isolated_database, family_id_4, 2)) == 1
+    assert [event[0] for event in _events(isolated_database, child_id_4)] == [
+        "round_admitted",
+        "round_admission_denied",
+    ]
