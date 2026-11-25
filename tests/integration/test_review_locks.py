@@ -101,6 +101,8 @@ def _insert_envelope(
     review_deadline_at,
     reviewer_id=None,
     decided_at=None,
+    max_total_seconds=900,
+    max_fuzz_seconds=300,
 ):
     database.connection.execute(
         "INSERT INTO family_envelopes (envelope_id, family_id, envelope_digest, "
@@ -110,7 +112,14 @@ def _insert_envelope(
             uuid4(),
             family_id,
             envelope_digest,
-            Jsonb({"mode": "guided", "envelope_digest": envelope_digest}),
+            Jsonb(
+                {
+                    "mode": "guided",
+                    "envelope_digest": envelope_digest,
+                    "max_total_seconds": max_total_seconds,
+                    "max_fuzz_seconds": max_fuzz_seconds,
+                }
+            ),
             status_name,
             review_deadline_at,
             reviewer_id,
@@ -3296,3 +3305,50 @@ def test_explicit_digest_reapproval_still_idempotent(isolated_database):
         "SELECT count(*) FROM reviews WHERE job_id = %s",
         (seed["family_id"],),
     )[0] == 1
+
+
+def test_family_approval_initializes_budget_ledger(
+    isolated_database, tmp_path, monkeypatch
+):
+    monkeypatch.setenv("DATACON_EVIDENCE_ROOT", str(tmp_path / "evidence"))
+    seed = _seed_family(isolated_database)
+
+    outcome = _review(isolated_database, seed)
+
+    assert outcome.status == "applied", outcome.message
+    ledger = state.load_budget_ledger(isolated_database.dsn, seed["family_id"])
+    assert ledger is not None, "family approval did not initialize budget_ledger"
+    assert ledger["max_total_seconds"] == 900
+    assert ledger["max_fuzz_seconds"] == 300
+    assert ledger["remaining_total_seconds"] == 900
+    assert ledger["remaining_fuzz_seconds"] == 300
+
+    charge = state.charge_step_budget(
+        isolated_database.dsn,
+        family_id=seed["family_id"],
+        job_id=seed["child_id"],
+        step_key="build",
+        attempt_no=1,
+        charge_kind="general",
+        elapsed_seconds=1,
+    )
+    assert charge.status == "charged", charge.status
+    summary = state.family_budget_summary(
+        isolated_database.dsn, seed["family_id"]
+    )
+    assert summary["remaining_seconds"] == 899
+
+    repeated = _review(isolated_database, seed)
+    assert repeated.status == "idempotent"
+    assert _row(
+        isolated_database,
+        "SELECT count(*) FROM budget_ledger WHERE family_id = %s",
+        (seed["family_id"],),
+    )[0] == 1, "re-approval inserted a second budget ledger row"
+    after = state.load_budget_ledger(isolated_database.dsn, seed["family_id"])
+    assert after["remaining_total_seconds"] == 899, (
+        "re-approval reset the spent budget"
+    )
+    assert state.family_budget_summary(
+        isolated_database.dsn, seed["family_id"]
+    )["spent_seconds"] == 1

@@ -2837,14 +2837,48 @@ _BUDGET_CHARGE_COLUMNS = (
 )
 
 
-def initialize_budget_ledger(
-    dsn: str,
+def _approved_envelope_budget(
+    envelope_body: Mapping[str, Any],
+) -> tuple[int, int]:
+    """Return the approved envelope's family budget ceilings.
+
+    The ledger is initialized from the envelope body that was just approved,
+    never from the request or a caller-supplied snapshot. Missing or malformed
+    caps fail closed so no family can run without a budget authority.
+    """
+    max_total = envelope_body.get("max_total_seconds")
+    if type(max_total) is not int or max_total < 1:
+        raise StateError(
+            "approved envelope max_total_seconds must be a positive integer"
+        )
+    max_fuzz = envelope_body.get("max_fuzz_seconds")
+    if (
+        type(max_fuzz) is not int
+        or max_fuzz < 0
+        or max_fuzz > max_total
+    ):
+        raise StateError(
+            "approved envelope max_fuzz_seconds must be between 0 and "
+            "max_total_seconds"
+        )
+    return int(max_total), int(max_fuzz)
+
+
+def _initialize_budget_ledger_in_tx(
+    connection,
     family_id: UUID | str,
     *,
     max_total_seconds: int,
     max_fuzz_seconds: int,
 ) -> dict[str, Any]:
-    """Create the family ledger once, or return the existing row unchanged."""
+    """Create the ledger inside the caller's transaction, or return it unchanged.
+
+    This is the one implementation shared by the standalone initializer and the
+    human-approval path: approving a family envelope and creating its ledger
+    must be one transaction. An existing row is locked and its approved caps
+    are compared with the current envelope; a different envelope never silently
+    reuses the old budget.
+    """
     if type(max_total_seconds) is not int or max_total_seconds < 1:
         raise StateError("max_total_seconds must be a positive integer")
     if (
@@ -2860,32 +2894,59 @@ def initialize_budget_ledger(
     except (TypeError, ValueError) as error:
         raise StateError("family_id must be a UUID") from error
 
+    row = connection.execute(
+        "INSERT INTO budget_ledger "
+        "(family_id, max_total_seconds, max_fuzz_seconds, "
+        "remaining_total_seconds, remaining_fuzz_seconds) "
+        "VALUES (%s, %s, %s, %s, %s) "
+        "ON CONFLICT (family_id) DO NOTHING "
+        f"RETURNING {_BUDGET_LEDGER_COLUMNS}",
+        (
+            family_id,
+            max_total_seconds,
+            max_fuzz_seconds,
+            max_total_seconds,
+            max_fuzz_seconds,
+        ),
+    ).fetchone()
+    if row is None:
+        row = connection.execute(
+            "SELECT " + _BUDGET_LEDGER_COLUMNS +
+            " FROM budget_ledger WHERE family_id = %s FOR UPDATE",
+            (family_id,),
+        ).fetchone()
+        if row is None:
+            raise StateError("budget ledger could not be initialized")
+        if (
+            row["max_total_seconds"] != max_total_seconds
+            or row["max_fuzz_seconds"] != max_fuzz_seconds
+        ):
+            raise StateError(
+                "budget ledger already exists with different caps: "
+                f"approved max_total_seconds={max_total_seconds}, "
+                f"max_fuzz_seconds={max_fuzz_seconds}; existing "
+                f"max_total_seconds={row['max_total_seconds']}, "
+                f"max_fuzz_seconds={row['max_fuzz_seconds']}"
+            )
+    return dict(row)
+
+
+def initialize_budget_ledger(
+    dsn: str,
+    family_id: UUID | str,
+    *,
+    max_total_seconds: int,
+    max_fuzz_seconds: int,
+) -> dict[str, Any]:
+    """Create the family ledger once, or return the existing row unchanged."""
     with _connect(dsn) as connection:
         with connection.transaction():
-            row = connection.execute(
-                "INSERT INTO budget_ledger "
-                "(family_id, max_total_seconds, max_fuzz_seconds, "
-                "remaining_total_seconds, remaining_fuzz_seconds) "
-                "VALUES (%s, %s, %s, %s, %s) "
-                "ON CONFLICT (family_id) DO NOTHING "
-                f"RETURNING {_BUDGET_LEDGER_COLUMNS}",
-                (
-                    family_id,
-                    max_total_seconds,
-                    max_fuzz_seconds,
-                    max_total_seconds,
-                    max_fuzz_seconds,
-                ),
-            ).fetchone()
-            if row is None:
-                row = connection.execute(
-                    "SELECT " + _BUDGET_LEDGER_COLUMNS +
-                    " FROM budget_ledger WHERE family_id = %s",
-                    (family_id,),
-                ).fetchone()
-            if row is None:
-                raise StateError("budget ledger could not be initialized")
-            return dict(row)
+            return _initialize_budget_ledger_in_tx(
+                connection,
+                family_id,
+                max_total_seconds=max_total_seconds,
+                max_fuzz_seconds=max_fuzz_seconds,
+            )
 
 
 def load_budget_ledger(
@@ -3221,7 +3282,8 @@ def _record_family_review(
     # decision; it never appends a new row. The expiry check comes from the
     # envelope's own deadline, not the family's.
     envelope = connection.execute(
-        "SELECT envelope_id, status, review_deadline_at, reviewer_id, decided_at "
+        "SELECT envelope_id, status, review_deadline_at, reviewer_id, "
+        "decided_at, envelope_json "
         "FROM family_envelopes WHERE family_id = %s AND envelope_digest = %s",
         (job_id, resolved_envelope),
     ).fetchone()
@@ -3402,6 +3464,23 @@ def _record_family_review(
         ).fetchone()
         if decided_envelope is None:
             raise StateError("family envelope changed while recording the review")
+        # The approved envelope is the budget authority for the whole family.
+        # Creating the ledger here makes approval and budget initialization one
+        # transaction, so a real family can charge its first step immediately.
+        # A changed envelope with different caps fails closed inside the helper
+        # rather than silently reusing the old budget.
+        envelope_body = envelope["envelope_json"]
+        if not isinstance(envelope_body, Mapping):
+            raise StateError("approved family envelope must be a JSON object")
+        max_total_seconds, max_fuzz_seconds = _approved_envelope_budget(
+            envelope_body
+        )
+        _initialize_budget_ledger_in_tx(
+            connection,
+            job_id,
+            max_total_seconds=max_total_seconds,
+            max_fuzz_seconds=max_fuzz_seconds,
+        )
         if first_round:
             updated_child = connection.execute(
                 "UPDATE jobs SET state = 'READY', stage = 'ready', "
