@@ -314,6 +314,70 @@ def _verified_provenance_face(
     return data
 
 
+def _check_declared_compile_flags_consistency(
+    context: ExecutionContext,
+) -> tuple[bool, list[str], str]:
+    """Verify ``plan.compile_flags`` matches ``build_spec.declared_compile_flags`` after normalization.
+
+    Per interface-contract-delta.md §3 & §5, both sides must normalize to the
+    exact same ordered flag sequence under ``build_provenance.normalize_compile_flags``.
+    """
+    build_spec = _build_spec_from_context(context)
+    if build_spec is None:
+        return (
+            False,
+            [],
+            "v2 plan is missing build_spec for compile_flags consistency check",
+        )
+    repo_root = _build_provenance_repo_root(context)
+    plan_flags = context.plan.get("compile_flags")
+    spec_flags = build_spec.get("declared_compile_flags")
+    if not isinstance(plan_flags, list) or not all(
+        isinstance(item, str) for item in plan_flags
+    ):
+        return (
+            False,
+            [],
+            "v2 plan.compile_flags must be a list of strings",
+        )
+    if not isinstance(spec_flags, list) or not all(
+        isinstance(item, str) for item in spec_flags
+    ):
+        return (
+            False,
+            [],
+            "v2 build_spec.declared_compile_flags must be a list of strings",
+        )
+    try:
+        norm_plan = build_provenance.normalize_compile_flags(
+            plan_flags, repo_root=repo_root
+        )
+    except ValueError as error:
+        return (
+            False,
+            list(plan_flags),
+            f"invalid plan.compile_flags: {error}",
+        )
+    try:
+        norm_spec = build_provenance.normalize_compile_flags(
+            spec_flags, repo_root=repo_root
+        )
+    except ValueError as error:
+        return (
+            False,
+            norm_plan,
+            f"invalid build_spec.declared_compile_flags: {error}",
+        )
+    if norm_plan != norm_spec:
+        return (
+            False,
+            norm_plan,
+            "plan.compile_flags does not match build_spec.declared_compile_flags "
+            f"after normalization: plan={norm_plan!r} != build_spec={norm_spec!r}",
+        )
+    return True, norm_plan, ""
+
+
 def _verify_v2_build_provenance(
     context: ExecutionContext,
     build_root: Path,
@@ -338,20 +402,12 @@ def _verify_v2_build_provenance(
         else ""
     )
     repo_root = _build_provenance_repo_root(context)
+    flags_ok, normalized_declared, flags_error = (
+        _check_declared_compile_flags_consistency(context)
+    )
     raw_declared = context.plan.get("compile_flags")
     if not isinstance(raw_declared, list):
         raw_declared = build_spec.get("declared_compile_flags", [])
-
-    try:
-        normalized_declared = build_provenance.normalize_compile_flags(
-            raw_declared, repo_root=repo_root
-        )
-    except ValueError:
-        normalized_declared = (
-            [str(item) for item in raw_declared]
-            if isinstance(raw_declared, list)
-            else []
-        )
 
     archived_faces: dict[str, bytes] = {}
     version_faces: dict[str, bytes | None] = {}
@@ -367,6 +423,29 @@ def _verify_v2_build_provenance(
         version_faces[version] = face
         if face:
             archived_faces[version] = face
+
+    if not flags_ok:
+        summary = {
+            "vulnerable": {
+                "face": face_name,
+                "declared": list(normalized_declared),
+                "effective": [],
+            },
+            "fixed": {
+                "face": face_name,
+                "declared": list(normalized_declared),
+                "effective": [],
+            },
+            "comparable": False,
+        }
+        return _ProvenanceCheckOutcome(
+            comparable=False,
+            report_summary=summary,
+            rules_version=rules_version,
+            reason_code=build_provenance.BUILD_PROVENANCE_MISSING,
+            error_detail=flags_error,
+            faces=archived_faces,
+        )
 
     vuln_face = version_faces["vulnerable"]
     fixed_face = version_faces["fixed"]
@@ -4183,6 +4262,10 @@ def _archive_only(dsn: str, context: ExecutionContext) -> ExecutionResult:
             probe = None
         elif probe.get("status") != "completed":
             probe = None
+    v2_build_spec = (
+        _build_spec_from_context(context) if _is_v2_context(context) else None
+    )
+    is_v2_spec = v2_build_spec is not None
     builds: dict[str, dict[str, Any]] = {}
     for version in ("vulnerable", "fixed"):
         result = completed.get(f"build:{version}")
@@ -4195,30 +4278,118 @@ def _archive_only(dsn: str, context: ExecutionContext) -> ExecutionResult:
         if result.get("input_digest") != context.plan["analysis_digest"]:
             rejected.append(f"build:{version} input does not match the plan")
             continue
-        if _reusable_build(build_root, result):
+        if _reusable_build(
+            build_root, result, check_provenance_face=not is_v2_spec
+        ):
             builds[version] = result
     runs: list[dict[str, Any]] = []
-    for version in ("vulnerable", "fixed"):
-        for phase in ("normal", "candidate_1", "candidate_2"):
-            result = completed.get(_replay_step(version, phase))
-            if result is None:
-                continue
-            if not isinstance(result, dict) or not plan_bound(
-                result, _replay_step(version, phase)
-            ):
-                continue
-            expected_input = (
-                context.plan["inputs"]["normal"]
-                if phase == "normal"
-                else context.plan["inputs"]["candidate"]
-            )
-            if result.get("input_digest") != expected_input:
-                rejected.append(
-                    f"{version}/{phase} input does not match the approved plan"
+    plan_inputs = context.plan.get("inputs")
+    if isinstance(plan_inputs, Mapping):
+        for version in ("vulnerable", "fixed"):
+            for phase in ("normal", "candidate_1", "candidate_2"):
+                result = completed.get(_replay_step(version, phase))
+                if result is None:
+                    continue
+                if not isinstance(result, dict) or not plan_bound(
+                    result, _replay_step(version, phase)
+                ):
+                    continue
+                expected_input = (
+                    plan_inputs["normal"]
+                    if phase == "normal"
+                    else plan_inputs["candidate"]
                 )
-                continue
-            if _reusable_replay(build_root, result):
-                runs.append(result)
+                if result.get("input_digest") != expected_input:
+                    rejected.append(
+                        f"{version}/{phase} input does not match the approved plan"
+                    )
+                    continue
+                if _reusable_replay(build_root, result):
+                    runs.append(result)
+
+    # On v2 with BuildSpec, evaluate provenance BEFORE the generic completeness
+    # check so a missing/corrupted/non-comparable provenance face or a
+    # plan.compile_flags mismatch ALWAYS fails closed as FAILED /
+    # BUILD_PROVENANCE_MISSING and NEVER downgrades to INCONCLUSIVE or
+    # NOT_REPRODUCED during ARCHIVING recovery.
+    provenance_outcome: _ProvenanceCheckOutcome | None = None
+    if is_v2_spec:
+        assert v2_build_spec is not None
+        freeze_decision = build_provenance.validate_build_spec_for_freeze(
+            v2_build_spec
+        )
+        if not freeze_decision.ok:
+            return _finish_failed(
+                dsn,
+                context.job_id,
+                context.generation,
+                ExecutionFailed(
+                    build_provenance.BUILD_PROVENANCE_MISSING,
+                    freeze_decision.error_detail
+                    or "v2 build_spec failed provenance freeze validation",
+                ),
+                context=context,
+                probe=probe,
+                builds=builds,
+                runs=runs,
+                build_provenance_summary=_empty_build_provenance_summary(
+                    context, comparable=False
+                ),
+            )
+        flags_ok, _norm_flags, flags_error = (
+            _check_declared_compile_flags_consistency(context)
+        )
+        if not flags_ok:
+            return _finish_failed(
+                dsn,
+                context.job_id,
+                context.generation,
+                ExecutionFailed(
+                    build_provenance.BUILD_PROVENANCE_MISSING,
+                    flags_error,
+                ),
+                context=context,
+                probe=probe,
+                builds=builds,
+                runs=runs,
+                build_provenance_summary=_empty_build_provenance_summary(
+                    context, comparable=False
+                ),
+            )
+        kind = v2_build_spec.get("kind")
+        expected_face_name = (
+            build_provenance.FACE_FILENAMES.get(kind)
+            if isinstance(kind, str)
+            else None
+        )
+        any_present_build_missing_face = bool(builds) and any(
+            _verified_provenance_face(
+                build_root, build_row, expected_face_name=expected_face_name
+            )
+            is None
+            for build_row in builds.values()
+        )
+        if len(builds) == 2 or any_present_build_missing_face:
+            provenance_outcome = _verify_v2_build_provenance(
+                context, build_root, builds
+            )
+            if not provenance_outcome.comparable:
+                return _finish_failed(
+                    dsn,
+                    context.job_id,
+                    context.generation,
+                    ExecutionFailed(
+                        build_provenance.BUILD_PROVENANCE_MISSING,
+                        provenance_outcome.error_detail
+                        or "v2 build provenance verification failed",
+                    ),
+                    context=context,
+                    probe=probe,
+                    builds=builds,
+                    runs=runs,
+                    build_provenance_summary=provenance_outcome.report_summary,
+                )
+
     complete = (
         isinstance(probe, dict)
         and len(builds) == 2
@@ -4297,32 +4468,6 @@ def _archive_only(dsn: str, context: ExecutionContext) -> ExecutionResult:
         if not finished:
             return ExecutionResult("STALE")
         return ExecutionResult("INCONCLUSIVE", reason_code="EVIDENCE_INCOMPLETE")
-
-    provenance_outcome: _ProvenanceCheckOutcome | None = None
-    if (
-        _is_v2_context(context)
-        and _build_spec_from_context(context) is not None
-        and len(builds) == 2
-    ):
-        provenance_outcome = _verify_v2_build_provenance(
-            context, build_root, builds
-        )
-        if not provenance_outcome.comparable:
-            return _finish_failed(
-                dsn,
-                context.job_id,
-                context.generation,
-                ExecutionFailed(
-                    build_provenance.BUILD_PROVENANCE_MISSING,
-                    provenance_outcome.error_detail
-                    or "v2 build provenance verification failed",
-                ),
-                context=context,
-                probe=probe,
-                builds=builds,
-                runs=runs,
-                build_provenance_summary=provenance_outcome.report_summary,
-            )
 
     report, report_markdown = _build_report(
         context,
@@ -4581,6 +4726,24 @@ def run_execution(
     missing: list[str] = []
     provenance_outcome: _ProvenanceCheckOutcome | None = None
     try:
+        if _is_v2_context(context) and _build_spec_from_context(context) is not None:
+            flags_ok, _norm_flags, flags_error = (
+                _check_declared_compile_flags_consistency(context)
+            )
+            if not flags_ok:
+                provenance_outcome = _ProvenanceCheckOutcome(
+                    comparable=False,
+                    report_summary=_empty_build_provenance_summary(
+                        context, comparable=False
+                    ),
+                    rules_version=_provenance_rules_version(context),
+                    reason_code=build_provenance.BUILD_PROVENANCE_MISSING,
+                    error_detail=flags_error,
+                )
+                raise ExecutionFailed(
+                    build_provenance.BUILD_PROVENANCE_MISSING,
+                    flags_error,
+                )
         probe_result, _ = _run_step(
             dsn,
             context,
@@ -4963,7 +5126,12 @@ def _to_observation(payload: Mapping[str, Any], run_root: Path) -> RunObservatio
     )
 
 
-def _reusable_build(run_root: Path, payload: Mapping[str, Any]) -> bool:
+def _reusable_build(
+    run_root: Path,
+    payload: Mapping[str, Any],
+    *,
+    check_provenance_face: bool = True,
+) -> bool:
     if payload.get("status") != "completed":
         return False
     files = payload.get("files")
@@ -4979,7 +5147,7 @@ def _reusable_build(run_root: Path, payload: Mapping[str, Any]) -> bool:
         data = _read_run_file_bounded(path, max_bytes=limit)
         if data is None or _digest(data) != digests.get(key):
             return False
-    if files.get("provenance_face") is not None:
+    if check_provenance_face and files.get("provenance_face") is not None:
         if _verified_provenance_face(run_root, payload) is None:
             return False
     return True

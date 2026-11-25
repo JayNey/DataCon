@@ -899,12 +899,17 @@ def _cmake_has_export_compile_commands(configure: Sequence[str]) -> bool:
 
 
 def _extract_cmake_build_dir(configure: Sequence[str]) -> tuple[str, str]:
-    raw_dir = "build"
+    raw_dir = "."
     i = 0
     total = len(configure)
     while i < total:
         tok = configure[i]
-        if tok == "-B" and i + 1 < total:
+        if tok == "-B":
+            if i + 1 >= total or configure[i + 1].startswith("-"):
+                raise SandboxError(
+                    "cmake -B requires a build directory argument",
+                    reason_code=build_provenance.BUILD_PROVENANCE_MISSING,
+                )
             raw_dir = configure[i + 1]
             i += 2
             continue
@@ -914,7 +919,12 @@ def _extract_cmake_build_dir(configure: Sequence[str]) -> tuple[str, str]:
             continue
         i += 1
 
-    if "\\" in raw_dir or any(ch in raw_dir for ch in _UNSAFE_WORK_PATH_CHARS):
+    if (
+        not raw_dir
+        or not raw_dir.strip()
+        or "\\" in raw_dir
+        or any(ch in raw_dir for ch in _UNSAFE_WORK_PATH_CHARS)
+    ):
         raise SandboxError(
             f"unsafe cmake build directory: {raw_dir!r}",
             reason_code=build_provenance.BUILD_PROVENANCE_MISSING,
@@ -965,18 +975,263 @@ def _is_controlled_cxx_shim(value: Any) -> bool:
     return posixpath.basename(value) in _CXX_SHIM_BASENAMES
 
 
+_FORBIDDEN_SHIM_MOUNT_PREFIXES = (
+    "/fixture",
+    "/work",
+    "/tmp",
+    "/proc",
+    "/sys",
+    "/dev",
+)
+
+
 def _validate_shim_destination(destination: str, *, label: str) -> str:
+    if (
+        not isinstance(destination, str)
+        or not destination.startswith("/")
+        or destination.startswith("//")
+        or destination.endswith("/")
+    ):
+        raise SandboxError(
+            f"unsafe {label} mount destination: {destination!r}",
+            reason_code=build_provenance.BUILD_PROVENANCE_MISSING,
+        )
     norm = posixpath.normpath(destination)
     if (
         not norm.startswith("/")
-        or norm in ("/", "/fixture", "/work", "/tmp")
-        or norm.startswith("/fixture/")
+        or norm.startswith("//")
+        or norm == "/"
+        or any(
+            norm == prefix or norm.startswith(prefix + "/")
+            for prefix in _FORBIDDEN_SHIM_MOUNT_PREFIXES
+        )
     ):
         raise SandboxError(
             f"unsafe {label} mount destination: {destination!r}",
             reason_code=build_provenance.BUILD_PROVENANCE_MISSING,
         )
     return norm
+
+
+def _ensure_safe_dir_component(
+    parent_fd: int,
+    name: str,
+    *,
+    mode: int,
+    exclusive: bool,
+    label: str,
+) -> int:
+    dir_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    if exclusive:
+        try:
+            os.mkdir(name, mode, dir_fd=parent_fd)
+        except FileExistsError as error:
+            raise SandboxPolicyError(
+                f"the one-shot {label} directory already exists"
+            ) from error
+        except OSError as error:
+            raise SandboxPolicyError(
+                f"cannot create {label} directory safely: {error}"
+            ) from error
+        try:
+            fd = os.open(name, dir_flags, dir_fd=parent_fd)
+        except OSError as error:
+            raise SandboxPolicyError(
+                f"cannot open {label} directory without following a symlink: {error}"
+            ) from error
+    else:
+        try:
+            fd = os.open(name, dir_flags, dir_fd=parent_fd)
+        except FileNotFoundError:
+            try:
+                os.mkdir(name, mode, dir_fd=parent_fd)
+            except FileExistsError:
+                pass
+            except OSError as error:
+                raise SandboxPolicyError(
+                    f"cannot create {label} directory safely: {error}"
+                ) from error
+            try:
+                fd = os.open(name, dir_flags, dir_fd=parent_fd)
+            except OSError as error:
+                raise SandboxPolicyError(
+                    f"cannot open {label} directory without following a symlink: {error}"
+                ) from error
+        except OSError as error:
+            raise SandboxPolicyError(
+                f"cannot open {label} directory without following a symlink: {error}"
+            ) from error
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISDIR(info.st_mode):
+            raise SandboxPolicyError(f"{label} is not a real directory")
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def _create_safe_build_work_dir(
+    run_root: Path, version: str
+) -> tuple[int, Path, str, tuple[int, int]]:
+    """Create a one-shot build staging dir under ``run_root`` without following symlinks."""
+    try:
+        root_lstat = os.lstat(run_root)
+    except FileNotFoundError:
+        try:
+            run_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        except OSError as error:
+            raise SandboxPolicyError(
+                f"sandbox run_root cannot be created safely: {error}"
+            ) from error
+    except OSError as error:
+        raise SandboxPolicyError(
+            f"sandbox run_root cannot be inspected: {error}"
+        ) from error
+    else:
+        if stat.S_ISLNK(root_lstat.st_mode) or not stat.S_ISDIR(root_lstat.st_mode):
+            raise SandboxPolicyError(
+                "sandbox run_root must be a real directory, not a symlink"
+            )
+
+    dir_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        root_fd = os.open(run_root, dir_flags)
+    except OSError as error:
+        raise SandboxPolicyError(
+            f"sandbox run_root cannot be opened without following a symlink: {error}"
+        ) from error
+
+    build_fd: int | None = None
+    version_fd: int | None = None
+    work_fd: int | None = None
+    try:
+        build_fd = _ensure_safe_dir_component(
+            root_fd, "build", mode=0o755, exclusive=False, label="build root"
+        )
+        version_fd = _ensure_safe_dir_component(
+            build_fd,
+            version,
+            mode=0o755,
+            exclusive=False,
+            label=f"build/{version}",
+        )
+        leaf = uuid.uuid4().hex
+        work_fd = _ensure_safe_dir_component(
+            version_fd,
+            leaf,
+            mode=0o755,
+            exclusive=True,
+            label="build work",
+        )
+        os.fchmod(work_fd, 0o755)
+        work = run_root / "build" / version / leaf
+        by_fd = os.fstat(work_fd)
+        by_path = os.lstat(work)
+        if stat.S_ISLNK(by_path.st_mode) or not stat.S_ISDIR(by_path.st_mode):
+            raise SandboxPolicyError("build work directory is not a real directory")
+        if (by_fd.st_dev, by_fd.st_ino) != (by_path.st_dev, by_path.st_ino):
+            raise SandboxPolicyError(
+                "build work directory identity changed after creation"
+            )
+        result_fd = work_fd
+        work_fd = None
+        return result_fd, work, leaf, (by_fd.st_dev, by_fd.st_ino)
+    except SandboxPolicyError:
+        raise
+    except OSError as error:
+        raise SandboxPolicyError(
+            f"cannot prepare build work directory safely: {error}"
+        ) from error
+    finally:
+        if work_fd is not None:
+            os.close(work_fd)
+        if version_fd is not None:
+            os.close(version_fd)
+        if build_fd is not None:
+            os.close(build_fd)
+        os.close(root_fd)
+
+
+def _verify_bound_shim_file(
+    work_fd: int, work: Path, shim_name: str, *, label: str
+) -> Path:
+    shim_path = work / shim_name
+    try:
+        by_dir_fd = os.lstat(shim_name, dir_fd=work_fd)
+        by_path = os.lstat(shim_path)
+    except OSError as error:
+        raise SandboxPolicyError(
+            f"cannot verify {label} before mounting: {error}"
+        ) from error
+    if (
+        stat.S_ISLNK(by_dir_fd.st_mode)
+        or not stat.S_ISREG(by_dir_fd.st_mode)
+        or stat.S_ISLNK(by_path.st_mode)
+        or not stat.S_ISREG(by_path.st_mode)
+        or (by_dir_fd.st_dev, by_dir_fd.st_ino) != (by_path.st_dev, by_path.st_ino)
+    ):
+        raise SandboxPolicyError(
+            f"{label} failed symlink/inode boundary verification before mounting"
+        )
+    return shim_path
+
+
+def _cleanup_safe_build_work_dir(
+    run_root: Path,
+    version: str,
+    leaf: str,
+    work_identity: tuple[int, int],
+    shim_names: Sequence[str],
+) -> None:
+    """Remove staged shim files and the per-build temp dir without following symlinks."""
+    dir_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    root_fd: int | None = None
+    build_fd: int | None = None
+    version_fd: int | None = None
+    work_fd: int | None = None
+    try:
+        root_fd = os.open(run_root, dir_flags)
+        build_fd = os.open("build", dir_flags, dir_fd=root_fd)
+        version_fd = os.open(version, dir_flags, dir_fd=build_fd)
+        work_fd = os.open(leaf, dir_flags, dir_fd=version_fd)
+        info = os.fstat(work_fd)
+        if (info.st_dev, info.st_ino) != work_identity:
+            return
+        for shim_name in shim_names:
+            try:
+                os.unlink(shim_name, dir_fd=work_fd)
+            except OSError:
+                pass
+        os.close(work_fd)
+        work_fd = None
+        try:
+            os.rmdir(leaf, dir_fd=version_fd)
+        except OSError:
+            pass
+    except OSError:
+        pass
+    finally:
+        if work_fd is not None:
+            os.close(work_fd)
+        if version_fd is not None:
+            os.close(version_fd)
+        if build_fd is not None:
+            os.close(build_fd)
+        if root_fd is not None:
+            os.close(root_fd)
 
 
 def render_cc_shim_script(
@@ -1225,12 +1480,12 @@ def prepare_build_spec_execution(
 
     if kind == "cmake":
         raw_configure = list(build_spec["configure"])
+        cmake_build_dir, provenance_face_container_path = _extract_cmake_build_dir(
+            raw_configure
+        )
         if not _cmake_has_export_compile_commands(raw_configure):
             raw_configure.append("-DCMAKE_EXPORT_COMPILE_COMMANDS=ON")
         configure_argv = tuple(raw_configure)
-        cmake_build_dir, provenance_face_container_path = _extract_cmake_build_dir(
-            configure_argv
-        )
     elif kind == "make":
         provenance_face_container_path = _validate_work_container_path(
             cc_shim_log_path, label="cc-shim log path"
@@ -2424,52 +2679,66 @@ printf 'uid=%s\nseccomp=%s\nseccomp_filters=%s\nno_new_privs=%s\ncap_eff=%s\ncgr
         compile_args: Sequence[str],
         deadline_seconds: float,
     ) -> BuildResult:
-        work = self.run_root / "build" / version / uuid.uuid4().hex
-        work.mkdir(mode=0o755, parents=True, exist_ok=True)
-        work.chmod(0o755)
+        work_fd, work, work_leaf, work_identity = _create_safe_build_work_dir(
+            self.run_root, version
+        )
         mounts: list[tuple[str, str, bool]] = [(str(materials), "/fixture", True)]
-        shim_files: list[Path] = []
+        shim_names: list[str] = []
         started = time.monotonic()
         name: str | None = None
         try:
-            if plan.kind == "make":
-                assert plan.cc_shim_destination is not None
-                assert plan.provenance_face_container_path is not None
-                cc_shim_path = work / "cc-shim"
-                cc_shim_script = render_cc_shim_script(
-                    real_compiler=DEFAULT_CC_SHIM_COMPILER,
-                    log_path=plan.provenance_face_container_path,
-                )
-                try:
-                    fileio.write_regular_file(
-                        cc_shim_path,
-                        cc_shim_script.encode("utf-8"),
-                        mode=0o555,
-                    )
-                except fileio.UnsafeFileError as error:
-                    raise SandboxPolicyError(
-                        f"cannot write cc-shim script safely: {error.message}"
-                    ) from error
-                shim_files.append(cc_shim_path)
-                mounts.append((str(cc_shim_path), plan.cc_shim_destination, True))
-                if plan.cxx_shim_destination is not None:
-                    cxx_shim_path = work / "cxx-shim"
-                    cxx_shim_script = render_cc_shim_script(
-                        real_compiler=DEFAULT_CXX_SHIM_COMPILER,
+            try:
+                if plan.kind == "make":
+                    assert plan.cc_shim_destination is not None
+                    assert plan.provenance_face_container_path is not None
+                    cc_shim_script = render_cc_shim_script(
+                        real_compiler=DEFAULT_CC_SHIM_COMPILER,
                         log_path=plan.provenance_face_container_path,
                     )
                     try:
                         fileio.write_regular_file(
-                            cxx_shim_path,
-                            cxx_shim_script.encode("utf-8"),
+                            "cc-shim",
+                            cc_shim_script.encode("utf-8"),
                             mode=0o555,
+                            dir_fd=work_fd,
+                            parent_path=work,
                         )
                     except fileio.UnsafeFileError as error:
                         raise SandboxPolicyError(
-                            f"cannot write cxx-shim script safely: {error.message}"
+                            f"cannot write cc-shim script safely: {error.message}"
                         ) from error
-                    shim_files.append(cxx_shim_path)
-                    mounts.append((str(cxx_shim_path), plan.cxx_shim_destination, True))
+                    shim_names.append("cc-shim")
+                    cc_shim_path = _verify_bound_shim_file(
+                        work_fd, work, "cc-shim", label="cc-shim"
+                    )
+                    mounts.append((str(cc_shim_path), plan.cc_shim_destination, True))
+                    if plan.cxx_shim_destination is not None:
+                        cxx_shim_script = render_cc_shim_script(
+                            real_compiler=DEFAULT_CXX_SHIM_COMPILER,
+                            log_path=plan.provenance_face_container_path,
+                        )
+                        try:
+                            fileio.write_regular_file(
+                                "cxx-shim",
+                                cxx_shim_script.encode("utf-8"),
+                                mode=0o555,
+                                dir_fd=work_fd,
+                                parent_path=work,
+                            )
+                        except fileio.UnsafeFileError as error:
+                            raise SandboxPolicyError(
+                                f"cannot write cxx-shim script safely: {error.message}"
+                            ) from error
+                        shim_names.append("cxx-shim")
+                        cxx_shim_path = _verify_bound_shim_file(
+                            work_fd, work, "cxx-shim", label="cxx-shim"
+                        )
+                        mounts.append(
+                            (str(cxx_shim_path), plan.cxx_shim_destination, True)
+                        )
+            finally:
+                os.close(work_fd)
+                work_fd = -1
 
             container_env: dict[str, str] = {
                 "TMPDIR": "/work",
@@ -2553,18 +2822,25 @@ printf 'uid=%s\nseccomp=%s\nseccomp_filters=%s\nno_new_privs=%s\ncap_eff=%s\ncgr
             )
             capture_error = state.pop("_capture_error", None)
             log, log_truncated = _truncate_log(log_bytes)
-            truncated = log_truncated or bool(truncated_streams)
+            declared_copy_paths: set[str] = {
+                container_path for _rel, container_path in plan.output_container_paths
+            }
+            if plan.provenance_face_container_path is not None:
+                declared_copy_paths.add(plan.provenance_face_container_path)
+            relevant_truncated_streams = {
+                item
+                for item in truncated_streams
+                if item != "/work/parser" or "/work/parser" in declared_copy_paths
+            }
+            truncated = log_truncated or bool(relevant_truncated_streams)
             truncated_roles = tuple(
                 role for role in STREAM_ROLES if role in truncated_streams
             )
             artifact = files.get(plan.primary_output_container_path)
-            if artifact is None and plan.primary_output_container_path != "/work/parser":
-                if (
-                    len(plan.outputs) == 1
-                    or PurePosixPath(plan.primary_output).name == "parser"
-                ):
-                    artifact = files.get("/work/parser")
-            if artifact is not None and len(artifact) > MAX_ARTIFACT_BYTES:
+            if (
+                plan.primary_output_container_path in truncated_streams
+                or (artifact is not None and len(artifact) > MAX_ARTIFACT_BYTES)
+            ):
                 artifact = None
                 truncated = True
             if capture_error is not None:
@@ -2585,11 +2861,11 @@ printf 'uid=%s\nseccomp=%s\nseccomp_filters=%s\nno_new_privs=%s\ncap_eff=%s\ncgr
                 ):
                     artifact = None
                     artifact_digest = None
-                    log_truncated = True
+                    truncated = True
             elif artifact is not None:
                 artifact = None
                 artifact_digest = None
-                log_truncated = True
+                truncated = True
 
             provenance_face_name = plan.provenance_face_name
             provenance_face: bytes | None = None
@@ -2632,13 +2908,11 @@ printf 'uid=%s\nseccomp=%s\nseccomp_filters=%s\nno_new_privs=%s\ncap_eff=%s\ncgr
 
             outputs_meta: dict[str, Any] = {}
             for rel_out, c_path in plan.output_container_paths:
-                out_bytes = files.get(c_path)
-                if (
-                    out_bytes is None
-                    and c_path == plan.primary_output_container_path
-                    and artifact is not None
-                ):
-                    out_bytes = artifact
+                out_bytes = (
+                    artifact
+                    if c_path == plan.primary_output_container_path
+                    else files.get(c_path)
+                )
                 if (
                     out_bytes is not None
                     and c_path not in truncated_streams
@@ -2703,12 +2977,11 @@ printf 'uid=%s\nseccomp=%s\nseccomp_filters=%s\nno_new_privs=%s\ncap_eff=%s\ncgr
                 provenance_face_name=provenance_face_name,
             )
         finally:
-            for shim_file in shim_files:
-                try:
-                    shim_file.chmod(0o600)
-                except OSError:
-                    pass
-                shim_file.unlink(missing_ok=True)
+            if work_fd >= 0:
+                os.close(work_fd)
+            _cleanup_safe_build_work_dir(
+                self.run_root, version, work_leaf, work_identity, shim_names
+            )
 
     def replay(
         self,

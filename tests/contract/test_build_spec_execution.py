@@ -34,7 +34,10 @@ import pytest
 from datacon import build_provenance, contracts, evidence, execution, jsonutil
 from datacon.asan import ASanSignature
 from datacon.cases import load_registry
+from datacon.tools import sandbox as sandbox_mod
 from datacon.tools.sandbox import (
+    MAX_ARTIFACT_BYTES,
+    MAX_PROVENANCE_FACE_BYTES,
     SECCOMP_PROFILE_DIGEST,
     BuildResult,
     DockerSandbox,
@@ -43,6 +46,7 @@ from datacon.tools.sandbox import (
     ReplayResult,
     ResourceLimits,
     SandboxError,
+    SandboxPolicyError,
     build_runner_command,
     prepare_build_spec_execution,
     render_cc_shim_script,
@@ -412,6 +416,11 @@ class _InMemoryState:
         monkeypatch.setattr(
             execution.state, "execution_attempts", self.execution_attempts
         )
+        monkeypatch.setattr(
+            execution.state,
+            "execution_attempts_across_generations",
+            self.execution_attempts_across_generations,
+        )
         monkeypatch.setattr(execution.state, "mark_archiving", self.mark_archiving)
         monkeypatch.setattr(
             execution.state, "assert_archive_fence", self.assert_archive_fence
@@ -505,6 +514,11 @@ class _InMemoryState:
         self, dsn: str, job_id: UUID, generation: int
     ) -> list[dict[str, Any]]:
         return [deepcopy(row) for row in self.attempts if row["generation"] == generation]
+
+    def execution_attempts_across_generations(
+        self, dsn: str, job_id: UUID
+    ) -> list[dict[str, Any]]:
+        return [deepcopy(row) for row in self.attempts]
 
     def mark_archiving(self, dsn: str, job_id: UUID, *, generation: int) -> bool:
         self.job["state"] = "ARCHIVING"
@@ -1513,3 +1527,811 @@ def test_v2_provenance_failure_fails_closed_without_replay_or_inconclusive_downg
     # Double-check permission bits on archived files are non-writable (0444).
     mode = stat.S_IMODE((bundle_root / "report.json").stat().st_mode)
     assert mode == 0o444
+
+
+# ---------------------------------------------------------------------------
+# 6. Direct DockerSandbox._build_with_spec hardening & edge-case coverage
+# ---------------------------------------------------------------------------
+
+
+def _build_result_marker(artifact: bytes | None, *, code: int = 0) -> bytes:
+    if artifact is None:
+        return f"\nDATACON_BUILD_RESULT code={code} size=-1 digest=missing\n".encode("ascii")
+    digest = hashlib.sha256(artifact).hexdigest()
+    return (
+        f"\nDATACON_BUILD_RESULT code={code} size={len(artifact)} digest={digest}\n"
+    ).encode("ascii")
+
+
+def test_build_with_spec_make_mounts_cc_and_cxx_shims_readonly_and_cleans_up_temp_dir(
+    tmp_path, monkeypatch
+):
+    sandbox = _make_sandbox(tmp_path)
+    materials = tmp_path / "materials"
+    materials.mkdir()
+
+    spec = _make_spec(cc="/opt/datacon/bin/cc-shim")
+    spec["env"]["CXX"] = "/usr/local/bin/cxx-shim"
+
+    artifact_bytes = b"ELF-make-parser"
+    shim_log_bytes = _make_cc_shim_log_bytes(flags=DECLARED_FLAGS)
+
+    observed_create: list[dict[str, Any]] = []
+    observed_start: list[dict[str, Any]] = []
+    staged_work_dirs: list[Path] = []
+    staged_shim_paths: list[Path] = []
+
+    def fake_create(*, suffix, command, mounts, env=None):
+        observed_create.append(
+            {
+                "suffix": suffix,
+                "command": list(command),
+                "mounts": list(mounts),
+                "env": dict(env or {}),
+            }
+        )
+        # Inspect staged shims while the container would be alive.
+        mount_map = {dst: (Path(src), ro) for src, dst, ro in mounts}
+        assert mount_map["/fixture"] == (materials, True)
+        cc_src, cc_ro = mount_map["/opt/datacon/bin/cc-shim"]
+        cxx_src, cxx_ro = mount_map["/usr/local/bin/cxx-shim"]
+        assert cc_ro is True and cxx_ro is True
+        assert not cc_src.is_symlink() and cc_src.is_file()
+        assert not cxx_src.is_symlink() and cxx_src.is_file()
+        assert stat.S_IMODE(cc_src.stat().st_mode) == 0o555
+        assert stat.S_IMODE(cxx_src.stat().st_mode) == 0o555
+        cc_text = cc_src.read_text(encoding="utf-8")
+        cxx_text = cxx_src.read_text(encoding="utf-8")
+        assert "_datacon_real_compiler=clang\n" in cc_text
+        assert "_datacon_real_compiler='clang++'\n" in cxx_text or "_datacon_real_compiler=clang++\n" in cxx_text
+        assert "/work/.datacon-cc-shim.log" in cc_text
+        assert "/work/.datacon-cc-shim.log" in cxx_text
+        assert cc_src.parent == cxx_src.parent
+        staged_work_dirs.append(cc_src.parent)
+        staged_shim_paths.extend([cc_src, cxx_src])
+        return "fake-make-cid", {}
+
+    def fake_start_and_wait(
+        name, *, deadline_seconds, artifact=False, extra_copy_paths=()
+    ):
+        observed_start.append(
+            {
+                "name": name,
+                "artifact": artifact,
+                "extra_copy_paths": list(extra_copy_paths),
+            }
+        )
+        return (
+            b"make stdout\n",
+            b"make stderr\n" + _build_result_marker(artifact_bytes, code=0),
+            {
+                "/work/src/parser": artifact_bytes,
+                "/work/.datacon-cc-shim.log": shim_log_bytes,
+            },
+            set(),
+            {"Running": False, "Status": "exited", "ExitCode": 0},
+            False,
+            0,
+            None,
+        )
+
+    monkeypatch.setattr(sandbox, "_create", fake_create)
+    monkeypatch.setattr(sandbox, "_start_and_wait", fake_start_and_wait)
+
+    result = sandbox.build("vulnerable", materials_dir=materials, build_spec=spec)
+
+    assert result.status == "completed"
+    assert result.artifact == artifact_bytes
+    assert result.artifact_digest == _sha256_prefixed(artifact_bytes)
+    assert result.provenance_face == shim_log_bytes
+    assert result.provenance_face_name == "cc-shim.log"
+    assert result.log_truncated is False
+    assert result.metadata["provenance_face_truncated"] is False
+    assert len(observed_create) == 1
+    assert len(observed_start) == 1
+    assert observed_start[0]["extra_copy_paths"] == [
+        ("/work/src/parser", MAX_ARTIFACT_BYTES),
+        ("/work/.datacon-cc-shim.log", MAX_PROVENANCE_FACE_BYTES),
+    ]
+    # Both shim files AND the per-build temp directory must be removed in finally.
+    assert len(staged_work_dirs) == 1
+    for shim_path in staged_shim_paths:
+        assert not shim_path.exists(), f"shim file leaked after build: {shim_path}"
+    assert not staged_work_dirs[0].exists(), (
+        f"per-build temp dir leaked after build: {staged_work_dirs[0]}"
+    )
+
+    # Also verify cleanup happens when _create raises.
+    staged_work_dirs.clear()
+    staged_shim_paths.clear()
+
+    def failing_create(*, suffix, command, mounts, env=None):
+        mount_map = {dst: Path(src) for src, dst, _ in mounts}
+        cc_src = mount_map["/opt/datacon/bin/cc-shim"]
+        cxx_src = mount_map["/usr/local/bin/cxx-shim"]
+        staged_work_dirs.append(cc_src.parent)
+        staged_shim_paths.extend([cc_src, cxx_src])
+        raise SandboxError("simulated docker create failure")
+
+    monkeypatch.setattr(sandbox, "_create", failing_create)
+    with pytest.raises(SandboxError, match="simulated docker create failure"):
+        sandbox.build("vulnerable", materials_dir=materials, build_spec=spec)
+    assert len(staged_work_dirs) == 1
+    for shim_path in staged_shim_paths:
+        assert not shim_path.exists()
+    assert not staged_work_dirs[0].exists()
+
+
+@pytest.mark.parametrize("symlink_level", ["run_root", "build", "version"])
+def test_build_with_spec_rejects_symlinks_under_untrusted_run_root(
+    tmp_path, monkeypatch, symlink_level
+):
+    outside = tmp_path / "outside-target"
+    outside.mkdir()
+    run_root = tmp_path / "untrusted-run-root"
+    if symlink_level == "run_root":
+        run_root.symlink_to(outside)
+    elif symlink_level == "build":
+        run_root.mkdir()
+        (run_root / "build").symlink_to(outside)
+    else:
+        (run_root / "build").mkdir(parents=True)
+        (run_root / "build" / "vulnerable").symlink_to(outside)
+
+    sandbox = DockerSandbox(
+        image=IMAGE,
+        platform="linux/amd64",
+        policy=POLICY,
+        limits=LIMITS,
+        job_id=str(uuid4()),
+        run_root=run_root,
+        generation=1,
+    )
+    create_calls = 0
+
+    def fail_create(*args: Any, **kwargs: Any) -> Any:
+        nonlocal create_calls
+        create_calls += 1
+        raise AssertionError("_create must not be called when run_root contains a symlink")
+
+    monkeypatch.setattr(sandbox, "_create", fail_create)
+    materials = tmp_path / "materials"
+    materials.mkdir()
+
+    with pytest.raises(SandboxPolicyError):
+        sandbox.build(
+            "vulnerable",
+            materials_dir=materials,
+            build_spec=_make_spec(),
+        )
+    assert create_calls == 0
+    assert list(outside.iterdir()) == [], (
+        f"symlink boundary was crossed at {symlink_level}: {list(outside.iterdir())!r}"
+    )
+
+
+def test_build_with_spec_insource_cmake_reads_work_compile_commands_and_handles_B_variants(
+    tmp_path, monkeypatch
+):
+    # Omitted -B (in-source build) must target /work/compile_commands.json.
+    for insource_cfg in (["cmake", "."], ["cmake", "-S", "."]):
+        plan = prepare_build_spec_execution(
+            _cmake_spec(
+                configure=insource_cfg,
+                build=["cmake", "--build", ".", "--target", "parser"],
+                outputs=["parser"],
+            )
+        )
+        assert plan.cmake_build_dir == "."
+        assert plan.provenance_face_container_path == "/work/compile_commands.json"
+
+    # Connected -B<dir> must target /work/<dir>/compile_commands.json.
+    connected_plan = prepare_build_spec_execution(
+        _cmake_spec(configure=["cmake", "-S", ".", "-Bcustom_out"])
+    )
+    assert connected_plan.cmake_build_dir == "custom_out"
+    assert (
+        connected_plan.provenance_face_container_path
+        == "/work/custom_out/compile_commands.json"
+    )
+
+    # Dangling -B without a value must fail closed.
+    with pytest.raises(SandboxError) as exc_info:
+        prepare_build_spec_execution(
+            _cmake_spec(configure=["cmake", "-S", ".", "-B"])
+        )
+    assert exc_info.value.reason_code == build_provenance.BUILD_PROVENANCE_MISSING
+
+    # End-to-end mocked _build_with_spec on in-source CMake.
+    sandbox = _make_sandbox(tmp_path)
+    materials = tmp_path / "materials"
+    materials.mkdir()
+    spec = _cmake_spec(
+        configure=["cmake", "."],
+        build=["cmake", "--build", ".", "--target", "parser"],
+        outputs=["parser"],
+    )
+    artifact_bytes = b"ELF-insource-cmake"
+    face_bytes = _cmake_compile_commands_bytes(
+        flags=DECLARED_FLAGS, directory="/work", source="/work/src/parser.c"
+    )
+    captured_extra: list[tuple[str, int]] = []
+
+    monkeypatch.setattr(sandbox, "_create", lambda **kwargs: ("fake-cmake-cid", {}))
+
+    def fake_start(name, *, deadline_seconds, artifact=False, extra_copy_paths=()):
+        captured_extra.extend(extra_copy_paths)
+        return (
+            b"cmake ok\n",
+            _build_result_marker(artifact_bytes, code=0),
+            {
+                "/work/parser": artifact_bytes,
+                "/work/compile_commands.json": face_bytes,
+            },
+            set(),
+            {"Running": False, "Status": "exited", "ExitCode": 0},
+            False,
+            0,
+            None,
+        )
+
+    monkeypatch.setattr(sandbox, "_start_and_wait", fake_start)
+    result = sandbox.build("vulnerable", materials_dir=materials, build_spec=spec)
+    assert result.status == "completed"
+    assert result.provenance_face == face_bytes
+    assert result.provenance_face_name == "compile_commands.json"
+    assert ("/work/compile_commands.json", MAX_PROVENANCE_FACE_BYTES) in captured_extra
+    # Ensure no per-build temp dir leaked for cmake either.
+    version_dir = sandbox.run_root / "build" / "vulnerable"
+    assert version_dir.is_dir() and list(version_dir.iterdir()) == []
+
+
+def test_build_with_spec_missing_primary_output_never_falls_back_to_work_parser_or_sets_log_truncated(
+    tmp_path, monkeypatch
+):
+    sandbox = _make_sandbox(tmp_path)
+    materials = tmp_path / "materials"
+    materials.mkdir()
+
+    # 1. CMake build declaring build/parser, which was NOT produced while an unrelated
+    # /work/parser exists in the container tmpfs.
+    cmake_spec = _cmake_spec(outputs=["build/parser"])
+    face_bytes = _cmake_compile_commands_bytes(flags=DECLARED_FLAGS)
+
+    monkeypatch.setattr(sandbox, "_create", lambda **kwargs: ("fake-missing-cid", {}))
+
+    def fake_start_missing(
+        name, *, deadline_seconds, artifact=False, extra_copy_paths=()
+    ):
+        return (
+            b"build output\n",
+            _build_result_marker(None, code=0),
+            {
+                "/work/parser": b"UNRELATED-STALE-BINARY",
+                "/work/build/compile_commands.json": face_bytes,
+            },
+            set(),
+            {"Running": False, "Status": "exited", "ExitCode": 0},
+            False,
+            0,
+            None,
+        )
+
+    monkeypatch.setattr(sandbox, "_start_and_wait", fake_start_missing)
+    cmake_res = sandbox.build(
+        "vulnerable", materials_dir=materials, build_spec=cmake_spec
+    )
+    assert cmake_res.status == "build_failed"
+    assert cmake_res.artifact is None
+    assert cmake_res.artifact_digest is None
+    assert cmake_res.log_truncated is False, (
+        "missing primary output must not falsely flag log_truncated=True"
+    )
+    assert cmake_res.capture_error is None
+    assert cmake_res.metadata["outputs"]["build/parser"] is None
+    assert cmake_res.provenance_face == face_bytes
+
+    # 2. Shell build declaring out/parser missing while unrelated /work/parser exists
+    # must also keep log_truncated=False and provenance_face_truncated=False.
+    shell_spec = _shell_spec(
+        face_digest="sha256:" + "3" * 64,
+        review={
+            "reviewer_id": "reviewer-01",
+            "reviewed_at": "2099-01-01T00:00:00Z",
+            "face_kind": "build_log",
+        },
+    )
+    shell_res = sandbox.build(
+        "vulnerable", materials_dir=materials, build_spec=shell_spec
+    )
+    assert shell_res.status == "build_failed"
+    assert shell_res.artifact is None
+    assert shell_res.log_truncated is False
+    assert shell_res.metadata["provenance_face_truncated"] is False
+    assert shell_res.provenance_face == shell_res.log
+
+
+@pytest.mark.parametrize("mode", ["truncated_stream", "oversize_bytes", "shell_stream_truncated"])
+def test_build_with_spec_provenance_face_truncation_and_oversize_fail_closed(
+    tmp_path, monkeypatch, mode
+):
+    sandbox = _make_sandbox(tmp_path)
+    materials = tmp_path / "materials"
+    materials.mkdir()
+    artifact_bytes = b"ELF-ok"
+
+    monkeypatch.setattr(sandbox, "_create", lambda **kwargs: ("fake-trunc-cid", {}))
+
+    if mode == "shell_stream_truncated":
+        spec = _shell_spec(
+            face_digest="sha256:" + "4" * 64,
+            review={
+                "reviewer_id": "reviewer-01",
+                "reviewed_at": "2099-01-01T00:00:00Z",
+                "face_kind": "build_log",
+            },
+        )
+        out_path = "/work/out/parser"
+
+        def fake_start_shell(
+            name, *, deadline_seconds, artifact=False, extra_copy_paths=()
+        ):
+            return (
+                b"truncated log...",
+                _build_result_marker(artifact_bytes, code=0),
+                {out_path: artifact_bytes},
+                {"stdout"},
+                {"Running": False, "Status": "exited", "ExitCode": 0},
+                False,
+                0,
+                None,
+            )
+
+        monkeypatch.setattr(sandbox, "_start_and_wait", fake_start_shell)
+        result = sandbox.build("vulnerable", materials_dir=materials, build_spec=spec)
+        assert result.provenance_face is None
+        assert result.metadata["provenance_face_truncated"] is True
+        assert result.log_truncated is True
+        return
+
+    spec = _cmake_spec()
+    face_path = "/work/build/compile_commands.json"
+    if mode == "oversize_bytes":
+        monkeypatch.setattr(sandbox_mod, "MAX_PROVENANCE_FACE_BYTES", 64)
+        face_payload = b"[" + b" " * 128 + b"]"
+        truncated_set: set[str] = set()
+    else:
+        face_payload = _cmake_compile_commands_bytes(flags=DECLARED_FLAGS)
+        truncated_set = {face_path}
+
+    captured_extra: list[tuple[str, int]] = []
+
+    def fake_start_cmake(
+        name, *, deadline_seconds, artifact=False, extra_copy_paths=()
+    ):
+        captured_extra.extend(extra_copy_paths)
+        return (
+            b"cmake build\n",
+            _build_result_marker(artifact_bytes, code=0),
+            {
+                "/work/build/parser": artifact_bytes,
+                face_path: face_payload,
+            },
+            truncated_set,
+            {"Running": False, "Status": "exited", "ExitCode": 0},
+            False,
+            0,
+            None,
+        )
+
+    monkeypatch.setattr(sandbox, "_start_and_wait", fake_start_cmake)
+    result = sandbox.build("vulnerable", materials_dir=materials, build_spec=spec)
+    assert (face_path, sandbox_mod.MAX_PROVENANCE_FACE_BYTES) in captured_extra
+    assert result.provenance_face is None
+    assert result.metadata["provenance_face_truncated"] is True
+    assert result.log_truncated is True
+
+
+@pytest.mark.parametrize(
+    "bad_cc,bad_cxx",
+    [
+        ("/work/cc-shim", None),
+        ("/work/bin/cc-shim", None),
+        ("//work/cc-shim", None),
+        ("/tmp/cc-shim", None),
+        ("/tmp/bin/cc-shim", None),
+        ("/fixture/cc-shim", None),
+        ("/proc/cc-shim", None),
+        ("/sys/cc-shim", None),
+        ("/dev/cc-shim", None),
+        ("/opt/datacon/cc-shim", "/work/cxx-shim"),
+        ("/opt/datacon/cc-shim", "/tmp/bin/cxx-shim"),
+    ],
+)
+def test_shim_destination_rejects_conflicting_mount_prefixes_before_create(
+    tmp_path, monkeypatch, bad_cc, bad_cxx
+):
+    sandbox = _make_sandbox(tmp_path)
+    create_calls = 0
+
+    def fail_create(*args: Any, **kwargs: Any) -> Any:
+        nonlocal create_calls
+        create_calls += 1
+        raise AssertionError("_create must not be called for conflicting shim destination")
+
+    monkeypatch.setattr(sandbox, "_create", fail_create)
+    materials = tmp_path / "materials"
+    materials.mkdir()
+
+    spec = _make_spec(cc=bad_cc)
+    if bad_cxx is not None:
+        spec["env"]["CXX"] = bad_cxx
+
+    with pytest.raises(SandboxError) as exc_info:
+        sandbox.build("vulnerable", materials_dir=materials, build_spec=spec)
+    assert exc_info.value.reason_code == build_provenance.BUILD_PROVENANCE_MISSING
+    assert create_calls == 0
+
+
+@pytest.mark.parametrize(
+    "good_cc,good_cxx",
+    [
+        ("/opt/datacon/cc-shim", None),
+        ("/opt/datacon/bin/cc-shim", "/opt/datacon/bin/cxx-shim"),
+        ("/usr/local/bin/cc-shim", "/usr/local/bin/cxx-shim"),
+    ],
+)
+def test_shim_destination_allows_spec_valid_readonly_rootfs_paths(good_cc, good_cxx):
+    spec = _make_spec(cc=good_cc)
+    if good_cxx is not None:
+        spec["env"]["CXX"] = good_cxx
+    plan = prepare_build_spec_execution(spec)
+    assert plan.cc_shim_destination == good_cc
+    assert plan.cxx_shim_destination == good_cxx
+
+
+# ---------------------------------------------------------------------------
+# 7. plan.compile_flags vs build_spec.declared_compile_flags consistency
+# ---------------------------------------------------------------------------
+
+
+def test_v2_compile_flags_normalized_equivalent_passes_end_to_end(
+    tmp_path, monkeypatch
+):
+    run_root, _ = _configure_isolated_roots(tmp_path, monkeypatch)
+    # Split/absolute form in plan.compile_flags vs connected/relative form in build_spec.
+    spec = _cmake_spec(
+        declared_compile_flags=[
+            "-fsanitize=address",
+            "-g",
+            "-O1",
+            "-Iinclude",
+            "-D_GNU_SOURCE",
+        ]
+    )
+    equivalent_plan_flags = [
+        "-fsanitize=address",
+        "-g",
+        "-O1",
+        "-I",
+        "/work/include",
+        "-D",
+        "_GNU_SOURCE",
+    ]
+    job, plan, plan_digest, review = _setup_fixture_plan_and_job(
+        version=2, build_spec=spec, compile_flags=equivalent_plan_flags
+    )
+    mem_state = _InMemoryState(job, plan, plan_digest, review)
+    mem_state.install(monkeypatch)
+
+    face = _cmake_compile_commands_bytes(
+        flags=["-fsanitize=address", "-g", "-O1", "-I../include", "-D_GNU_SOURCE"]
+    )
+    fake_sandbox = _FakeSandbox(
+        image_digest=plan["image_digest"],
+        build_recipe_digest=plan["build_recipe_digest"],
+        faces={"vulnerable": face, "fixed": face},
+        face_name="compile_commands.json",
+    )
+
+    result = execution.run_execution(
+        "dsn",
+        job["job_id"],
+        1,
+        case_root=str(FIXTURE_CASES),
+        run_root=run_root,
+        sandbox=fake_sandbox,
+    )
+    assert result.state == "REPRODUCED"
+    assert len(fake_sandbox.build_calls) == 2
+    assert len(fake_sandbox.replay_calls) == 6
+
+
+@pytest.mark.parametrize(
+    "label,plan_flags,spec_flags",
+    [
+        (
+            "extra_flag_in_build_spec",
+            ["-fsanitize=address", "-g"],
+            ["-fsanitize=address", "-g", "-O1"],
+        ),
+        (
+            "order_difference",
+            ["-fsanitize=address", "-I", "a", "-I", "b"],
+            ["-fsanitize=address", "-I", "b", "-I", "a"],
+        ),
+    ],
+)
+def test_v2_compile_flags_vs_declared_compile_flags_mismatch_fails_closed(
+    tmp_path, monkeypatch, label, plan_flags, spec_flags
+):
+    run_root, _ = _configure_isolated_roots(tmp_path, monkeypatch)
+    spec = _cmake_spec(declared_compile_flags=spec_flags)
+    job, plan, plan_digest, review = _setup_fixture_plan_and_job(
+        version=2, build_spec=spec, compile_flags=plan_flags
+    )
+    mem_state = _InMemoryState(job, plan, plan_digest, review)
+    mem_state.install(monkeypatch)
+
+    face = _cmake_compile_commands_bytes(flags=spec_flags)
+    fake_sandbox = _FakeSandbox(
+        image_digest=plan["image_digest"],
+        build_recipe_digest=plan["build_recipe_digest"],
+        faces={"vulnerable": face, "fixed": face},
+        face_name="compile_commands.json",
+    )
+
+    result = execution.run_execution(
+        "dsn",
+        job["job_id"],
+        1,
+        case_root=str(FIXTURE_CASES),
+        run_root=run_root,
+        sandbox=fake_sandbox,
+    )
+    assert result.state == "FAILED", f"{label}: expected FAILED, got {result}"
+    assert result.reason_code == build_provenance.BUILD_PROVENANCE_MISSING
+    assert result.verdict is None
+    assert len(fake_sandbox.build_calls) == 0, f"{label}: must not build on mismatch"
+    assert len(fake_sandbox.replay_calls) == 0, f"{label}: must run 0 replays"
+    assert result.evidence_path is not None
+    report = json.loads(
+        (Path(result.evidence_path) / "report.json").read_text(encoding="utf-8")
+    )
+    assert report["reason_code"] == build_provenance.BUILD_PROVENANCE_MISSING
+    assert report["build_provenance"]["comparable"] is False
+    assert "plan.compile_flags" in str(report["error"])
+
+
+# ---------------------------------------------------------------------------
+# 8. _archive_only recovery on v2 preserves FAILED / BUILD_PROVENANCE_MISSING
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "scenario",
+    [
+        "missing_face_zero_replays",
+        "deleted_face_with_six_non_crashing_replays",
+        "non_comparable_faces_with_six_replays",
+        "compile_flags_mismatch_in_archive_only",
+    ],
+)
+def test_v2_archive_only_recovery_never_downgrades_provenance_failure(
+    tmp_path, monkeypatch, scenario
+):
+    run_root, _ = _configure_isolated_roots(tmp_path, monkeypatch)
+
+    if scenario == "non_comparable_faces_with_six_replays":
+        spec = _make_spec(declared_compile_flags=["-fsanitize=address", "-g"])
+        face_name = "cc-shim.log"
+        vuln_face: bytes | None = _make_cc_shim_log_bytes(
+            flags=["-fsanitize=address", "-g", "-I", "a", "-I", "b"]
+        )
+        fixed_face: bytes | None = _make_cc_shim_log_bytes(
+            flags=["-fsanitize=address", "-g", "-I", "b", "-I", "a"]
+        )
+        plan_compile_flags: list[str] | None = None
+    elif scenario == "compile_flags_mismatch_in_archive_only":
+        spec = _cmake_spec(declared_compile_flags=["-fsanitize=address", "-g", "-O1"])
+        face_name = "compile_commands.json"
+        vuln_face = _cmake_compile_commands_bytes(
+            flags=["-fsanitize=address", "-g", "-O1"]
+        )
+        fixed_face = _cmake_compile_commands_bytes(
+            flags=["-fsanitize=address", "-g", "-O1"]
+        )
+        plan_compile_flags = ["-fsanitize=address", "-g"]
+    else:
+        spec = _cmake_spec()
+        face_name = "compile_commands.json"
+        vuln_face = _cmake_compile_commands_bytes(flags=DECLARED_FLAGS)
+        fixed_face = (
+            None
+            if scenario == "missing_face_zero_replays"
+            else _cmake_compile_commands_bytes(flags=DECLARED_FLAGS)
+        )
+        plan_compile_flags = None
+
+    job, plan, plan_digest, review = _setup_fixture_plan_and_job(
+        version=2, build_spec=spec, compile_flags=plan_compile_flags
+    )
+    # Generation 2 recovers an ARCHIVING job whose steps ran in generation 1.
+    job["state"] = "ARCHIVING"
+    job["generation"] = 2
+    mem_state = _InMemoryState(job, plan, plan_digest, review)
+    mem_state.install(monkeypatch)
+
+    ctx = execution._load_context(
+        "dsn",
+        job["job_id"],
+        2,
+        case_root=str(FIXTURE_CASES),
+        run_root=run_root,
+    )
+    work_root = execution._work_root(ctx)
+    gen1_root = work_root / "generation-1"
+
+    # Seed completed probe attempt from generation 1.
+    probe_payload = {
+        "tool_id": "sandbox.probe",
+        "job_id": ctx.job_id_text,
+        "generation": 1,
+        "plan_digest": plan_digest,
+        "status": "completed",
+        "ok": True,
+        "checks": {"uid": "65534", "errors": []},
+        "compiler_version": "clang 19.1.7",
+        "image_digest": plan["image_digest"],
+    }
+    mem_state.record_attempt(
+        "dsn",
+        job["job_id"],
+        stage="execute",
+        step_key="sandbox.probe",
+        attempt_no=1,
+        generation=1,
+        input_digest=plan_digest,
+        status="completed",
+        result=probe_payload,
+    )
+
+    # Seed completed build attempts (vulnerable & fixed) on disk under generation 1.
+    face_paths: dict[str, Path] = {}
+    for version, raw_face in (("vulnerable", vuln_face), ("fixed", fixed_face)):
+        bdir = gen1_root / "build" / version
+        bdir.mkdir(parents=True, exist_ok=True)
+        log_bytes = f"build {version}\n".encode("utf-8")
+        art_bytes = f"ELF-{version}".encode("utf-8")
+        log_file = bdir / "build.log"
+        art_file = bdir / "parser"
+        log_file.write_bytes(log_bytes)
+        art_file.write_bytes(art_bytes)
+        files_map: dict[str, Any] = {
+            "log": str(log_file.relative_to(work_root)),
+            "artifact": str(art_file.relative_to(work_root)),
+        }
+        digests_map: dict[str, Any] = {
+            "log": _sha256_prefixed(log_bytes),
+            "artifact": _sha256_prefixed(art_bytes),
+        }
+        if raw_face is not None:
+            fdir = bdir / "build_provenance"
+            fdir.mkdir(parents=True, exist_ok=True)
+            ffile = fdir / face_name
+            ffile.write_bytes(raw_face)
+            face_paths[version] = ffile
+            files_map["provenance_face"] = str(ffile.relative_to(work_root))
+            digests_map["provenance_face"] = _sha256_prefixed(raw_face)
+        build_payload = {
+            "tool_id": "sandbox.build",
+            "job_id": ctx.job_id_text,
+            "generation": 1,
+            "plan_digest": plan_digest,
+            "input_digest": plan["analysis_digest"],
+            "status": "completed",
+            "version": version,
+            "container_id": f"gen1-build-{version}",
+            "artifact_digest": _sha256_prefixed(art_bytes),
+            "attempt_no": 1,
+            "files": files_map,
+            "file_digests": digests_map,
+            "build_spec_kind": spec["kind"],
+            "provenance_face_name": face_name,
+        }
+        mem_state.record_attempt(
+            "dsn",
+            job["job_id"],
+            stage="execute",
+            step_key=f"build:{version}",
+            attempt_no=1,
+            generation=1,
+            input_digest=plan["analysis_digest"],
+            status="completed",
+            result=build_payload,
+        )
+
+    # For scenarios with 6 replays, seed clean non-crashing replays (which would
+    # otherwise yield NOT_REPRODUCED if provenance were bypassed!).
+    if scenario != "missing_face_zero_replays":
+        for version in ("vulnerable", "fixed"):
+            for phase in ("normal", "candidate_1", "candidate_2"):
+                rdir = gen1_root / "replay" / version / phase
+                rdir.mkdir(parents=True, exist_ok=True)
+                out_bytes = b"OK\n" if phase == "normal" else b"ABCD\n"
+                err_bytes = b""
+                out_file = rdir / "stdout.log"
+                err_file = rdir / "stderr.log"
+                out_file.write_bytes(out_bytes)
+                err_file.write_bytes(err_bytes)
+                in_digest = (
+                    plan["inputs"]["normal"]
+                    if phase == "normal"
+                    else plan["inputs"]["candidate"]
+                )
+                replay_payload = {
+                    "tool_id": "sandbox.replay",
+                    "job_id": ctx.job_id_text,
+                    "generation": 1,
+                    "plan_digest": plan_digest,
+                    "input_digest": in_digest,
+                    "artifact_digest": _sha256_prefixed(f"ELF-{version}".encode("utf-8")),
+                    "status": "completed",
+                    "version": version,
+                    "phase": phase,
+                    "exit_code": 0,
+                    "duration_seconds": 0.05,
+                    "container_id": f"gen1-replay-{version}-{phase}",
+                    "signature": None,
+                    "timed_out": False,
+                    "quota_hit": False,
+                    "log_truncated": False,
+                    "capture_error": None,
+                    "truncated_roles": [],
+                    "attempt_no": 1,
+                    "files": {
+                        "stdout": str(out_file.relative_to(work_root)),
+                        "stderr": str(err_file.relative_to(work_root)),
+                    },
+                    "file_digests": {
+                        "stdout": _sha256_prefixed(out_bytes),
+                        "stderr": _sha256_prefixed(err_bytes),
+                    },
+                }
+                mem_state.record_attempt(
+                    "dsn",
+                    job["job_id"],
+                    stage="execute",
+                    step_key=f"replay:{version}:{phase}",
+                    attempt_no=1,
+                    generation=1,
+                    input_digest=in_digest,
+                    status="completed",
+                    result=replay_payload,
+                )
+
+    if scenario == "deleted_face_with_six_non_crashing_replays":
+        # Remove the fixed provenance face from disk before _archive_only runs.
+        face_paths["fixed"].unlink()
+
+    result = execution.run_execution(
+        "dsn",
+        job["job_id"],
+        2,
+        case_root=str(FIXTURE_CASES),
+        run_root=run_root,
+    )
+    assert result.state == "FAILED", (
+        f"{scenario}: _archive_only must stay FAILED (never INCONCLUSIVE/NOT_REPRODUCED), "
+        f"got {result}"
+    )
+    assert result.reason_code == build_provenance.BUILD_PROVENANCE_MISSING
+    assert result.verdict is None
+    assert result.evidence_path is not None
+    report = json.loads(
+        (Path(result.evidence_path) / "report.json").read_text(encoding="utf-8")
+    )
+    assert report["state"] == "FAILED"
+    assert report["verdict"] == "FAILED"
+    assert report["reason_code"] == build_provenance.BUILD_PROVENANCE_MISSING
+    assert report["build_provenance"]["comparable"] is False
