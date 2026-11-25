@@ -240,6 +240,8 @@ def _envelope_digest_or_null(value: Any, *, label: str) -> str | None:
 def _envelope_signature_set(value: Any) -> list[dict[str, Any]]:
     if not isinstance(value, list):
         raise ValueError("envelope.accepted_signature_set must be a JSON array")
+    if not value:
+        raise ValueError("envelope.accepted_signature_set must not be empty")
     normalized: list[dict[str, Any]] = []
     for index, item in enumerate(value):
         label = f"accepted_signature_set[{index}]"
