@@ -111,7 +111,14 @@ def _admit(
     recomputable: bool = True,
     campaign_bundle_digest: str | None = None,
     existing_rounds: tuple[int, ...] = (),
+    approved_envelope_digest: str | None = None,
+    plan_envelope_digest: str | None = None,
 ):
+    binding_options = {}
+    if approved_envelope_digest is not None:
+        binding_options["approved_envelope_digest"] = approved_envelope_digest
+    if plan_envelope_digest is not None:
+        binding_options["plan_envelope_digest"] = plan_envelope_digest
     return state.policy_admit_round(
         store=store,
         clock=clock or FakeClock(),
@@ -128,6 +135,7 @@ def _admit(
         campaign_bundle_digest=campaign_bundle_digest,
         admission_id=ADMISSION_ID,
         existing_rounds=existing_rounds,
+        **binding_options,
     )
 
 
@@ -193,6 +201,41 @@ def test_policy_admission_appends_round_admitted_event():
     assert not denied_store.admissions
     assert denied_store.events[-1]["event_type"] == "round_admission_denied"
     assert denied_store.events[-1]["reason_code"] == "ADMISSION_DENIED"
+
+
+def test_admission_envelope_must_match_approval():
+    store = RecordingAdmissionStore()
+    unapproved_digest = _digest("b")
+
+    outcome = _admit(store=store, approved_envelope_digest=unapproved_digest)
+
+    assert not outcome.admitted
+    assert outcome.reason_code == "ADMISSION_DENIED"
+    assert outcome.sub_reason == "PARENT_APPROVAL_ENVELOPE_MISMATCH"
+    assert not store.admissions, "unapproved envelope wrote an admissions row"
+    assert [event["event_type"] for event in store.events] == [
+        "round_admission_denied"
+    ]
+    assert store.events[0]["detail"]["sub_reason"] == (
+        "PARENT_APPROVAL_ENVELOPE_MISMATCH"
+    )
+    assert store.events[0]["reason_code"] == "ADMISSION_DENIED"
+
+
+def test_admission_plan_envelope_must_match():
+    store = RecordingAdmissionStore()
+    plan_digest = _digest("b")
+
+    outcome = _admit(store=store, plan_envelope_digest=plan_digest)
+
+    assert not outcome.admitted
+    assert outcome.reason_code == "ADMISSION_DENIED"
+    assert outcome.sub_reason == "PLAN_ENVELOPE_MISMATCH"
+    assert not store.admissions, "plan/envelope mismatch wrote an admissions row"
+    assert [event["event_type"] for event in store.events] == [
+        "round_admission_denied"
+    ]
+    assert store.events[0]["detail"]["sub_reason"] == "PLAN_ENVELOPE_MISMATCH"
 
 
 def test_round_beyond_max_rounds_is_denied():

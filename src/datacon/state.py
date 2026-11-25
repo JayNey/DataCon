@@ -2087,6 +2087,9 @@ def propose_envelope(
     }
 
 
+_ADMISSION_BINDING_UNSET = object()
+
+
 def policy_admit_round(
     *,
     store: Any = None,
@@ -2104,6 +2107,9 @@ def policy_admit_round(
     campaign_bundle_digest: str | None = None,
     admission_id: UUID | str | None = None,
     existing_rounds: Any = (),
+    approved_envelope_digest: str | None = None,
+    plan_parent_approval_digest: str | None = None,
+    plan_envelope_digest: Any = _ADMISSION_BINDING_UNSET,
 ) -> AdmissionOutcome:
     """Decide one policy round and emit exactly one admission audit event.
 
@@ -2114,7 +2120,10 @@ def policy_admit_round(
     (``approval_kind='policy'``) and appends ``round_admitted``; a denied
     round writes no admission row and appends ``round_admission_denied``.
     Round capacity is checked here rather than delegated to the
-    ``UNIQUE(parent_job_id, round_no)`` backstop.
+    ``UNIQUE(parent_job_id, round_no)`` backstop. Optional binding inputs let
+    callers pass the persisted approval/plan envelope digests; when supplied,
+    the predicate denies an envelope that is not the approved one or not the
+    frozen plan's one. Omitting them keeps the historical predicate behavior.
     """
     if not isinstance(envelope, Mapping):
         raise StateError("envelope must be a JSON object")
@@ -2155,6 +2164,28 @@ def policy_admit_round(
         try:
             approval_chain_tail_digest = jsonutil.require_digest(
                 approval_chain_tail_digest, "approval_chain_tail_digest"
+            )
+        except ValueError as error:
+            raise StateError(str(error)) from error
+    if approved_envelope_digest is not None:
+        try:
+            approved_envelope_digest = jsonutil.require_digest(
+                approved_envelope_digest, "approved_envelope_digest"
+            )
+        except ValueError as error:
+            raise StateError(str(error)) from error
+    if plan_parent_approval_digest is not None:
+        try:
+            plan_parent_approval_digest = jsonutil.require_digest(
+                plan_parent_approval_digest, "plan_parent_approval_digest"
+            )
+        except ValueError as error:
+            raise StateError(str(error)) from error
+    plan_envelope_checked = plan_envelope_digest is not _ADMISSION_BINDING_UNSET
+    if plan_envelope_checked and plan_envelope_digest is not None:
+        try:
+            plan_envelope_digest = jsonutil.require_digest(
+                plan_envelope_digest, "plan_envelope_digest"
             )
         except ValueError as error:
             raise StateError(str(error)) from error
@@ -2203,6 +2234,23 @@ def policy_admit_round(
     ):
         reason_code = "ADMISSION_DENIED"
         sub_reason = "PARENT_APPROVAL_NOT_CHAIN_TAIL"
+    elif (
+        plan_parent_approval_digest is not None
+        and plan_parent_approval_digest != approval_chain_tail_digest
+    ):
+        reason_code = "ADMISSION_DENIED"
+        sub_reason = "PARENT_APPROVAL_NOT_CHAIN_TAIL"
+    elif (
+        approved_envelope_digest is not None
+        and approved_envelope_digest != envelope_digest
+    ):
+        reason_code = "ADMISSION_DENIED"
+        sub_reason = "PARENT_APPROVAL_ENVELOPE_MISMATCH"
+    elif (
+        plan_envelope_checked and plan_envelope_digest != envelope_digest
+    ):
+        reason_code = "ADMISSION_DENIED"
+        sub_reason = "PLAN_ENVELOPE_MISMATCH"
     elif type(round_no) is not int or round_no < 1:
         reason_code = "ADMISSION_DENIED"
         sub_reason = "INVALID_ROUND_NO"
@@ -2241,6 +2289,18 @@ def policy_admit_round(
         "supporting_bundle_digest": supporting_bundle_digest,
         "budget_snapshot_digest": budget_snapshot_digest,
     }
+    if sub_reason == "PARENT_APPROVAL_ENVELOPE_MISMATCH":
+        detail["expected_envelope_digest"] = approved_envelope_digest
+        detail["actual_envelope_digest"] = envelope_digest
+    elif sub_reason == "PLAN_ENVELOPE_MISMATCH":
+        detail["expected_envelope_digest"] = plan_envelope_digest
+        detail["actual_envelope_digest"] = envelope_digest
+    elif (
+        sub_reason == "PARENT_APPROVAL_NOT_CHAIN_TAIL"
+        and plan_parent_approval_digest is not None
+    ):
+        detail["expected_parent_approval_digest"] = approval_chain_tail_digest
+        detail["actual_parent_approval_digest"] = plan_parent_approval_digest
 
     admission: dict[str, Any] | None
     if reason_code is None:
@@ -2289,17 +2349,22 @@ def policy_admit_round(
     )
 
 
-def _family_approval_chain_tail(connection, family_id: UUID) -> str | None:
-    """Return the approval digest no later approval supersedes, if any."""
+def _family_approval_chain_tail(
+    connection, family_id: UUID
+) -> tuple[str, str] | None:
+    """Return the chain-tail approval digest and its approved envelope digest."""
     row = connection.execute(
-        "SELECT prior.approval_digest FROM family_approvals AS prior "
+        "SELECT prior.approval_digest, prior.envelope_digest "
+        "FROM family_approvals AS prior "
         "WHERE prior.family_id = %s AND NOT EXISTS ("
         "SELECT 1 FROM family_approvals AS later "
         "WHERE later.supersedes = prior.approval_id) "
         "LIMIT 1",
         (family_id,),
     ).fetchone()
-    return row["approval_digest"] if row is not None else None
+    if row is None:
+        return None
+    return row["approval_digest"], row["envelope_digest"]
 
 
 def _admission_record(row: Mapping[str, Any]) -> dict[str, Any]:
@@ -2405,7 +2470,30 @@ def record_admission(
             ).fetchone()
             if family is None:
                 raise StateError("admission family does not exist")
-            approval_tail = _family_approval_chain_tail(connection, family_id)
+            approval_tail_row = _family_approval_chain_tail(
+                connection, family_id
+            )
+            if approval_tail_row is None:
+                approval_tail = None
+                approved_envelope_digest = None
+            else:
+                approval_tail, approved_envelope_digest = approval_tail_row
+            plan_row = connection.execute(
+                "SELECT plan FROM plans WHERE job_id = %s "
+                "ORDER BY created_at DESC, plan_id DESC LIMIT 1",
+                (job_id,),
+            ).fetchone()
+            if plan_row is None:
+                raise StateError(
+                    "admission requires a frozen plan for the round job"
+                )
+            plan_body = plan_row["plan"]
+            if not isinstance(plan_body, Mapping):
+                raise StateError("admission plan must be a JSON object")
+            plan_envelope_digest = plan_body.get("envelope_digest")
+            plan_parent_approval_digest = plan_body.get(
+                "parent_approval_digest"
+            )
             existing = connection.execute(
                 "SELECT admission_id, job_id, parent_job_id, round_no, "
                 "approval_kind, envelope_digest, parent_approval_digest, "
@@ -2490,6 +2578,9 @@ def record_admission(
                 experiment=experiment,
                 recomputable=recomputable,
                 campaign_bundle_digest=campaign_bundle_digest,
+                approved_envelope_digest=approved_envelope_digest,
+                plan_parent_approval_digest=plan_parent_approval_digest,
+                plan_envelope_digest=plan_envelope_digest,
             )
 
             if outcome.admission is not None:

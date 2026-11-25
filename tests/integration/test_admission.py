@@ -14,7 +14,7 @@ from uuid import uuid4
 import pytest
 from psycopg.types.json import Jsonb
 
-from datacon import contracts, state
+from datacon import contracts, jsonutil, state
 
 pytestmark = pytest.mark.postgres
 
@@ -62,11 +62,21 @@ def _envelope(*, max_rounds: int = 8) -> dict:
     )
 
 
-def _seed_family(database, *, max_rounds: int = 8):
+def _seed_family(
+    database,
+    *,
+    max_rounds: int = 8,
+    plan_envelope_digest: str | None = None,
+):
     family_id = uuid4()
     child_id = uuid4()
     envelope = _envelope(max_rounds=max_rounds)
     envelope_digest = contracts.envelope_digest(envelope)
+    plan = {
+        "schema_version": 2,
+        "envelope_digest": plan_envelope_digest or envelope_digest,
+        "parent_approval_digest": APPROVAL_DIGEST,
+    }
 
     database.connection.execute(
         "INSERT INTO jobs (job_id, request, state, stage, submitted_at, "
@@ -97,6 +107,17 @@ def _seed_family(database, *, max_rounds: int = 8):
             REVIEWER_ID,
         ),
     )
+    database.connection.execute(
+        "INSERT INTO plans (plan_id, job_id, plan_digest, plan, summary) "
+        "VALUES (%s, %s, %s, %s, %s)",
+        (
+            uuid4(),
+            child_id,
+            jsonutil.digest_json(plan),
+            Jsonb(plan),
+            Jsonb({}),
+        ),
+    )
     return family_id, child_id, envelope
 
 
@@ -105,19 +126,20 @@ def _admit(
     seed,
     *,
     round_no: int = 2,
+    envelope: dict | None = None,
     seed_digest: str = SEED_CORPUS_DIGEST,
     experiment: dict | None = None,
     recomputable: bool = True,
     campaign_bundle_digest: str | None = None,
     budget_snapshot: dict | None = None,
 ):
-    family_id, child_id, envelope = seed
+    family_id, child_id, approved_envelope = seed
     return state.record_admission(
         database.dsn,
         family_id=family_id,
         job_id=child_id,
         round_no=round_no,
-        envelope=envelope,
+        envelope=approved_envelope if envelope is None else envelope,
         seed_digest=seed_digest,
         budget_snapshot=BUDGET_SNAPSHOT if budget_snapshot is None else budget_snapshot,
         experiment=experiment,
@@ -310,3 +332,43 @@ def test_conflicting_budget_snapshot_is_denied(isolated_database):
     assert events[-1][2]["budget_snapshot_digest"] != first.event_detail[
         "budget_snapshot_digest"
     ]
+
+
+def test_unapproved_envelope_is_denied(isolated_database):
+    seed = _seed_family(isolated_database)
+    family_id, child_id, approved_envelope = seed
+    unapproved_envelope = _envelope(max_rounds=7)
+    assert contracts.envelope_digest(unapproved_envelope) != (
+        contracts.envelope_digest(approved_envelope)
+    )
+
+    outcome = _admit(isolated_database, seed, envelope=unapproved_envelope)
+
+    assert not outcome.admitted
+    assert outcome.status == "denied"
+    assert outcome.reason_code == "ADMISSION_DENIED"
+    assert outcome.sub_reason == "PARENT_APPROVAL_ENVELOPE_MISMATCH"
+    assert _admissions(isolated_database, family_id, 2) == []
+
+    events = _events(isolated_database, child_id)
+    assert [event[0] for event in events] == ["round_admission_denied"]
+    assert events[0][2]["sub_reason"] == "PARENT_APPROVAL_ENVELOPE_MISMATCH"
+
+
+def test_plan_envelope_mismatch_is_denied(isolated_database):
+    family_id, child_id, _approved_envelope = _seed_family(
+        isolated_database,
+        plan_envelope_digest=_digest("7"),
+    )
+
+    outcome = _admit(isolated_database, (family_id, child_id, _approved_envelope))
+
+    assert not outcome.admitted
+    assert outcome.status == "denied"
+    assert outcome.reason_code == "ADMISSION_DENIED"
+    assert outcome.sub_reason == "PLAN_ENVELOPE_MISMATCH"
+    assert _admissions(isolated_database, family_id, 2) == []
+
+    events = _events(isolated_database, child_id)
+    assert [event[0] for event in events] == ["round_admission_denied"]
+    assert events[0][2]["sub_reason"] == "PLAN_ENVELOPE_MISMATCH"
