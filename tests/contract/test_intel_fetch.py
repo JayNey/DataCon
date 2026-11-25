@@ -1215,6 +1215,31 @@ def test_snapshot_provider_maps_failures_to_reason_codes():
             [],
         ),
     ]
+    from datacon.tools import intel_fetch as _intel_fetch
+
+    oversized = b"\0" * (_intel_fetch.MAX_WIRE_BYTES + 1)
+    untrusted.extend(
+        [
+            (
+                "registered snapshot is empty",
+                _intel_source(snapshot_digest=_digest(b"")),
+                _loader(b""),
+                # Nothing to reproduce from: the fetch path refuses an empty
+                # body as well.
+                "MATERIAL_MISSING",
+                "EMPTY_CONTENT",
+                [(INTEL_CASE_ID, INTEL_SOURCE_ID)],
+            ),
+            (
+                "registered snapshot is larger than the wire cap",
+                _intel_source(snapshot_digest=_digest(oversized)),
+                _loader(oversized),
+                "MATERIAL_MISSING",
+                "SIZE_LIMIT_EXCEEDED",
+                [(INTEL_CASE_ID, INTEL_SOURCE_ID)],
+            ),
+        ]
+    )
     for change, body in (
         ("altered", TAMPERED_ADVISORY),
         ("truncated", PINNED_ADVISORY[:-6]),
@@ -1318,3 +1343,68 @@ def test_snapshot_provider_reads_pinned_snapshots_without_network(monkeypatch):
     assert INTEL_BODY_MARKER not in repr(dict(result.summary)), (
         "intel summary leaked the snapshot body"
     )
+
+
+def test_snapshot_provider_summary_never_carries_url_credentials():
+    from datacon.tools.intel_provider import SnapshotIntelProvider
+
+    url_secret = "S3cret-" + "Pass-7Qq1"
+    credentialed = f"https://admin:{url_secret}@{ALLOWLIST[0]}/cve-2099-0001.txt"
+
+    def _resolve(source: object, loader: object) -> object:
+        provider = SnapshotIntelProvider(
+            registry=_SourceRegistry(source), snapshot_loader=loader
+        )
+        return provider.resolve_intel(
+            job_id=INTEL_JOB_ID, family_id=INTEL_FAMILY_ID, request=_request()
+        )
+
+    result = _resolve(
+        _intel_source(source_url=credentialed),
+        _SnapshotLoader((INTEL_CASE_ID, INTEL_SOURCE_ID, PINNED_ADVISORY)),
+    )
+    assert result.status == "ready", result
+    # The summary is report and audit material: the URL keeps its host, path
+    # and query, and loses whatever identified the operator.
+    assert result.summary["source_url"] == INTEL_SOURCE_URL, result.summary
+    assert url_secret not in repr(dict(result.summary)), "summary leaked URL credentials"
+
+    # A source whose provenance cannot be named as a URL is refused before
+    # its snapshot is opened.
+    unnamable = (
+        ("empty", ""),
+        ("not text", None),
+        ("unparseable", "https://[::1/advisory.txt"),
+    )
+    for label, source_url in unnamable:
+        loader = _SnapshotLoader((INTEL_CASE_ID, INTEL_SOURCE_ID, PINNED_ADVISORY))
+        result = _resolve(_intel_source(source_url=source_url), loader)
+        assert result.status == "blocked", (label, result)
+        assert result.reason_code == "POLICY_DENIED", (label, result)
+        assert dict(result.summary).get("sub_reason") == "SOURCE_URL_INVALID", (
+            label,
+            result,
+        )
+        assert loader.calls == [], (label, loader.calls)
+
+
+def test_snapshot_records_source_url_without_credentials():
+    from datacon.tools.intel_fetch import FetchResult, build_snapshot
+
+    url_secret = "S3cret-" + "Pass-7Qq1"
+    credentialed = f"https://admin:{url_secret}@{ALLOWLIST[0]}/cve-2099-0001.txt"
+    redirected = f"https://{ALLOWLIST[1]}/cve-2099-0001.txt?dl=1"
+    snapshot = dict(
+        build_snapshot(
+            FetchResult(
+                body=b"advisory\n", status=200, hops=(credentialed, redirected)
+            ),
+            "CC-BY-4.0",
+        )
+    )
+    assert snapshot["source_url"] == f"https://{ALLOWLIST[0]}/cve-2099-0001.txt"
+    assert url_secret not in repr(snapshot), "snapshot record leaked URL credentials"
+
+    # Provenance that carries no secret is kept exactly, query included.
+    exact = build_snapshot(FetchResult(body=b"a", status=200, hops=(redirected,)), "X")
+    assert exact["source_url"] == redirected

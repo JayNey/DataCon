@@ -23,17 +23,26 @@ section 5, edges #5 and #6):
    conflict comes before content;
 4. the registered digest is not a ``sha256:`` digest: nothing can be
    verified against such a pin;
-5. the snapshot store answers ``None`` or raises;
-6. the bytes do not hash to the registered digest: the material exists but
+5. the registered source URL is missing or unparseable: material that
+   cannot be attributed is policy, not content, so the snapshot is not
+   opened;
+6. the snapshot store answers ``None`` or raises, answers something other
+   than bytes, or answers more than the fetch path's wire cap;
+7. the bytes do not hash to the registered digest: the material exists but
    cannot be verified, which v0.1 files under ``MATERIAL_MISSING``;
-7. the license is missing or does not cover the system use.
+8. the bytes are empty because emptiness is what was pinned: there is
+   nothing to reproduce from;
+9. the license is missing or does not cover the system use.
 
-Integrity (step 6) is decided before license (step 7) on purpose: altered
+Integrity (step 7) is decided before license (step 9) on purpose: altered
 material is reported as unverifiable material, never as a policy matter.
 Reason codes follow interface contract delta section 10, where T15 adds no
 top-level reason code: snapshot failures are ``MATERIAL_MISSING``, a source
 conflict is ``SOURCE_CONFLICT`` and a license failure is ``POLICY_DENIED``.
-The fine reason rides in ``summary["sub_reason"]``.
+The fine reason rides in ``summary["sub_reason"]``. A ready summary names
+the snapshot by digest and carries the license and the provenance URL, with
+any credentials embedded in that URL removed: the summary is report and
+audit material.
 
 ``resolve_intel`` never raises. Every failure, down to a port that raises
 unexpectedly, is an answer: a blocked ``IntelResult`` that offers no snapshot
@@ -50,7 +59,7 @@ from typing import Any, Mapping, Protocol, Sequence, runtime_checkable
 
 from datacon import jsonutil
 from datacon.orchestration import IntelResult
-from datacon.tools.intel_fetch import SYSTEM_USE
+from datacon.tools.intel_fetch import MAX_WIRE_BYTES, SYSTEM_USE, strip_url_credentials
 
 
 class _Blocked(Exception):
@@ -149,6 +158,35 @@ def _source_id(source: IntelSource) -> str | None:
     return source.source_id if isinstance(source.source_id, str) else None
 
 
+def _public_source_url(source: IntelSource) -> str:
+    """Return ``source``'s URL as it may appear in a summary, or refuse.
+
+    The ready summary is report and audit material, so the provenance URL
+    is recorded without any ``user:password@`` part. A registration whose
+    URL is missing, not text or unparseable names no provenance at all and
+    is refused before its snapshot is opened: material that cannot be
+    attributed to a source is policy, not content.
+    """
+    url = source.source_url
+    if not isinstance(url, str) or not url.strip():
+        raise _Blocked(
+            "POLICY_DENIED",
+            "SOURCE_URL_INVALID",
+            f"intel source {_source_id(source)!r} registers no source URL",
+            _source_id(source),
+        )
+    try:
+        return strip_url_credentials(url)
+    except ValueError as error:
+        raise _Blocked(
+            "POLICY_DENIED",
+            "SOURCE_URL_INVALID",
+            f"intel source {_source_id(source)!r} registers a source URL"
+            " that cannot be parsed",
+            _source_id(source),
+        ) from error
+
+
 def _license_rejection(source: IntelSource) -> str | None:
     """Return why ``source``'s license is refused, or ``None`` when it passes.
 
@@ -177,7 +215,7 @@ def _ready(source: IntelSource) -> IntelResult:
     summary = {
         "snapshot_digest": source.snapshot_digest,
         "license": source.license,
-        "source_url": source.source_url,
+        "source_url": _public_source_url(source),
         # A pinned snapshot is read, not fetched: no redirect was followed.
         "redirect_chain_digest": None,
     }
@@ -275,6 +313,9 @@ class SnapshotIntelProvider:
                 " is not a sha256 digest",
                 source_id,
             )
+        # Provenance is settled before content, like a case conflict: the
+        # snapshot of a source that cannot be named is never opened.
+        _public_source_url(source)
         body = self._read(case_id, source, source_id)
         if jsonutil.digest_bytes(body) != source.snapshot_digest:
             raise _Blocked(
@@ -282,6 +323,15 @@ class SnapshotIntelProvider:
                 "DIGEST_MISMATCH",
                 f"pinned snapshot of intel source {source_id!r} does not match"
                 " its registered digest",
+                source_id,
+            )
+        if not body:
+            # Reached only when the empty bytes are what was pinned: there is
+            # nothing to reproduce from, exactly as on the fetch path.
+            raise _Blocked(
+                "MATERIAL_MISSING",
+                "EMPTY_CONTENT",
+                f"pinned snapshot of intel source {source_id!r} is empty",
                 source_id,
             )
         # Integrity first, license second: altered material is reported as
@@ -322,6 +372,17 @@ class SnapshotIntelProvider:
                 "SNAPSHOT_UNREADABLE",
                 f"snapshot store answered {type(body).__name__}, not bytes, for"
                 f" intel source {source_id!r}",
+                source_id,
+            )
+        # The same ceiling as a fetched body. The store has already handed
+        # the bytes over, so this bounds the hashing and the copies, not the
+        # read itself; bounding the read is the snapshot-store adapter's job.
+        if len(body) > MAX_WIRE_BYTES:
+            raise _Blocked(
+                "MATERIAL_MISSING",
+                "SIZE_LIMIT_EXCEEDED",
+                f"pinned snapshot of intel source {source_id!r} is"
+                f" {len(body)} bytes, above the {MAX_WIRE_BYTES} byte cap",
                 source_id,
             )
         return body
