@@ -3352,3 +3352,78 @@ def test_family_approval_initializes_budget_ledger(
     assert state.family_budget_summary(
         isolated_database.dsn, seed["family_id"]
     )["spent_seconds"] == 1
+
+
+def test_reapproval_tightens_budget_ledger_and_propose_rejects_below_spent(
+    isolated_database, tmp_path, monkeypatch
+):
+    monkeypatch.setenv("DATACON_EVIDENCE_ROOT", str(tmp_path / "evidence"))
+    seed = _seed_family(isolated_database)
+    family_id = seed["family_id"]
+
+    first_approval = _review(isolated_database, seed)
+    assert first_approval.status == "applied", first_approval.message
+
+    charge = state.charge_step_budget(
+        isolated_database.dsn,
+        family_id=family_id,
+        job_id=seed["child_id"],
+        step_key="fuzz",
+        attempt_no=1,
+        charge_kind="fuzz",
+        elapsed_seconds=10,
+        elapsed_fuzz_seconds=5,
+    )
+    assert charge.status == "charged", charge.status
+
+    tightened = deepcopy(GUIDED_ENVELOPE_BODY)
+    tightened["max_total_seconds"] = 600
+    tightened["max_fuzz_seconds"] = 200
+    tightened_digest = jsonutil.digest_json(tightened)
+    proposed = state.propose_envelope(
+        isolated_database.dsn, family_id, tightened
+    )
+    assert proposed["envelope_digest"] == tightened_digest
+
+    reapproved = state.record_review(
+        isolated_database.dsn,
+        family_id,
+        plan_digest=FIRST_PLAN_DIGEST,
+        decision="approve",
+        reviewer_id=REVIEWER_2,
+        envelope_digest=tightened_digest,
+    )
+    assert reapproved.status == "applied", reapproved.message
+
+    summary = state.family_budget_summary(isolated_database.dsn, family_id)
+    assert summary == {
+        "max_total_seconds": 600,
+        "max_fuzz_seconds": 200,
+        "spent_seconds": 10,
+        "spent_fuzz_seconds": 5,
+        "remaining_seconds": 590,
+        "remaining_fuzz_seconds": 195,
+    }
+
+    too_small_total = deepcopy(GUIDED_ENVELOPE_BODY)
+    too_small_total["max_total_seconds"] = 5
+    too_small_total["max_fuzz_seconds"] = 2
+    with pytest.raises(state.StateError, match="spent"):
+        state.propose_envelope(
+            isolated_database.dsn, family_id, too_small_total
+        )
+
+    too_small_fuzz = deepcopy(GUIDED_ENVELOPE_BODY)
+    too_small_fuzz["max_total_seconds"] = 50
+    too_small_fuzz["max_fuzz_seconds"] = 2
+    with pytest.raises(state.StateError, match="spent"):
+        state.propose_envelope(
+            isolated_database.dsn, family_id, too_small_fuzz
+        )
+
+    assert _row(
+        isolated_database,
+        "SELECT count(*) FROM family_envelopes WHERE family_id = %s "
+        "AND status = 'pending'",
+        (family_id,),
+    )[0] == 0, "unapprovable envelope left a stuck pending row"

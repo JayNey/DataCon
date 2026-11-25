@@ -9,6 +9,7 @@ decision for the same ``(parent_job_id, round_no)`` is a real denial.
 
 from __future__ import annotations
 
+from typing import Any
 from uuid import uuid4
 
 import pytest
@@ -17,6 +18,7 @@ from psycopg.types.json import Jsonb
 from datacon import contracts, jsonutil, state
 
 pytestmark = pytest.mark.postgres
+_UNSET = object()
 
 
 def _digest(token: str) -> str:
@@ -66,16 +68,26 @@ def _seed_family(
     database,
     *,
     max_rounds: int = 8,
+    round_no: int = 2,
+    approval_digest: str = APPROVAL_DIGEST,
     plan_envelope_digest: str | None = None,
+    plan_parent_approval_digest: Any = _UNSET,
+    envelope: dict | None = None,
+    family_state: str = "AGGREGATING",
 ):
     family_id = uuid4()
     child_id = uuid4()
-    envelope = _envelope(max_rounds=max_rounds)
+    envelope = _envelope(max_rounds=max_rounds) if envelope is None else envelope
     envelope_digest = contracts.envelope_digest(envelope)
+    resolved_plan_parent = (
+        approval_digest
+        if plan_parent_approval_digest is _UNSET
+        else plan_parent_approval_digest
+    )
     plan = {
         "schema_version": 2,
         "envelope_digest": plan_envelope_digest or envelope_digest,
-        "parent_approval_digest": APPROVAL_DIGEST,
+        "parent_approval_digest": resolved_plan_parent,
     }
 
     database.connection.execute(
@@ -91,9 +103,21 @@ def _seed_family(
         "job_contract_version, family_id, job_kind, parent_job_id, round_no, "
         "generation) "
         "VALUES (%s, %s, 'QUEUED', 'admission', clock_timestamp(), 2, %s, "
-        "'round', %s, 2, 1)",
-        (child_id, Jsonb({"schema_version": 2}), family_id, family_id),
+        "'round', %s, %s, 1)",
+        (child_id, Jsonb({"schema_version": 2}), family_id, family_id, round_no),
     )
+    if family_state == "COMPLETED":
+        database.connection.execute(
+            "UPDATE jobs SET state = 'COMPLETED', evidence_status = 'archived', "
+            "evidence_path = '/tmp/family.json', evidence_digest = %s "
+            "WHERE job_id = %s",
+            (_digest("8"), family_id),
+        )
+    elif family_state != "AGGREGATING":
+        database.connection.execute(
+            "UPDATE jobs SET state = %s WHERE job_id = %s",
+            (family_state, family_id),
+        )
     database.connection.execute(
         "INSERT INTO family_approvals (approval_id, family_id, approval_digest, "
         "envelope_digest, first_plan_digest, reviewer_id, decided_at, supersedes) "
@@ -101,7 +125,7 @@ def _seed_family(
         (
             uuid4(),
             family_id,
-            APPROVAL_DIGEST,
+            approval_digest,
             envelope_digest,
             FIRST_PLAN_DIGEST,
             REVIEWER_ID,
@@ -117,6 +141,12 @@ def _seed_family(
             Jsonb(plan),
             Jsonb({}),
         ),
+    )
+    state.initialize_budget_ledger(
+        database.dsn,
+        family_id,
+        max_total_seconds=envelope["max_total_seconds"],
+        max_fuzz_seconds=envelope["max_fuzz_seconds"],
     )
     return family_id, child_id, envelope
 
@@ -223,7 +253,7 @@ def test_policy_admission_persists_one_row_and_one_event(isolated_database):
 
 
 def test_predicate_denial_writes_round_admission_denied_event(isolated_database):
-    seed = _seed_family(isolated_database)
+    seed = _seed_family(isolated_database, round_no=9)
     family_id, child_id, _envelope_value = seed
 
     outcome = _admit(isolated_database, seed, round_no=9)
@@ -372,3 +402,245 @@ def test_plan_envelope_mismatch_is_denied(isolated_database):
     events = _events(isolated_database, child_id)
     assert [event[0] for event in events] == ["round_admission_denied"]
     assert events[0][2]["sub_reason"] == "PLAN_ENVELOPE_MISMATCH"
+
+
+def test_record_admission_denies_exhausted_ledger_even_with_forged_snapshot(
+    isolated_database,
+):
+    seed = _seed_family(isolated_database)
+    family_id, child_id, _envelope_value = seed
+    charge = state.charge_step_budget(
+        isolated_database.dsn,
+        family_id=family_id,
+        job_id=child_id,
+        step_key="drain",
+        attempt_no=1,
+        charge_kind="general",
+        elapsed_seconds=900,
+    )
+    assert charge.status == "budget_exhausted"
+
+    outcome = _admit(
+        isolated_database,
+        seed,
+        budget_snapshot={
+            "remaining_total_seconds": 900,
+            "remaining_fuzz_seconds": 300,
+        },
+    )
+
+    assert not outcome.admitted
+    assert outcome.status == "denied"
+    assert outcome.reason_code == "BUDGET_EXHAUSTED"
+    assert outcome.sub_reason == "BUDGET_EXHAUSTED"
+    assert _admissions(isolated_database, family_id, 2) == []
+    events = _events(isolated_database, child_id)
+    assert [event[0] for event in events] == ["round_admission_denied"]
+    assert events[0][1] == "BUDGET_EXHAUSTED"
+
+
+def test_record_admission_rejects_snapshot_exceeding_ledger(isolated_database):
+    seed = _seed_family(isolated_database)
+    family_id, child_id, _envelope_value = seed
+    charge = state.charge_step_budget(
+        isolated_database.dsn,
+        family_id=family_id,
+        job_id=child_id,
+        step_key="build",
+        attempt_no=1,
+        charge_kind="general",
+        elapsed_seconds=100,
+    )
+    assert charge.status == "charged"
+
+    with pytest.raises(state.StateError, match="budget_snapshot"):
+        _admit(
+            isolated_database,
+            seed,
+            budget_snapshot={
+                "remaining_total_seconds": 900,
+                "remaining_fuzz_seconds": 300,
+            },
+        )
+    assert _admissions(isolated_database, family_id, 2) == []
+
+
+def test_record_admission_rejects_non_aggregating_family_and_wrong_job_identity(
+    isolated_database,
+):
+    blocked_seed = _seed_family(
+        isolated_database,
+        family_state="BLOCKED",
+        approval_digest=_digest("1"),
+    )
+    with pytest.raises(state.StateError, match="AGGREGATING"):
+        _admit(isolated_database, blocked_seed)
+    assert _admissions(isolated_database, blocked_seed[0], 2) == []
+
+    completed_seed = _seed_family(
+        isolated_database,
+        family_state="COMPLETED",
+        approval_digest=_digest("2"),
+    )
+    with pytest.raises(state.StateError, match="AGGREGATING"):
+        _admit(isolated_database, completed_seed)
+    assert _admissions(isolated_database, completed_seed[0], 2) == []
+
+    seed = _seed_family(isolated_database, approval_digest=_digest("3"))
+    family_id, child_id, approved_envelope = seed
+
+    # Mismatched round_no (child has round_no=2, request says round_no=3)
+    with pytest.raises(state.StateError, match="round_no"):
+        _admit(isolated_database, seed, round_no=3)
+
+    # Child from another family cannot be admitted under family_id
+    other_seed = _seed_family(isolated_database, approval_digest=_digest("6"))
+    with pytest.raises(state.StateError, match="belong"):
+        state.record_admission(
+            isolated_database.dsn,
+            family_id=family_id,
+            job_id=other_seed[1],
+            round_no=2,
+            envelope=approved_envelope,
+            seed_digest=SEED_CORPUS_DIGEST,
+            budget_snapshot=BUDGET_SNAPSHOT,
+        )
+
+    # Campaign child cannot be policy-admitted
+    campaign_id = uuid4()
+    campaign_plan = {
+        "schema_version": 2,
+        "envelope_digest": contracts.envelope_digest(approved_envelope),
+        "parent_approval_digest": _digest("3"),
+    }
+    isolated_database.connection.execute(
+        "INSERT INTO jobs (job_id, request, state, stage, submitted_at, "
+        "job_contract_version, family_id, job_kind, parent_job_id, round_no, "
+        "generation) "
+        "VALUES (%s, %s, 'QUEUED', 'admission', clock_timestamp(), 2, %s, "
+        "'campaign', %s, NULL, 1)",
+        (campaign_id, Jsonb({"schema_version": 2}), family_id, family_id),
+    )
+    isolated_database.connection.execute(
+        "INSERT INTO plans (plan_id, job_id, plan_digest, plan, summary) "
+        "VALUES (%s, %s, %s, %s, %s)",
+        (
+            uuid4(),
+            campaign_id,
+            jsonutil.digest_json(campaign_plan),
+            Jsonb(campaign_plan),
+            Jsonb({}),
+        ),
+    )
+    with pytest.raises(state.StateError, match="round"):
+        state.record_admission(
+            isolated_database.dsn,
+            family_id=family_id,
+            job_id=campaign_id,
+            round_no=1,
+            envelope=approved_envelope,
+            seed_digest=SEED_CORPUS_DIGEST,
+            budget_snapshot=BUDGET_SNAPSHOT,
+        )
+
+    # Multiple approval chain tails fail closed
+    isolated_database.connection.execute(
+        "INSERT INTO family_approvals (approval_id, family_id, approval_digest, "
+        "envelope_digest, first_plan_digest, reviewer_id, decided_at, supersedes) "
+        "VALUES (%s, %s, %s, %s, %s, %s, clock_timestamp(), NULL)",
+        (
+            uuid4(),
+            family_id,
+            _digest("4"),
+            _digest("5"),
+            FIRST_PLAN_DIGEST,
+            REVIEWER_ID,
+        ),
+    )
+    with pytest.raises(state.StateError, match="tail"):
+        _admit(isolated_database, seed)
+
+
+def test_record_admission_denies_null_plan_parent_approval_and_fixed_envelope(
+    isolated_database,
+):
+    null_parent_seed = _seed_family(
+        isolated_database,
+        approval_digest=_digest("1"),
+        plan_parent_approval_digest=None,
+    )
+    outcome = _admit(isolated_database, null_parent_seed)
+    assert not outcome.admitted
+    assert outcome.reason_code == "ADMISSION_DENIED"
+    assert outcome.sub_reason == "PLAN_PARENT_APPROVAL_MISSING"
+    assert _admissions(isolated_database, null_parent_seed[0], 2) == []
+
+    fixed = contracts.fixed_envelope(
+        harness_digest=HARNESS_DIGEST,
+        accepted_signature_set=[dict(SIGNATURE)],
+        max_total_seconds=900,
+        admission_predicate_version="admission-v1",
+    )
+    fixed_seed = _seed_family(
+        isolated_database,
+        round_no=1,
+        approval_digest=_digest("2"),
+        envelope=fixed,
+        plan_parent_approval_digest=None,
+    )
+    fixed_outcome = _admit(
+        isolated_database,
+        fixed_seed,
+        round_no=1,
+        budget_snapshot={
+            "remaining_total_seconds": 900,
+            "remaining_fuzz_seconds": 0,
+        },
+    )
+    assert not fixed_outcome.admitted
+    assert fixed_outcome.reason_code == "ENVELOPE_VIOLATION"
+    assert _admissions(isolated_database, fixed_seed[0], 1) == []
+
+
+def test_idempotent_readmission_survives_envelope_reapproval(isolated_database):
+    seed = _seed_family(isolated_database)
+    family_id, child_id, envelope_1 = seed
+
+    first = _admit(isolated_database, seed)
+    assert first.admitted
+    assert first.admission is not None
+
+    # Legitimate envelope change appends a new chain tail A2 superseding A1.
+    envelope_2 = _envelope(max_rounds=6)
+    envelope_2_digest = contracts.envelope_digest(envelope_2)
+    approval_1_id = isolated_database.connection.execute(
+        "SELECT approval_id FROM family_approvals WHERE family_id = %s",
+        (family_id,),
+    ).fetchone()[0]
+    isolated_database.connection.execute(
+        "INSERT INTO family_approvals (approval_id, family_id, approval_digest, "
+        "envelope_digest, first_plan_digest, reviewer_id, decided_at, supersedes) "
+        "VALUES (%s, %s, %s, %s, %s, %s, clock_timestamp(), %s)",
+        (
+            uuid4(),
+            family_id,
+            _digest("b"),
+            envelope_2_digest,
+            FIRST_PLAN_DIGEST,
+            "reviewer-2",
+            approval_1_id,
+        ),
+    )
+
+    retry = _admit(isolated_database, seed, envelope=envelope_1)
+
+    assert not retry.admitted
+    assert retry.status == "already_admitted"
+    assert retry.reason_code is None
+    assert retry.event_type is None
+    assert retry.admission is not None
+    assert retry.admission["admission_id"] == first.admission["admission_id"]
+    assert len(_admissions(isolated_database, family_id, 2)) == 1
+    assert [event[0] for event in _events(isolated_database, child_id)] == [
+        "round_admitted"
+    ]

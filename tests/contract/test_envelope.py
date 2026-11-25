@@ -376,3 +376,58 @@ def test_guided_fuzz_image_defaults_to_toolchain_image():
     assert contracts.envelope_digest(explicit) != contracts.envelope_digest(
         envelope
     ), "explicit fuzz image did not change envelope_digest"
+
+
+def test_check_experiment_against_envelope_fails_closed_on_missing_fields():
+    envelope = _guided_envelope()
+    fixed = _fixed_envelope()
+
+    invalid_experiments = [
+        ("empty", {}),
+        ("only_input_family", {"input_family": "byte_flip"}),
+        (
+            "missing_expected_signature",
+            {
+                "input_family": "byte_flip",
+                "mutation_constraints": {
+                    "allowed_ops": ["append"],
+                    "max_input_bytes": 1024,
+                },
+            },
+        ),
+        (
+            "missing_mutation_constraints",
+            {
+                "input_family": "byte_flip",
+                "expected_signature": deepcopy(SIGNATURE),
+            },
+        ),
+        (
+            "duplicate_allowed_ops",
+            _experiment(
+                mutation_constraints={
+                    "allowed_ops": ["append", "append"],
+                    "max_input_bytes": 1024,
+                }
+            ),
+        ),
+    ]
+
+    for label, experiment in invalid_experiments:
+        with pytest.raises(contracts.EnvelopeViolation) as raised:
+            contracts.check_experiment_against_envelope(experiment, envelope)
+        assert raised.value.reason_code == "ENVELOPE_VIOLATION", label
+
+    with pytest.raises(contracts.EnvelopeViolation) as fixed_raised:
+        contracts.check_experiment_against_envelope(_experiment(), fixed)
+    assert fixed_raised.value.reason_code == "ENVELOPE_VIOLATION"
+
+
+def test_state_and_contracts_envelope_validators_agree_on_whitespace_predicate_version():
+    for bad_version in ("admission v1", " admission-v1", "admission-v1\t"):
+        raw = _guided_envelope()
+        raw["admission_predicate_version"] = bad_version
+        with pytest.raises(ValueError, match="whitespace"):
+            contracts.normalize_envelope(raw)
+        with pytest.raises(ValueError, match="whitespace"):
+            state._validate_envelope(raw)

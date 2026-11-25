@@ -21,7 +21,7 @@ from psycopg.conninfo import conninfo_to_dict, make_conninfo
 from psycopg.types.json import Jsonb
 import pytest
 
-from datacon import state
+from datacon import jsonutil, state
 
 ROOT = Path(__file__).resolve().parents[2]
 MIGRATIONS = sorted((ROOT / "migrations").glob("*.sql"))
@@ -331,3 +331,239 @@ def test_concurrent_charge_cannot_overdraw_family_budget(budget_database):
     )
     assert summary["spent_seconds"] <= 100
     assert sum(1 for outcome in outcomes if outcome.status == "charged") <= 1
+
+
+def test_budget_numeric_validation_and_zero_elapsed_fuzz_and_round_reason_code():
+    ledger = _ledger()
+    for bad in (float("nan"), float("inf"), float("-inf"), True, -1):
+        with pytest.raises(state.StateError):
+            _charge(ledger, [], elapsed_seconds=bad)
+        with pytest.raises(state.StateError):
+            state.compute_budget_charge(
+                ledger, charge_kind="general", elapsed_seconds=bad
+            )
+        with pytest.raises(state.StateError):
+            state.compute_budget_charge(
+                ledger,
+                charge_kind="fuzz",
+                elapsed_seconds=1,
+                elapsed_fuzz_seconds=bad,
+            )
+
+    assert state.compute_budget_charge(
+        ledger, charge_kind="fuzz", elapsed_seconds=1.2, elapsed_fuzz_seconds=0.2
+    ) == (2, 1)
+    assert state.compute_budget_charge(
+        ledger, charge_kind="fuzz", elapsed_seconds=0, elapsed_fuzz_seconds=0
+    ) == (1, 1)
+
+    charges: list[dict] = []
+    zero_fuzz = _charge(
+        ledger,
+        charges,
+        step_key="fuzz-zero",
+        charge_kind="fuzz",
+        elapsed_seconds=0,
+        elapsed_fuzz_seconds=0,
+    )
+    assert zero_fuzz.status == "charged", zero_fuzz.status
+    assert zero_fuzz.charge is not None
+    assert zero_fuzz.charge["seconds"] == 1
+    assert zero_fuzz.charge["fuzz_seconds"] == 1
+    assert ledger["remaining_total_seconds"] == 99
+    assert ledger["remaining_fuzz_seconds"] == 59
+
+    round_limit = state.decide_next_round(ledger, round_no=8, max_rounds=8)
+    assert not round_limit.allowed
+    assert round_limit.reason_code == "BUDGET_EXHAUSTED"
+    assert round_limit.sub_reason == "ROUND_BEYOND_MAX_ROUNDS"
+    assert round_limit.next_round_no is None
+
+
+def test_budget_summary_rejects_unreconciled_ledger():
+    with pytest.raises(state.StateError, match="reconcile"):
+        state.budget_summary(_ledger(remaining_total_seconds=50), [])
+    with pytest.raises(state.StateError, match="reconcile"):
+        state.budget_summary(_ledger(remaining_fuzz_seconds=50), [])
+
+
+@pytest.mark.postgres
+def test_postgres_charge_step_budget_recovery_retry_fuzz_exhaustion_and_reconciliation(
+    budget_database,
+):
+    family_id = uuid.uuid4()
+    child_id = uuid.uuid4()
+    budget_database.connection.execute(
+        "INSERT INTO jobs (job_id, request, state, stage, submitted_at, "
+        "job_contract_version, family_id, job_kind, parent_job_id, round_no, "
+        "generation, workflow_synced) "
+        "VALUES (%s, %s, 'AGGREGATING', 'family', clock_timestamp(), 2, %s, "
+        "'family', NULL, NULL, 1, true)",
+        (family_id, Jsonb({"schema_version": 2}), family_id),
+    )
+    budget_database.connection.execute(
+        "INSERT INTO jobs (job_id, request, state, stage, submitted_at, "
+        "job_contract_version, family_id, job_kind, parent_job_id, round_no, "
+        "generation) "
+        "VALUES (%s, %s, 'RUNNING', 'build', clock_timestamp(), 2, %s, "
+        "'round', %s, 2, 1)",
+        (child_id, Jsonb({"schema_version": 2}), family_id, family_id),
+    )
+    state.initialize_budget_ledger(
+        budget_database.dsn,
+        family_id,
+        max_total_seconds=100,
+        max_fuzz_seconds=60,
+    )
+
+    first = state.charge_step_budget(
+        budget_database.dsn,
+        family_id=family_id,
+        job_id=child_id,
+        step_key="build",
+        attempt_no=1,
+        charge_kind="general",
+        elapsed_seconds=10,
+    )
+    assert first.status == "charged"
+    assert first.charge is not None
+    assert jsonutil.canonical_bytes(first.charge)
+
+    recovered = state.charge_step_budget(
+        budget_database.dsn,
+        family_id=family_id,
+        job_id=child_id,
+        step_key="build",
+        attempt_no=1,
+        charge_kind="general",
+        elapsed_seconds=10,
+    )
+    assert recovered.status == "recovered"
+    assert recovered.charge == first.charge
+    assert jsonutil.canonical_bytes(recovered.charge) == jsonutil.canonical_bytes(
+        first.charge
+    )
+
+    retry = state.charge_step_budget(
+        budget_database.dsn,
+        family_id=family_id,
+        job_id=child_id,
+        step_key="build",
+        attempt_no=2,
+        charge_kind="general",
+        elapsed_seconds=5,
+    )
+    assert retry.status == "charged"
+
+    fuzz_frac = state.charge_step_budget(
+        budget_database.dsn,
+        family_id=family_id,
+        job_id=child_id,
+        step_key="fuzz-frac",
+        attempt_no=1,
+        charge_kind="fuzz",
+        elapsed_seconds=0.2,
+        elapsed_fuzz_seconds=0.2,
+    )
+    assert fuzz_frac.status == "charged"
+    assert fuzz_frac.charge is not None
+    assert fuzz_frac.charge["seconds"] == 1
+    assert fuzz_frac.charge["fuzz_seconds"] == 1
+
+    fuzz_zero = state.charge_step_budget(
+        budget_database.dsn,
+        family_id=family_id,
+        job_id=child_id,
+        step_key="fuzz-zero",
+        attempt_no=1,
+        charge_kind="fuzz",
+        elapsed_seconds=0,
+        elapsed_fuzz_seconds=0,
+    )
+    assert fuzz_zero.status == "charged"
+    assert fuzz_zero.charge is not None
+    assert fuzz_zero.charge["seconds"] == 1
+    assert fuzz_zero.charge["fuzz_seconds"] == 1
+
+    exhausted = state.charge_step_budget(
+        budget_database.dsn,
+        family_id=family_id,
+        job_id=child_id,
+        step_key="replay",
+        attempt_no=1,
+        charge_kind="general",
+        elapsed_seconds=100,
+    )
+    assert exhausted.status == "budget_exhausted"
+    assert exhausted.reason_code == "BUDGET_EXHAUSTED"
+
+    summary = state.family_budget_summary(budget_database.dsn, family_id)
+    assert summary == {
+        "max_total_seconds": 100,
+        "max_fuzz_seconds": 60,
+        "spent_seconds": 100,
+        "spent_fuzz_seconds": 2,
+        "remaining_seconds": 0,
+        "remaining_fuzz_seconds": 58,
+    }
+
+    budget_database.connection.execute(
+        "UPDATE budget_ledger SET remaining_total_seconds = 1 WHERE family_id = %s",
+        (family_id,),
+    )
+    with pytest.raises(state.StateError, match="reconcile"):
+        state.family_budget_summary(budget_database.dsn, family_id)
+
+
+@pytest.mark.postgres
+def test_postgres_charge_step_budget_rejects_wrong_family_and_family_self_job(
+    budget_database,
+):
+    family_a = uuid.uuid4()
+    family_b = uuid.uuid4()
+    child_b = uuid.uuid4()
+    for fid in (family_a, family_b):
+        budget_database.connection.execute(
+            "INSERT INTO jobs (job_id, request, state, stage, submitted_at, "
+            "job_contract_version, family_id, job_kind, parent_job_id, round_no, "
+            "generation, workflow_synced) "
+            "VALUES (%s, %s, 'AGGREGATING', 'family', clock_timestamp(), 2, %s, "
+            "'family', NULL, NULL, 1, true)",
+            (fid, Jsonb({"schema_version": 2}), fid),
+        )
+        state.initialize_budget_ledger(
+            budget_database.dsn,
+            fid,
+            max_total_seconds=100,
+            max_fuzz_seconds=60,
+        )
+    budget_database.connection.execute(
+        "INSERT INTO jobs (job_id, request, state, stage, submitted_at, "
+        "job_contract_version, family_id, job_kind, parent_job_id, round_no, "
+        "generation) "
+        "VALUES (%s, %s, 'RUNNING', 'build', clock_timestamp(), 2, %s, "
+        "'round', %s, 1, 1)",
+        (child_b, Jsonb({"schema_version": 2}), family_b, family_b),
+    )
+
+    with pytest.raises(state.StateError):
+        state.charge_step_budget(
+            budget_database.dsn,
+            family_id=family_a,
+            job_id=family_a,
+            step_key="build",
+            attempt_no=1,
+            charge_kind="general",
+            elapsed_seconds=5,
+        )
+
+    with pytest.raises(state.StateError):
+        state.charge_step_budget(
+            budget_database.dsn,
+            family_id=family_a,
+            job_id=child_b,
+            step_key="build",
+            attempt_no=1,
+            charge_kind="general",
+            elapsed_seconds=5,
+        )

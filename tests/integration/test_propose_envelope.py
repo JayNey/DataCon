@@ -236,3 +236,15 @@ def test_propose_envelope_requires_a_first_approval(isolated_database):
         "SELECT count(*) FROM family_envelopes WHERE family_id = %s",
         (seed["family_id"],),
     )[0] == 0
+
+
+def test_propose_envelope_rejects_whitespace_in_predicate_version(
+    isolated_database,
+):
+    seed = _approved_family(isolated_database)
+    with pytest.raises(state.StateError, match="whitespace"):
+        state.propose_envelope(
+            isolated_database.dsn,
+            seed["family_id"],
+            _envelope(admission_predicate_version="admission v1"),
+        )

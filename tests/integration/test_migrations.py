@@ -666,6 +666,15 @@ def test_budget_ledger_has_no_cross_remaining_check(isolated_database):
     from datacon import state
 
     family_id = _insert_family(isolated_database)
+    child_id = uuid4()
+    _insert_identity_job(
+        isolated_database,
+        child_id,
+        job_kind="round",
+        family_id=family_id,
+        parent_job_id=family_id,
+        round_no=1,
+    )
     try:
         ledger = state.initialize_budget_ledger(
             isolated_database.dsn,
@@ -680,18 +689,25 @@ def test_budget_ledger_has_no_cross_remaining_check(isolated_database):
     assert ledger["remaining_fuzz_seconds"] == 60
 
     try:
-        isolated_database.connection.execute(
-            "UPDATE budget_ledger SET remaining_total_seconds = 20, "
-            "remaining_fuzz_seconds = 50 WHERE family_id = %s",
-            (family_id,),
+        first_charge = state.charge_step_budget(
+            isolated_database.dsn,
+            family_id=family_id,
+            job_id=child_id,
+            step_key="prepare-build",
+            attempt_no=1,
+            charge_kind="general",
+            elapsed_seconds=80,
         )
     except psycopg.errors.CheckViolation as error:
         pytest.fail(f"cross remaining check rejected a valid ledger: {error}")
+    assert first_charge.status == "charged", first_charge.status
+    assert first_charge.ledger["remaining_total_seconds"] == 20
+    assert first_charge.ledger["remaining_fuzz_seconds"] == 60
 
     outcome = state.charge_step_budget(
         isolated_database.dsn,
         family_id=family_id,
-        job_id=family_id,
+        job_id=child_id,
         step_key="build",
         attempt_no=1,
         charge_kind="general",
@@ -701,7 +717,9 @@ def test_budget_ledger_has_no_cross_remaining_check(isolated_database):
 
     summary = state.family_budget_summary(isolated_database.dsn, family_id)
     assert summary["remaining_seconds"] == 15
-    assert summary["remaining_fuzz_seconds"] == 50
+    assert summary["remaining_fuzz_seconds"] == 60
+    assert summary["spent_seconds"] == 85
+    assert summary["spent_fuzz_seconds"] == 0
 
     checks = isolated_database.connection.execute(
         "SELECT conname, pg_get_constraintdef(oid) FROM pg_constraint "

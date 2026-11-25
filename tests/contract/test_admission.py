@@ -11,6 +11,8 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 import uuid
 
+import pytest
+
 from datacon import contracts, state
 
 
@@ -256,3 +258,165 @@ def test_round_beyond_max_rounds_is_denied():
         store=RecordingAdmissionStore(), round_no=envelope["max_rounds"]
     )
     assert last_allowed.admitted
+
+
+def test_admission_validates_budget_snapshot_and_denies_exhausted():
+    bad_snapshots = [
+        {"not_a_budget": True},
+        {"remaining_total_seconds": True, "remaining_fuzz_seconds": 10},
+        {"remaining_total_seconds": -1, "remaining_fuzz_seconds": 10},
+        {"remaining_seconds": False},
+        {"remaining_seconds": -5},
+        {"remaining_total_seconds": 10, "remaining_seconds": 5},
+        {"remaining_total_seconds": 10, "remaining_fuzz_seconds": True},
+        {"remaining_total_seconds": 10, "remaining_fuzz_seconds": -1},
+    ]
+    for bad in bad_snapshots:
+        with pytest.raises(state.StateError):
+            state.policy_admit_round(
+                clock=FakeClock(),
+                job_id=JOB_ID,
+                parent_job_id=FAMILY_ID,
+                envelope=_guided_envelope(),
+                parent_approval_digest=APPROVAL_DIGEST,
+                approval_chain_tail_digest=APPROVAL_DIGEST,
+                seed_digest=SEED_CORPUS_DIGEST,
+                round_no=2,
+                budget_snapshot=bad,
+                admission_id=ADMISSION_ID,
+            )
+
+    report_form = state.policy_admit_round(
+        clock=FakeClock(),
+        job_id=JOB_ID,
+        parent_job_id=FAMILY_ID,
+        envelope=_guided_envelope(),
+        parent_approval_digest=APPROVAL_DIGEST,
+        approval_chain_tail_digest=APPROVAL_DIGEST,
+        seed_digest=SEED_CORPUS_DIGEST,
+        round_no=2,
+        budget_snapshot={"remaining_seconds": 10, "remaining_fuzz_seconds": 0},
+        admission_id=ADMISSION_ID,
+    )
+    assert report_form.admitted
+
+    for exhausted_snapshot in (
+        {"remaining_total_seconds": 0, "remaining_fuzz_seconds": 0},
+        {"remaining_seconds": 0, "remaining_fuzz_seconds": 10},
+    ):
+        store = RecordingAdmissionStore()
+        denied = state.policy_admit_round(
+            store=store,
+            clock=FakeClock(),
+            job_id=JOB_ID,
+            parent_job_id=FAMILY_ID,
+            envelope=_guided_envelope(),
+            parent_approval_digest=APPROVAL_DIGEST,
+            approval_chain_tail_digest=APPROVAL_DIGEST,
+            seed_digest=SEED_CORPUS_DIGEST,
+            round_no=2,
+            budget_snapshot=exhausted_snapshot,
+            admission_id=ADMISSION_ID,
+        )
+        assert not denied.admitted
+        assert denied.reason_code == "BUDGET_EXHAUSTED"
+        assert denied.sub_reason == "BUDGET_EXHAUSTED"
+        assert denied.event_type == "round_admission_denied"
+        assert not store.admissions
+        assert [event["event_type"] for event in store.events] == [
+            "round_admission_denied"
+        ]
+
+
+def test_admission_denies_null_plan_parent_approval_digest():
+    store = RecordingAdmissionStore()
+    outcome = state.policy_admit_round(
+        store=store,
+        clock=FakeClock(),
+        job_id=JOB_ID,
+        parent_job_id=FAMILY_ID,
+        envelope=_guided_envelope(),
+        parent_approval_digest=APPROVAL_DIGEST,
+        approval_chain_tail_digest=APPROVAL_DIGEST,
+        seed_digest=SEED_CORPUS_DIGEST,
+        round_no=2,
+        budget_snapshot=_budget_snapshot(),
+        admission_id=ADMISSION_ID,
+        plan_parent_approval_digest=None,
+    )
+
+    assert not outcome.admitted
+    assert outcome.reason_code == "ADMISSION_DENIED"
+    assert outcome.sub_reason == "PLAN_PARENT_APPROVAL_MISSING"
+    assert not store.admissions
+    assert [event["event_type"] for event in store.events] == [
+        "round_admission_denied"
+    ]
+
+
+def test_admission_denies_fixed_envelope():
+    fixed = contracts.fixed_envelope(
+        harness_digest=HARNESS_DIGEST,
+        accepted_signature_set=[dict(SIGNATURE)],
+        max_total_seconds=900,
+        admission_predicate_version="admission-v1",
+    )
+    store = RecordingAdmissionStore()
+    outcome = state.policy_admit_round(
+        store=store,
+        clock=FakeClock(),
+        job_id=JOB_ID,
+        parent_job_id=FAMILY_ID,
+        envelope=fixed,
+        parent_approval_digest=APPROVAL_DIGEST,
+        approval_chain_tail_digest=APPROVAL_DIGEST,
+        seed_digest=SEED_CORPUS_DIGEST,
+        round_no=1,
+        budget_snapshot=_budget_snapshot(),
+        admission_id=ADMISSION_ID,
+    )
+
+    assert not outcome.admitted
+    assert outcome.reason_code == "ENVELOPE_VIOLATION"
+    assert outcome.sub_reason is not None and "FIXED" in outcome.sub_reason
+    assert not store.admissions
+    assert [event["event_type"] for event in store.events] == [
+        "round_admission_denied"
+    ]
+
+
+def test_admission_denies_unsupported_predicate_version():
+    envelope = contracts.guided_envelope(
+        allowed_mutation_families=["byte_flip"],
+        mutation_limits={"allowed_ops": ["append"], "max_input_bytes": 1024},
+        seed_corpus_digest=SEED_CORPUS_DIGEST,
+        toolchain_image_digest=TOOLCHAIN_IMAGE_DIGEST,
+        harness_digest=HARNESS_DIGEST,
+        max_rounds=8,
+        max_total_seconds=900,
+        max_fuzz_seconds=300,
+        accepted_signature_set=[dict(SIGNATURE)],
+        admission_predicate_version="admission-v99",
+    )
+    store = RecordingAdmissionStore()
+    outcome = state.policy_admit_round(
+        store=store,
+        clock=FakeClock(),
+        job_id=JOB_ID,
+        parent_job_id=FAMILY_ID,
+        envelope=envelope,
+        parent_approval_digest=APPROVAL_DIGEST,
+        approval_chain_tail_digest=APPROVAL_DIGEST,
+        seed_digest=SEED_CORPUS_DIGEST,
+        round_no=2,
+        budget_snapshot=_budget_snapshot(),
+        admission_id=ADMISSION_ID,
+    )
+
+    assert not outcome.admitted
+    assert outcome.reason_code == "ADMISSION_DENIED"
+    assert outcome.sub_reason == "UNSUPPORTED_PREDICATE_VERSION"
+    assert not store.admissions
+    assert [event["event_type"] for event in store.events] == [
+        "round_admission_denied"
+    ]
