@@ -1535,206 +1535,17 @@ def finalize_workflow(dsn: str, job_id: UUID, generation: int) -> bool:
 # into guided and its mutation surface is empty. The envelope body is closed:
 # every field documented in interface-contract-delta §2 is required and any
 # other field is rejected, because envelope_digest commits to these exact bytes.
-_ENVELOPE_FIELDS = frozenset(
-    {
-        "mode",
-        "allowed_mutation_families",
-        "mutation_limits",
-        "seed_corpus_digest",
-        "fuzz_image_digest",
-        "harness_digest",
-        "max_rounds",
-        "max_total_seconds",
-        "max_fuzz_seconds",
-        "accepted_signature_set",
-        "admission_predicate_version",
-    }
-)
-_MUTATION_LIMIT_FIELDS = frozenset({"allowed_ops", "max_input_bytes"})
-_ENVELOPE_SIGNATURE_FIELDS = frozenset({"error", "function", "source"})
-_ENVELOPE_SIGNATURE_OPTIONAL = frozenset({"operation", "access_size"})
-_ENVELOPE_MODES = frozenset({"fixed", "guided"})
-_ENVELOPE_MAX_ACCESS_SIZE = 2**31 - 1
-
-
-def _envelope_text(value: Any, label: str) -> str:
-    """Require a non-empty string envelope identifier without whitespace."""
-    text = jsonutil.require_text(value, label)
-    if any(character.isspace() for character in text):
-        raise ValueError(f"{label} must not contain whitespace")
-    return text
-
-
-def _envelope_string_list(value: Any, label: str) -> list[str]:
-    if not isinstance(value, list):
-        raise ValueError(f"{label} must be a JSON array")
-    result: list[str] = []
-    seen: set[str] = set()
-    for index, item in enumerate(value):
-        text = _envelope_text(item, f"{label}[{index}]")
-        if text in seen:
-            raise ValueError(f"{label} must not contain duplicates")
-        seen.add(text)
-        result.append(text)
-    return result
-
-
-def _envelope_digest_or_null(value: Any, label: str) -> str | None:
-    if value is None:
-        return None
-    return jsonutil.require_digest(value, label)
-
-
 def _envelope_signature_set(value: Any) -> list[dict[str, Any]]:
-    if not isinstance(value, list):
-        raise ValueError("envelope.accepted_signature_set must be a JSON array")
-    normalized: list[dict[str, Any]] = []
-    for index, item in enumerate(value):
-        label = f"accepted_signature_set[{index}]"
-        signature = jsonutil.require_object(
-            item,
-            required=set(_ENVELOPE_SIGNATURE_FIELDS),
-            optional=_ENVELOPE_SIGNATURE_OPTIONAL,
-            label=label,
-        )
-        entry: dict[str, Any] = {
-            field: jsonutil.require_text(signature[field], f"{label}.{field}")
-            for field in sorted(_ENVELOPE_SIGNATURE_FIELDS)
-        }
-        if "operation" in signature:
-            operation = jsonutil.require_text(
-                signature["operation"], f"{label}.operation"
-            )
-            if operation not in ("READ", "WRITE"):
-                raise ValueError(f"{label}.operation must be READ or WRITE")
-            entry["operation"] = operation
-        if "access_size" in signature:
-            access_size = signature["access_size"]
-            if (
-                type(access_size) is not int
-                or not 1 <= access_size <= _ENVELOPE_MAX_ACCESS_SIZE
-            ):
-                raise ValueError(
-                    f"{label}.access_size must be an integer between 1 and "
-                    f"{_ENVELOPE_MAX_ACCESS_SIZE}"
-                )
-            entry["access_size"] = access_size
-        normalized.append(entry)
-    return normalized
+    return contracts._envelope_signature_set(value)
 
 
 def _validate_envelope(envelope: Any) -> dict[str, Any]:
     """Validate and normalize one proposed exploration envelope.
 
-    The body is closed and every documented field is required. Fixed mode is
-    kept at its degenerate values so a fixed envelope can never carry a
-    mutation surface; guided mode requires the seed/fuzz digests that make the
-    admitted rounds reproducible. Values are otherwise preserved byte-for-byte
-    (apart from the deterministic ordering of accepted_signature_set fields) so
-    the persisted body and envelope_digest describe the approval.
+    Delegates directly to ``contracts.normalize_envelope`` so plan freezing,
+    envelope proposals and policy admission share one validation boundary.
     """
-    jsonutil.require_object(
-        envelope,
-        required=set(_ENVELOPE_FIELDS),
-        label="envelope",
-    )
-    mode = envelope["mode"]
-    if not isinstance(mode, str) or mode not in _ENVELOPE_MODES:
-        raise ValueError("envelope.mode must be fixed or guided")
-
-    families = _envelope_string_list(
-        envelope["allowed_mutation_families"],
-        "envelope.allowed_mutation_families",
-    )
-    limits = jsonutil.require_object(
-        envelope["mutation_limits"],
-        required=set(_MUTATION_LIMIT_FIELDS),
-        label="envelope.mutation_limits",
-    )
-    allowed_ops = _envelope_string_list(
-        limits["allowed_ops"], "envelope.mutation_limits.allowed_ops"
-    )
-    max_input_bytes = limits["max_input_bytes"]
-    if type(max_input_bytes) is not int or max_input_bytes < 0:
-        raise ValueError(
-            "envelope.mutation_limits.max_input_bytes must be a non-negative integer"
-        )
-
-    seed_corpus_digest = _envelope_digest_or_null(
-        envelope["seed_corpus_digest"], "envelope.seed_corpus_digest"
-    )
-    fuzz_image_digest = _envelope_digest_or_null(
-        envelope["fuzz_image_digest"], "envelope.fuzz_image_digest"
-    )
-    harness_digest = jsonutil.require_digest(
-        envelope["harness_digest"], "envelope.harness_digest"
-    )
-    max_rounds = envelope["max_rounds"]
-    if type(max_rounds) is not int or max_rounds < 1:
-        raise ValueError("envelope.max_rounds must be a positive integer")
-    max_total_seconds = envelope["max_total_seconds"]
-    if type(max_total_seconds) is not int or max_total_seconds < 1:
-        raise ValueError("envelope.max_total_seconds must be a positive integer")
-    max_fuzz_seconds = envelope["max_fuzz_seconds"]
-    if (
-        type(max_fuzz_seconds) is not int
-        or not 0 <= max_fuzz_seconds <= max_total_seconds
-    ):
-        raise ValueError(
-            "envelope.max_fuzz_seconds must be an integer between 0 and "
-            "max_total_seconds"
-        )
-    accepted_signature_set = _envelope_signature_set(
-        envelope["accepted_signature_set"]
-    )
-    admission_predicate_version = jsonutil.require_text(
-        envelope["admission_predicate_version"],
-        "envelope.admission_predicate_version",
-    )
-
-    if mode == "fixed":
-        if families:
-            raise ValueError("fixed envelope requires allowed_mutation_families=[]")
-        if allowed_ops:
-            raise ValueError("fixed envelope requires mutation_limits.allowed_ops=[]")
-        if max_input_bytes != 0:
-            raise ValueError(
-                "fixed envelope requires mutation_limits.max_input_bytes=0"
-            )
-        if seed_corpus_digest is not None:
-            raise ValueError("fixed envelope requires seed_corpus_digest=null")
-        if fuzz_image_digest is not None:
-            raise ValueError("fixed envelope requires fuzz_image_digest=null")
-        if max_rounds != 1:
-            raise ValueError("fixed envelope requires max_rounds=1")
-        if max_fuzz_seconds != 0:
-            raise ValueError("fixed envelope requires max_fuzz_seconds=0")
-    else:
-        if not families:
-            raise ValueError(
-                "guided envelope requires a non-empty allowed_mutation_families"
-            )
-        if seed_corpus_digest is None:
-            raise ValueError("guided envelope requires seed_corpus_digest")
-        if fuzz_image_digest is None:
-            raise ValueError("guided envelope requires fuzz_image_digest")
-
-    return {
-        "mode": mode,
-        "allowed_mutation_families": families,
-        "mutation_limits": {
-            "allowed_ops": allowed_ops,
-            "max_input_bytes": max_input_bytes,
-        },
-        "seed_corpus_digest": seed_corpus_digest,
-        "fuzz_image_digest": fuzz_image_digest,
-        "harness_digest": harness_digest,
-        "max_rounds": max_rounds,
-        "max_total_seconds": max_total_seconds,
-        "max_fuzz_seconds": max_fuzz_seconds,
-        "accepted_signature_set": accepted_signature_set,
-        "admission_predicate_version": admission_predicate_version,
-    }
+    return contracts.normalize_envelope(envelope)
 
 
 def _request_exploration(request: Any) -> dict[str, Any] | None:
@@ -2088,6 +1899,68 @@ def propose_envelope(
 
 
 _ADMISSION_BINDING_UNSET = object()
+SUPPORTED_ADMISSION_PREDICATE_VERSIONS = frozenset({"admission-v1"})
+
+
+def _validate_budget_snapshot(
+    budget_snapshot: Mapping[str, Any],
+) -> tuple[int, int | None]:
+    """Validate admission budget_snapshot structure and return balances.
+
+    Accepts the DB/ledger key ``remaining_total_seconds`` and/or the
+    report/JSON key ``remaining_seconds``. Fails closed if neither is present,
+    if either is non-integer (including bool) or negative, if both are present
+    with conflicting values, or if ``remaining_fuzz_seconds`` is invalid.
+    """
+    has_total = "remaining_total_seconds" in budget_snapshot
+    has_remaining = "remaining_seconds" in budget_snapshot
+    if not has_total and not has_remaining:
+        raise StateError(
+            "budget_snapshot must include remaining_total_seconds or "
+            "remaining_seconds"
+        )
+    total_value: int | None = None
+    remaining_value: int | None = None
+    if has_total:
+        raw_total = budget_snapshot["remaining_total_seconds"]
+        if type(raw_total) is not int or raw_total < 0:
+            raise StateError(
+                "budget_snapshot.remaining_total_seconds must be a "
+                "non-negative integer"
+            )
+        total_value = raw_total
+    if has_remaining:
+        raw_remaining = budget_snapshot["remaining_seconds"]
+        if type(raw_remaining) is not int or raw_remaining < 0:
+            raise StateError(
+                "budget_snapshot.remaining_seconds must be a non-negative "
+                "integer"
+            )
+        remaining_value = raw_remaining
+    if (
+        total_value is not None
+        and remaining_value is not None
+        and total_value != remaining_value
+    ):
+        raise StateError(
+            "budget_snapshot remaining_total_seconds and remaining_seconds "
+            "must be equal"
+        )
+    available_total = (
+        total_value if total_value is not None else remaining_value
+    )
+    assert available_total is not None
+
+    remaining_fuzz: int | None = None
+    if "remaining_fuzz_seconds" in budget_snapshot:
+        raw_fuzz = budget_snapshot["remaining_fuzz_seconds"]
+        if type(raw_fuzz) is not int or raw_fuzz < 0:
+            raise StateError(
+                "budget_snapshot.remaining_fuzz_seconds must be a "
+                "non-negative integer"
+            )
+        remaining_fuzz = raw_fuzz
+    return available_total, remaining_fuzz
 
 
 def policy_admit_round(
@@ -2108,8 +1981,9 @@ def policy_admit_round(
     admission_id: UUID | str | None = None,
     existing_rounds: Any = (),
     approved_envelope_digest: str | None = None,
-    plan_parent_approval_digest: str | None = None,
+    plan_parent_approval_digest: Any = _ADMISSION_BINDING_UNSET,
     plan_envelope_digest: Any = _ADMISSION_BINDING_UNSET,
+    ledger_remaining_total_seconds: int | None = None,
 ) -> AdmissionOutcome:
     """Decide one policy round and emit exactly one admission audit event.
 
@@ -2174,7 +2048,10 @@ def policy_admit_round(
             )
         except ValueError as error:
             raise StateError(str(error)) from error
-    if plan_parent_approval_digest is not None:
+    plan_parent_approval_checked = (
+        plan_parent_approval_digest is not _ADMISSION_BINDING_UNSET
+    )
+    if plan_parent_approval_checked and plan_parent_approval_digest is not None:
         try:
             plan_parent_approval_digest = jsonutil.require_digest(
                 plan_parent_approval_digest, "plan_parent_approval_digest"
@@ -2213,6 +2090,22 @@ def policy_admit_round(
         ) from error
     if not budget_snapshot:
         raise StateError("budget_snapshot must not be empty")
+    snapshot_remaining_total, _snapshot_remaining_fuzz = (
+        _validate_budget_snapshot(budget_snapshot)
+    )
+    if ledger_remaining_total_seconds is not None:
+        if (
+            type(ledger_remaining_total_seconds) is not int
+            or ledger_remaining_total_seconds < 0
+        ):
+            raise StateError(
+                "ledger_remaining_total_seconds must be a non-negative integer"
+            )
+        available_total = min(
+            snapshot_remaining_total, ledger_remaining_total_seconds
+        )
+    else:
+        available_total = snapshot_remaining_total
 
     if type(recomputable) is not bool:
         raise StateError("recomputable must be a boolean")
@@ -2225,7 +2118,10 @@ def policy_admit_round(
     sub_reason: str | None = None
     supporting_bundle_digest: str | None = None
 
-    if parent_approval_digest is None:
+    if normalized_envelope["mode"] == "fixed":
+        reason_code = "ENVELOPE_VIOLATION"
+        sub_reason = "FIXED_ENVELOPE_HAS_NO_POLICY_ADMISSION"
+    elif parent_approval_digest is None:
         reason_code = "ADMISSION_DENIED"
         sub_reason = "PARENT_APPROVAL_MISSING"
     elif (
@@ -2234,8 +2130,11 @@ def policy_admit_round(
     ):
         reason_code = "ADMISSION_DENIED"
         sub_reason = "PARENT_APPROVAL_NOT_CHAIN_TAIL"
+    elif plan_parent_approval_checked and plan_parent_approval_digest is None:
+        reason_code = "ADMISSION_DENIED"
+        sub_reason = "PLAN_PARENT_APPROVAL_MISSING"
     elif (
-        plan_parent_approval_digest is not None
+        plan_parent_approval_checked
         and plan_parent_approval_digest != approval_chain_tail_digest
     ):
         reason_code = "ADMISSION_DENIED"
@@ -2251,6 +2150,9 @@ def policy_admit_round(
     ):
         reason_code = "ADMISSION_DENIED"
         sub_reason = "PLAN_ENVELOPE_MISMATCH"
+    elif predicate_version not in SUPPORTED_ADMISSION_PREDICATE_VERSIONS:
+        reason_code = "ADMISSION_DENIED"
+        sub_reason = "UNSUPPORTED_PREDICATE_VERSION"
     elif type(round_no) is not int or round_no < 1:
         reason_code = "ADMISSION_DENIED"
         sub_reason = "INVALID_ROUND_NO"
@@ -2260,6 +2162,9 @@ def policy_admit_round(
     elif round_no in admitted_rounds:
         reason_code = "ADMISSION_DENIED"
         sub_reason = "ROUND_ALREADY_ADMITTED"
+    elif available_total < 1:
+        reason_code = BUDGET_EXHAUSTED
+        sub_reason = BUDGET_EXHAUSTED
     elif not recomputable and campaign_bundle_digest is None:
         reason_code = "ADMISSION_DENIED"
         sub_reason = "SUPPORTING_BUNDLE_MISSING"
@@ -2297,6 +2202,7 @@ def policy_admit_round(
         detail["actual_envelope_digest"] = envelope_digest
     elif (
         sub_reason == "PARENT_APPROVAL_NOT_CHAIN_TAIL"
+        and plan_parent_approval_checked
         and plan_parent_approval_digest is not None
     ):
         detail["expected_parent_approval_digest"] = approval_chain_tail_digest
@@ -2352,19 +2258,20 @@ def policy_admit_round(
 def _family_approval_chain_tail(
     connection, family_id: UUID
 ) -> tuple[str, str] | None:
-    """Return the chain-tail approval digest and its approved envelope digest."""
-    row = connection.execute(
+    """Return the unique chain-tail approval digest and its envelope digest."""
+    rows = connection.execute(
         "SELECT prior.approval_digest, prior.envelope_digest "
         "FROM family_approvals AS prior "
         "WHERE prior.family_id = %s AND NOT EXISTS ("
         "SELECT 1 FROM family_approvals AS later "
-        "WHERE later.supersedes = prior.approval_id) "
-        "LIMIT 1",
+        "WHERE later.supersedes = prior.approval_id)",
         (family_id,),
-    ).fetchone()
-    if row is None:
+    ).fetchall()
+    if not rows:
         return None
-    return row["approval_digest"], row["envelope_digest"]
+    if len(rows) > 1:
+        raise StateError("family has multiple family_approvals chain tails")
+    return rows[0]["approval_digest"], rows[0]["envelope_digest"]
 
 
 def _admission_record(row: Mapping[str, Any]) -> dict[str, Any]:
@@ -2456,6 +2363,9 @@ def record_admission(
         ) from error
     if not budget_snapshot:
         raise StateError("budget_snapshot must not be empty")
+    snapshot_remaining_total, snapshot_remaining_fuzz = (
+        _validate_budget_snapshot(budget_snapshot)
+    )
 
     supporting_bundle_digest = (
         None if recomputable else campaign_bundle_digest
@@ -2465,11 +2375,42 @@ def record_admission(
     with _connect(dsn) as connection:
         with connection.transaction():
             family = connection.execute(
-                "SELECT job_id FROM jobs WHERE job_id = %s FOR UPDATE",
+                "SELECT job_id, job_kind, job_contract_version, state "
+                "FROM jobs WHERE job_id = %s FOR UPDATE",
                 (family_id,),
             ).fetchone()
             if family is None:
                 raise StateError("admission family does not exist")
+            if (
+                family["job_contract_version"] != 2
+                or family["job_kind"] != "family"
+            ):
+                raise StateError("admission target is not a v2 family")
+            round_job = connection.execute(
+                "SELECT job_id, job_kind, job_contract_version, family_id, "
+                "parent_job_id, round_no FROM jobs WHERE job_id = %s",
+                (job_id,),
+            ).fetchone()
+            if round_job is None:
+                raise StateError("admission round job does not exist")
+            if (
+                round_job["job_contract_version"] != 2
+                or round_job["job_kind"] != "round"
+            ):
+                raise StateError(
+                    "admission job_id must reference a v2 round child"
+                )
+            if (
+                round_job["family_id"] != family_id
+                or round_job["parent_job_id"] != family_id
+            ):
+                raise StateError(
+                    "admission job_id does not belong to family_id"
+                )
+            if round_job["round_no"] != round_no:
+                raise StateError(
+                    "admission round_no does not match the round job"
+                )
             approval_tail_row = _family_approval_chain_tail(
                 connection, family_id
             )
@@ -2507,10 +2448,24 @@ def record_admission(
                 existing_detail = _admitted_audit_detail(
                     connection, existing["job_id"], round_no
                 ) or {}
+                plan_approval_belongs_to_family = False
+                if isinstance(plan_parent_approval_digest, str):
+                    plan_approval_row = connection.execute(
+                        "SELECT envelope_digest FROM family_approvals "
+                        "WHERE family_id = %s AND approval_digest = %s",
+                        (family_id, plan_parent_approval_digest),
+                    ).fetchone()
+                    plan_approval_belongs_to_family = (
+                        plan_approval_row is not None
+                        and plan_approval_row["envelope_digest"]
+                        == envelope_digest
+                    )
                 same_inputs = (
                     str(existing["job_id"]) == str(job_id)
                     and existing["envelope_digest"] == envelope_digest
-                    and existing["parent_approval_digest"] == approval_tail
+                    and plan_approval_belongs_to_family
+                    and existing["parent_approval_digest"]
+                    == plan_parent_approval_digest
                     and existing["seed_digest"] == seed_digest
                     and existing["predicate_version"] == predicate_version
                     and existing["recomputable"] is recomputable
@@ -2562,6 +2517,34 @@ def record_admission(
                     sub_reason="ROUND_ALREADY_ADMITTED",
                 )
 
+            if family["state"] != "AGGREGATING":
+                raise StateError(
+                    f"admission family is {family['state']}, not AGGREGATING"
+                )
+            ledger = connection.execute(
+                "SELECT remaining_total_seconds, remaining_fuzz_seconds "
+                "FROM budget_ledger WHERE family_id = %s FOR UPDATE",
+                (family_id,),
+            ).fetchone()
+            if ledger is None:
+                raise StateError("admission family has no budget ledger")
+            ledger_remaining_total = int(ledger["remaining_total_seconds"])
+            ledger_remaining_fuzz = int(ledger["remaining_fuzz_seconds"])
+            if ledger_remaining_total >= 1:
+                if snapshot_remaining_total > ledger_remaining_total:
+                    raise StateError(
+                        "budget_snapshot remaining total exceeds family "
+                        "budget_ledger"
+                    )
+                if (
+                    snapshot_remaining_fuzz is not None
+                    and snapshot_remaining_fuzz > ledger_remaining_fuzz
+                ):
+                    raise StateError(
+                        "budget_snapshot remaining fuzz exceeds family "
+                        "budget_ledger"
+                    )
+
             decided_at = connection.execute(
                 "SELECT clock_timestamp() AS now"
             ).fetchone()["now"]
@@ -2581,6 +2564,7 @@ def record_admission(
                 approved_envelope_digest=approved_envelope_digest,
                 plan_parent_approval_digest=plan_parent_approval_digest,
                 plan_envelope_digest=plan_envelope_digest,
+                ledger_remaining_total_seconds=ledger_remaining_total,
             )
 
             if outcome.admission is not None:

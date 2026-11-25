@@ -249,12 +249,12 @@ def _envelope_signature_set(value: Any) -> list[dict[str, Any]]:
             optional=set(_ENVELOPE_SIGNATURE_OPTIONAL),
         )
         entry: dict[str, Any] = {
-            field: _text(signature[field], label=f"{label}.{field}")
+            field: jsonutil.require_text(signature[field], f"{label}.{field}")
             for field in ("error", "function", "source")
         }
         if "operation" in signature:
-            operation = _text(
-                signature["operation"], label=f"{label}.operation"
+            operation = jsonutil.require_text(
+                signature["operation"], f"{label}.operation"
             )
             if operation not in _ASAN_OPERATIONS:
                 raise ValueError(f"{label}.operation must be READ or WRITE")
@@ -506,11 +506,17 @@ def check_mutation_constraints(
         raise EnvelopeViolation(
             "mutation_constraints.allowed_ops must be a JSON array"
         )
+    seen_ops: set[str] = set()
     for index, operation in enumerate(operations):
         if not isinstance(operation, str):
             raise EnvelopeViolation(
                 f"mutation_constraints.allowed_ops[{index}] must be a string"
             )
+        if operation in seen_ops:
+            raise EnvelopeViolation(
+                "mutation_constraints.allowed_ops must not contain duplicates"
+            )
+        seen_ops.add(operation)
         if operation not in allowed_ops:
             raise EnvelopeViolation(
                 "mutation_constraints.allowed_ops contains an operation "
@@ -537,40 +543,57 @@ def check_experiment_against_envelope(
     Only the envelope-bound fields are checked here. The nine-field
     ExperimentSpec closure and signature matching belong to T14; this function
     enforces the §4 rule that a spec may tighten, never widen, the approved
-    mutation surface, input family or accepted signatures.
+    mutation surface, input family or accepted signatures. All three
+    envelope-bound fields are required and fail closed when absent.
     """
     if not isinstance(experiment, Mapping):
         raise EnvelopeViolation("ExperimentSpec must be a JSON object")
     normalized = normalize_envelope(envelope)
-
-    if "input_family" in experiment:
-        input_family = experiment["input_family"]
-        if (
-            not isinstance(input_family, str)
-            or input_family not in normalized["allowed_mutation_families"]
-        ):
-            raise EnvelopeViolation(
-                "ExperimentSpec.input_family is outside the envelope "
-                "allowed_mutation_families"
-            )
-
-    if "mutation_constraints" in experiment:
-        check_mutation_constraints(
-            experiment["mutation_constraints"], normalized
+    if normalized["mode"] == "fixed":
+        raise EnvelopeViolation(
+            "fixed envelope does not permit guided ExperimentSpec"
         )
 
-    if "expected_signature" in experiment:
-        try:
-            expected = _envelope_signature_set(
-                [experiment["expected_signature"]]
-            )[0]
-        except ValueError as error:
-            raise EnvelopeViolation(str(error)) from error
-        if expected not in normalized["accepted_signature_set"]:
-            raise EnvelopeViolation(
-                "ExperimentSpec.expected_signature is outside the envelope "
-                "accepted_signature_set"
-            )
+    missing = [
+        field
+        for field in (
+            "input_family",
+            "mutation_constraints",
+            "expected_signature",
+        )
+        if field not in experiment
+    ]
+    if missing:
+        raise EnvelopeViolation(
+            "ExperimentSpec is missing required field(s): "
+            + ", ".join(missing)
+        )
+
+    input_family = experiment["input_family"]
+    if (
+        not isinstance(input_family, str)
+        or input_family not in normalized["allowed_mutation_families"]
+    ):
+        raise EnvelopeViolation(
+            "ExperimentSpec.input_family is outside the envelope "
+            "allowed_mutation_families"
+        )
+
+    check_mutation_constraints(
+        experiment["mutation_constraints"], normalized
+    )
+
+    try:
+        expected = _envelope_signature_set(
+            [experiment["expected_signature"]]
+        )[0]
+    except ValueError as error:
+        raise EnvelopeViolation(str(error)) from error
+    if expected not in normalized["accepted_signature_set"]:
+        raise EnvelopeViolation(
+            "ExperimentSpec.expected_signature is outside the envelope "
+            "accepted_signature_set"
+        )
 
 
 def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
