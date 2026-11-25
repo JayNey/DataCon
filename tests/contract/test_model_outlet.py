@@ -1336,3 +1336,48 @@ def test_redaction_masks_command_line_credentials():
     # line of defense does not trip on an already masked command.
     masked = redact(f"curl -u {account} https://models.example.com/v1/analyze")
     assert redact(masked) == masked
+
+# --- AgentOutput v2: a model may only propose hypotheses (REQ-13, TC-13) ---
+#
+# The v0.1 parser (AgentOutput.from_mapping) keeps its frozen semantics:
+# a stored v1 kind=fact record stays parseable read-only.
+
+EVIDENCE = "git:commit/" + "a" * 40
+
+
+def _model_payload(kind):
+    return {
+        "outcome": "ok",
+        "artifacts": {},
+        "findings": [
+            {
+                "kind": kind,
+                "statement": "the terminator write can overrun the buffer",
+                "confidence": "medium",
+                "evidence_refs": [EVIDENCE],
+            }
+        ],
+        "reason_code": None,
+    }
+
+
+def test_model_finding_must_be_hypothesis():
+    from datacon.agent_contracts import (
+        AgentOutput,
+        ContractError,
+        parse_model_output,
+    )
+
+    # Model-sourced kind=fact is blocked on the v2 port; the error names
+    # the only allowed kind.
+    with pytest.raises(ContractError, match="hypothesis"):
+        parse_model_output(_model_payload("fact"))
+
+    parsed = parse_model_output(_model_payload("hypothesis"))
+    assert isinstance(parsed, AgentOutput)
+    assert parsed.findings[0].kind == "hypothesis"
+
+    # v1 compatibility must not regress: the frozen v0.1 parser still
+    # accepts the same fact payload read-only.
+    legacy = AgentOutput.from_mapping(_model_payload("fact"))
+    assert legacy.findings[0].kind == "fact"
