@@ -372,7 +372,10 @@ def test_admission_denies_fixed_envelope():
         approval_chain_tail_digest=APPROVAL_DIGEST,
         seed_digest=SEED_CORPUS_DIGEST,
         round_no=1,
-        budget_snapshot=_budget_snapshot(),
+        budget_snapshot={
+            "remaining_total_seconds": 900,
+            "remaining_fuzz_seconds": 0,
+        },
         admission_id=ADMISSION_ID,
     )
 
@@ -416,6 +419,64 @@ def test_admission_denies_unsupported_predicate_version():
     assert not outcome.admitted
     assert outcome.reason_code == "ADMISSION_DENIED"
     assert outcome.sub_reason == "UNSUPPORTED_PREDICATE_VERSION"
+    assert not store.admissions
+    assert [event["event_type"] for event in store.events] == [
+        "round_admission_denied"
+    ]
+
+
+def test_admission_rejects_budget_snapshot_exceeding_envelope_caps():
+    envelope = _guided_envelope()
+    over_cap_snapshots = [
+        {
+            "remaining_total_seconds": envelope["max_total_seconds"] + 1,
+            "remaining_fuzz_seconds": 100,
+        },
+        {
+            "remaining_seconds": envelope["max_total_seconds"] + 1,
+            "remaining_fuzz_seconds": 100,
+        },
+        {
+            "remaining_total_seconds": 500,
+            "remaining_fuzz_seconds": envelope["max_fuzz_seconds"] + 1,
+        },
+    ]
+    for bad in over_cap_snapshots:
+        with pytest.raises(state.StateError, match="exceeds"):
+            state.policy_admit_round(
+                clock=FakeClock(),
+                job_id=JOB_ID,
+                parent_job_id=FAMILY_ID,
+                envelope=envelope,
+                parent_approval_digest=APPROVAL_DIGEST,
+                approval_chain_tail_digest=APPROVAL_DIGEST,
+                seed_digest=SEED_CORPUS_DIGEST,
+                round_no=2,
+                budget_snapshot=bad,
+                admission_id=ADMISSION_ID,
+            )
+
+
+def test_admission_plan_seed_mismatch_is_denied():
+    store = RecordingAdmissionStore()
+    outcome = state.policy_admit_round(
+        store=store,
+        clock=FakeClock(),
+        job_id=JOB_ID,
+        parent_job_id=FAMILY_ID,
+        envelope=_guided_envelope(),
+        parent_approval_digest=APPROVAL_DIGEST,
+        approval_chain_tail_digest=APPROVAL_DIGEST,
+        seed_digest=SEED_CORPUS_DIGEST,
+        round_no=2,
+        budget_snapshot=_budget_snapshot(),
+        admission_id=ADMISSION_ID,
+        plan_seed_digest=_digest("9"),
+    )
+
+    assert not outcome.admitted
+    assert outcome.reason_code == "ADMISSION_DENIED"
+    assert outcome.sub_reason == "PLAN_SEED_MISMATCH"
     assert not store.admissions
     assert [event["event_type"] for event in store.events] == [
         "round_admission_denied"

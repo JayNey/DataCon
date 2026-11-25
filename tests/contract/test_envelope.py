@@ -431,3 +431,19 @@ def test_state_and_contracts_envelope_validators_agree_on_whitespace_predicate_v
             contracts.normalize_envelope(raw)
         with pytest.raises(ValueError, match="whitespace"):
             state._validate_envelope(raw)
+
+
+def test_envelope_rejects_empty_accepted_signature_set():
+    raw = _guided_envelope()
+    raw["accepted_signature_set"] = []
+    with pytest.raises(ValueError, match="accepted_signature_set"):
+        contracts.normalize_envelope(raw)
+    with pytest.raises(ValueError, match="accepted_signature_set"):
+        contracts.fixed_envelope(
+            harness_digest=HARNESS_DIGEST,
+            accepted_signature_set=[],
+            max_total_seconds=900,
+            admission_predicate_version="admission-v1",
+        )
+    with pytest.raises(ValueError, match="accepted_signature_set"):
+        _guided_envelope(accepted_signature_set=[])

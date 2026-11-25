@@ -644,3 +644,231 @@ def test_idempotent_readmission_survives_envelope_reapproval(isolated_database):
     assert [event[0] for event in _events(isolated_database, child_id)] == [
         "round_admitted"
     ]
+
+
+def _valid_experiment(input_family: str = "length_boundary") -> dict:
+    return {
+        "input_family": input_family,
+        "mutation_constraints": {
+            "allowed_ops": ["append", "truncate"],
+            "max_input_bytes": 2048,
+        },
+        "expected_signature": dict(SIGNATURE),
+    }
+
+
+def test_record_admission_rejects_new_round_while_pending_envelope_exists(
+    isolated_database,
+):
+    seed = _seed_family(isolated_database)
+    family_id, child_id, _envelope_value = seed
+    pending_envelope = _envelope(max_rounds=6)
+    isolated_database.connection.execute(
+        "INSERT INTO family_envelopes (envelope_id, family_id, envelope_digest, "
+        "envelope_json, status, review_deadline_at) "
+        "VALUES (%s, %s, %s, %s, 'pending', clock_timestamp() + interval '24 hours')",
+        (
+            uuid4(),
+            family_id,
+            contracts.envelope_digest(pending_envelope),
+            Jsonb(pending_envelope),
+        ),
+    )
+
+    with pytest.raises(state.StateError, match="pending"):
+        _admit(isolated_database, seed)
+    assert _admissions(isolated_database, family_id, 2) == []
+    assert _events(isolated_database, child_id) == []
+
+
+def test_readmission_rejects_out_of_envelope_or_different_experiment(
+    isolated_database,
+):
+    seed = _seed_family(isolated_database)
+    family_id, child_id, _envelope_value = seed
+    exp_a = _valid_experiment("length_boundary")
+    exp_b = _valid_experiment("byte_flip")
+
+    first = _admit(isolated_database, seed, experiment=exp_a)
+    assert first.admitted
+
+    # Exact same experiment remains an idempotent no-op.
+    same = _admit(isolated_database, seed, experiment=exp_a)
+    assert same.status == "already_admitted"
+    assert len(_events(isolated_database, child_id)) == 1
+
+    # Out-of-envelope experiments must never return already_admitted.
+    for bad_exp in ({"input_family": "FORBIDDEN"}, {}):
+        denied = _admit(isolated_database, seed, experiment=bad_exp)
+        assert not denied.admitted
+        assert denied.status == "denied"
+        assert denied.status != "already_admitted"
+
+    # Different valid experiment or omitted experiment must also be denied.
+    for other_exp in (exp_b, None):
+        denied = _admit(isolated_database, seed, experiment=other_exp)
+        assert not denied.admitted
+        assert denied.status == "denied"
+        assert denied.reason_code == "ADMISSION_DENIED"
+        assert denied.sub_reason == "ROUND_ALREADY_ADMITTED"
+
+    # Non-canonical JSON experiment fails closed with StateError.
+    with pytest.raises(state.StateError):
+        _admit(isolated_database, seed, experiment={"bad": float("nan")})
+
+    # Round originally admitted with experiment=None must also reject bad/new experiments.
+    seed_none = _seed_family(isolated_database, approval_digest=_digest("8"))
+    assert _admit(isolated_database, seed_none, experiment=None).admitted
+    for bad_exp in ({"input_family": "FORBIDDEN"}, {}, exp_a):
+        denied = _admit(isolated_database, seed_none, experiment=bad_exp)
+        assert not denied.admitted
+        assert denied.status == "denied"
+
+
+def test_readmission_rejects_plan_envelope_digest_mismatch(isolated_database):
+    seed = _seed_family(isolated_database)
+    family_id, child_id, _envelope_value = seed
+
+    first = _admit(isolated_database, seed)
+    assert first.admitted
+
+    isolated_database.connection.execute(
+        "UPDATE plans SET plan = jsonb_set(plan, '{envelope_digest}', to_jsonb(%s::text)) "
+        "WHERE job_id = %s",
+        (_digest("7"), child_id),
+    )
+
+    second = _admit(isolated_database, seed)
+    assert not second.admitted
+    assert second.status == "denied"
+    assert second.reason_code == "ADMISSION_DENIED"
+    assert len(_admissions(isolated_database, family_id, 2)) == 1
+
+
+@pytest.mark.parametrize("terminal_state", ["BLOCKED", "COMPLETED"])
+def test_readmission_on_terminal_family_blocks_dirty_audit(
+    isolated_database, terminal_state
+):
+    seed = _seed_family(isolated_database)
+    family_id, child_id, _envelope_value = seed
+
+    first = _admit(isolated_database, seed)
+    assert first.admitted
+    initial_events = _events(isolated_database, child_id)
+    assert len(initial_events) == 1
+
+    if terminal_state == "COMPLETED":
+        isolated_database.connection.execute(
+            "UPDATE jobs SET state = 'COMPLETED', evidence_status = 'archived', "
+            "evidence_path = '/tmp/family.json', evidence_digest = %s "
+            "WHERE job_id = %s",
+            (_digest("8"), family_id),
+        )
+    else:
+        isolated_database.connection.execute(
+            "UPDATE jobs SET state = 'BLOCKED' WHERE job_id = %s",
+            (family_id,),
+        )
+
+    # Same-input readmission remains a side-effect-free no-op.
+    same = _admit(isolated_database, seed)
+    assert same.status == "already_admitted"
+    assert len(_events(isolated_database, child_id)) == 1
+
+    # Conflicting readmission must fail closed without appending dirty audit events.
+    with pytest.raises(state.StateError, match="AGGREGATING"):
+        _admit(isolated_database, seed, seed_digest=_digest("9"))
+    assert len(_events(isolated_database, child_id)) == 1
+
+
+@pytest.mark.parametrize("round_state", ["BLOCKED", "COMPLETED"])
+def test_record_admission_rejects_terminal_round_job(
+    isolated_database, round_state
+):
+    seed = _seed_family(isolated_database)
+    family_id, child_id, _envelope_value = seed
+    if round_state == "COMPLETED":
+        isolated_database.connection.execute(
+            "UPDATE jobs SET state = 'COMPLETED', evidence_status = 'archived', "
+            "evidence_path = '/tmp/round.json', evidence_digest = %s "
+            "WHERE job_id = %s",
+            (_digest("8"), child_id),
+        )
+    else:
+        isolated_database.connection.execute(
+            "UPDATE jobs SET state = 'BLOCKED' WHERE job_id = %s",
+            (child_id,),
+        )
+
+    with pytest.raises(state.StateError, match=round_state):
+        _admit(isolated_database, seed)
+    assert _admissions(isolated_database, family_id, 2) == []
+    assert _events(isolated_database, child_id) == []
+
+
+def test_record_admission_validates_plan_round_no_and_candidate_seed(
+    isolated_database,
+):
+    # Mismatched candidate seed in plan -> denied with PLAN_SEED_MISMATCH
+    seed_mismatch = _seed_family(isolated_database, approval_digest=_digest("1"))
+    family_id_1, child_id_1, _ = seed_mismatch
+    isolated_database.connection.execute(
+        "UPDATE plans SET plan = plan || %s::jsonb WHERE job_id = %s",
+        (
+            jsonutil.canonical_bytes(
+                {
+                    "round_no": 2,
+                    "inputs": {
+                        "normal": _digest("1"),
+                        "candidate": _digest("9"),
+                    },
+                }
+            ).decode("utf-8"),
+            child_id_1,
+        ),
+    )
+    denied = _admit(isolated_database, seed_mismatch)
+    assert not denied.admitted
+    assert denied.status == "denied"
+    assert denied.reason_code == "ADMISSION_DENIED"
+    assert denied.sub_reason == "PLAN_SEED_MISMATCH"
+    assert _admissions(isolated_database, family_id_1, 2) == []
+    events = _events(isolated_database, child_id_1)
+    assert [event[0] for event in events] == ["round_admission_denied"]
+    assert events[0][2]["sub_reason"] == "PLAN_SEED_MISMATCH"
+
+    # Mismatched round_no in plan -> StateError
+    seed_round = _seed_family(isolated_database, approval_digest=_digest("2"))
+    family_id_2, child_id_2, _ = seed_round
+    isolated_database.connection.execute(
+        "UPDATE plans SET plan = plan || %s::jsonb WHERE job_id = %s",
+        (
+            jsonutil.canonical_bytes({"round_no": 3}).decode("utf-8"),
+            child_id_2,
+        ),
+    )
+    with pytest.raises(state.StateError, match="round_no"):
+        _admit(isolated_database, seed_round)
+    assert _admissions(isolated_database, family_id_2, 2) == []
+
+    # Matching round_no and candidate seed -> admitted cleanly
+    seed_ok = _seed_family(isolated_database, approval_digest=_digest("3"))
+    family_id_3, child_id_3, _ = seed_ok
+    isolated_database.connection.execute(
+        "UPDATE plans SET plan = plan || %s::jsonb WHERE job_id = %s",
+        (
+            jsonutil.canonical_bytes(
+                {
+                    "round_no": 2,
+                    "inputs": {
+                        "normal": _digest("1"),
+                        "candidate": SEED_CORPUS_DIGEST,
+                    },
+                }
+            ).decode("utf-8"),
+            child_id_3,
+        ),
+    )
+    admitted = _admit(isolated_database, seed_ok)
+    assert admitted.admitted
+    assert len(_admissions(isolated_database, family_id_3, 2)) == 1

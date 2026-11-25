@@ -567,3 +567,179 @@ def test_postgres_charge_step_budget_rejects_wrong_family_and_family_self_job(
             charge_kind="general",
             elapsed_seconds=5,
         )
+
+
+def test_charge_budget_local_rejects_cross_family_recovery():
+    ledger = _ledger()
+    charges: list[dict] = []
+    first = _charge(ledger, charges, elapsed_seconds=10)
+    assert first.status == "charged"
+
+    other_family = str(uuid.uuid4())
+    with pytest.raises(state.StateError, match="different family"):
+        state.charge_budget_local(
+            ledger,
+            charges,
+            family_id=other_family,
+            job_id=JOB_ID,
+            step_key="build",
+            attempt_no=1,
+            charge_kind="general",
+            elapsed_seconds=10,
+        )
+
+
+def test_budget_summary_rejects_invalid_ranges_and_booleans():
+    # Negative charge cancelling out a positive charge so spent+remaining==max
+    with pytest.raises(state.StateError):
+        state.budget_summary(
+            _ledger(remaining_total_seconds=100, remaining_fuzz_seconds=60),
+            [
+                {"seconds": -10, "fuzz_seconds": 0},
+                {"seconds": 10, "fuzz_seconds": 0},
+            ],
+        )
+    # Negative charge pushing remaining_total_seconds above max_total_seconds
+    with pytest.raises(state.StateError):
+        state.budget_summary(
+            _ledger(remaining_total_seconds=110, remaining_fuzz_seconds=60),
+            [{"seconds": -10, "fuzz_seconds": 0}],
+        )
+    # Negative fuzz charge cancelling out a positive fuzz charge
+    with pytest.raises(state.StateError):
+        state.budget_summary(
+            _ledger(remaining_total_seconds=90, remaining_fuzz_seconds=60),
+            [
+                {"seconds": 5, "fuzz_seconds": -5},
+                {"seconds": 5, "fuzz_seconds": 5},
+            ],
+        )
+    # fuzz_seconds > seconds
+    with pytest.raises(state.StateError):
+        state.budget_summary(
+            _ledger(remaining_total_seconds=95, remaining_fuzz_seconds=50),
+            [{"seconds": 5, "fuzz_seconds": 10}],
+        )
+    # remaining_fuzz_seconds > max_fuzz_seconds
+    with pytest.raises(state.StateError):
+        state.budget_summary(
+            _ledger(remaining_total_seconds=100, remaining_fuzz_seconds=70),
+            [{"seconds": 0, "fuzz_seconds": -10}],
+        )
+    # Invalid caps
+    with pytest.raises(state.StateError):
+        state.budget_summary(
+            _ledger(
+                max_total_seconds=0,
+                max_fuzz_seconds=0,
+                remaining_total_seconds=0,
+                remaining_fuzz_seconds=0,
+            ),
+            [],
+        )
+    with pytest.raises(state.StateError):
+        state.budget_summary(
+            _ledger(
+                max_total_seconds=50,
+                max_fuzz_seconds=60,
+                remaining_total_seconds=50,
+                remaining_fuzz_seconds=60,
+            ),
+            [],
+        )
+    # Boolean values in ledger or charges
+    with pytest.raises(state.StateError):
+        state.budget_summary(
+            _ledger(
+                max_total_seconds=True,
+                max_fuzz_seconds=0,
+                remaining_total_seconds=1,
+                remaining_fuzz_seconds=0,
+            ),
+            [],
+        )
+    with pytest.raises(state.StateError):
+        state.budget_summary(
+            _ledger(remaining_total_seconds=99, remaining_fuzz_seconds=60),
+            [{"seconds": True, "fuzz_seconds": False}],
+        )
+
+
+@pytest.mark.postgres
+def test_postgres_charge_step_budget_ledger_is_canonical_json(budget_database):
+    family_id = uuid.uuid4()
+    child_id = uuid.uuid4()
+    budget_database.connection.execute(
+        "INSERT INTO jobs (job_id, request, state, stage, submitted_at, "
+        "job_contract_version, family_id, job_kind, parent_job_id, round_no, "
+        "generation, workflow_synced) "
+        "VALUES (%s, %s, 'AGGREGATING', 'family', clock_timestamp(), 2, %s, "
+        "'family', NULL, NULL, 1, true)",
+        (family_id, Jsonb({"schema_version": 2}), family_id),
+    )
+    budget_database.connection.execute(
+        "INSERT INTO jobs (job_id, request, state, stage, submitted_at, "
+        "job_contract_version, family_id, job_kind, parent_job_id, round_no, "
+        "generation) "
+        "VALUES (%s, %s, 'RUNNING', 'build', clock_timestamp(), 2, %s, "
+        "'round', %s, 2, 1)",
+        (child_id, Jsonb({"schema_version": 2}), family_id, family_id),
+    )
+    state.initialize_budget_ledger(
+        budget_database.dsn,
+        family_id,
+        max_total_seconds=20,
+        max_fuzz_seconds=10,
+    )
+
+    charged = state.charge_step_budget(
+        budget_database.dsn,
+        family_id=family_id,
+        job_id=child_id,
+        step_key="build",
+        attempt_no=1,
+        charge_kind="general",
+        elapsed_seconds=5,
+    )
+    assert charged.status == "charged"
+    assert charged.ledger["family_id"] == str(family_id)
+    assert jsonutil.canonical_bytes(charged.ledger)
+
+    recovered = state.charge_step_budget(
+        budget_database.dsn,
+        family_id=family_id,
+        job_id=child_id,
+        step_key="build",
+        attempt_no=1,
+        charge_kind="general",
+        elapsed_seconds=5,
+    )
+    assert recovered.status == "recovered"
+    assert recovered.ledger["family_id"] == str(family_id)
+    assert jsonutil.canonical_bytes(recovered.ledger)
+
+    exhausted_on_charge = state.charge_step_budget(
+        budget_database.dsn,
+        family_id=family_id,
+        job_id=child_id,
+        step_key="replay",
+        attempt_no=1,
+        charge_kind="general",
+        elapsed_seconds=50,
+    )
+    assert exhausted_on_charge.status == "budget_exhausted"
+    assert exhausted_on_charge.ledger["family_id"] == str(family_id)
+    assert jsonutil.canonical_bytes(exhausted_on_charge.ledger)
+
+    exhausted_at_gate = state.charge_step_budget(
+        budget_database.dsn,
+        family_id=family_id,
+        job_id=child_id,
+        step_key="replay-2",
+        attempt_no=1,
+        charge_kind="general",
+        elapsed_seconds=1,
+    )
+    assert exhausted_at_gate.status == "budget_exhausted"
+    assert exhausted_at_gate.ledger["family_id"] == str(family_id)
+    assert jsonutil.canonical_bytes(exhausted_at_gate.ledger)

@@ -248,3 +248,71 @@ def test_propose_envelope_rejects_whitespace_in_predicate_version(
             seed["family_id"],
             _envelope(admission_predicate_version="admission v1"),
         )
+
+
+def test_propose_envelope_rejects_unsupported_predicate_version(
+    isolated_database,
+):
+    seed = _approved_family(isolated_database)
+    with pytest.raises(state.StateError, match="admission_predicate_version"):
+        state.propose_envelope(
+            isolated_database.dsn,
+            seed["family_id"],
+            _envelope(admission_predicate_version="admission-v99"),
+        )
+    assert _row(
+        isolated_database,
+        "SELECT count(*) FROM family_envelopes WHERE family_id = %s "
+        "AND status = 'pending'",
+        (seed["family_id"],),
+    )[0] == 0
+
+
+def test_propose_envelope_blocks_budget_tightening_while_child_active(
+    isolated_database,
+):
+    seed = _approved_family(isolated_database)
+    family_id = seed["family_id"]
+    child_id = seed["child_id"]
+    state.initialize_budget_ledger(
+        isolated_database.dsn,
+        family_id,
+        max_total_seconds=900,
+        max_fuzz_seconds=300,
+    )
+
+    for active_state in ("RUNNING", "ARCHIVING"):
+        isolated_database.connection.execute(
+            "UPDATE jobs SET state = %s WHERE job_id = %s",
+            (active_state, child_id),
+        )
+        with pytest.raises(state.StateError, match="RUNNING|ARCHIVING"):
+            state.propose_envelope(
+                isolated_database.dsn,
+                family_id,
+                _envelope(max_total_seconds=600, max_fuzz_seconds=300),
+            )
+        with pytest.raises(state.StateError, match="RUNNING|ARCHIVING"):
+            state.propose_envelope(
+                isolated_database.dsn,
+                family_id,
+                _envelope(max_total_seconds=900, max_fuzz_seconds=200),
+            )
+        assert _row(
+            isolated_database,
+            "SELECT count(*) FROM family_envelopes WHERE family_id = %s "
+            "AND status = 'pending'",
+            (family_id,),
+        )[0] == 0
+
+    # Non-active child (READY) still permits a legal budget tightening.
+    isolated_database.connection.execute(
+        "UPDATE jobs SET state = 'READY' WHERE job_id = %s",
+        (child_id,),
+    )
+    proposed = state.propose_envelope(
+        isolated_database.dsn,
+        family_id,
+        _envelope(max_total_seconds=600, max_fuzz_seconds=200),
+    )
+    assert proposed["status"] == "pending"
