@@ -2787,8 +2787,20 @@ def test_release_manifest_keeps_contract_version_one(tmp_path):
     assert manifest["contract_version"] == 1
     assert manifest["schema_version"] == 1
     assert manifest["toolchain_image_digest"] == release.TOOLCHAIN_IMAGE_DIGEST
-    assert release._candidate_config(manifest)["contract_version"] == 1
     release.validate_release_candidate_manifest(manifest)
+
+    promoted_backend = _backend()
+    approval_v1 = _approval(manifest)
+    promoted = release.promote_and_smoke(
+        manifest=manifest,
+        expected_manifest_digest=approval_v1["candidate_digest"],
+        approval=approval_v1,
+        backend=promoted_backend,
+        smoke_checks={"cli_smoke": lambda: True},
+        rollback_fn=lambda prev: {"restored_image": prev["image_id"], "ok": True},
+    )
+    assert promoted["status"] == "promoted"
+    assert promoted_backend.active_release()["config"]["contract_version"] == 1
 
     manifest_v2 = dict(manifest, contract_version=contracts.SCHEMA_VERSION_V2)
     with pytest.raises(release.ReleaseGateError, match="contract_version"):

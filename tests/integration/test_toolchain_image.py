@@ -13,7 +13,7 @@ import subprocess
 
 import pytest
 
-from datacon import release, toolchain
+from datacon import release, toolchain, verdict
 
 pytestmark = [pytest.mark.postgres, pytest.mark.docker]
 
@@ -25,7 +25,7 @@ def _is_ci() -> bool:
     return os.getenv("CI", "").lower() not in ("", "0", "false", "no")
 
 
-@pytest.fixture(autouse=True)
+@pytest.fixture(scope="module", autouse=True)
 def require_docker():
     if shutil.which("docker") is None:
         if _is_ci():
@@ -60,18 +60,25 @@ def require_docker():
         )
 
 
-def test_oniguruma_case_uses_existing_toolchain_image():
-    report = toolchain.verify_pinned_image_tool_boundary(image=release.TOOLCHAIN_IMAGE)
-    assert report.matches_v1_boundary is True, (
+@pytest.fixture(scope="module")
+def v1_probe_report(require_docker: None) -> toolchain.ToolchainProbeReport:
+    """Run the read-only live container probe once per module."""
+    return toolchain.verify_pinned_image_tool_boundary(image=release.TOOLCHAIN_IMAGE)
+
+
+def test_oniguruma_case_uses_existing_toolchain_image(
+    v1_probe_report: toolchain.ToolchainProbeReport,
+):
+    assert v1_probe_report.matches_v1_boundary is True, (
         f"pinned image drifted from v1 boundary: "
-        f"unexpected_missing={sorted(report.unexpected_missing)}, "
-        f"unexpected_present={sorted(report.unexpected_present)}"
+        f"unexpected_missing={sorted(v1_probe_report.unexpected_missing)}, "
+        f"unexpected_present={sorted(v1_probe_report.unexpected_present)}"
     )
     expected_oniguruma = {
         toolchain.normalize_tool_name(tool)
         for tool in toolchain.ONIGURUMA_REQUIRED_TOOLS
     }
-    assert expected_oniguruma <= report.available
+    assert expected_oniguruma <= v1_probe_report.available
 
     selection = toolchain.select_toolchain_image(toolchain.ONIGURUMA_REQUIRED_TOOLS)
     assert selection.image == release.TOOLCHAIN_IMAGE
@@ -82,20 +89,23 @@ def test_oniguruma_case_uses_existing_toolchain_image():
     assert selection.unknown_tools == ()
 
 
-def test_missing_tool_requires_toolchain_image_v2():
-    report = toolchain.verify_pinned_image_tool_boundary(image=release.TOOLCHAIN_IMAGE)
-    assert report.unexpected_present == frozenset(), (
+def test_missing_tool_requires_toolchain_image_v2(
+    v1_probe_report: toolchain.ToolchainProbeReport,
+):
+    assert v1_probe_report.unexpected_present == frozenset(), (
         f"tools expected absent from pinned v1 image were present: "
-        f"{sorted(report.unexpected_present)}"
+        f"{sorted(v1_probe_report.unexpected_present)}"
     )
-    assert toolchain.V1_MISSING_TOOLS <= report.missing
+    assert toolchain.V1_MISSING_TOOLS <= v1_probe_report.missing
 
     for missing_tool in sorted(toolchain.V1_MISSING_TOOLS):
         with pytest.raises(toolchain.ToolchainBoundaryError) as blocked:
             toolchain.select_toolchain_image(
                 [*toolchain.ONIGURUMA_REQUIRED_TOOLS, missing_tool]
             )
-        assert blocked.value.reason_code == toolchain.REASON_TOOLCHAIN_V2_REQUIRED
+        assert blocked.value.reason_code == toolchain.REASON_POLICY_DENIED
+        assert verdict.reason_allowed_v2("BLOCKED", blocked.value.reason_code)
+        assert blocked.value.sub_reason == toolchain.SUB_REASON_TOOLCHAIN_V2_REQUIRED
         assert missing_tool in blocked.value.missing_v1_tools
 
         routed = toolchain.select_toolchain_image(
@@ -113,4 +123,6 @@ def test_missing_tool_requires_toolchain_image_v2():
                 [missing_tool],
                 toolchain_image_v2=release.TOOLCHAIN_IMAGE,
             )
-        assert reused.value.reason_code == toolchain.REASON_INVALID_TOOLCHAIN_V2
+        assert reused.value.reason_code == toolchain.REASON_POLICY_DENIED
+        assert verdict.reason_allowed_v2("BLOCKED", reused.value.reason_code)
+        assert reused.value.sub_reason == toolchain.SUB_REASON_INVALID_TOOLCHAIN_V2

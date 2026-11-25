@@ -9,9 +9,9 @@ from pathlib import Path
 import re
 import subprocess
 from types import MappingProxyType
-from typing import Any, Literal
+from typing import Any, Literal, NoReturn
 
-from datacon import release
+from datacon import release, verdict
 from datacon.tools import sandbox
 
 # Single source of truth for the pinned v1 toolchain image and digest.
@@ -34,21 +34,26 @@ ONIGURUMA_REQUIRED_TOOLS: tuple[str, ...] = (
     "libFuzzer",
 )
 
-REASON_TOOLCHAIN_V2_REQUIRED = "TOOLCHAIN_IMAGE_V2_REQUIRED"
-REASON_INVALID_TOOLCHAIN_V2 = "INVALID_TOOLCHAIN_IMAGE_V2"
-REASON_INVALID_TOOL_REQUIREMENT = "INVALID_TOOL_REQUIREMENT"
-REASON_INVALID_PROBE_OUTPUT = "INVALID_TOOLCHAIN_PROBE_OUTPUT"
-REASON_TOOLCHAIN_PROBE_FAILED = "TOOLCHAIN_PROBE_FAILED"
+REASON_POLICY_DENIED = "POLICY_DENIED"
+
+SUB_REASON_TOOLCHAIN_V2_REQUIRED = "TOOLCHAIN_IMAGE_V2_REQUIRED"
+SUB_REASON_INVALID_TOOLCHAIN_V2 = "INVALID_TOOLCHAIN_IMAGE_V2"
+SUB_REASON_INVALID_TOOL_REQUIREMENT = "INVALID_TOOL_REQUIREMENT"
+SUB_REASON_INVALID_PROBE_OUTPUT = "INVALID_TOOLCHAIN_PROBE_OUTPUT"
+SUB_REASON_TOOLCHAIN_PROBE_FAILED = "TOOLCHAIN_PROBE_FAILED"
 
 _SHA256_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+_DNS_LABEL_RE = r"[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?"
+_FQDN_RE = rf"{_DNS_LABEL_RE}(?:\.{_DNS_LABEL_RE})+"
 _REGISTRY_PREFIX_RE = (
-    r"(?:(?:[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?"
-    r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)+|localhost)"
-    r"(?::[0-9]{1,5})?/)"
+    rf"(?:(?:(?:{_FQDN_RE}|localhost)(?::(?P<fqdn_port>[0-9]+))?)"
+    rf"|(?:{_DNS_LABEL_RE}:(?P<label_port>[0-9]+)))/"
 )
 _REPO_PATH_RE = r"[a-z0-9]+(?:[._-][a-z0-9]+)*(?:/[a-z0-9]+(?:[._-][a-z0-9]+)*)*"
 _IMAGE_TAG_RE = r"(?::[A-Za-z0-9_][A-Za-z0-9._-]{0,127})?"
-_IMAGE_REPO_RE = re.compile(f"^{_REGISTRY_PREFIX_RE}?{_REPO_PATH_RE}{_IMAGE_TAG_RE}$")
+_IMAGE_REPO_RE = re.compile(
+    f"^(?:{_REGISTRY_PREFIX_RE})?{_REPO_PATH_RE}{_IMAGE_TAG_RE}$"
+)
 _PROBE_LINE_RE = re.compile(r"^TOOL\s+(\S+)\s+(present|absent)$")
 
 _PROBE_COMMAND_TOOLS_PRESENT: tuple[str, ...] = (
@@ -67,21 +72,36 @@ _PROBE_COMMAND_TOOLS_ABSENT: tuple[str, ...] = (
 
 
 class ToolchainBoundaryError(ValueError):
-    """Fail-closed error for toolchain v1/v2 boundary, reference, or probe violations."""
+    """Fail-closed error for toolchain v1/v2 boundary, reference, or probe violations.
+
+    ``reason_code`` always belongs to the closed v0.2 ``BLOCKED`` reason enum
+    (default ``"POLICY_DENIED"``), validated fail-closed via
+    ``verdict.reason_allowed_v2("BLOCKED", reason_code)``. ``sub_reason``
+    carries the fine-grained diagnostic token for audit attribution.
+    """
 
     def __init__(
         self,
         detail: str,
         *,
-        reason_code: str,
+        sub_reason: str,
+        reason_code: str = REASON_POLICY_DENIED,
         missing_v1_tools: Sequence[str] = (),
         unknown_tools: Sequence[str] = (),
     ) -> None:
+        if not verdict.reason_allowed_v2("BLOCKED", reason_code):
+            raise ValueError(
+                "reason_code must be an allowed v0.2 BLOCKED reason, "
+                f"got {reason_code!r}"
+            )
+        if not isinstance(sub_reason, str) or not sub_reason.strip():
+            raise ValueError("sub_reason must be a non-empty string")
         self.reason_code = reason_code
+        self.sub_reason = sub_reason
         self.missing_v1_tools = tuple(missing_v1_tools)
         self.unknown_tools = tuple(unknown_tools)
         self.detail = detail
-        super().__init__(f"{reason_code}: {detail}")
+        super().__init__(f"{reason_code} ({sub_reason}): {detail}")
 
 
 @dataclass(frozen=True)
@@ -114,23 +134,23 @@ def normalize_tool_name(name: Any) -> str:
     if not isinstance(name, str):
         raise ToolchainBoundaryError(
             f"tool requirement must be a string, got {type(name).__name__}",
-            reason_code=REASON_INVALID_TOOL_REQUIREMENT,
+            sub_reason=SUB_REASON_INVALID_TOOL_REQUIREMENT,
         )
     if any(ord(ch) < 32 or ord(ch) == 127 for ch in name):
         raise ToolchainBoundaryError(
             f"tool requirement contains control characters: {name!r}",
-            reason_code=REASON_INVALID_TOOL_REQUIREMENT,
+            sub_reason=SUB_REASON_INVALID_TOOL_REQUIREMENT,
         )
     normalized = name.strip().lower()
     if not normalized:
         raise ToolchainBoundaryError(
             "tool requirement must be a non-empty string",
-            reason_code=REASON_INVALID_TOOL_REQUIREMENT,
+            sub_reason=SUB_REASON_INVALID_TOOL_REQUIREMENT,
         )
     if any(ch.isspace() for ch in normalized):
         raise ToolchainBoundaryError(
             f"tool requirement contains internal whitespace: {name!r}",
-            reason_code=REASON_INVALID_TOOL_REQUIREMENT,
+            sub_reason=SUB_REASON_INVALID_TOOL_REQUIREMENT,
         )
     return normalized
 
@@ -139,47 +159,43 @@ def validate_pinned_image_ref(
     image: Any,
     *,
     label: str = "toolchain_image",
-    reason_code: str = REASON_INVALID_TOOLCHAIN_V2,
+    sub_reason: str = SUB_REASON_INVALID_TOOLCHAIN_V2,
+    reason_code: str = REASON_POLICY_DENIED,
     missing_v1_tools: Sequence[str] = (),
     unknown_tools: Sequence[str] = (),
 ) -> tuple[str, str]:
     """Validate that an image reference is ``<repo>@sha256:<64 lowercase hex>``."""
+
+    def _fail(detail: str) -> NoReturn:
+        raise ToolchainBoundaryError(
+            detail,
+            sub_reason=sub_reason,
+            reason_code=reason_code,
+            missing_v1_tools=missing_v1_tools,
+            unknown_tools=unknown_tools,
+        )
+
     if not isinstance(image, str) or not image:
-        raise ToolchainBoundaryError(
-            f"{label} must be a non-empty digest-pinned image reference",
-            reason_code=reason_code,
-            missing_v1_tools=missing_v1_tools,
-            unknown_tools=unknown_tools,
-        )
+        _fail(f"{label} must be a non-empty digest-pinned image reference")
     if any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127 for ch in image):
-        raise ToolchainBoundaryError(
-            f"{label} must not contain whitespace or control characters: {image!r}",
-            reason_code=reason_code,
-            missing_v1_tools=missing_v1_tools,
-            unknown_tools=unknown_tools,
-        )
+        _fail(f"{label} must not contain whitespace or control characters: {image!r}")
     if image.count("@") != 1:
-        raise ToolchainBoundaryError(
-            f"{label} must be pinned by a single '@sha256:<digest>' suffix: {image!r}",
-            reason_code=reason_code,
-            missing_v1_tools=missing_v1_tools,
-            unknown_tools=unknown_tools,
+        _fail(
+            f"{label} must be pinned by a single '@sha256:<digest>' suffix: {image!r}"
         )
     repo, _, digest = image.partition("@")
-    if not _IMAGE_REPO_RE.fullmatch(repo):
-        raise ToolchainBoundaryError(
-            f"{label} has an invalid repository reference: {repo!r}",
-            reason_code=reason_code,
-            missing_v1_tools=missing_v1_tools,
-            unknown_tools=unknown_tools,
-        )
+    repo_match = _IMAGE_REPO_RE.fullmatch(repo)
+    if repo_match is None:
+        _fail(f"{label} has an invalid repository reference: {repo!r}")
+    port_str = repo_match.group("fqdn_port") or repo_match.group("label_port")
+    if port_str is not None and (
+        port_str.startswith("0")
+        or len(port_str) > 5
+        or not (1 <= int(port_str) <= 65535)
+    ):
+        _fail(f"{label} has an invalid registry port: {port_str!r}")
     if not _SHA256_DIGEST_RE.fullmatch(digest):
-        raise ToolchainBoundaryError(
-            f"{label} must use a lowercase sha256 digest: {digest!r}",
-            reason_code=reason_code,
-            missing_v1_tools=missing_v1_tools,
-            unknown_tools=unknown_tools,
-        )
+        _fail(f"{label} must use a lowercase sha256 digest: {digest!r}")
     return image, digest
 
 
@@ -201,7 +217,7 @@ def select_toolchain_image(
     ):
         raise ToolchainBoundaryError(
             "required_tools must be a sequence of tool names",
-            reason_code=REASON_INVALID_TOOL_REQUIREMENT,
+            sub_reason=SUB_REASON_INVALID_TOOL_REQUIREMENT,
         )
 
     normalized_ordered = tuple(
@@ -235,7 +251,7 @@ def select_toolchain_image(
         raise ToolchainBoundaryError(
             f"case requires toolchain image v2 ({reason_summary}) "
             "but toolchain_image_v2 is not configured",
-            reason_code=REASON_TOOLCHAIN_V2_REQUIRED,
+            sub_reason=SUB_REASON_TOOLCHAIN_V2_REQUIRED,
             missing_v1_tools=missing_v1,
             unknown_tools=unknown,
         )
@@ -243,7 +259,7 @@ def select_toolchain_image(
     validated_image, validated_digest = validate_pinned_image_ref(
         toolchain_image_v2,
         label="toolchain_image_v2",
-        reason_code=REASON_INVALID_TOOLCHAIN_V2,
+        sub_reason=SUB_REASON_INVALID_TOOLCHAIN_V2,
         missing_v1_tools=missing_v1,
         unknown_tools=unknown,
     )
@@ -251,7 +267,7 @@ def select_toolchain_image(
         raise ToolchainBoundaryError(
             "toolchain_image_v2 must not reuse the pinned v1 toolchain digest "
             f"({PINNED_TOOLCHAIN_IMAGE_DIGEST})",
-            reason_code=REASON_INVALID_TOOLCHAIN_V2,
+            sub_reason=SUB_REASON_INVALID_TOOLCHAIN_V2,
             missing_v1_tools=missing_v1,
             unknown_tools=unknown,
         )
@@ -292,7 +308,7 @@ def render_toolchain_probe_script() -> str:
             '  resdir="$(clang -print-resource-dir 2>/dev/null || true)"',
             '  if [ -n "$resdir" ] && find "$resdir" -name \'libclang_rt.fuzzer*.a\' 2>/dev/null | grep -q .; then',
             "    printf 'int LLVMFuzzerTestOneInput(const unsigned char *d, unsigned long s){(void)d;(void)s;return 0;}\\n' > /work/fuzzer_probe.c",
-            "    if clang -fsanitize=fuzzer /work/fuzzer_probe.c -o /work/fuzzer_probe >/dev/null 2>&1; then",
+            "    if clang -fsanitize=fuzzer /work/fuzzer_probe.c -o /work/fuzzer_probe >/dev/null; then",
             "      libfuzzer_ok=1",
             "    fi",
             "    rm -f /work/fuzzer_probe.c /work/fuzzer_probe",
@@ -322,14 +338,14 @@ def parse_toolchain_probe_output(output: str | bytes) -> ToolchainProbeReport:
         except UnicodeDecodeError as error:
             raise ToolchainBoundaryError(
                 f"toolchain probe output is not valid UTF-8: {error}",
-                reason_code=REASON_INVALID_PROBE_OUTPUT,
+                sub_reason=SUB_REASON_INVALID_PROBE_OUTPUT,
             ) from error
     elif isinstance(output, str):
         text = output
     else:
         raise ToolchainBoundaryError(
             f"toolchain probe output must be str or bytes, got {type(output).__name__}",
-            reason_code=REASON_INVALID_PROBE_OUTPUT,
+            sub_reason=SUB_REASON_INVALID_PROBE_OUTPUT,
         )
 
     parsed: dict[str, bool] = {}
@@ -341,18 +357,24 @@ def parse_toolchain_probe_output(output: str | bytes) -> ToolchainProbeReport:
         if match is None:
             raise ToolchainBoundaryError(
                 f"malformed probe line {line_no}: {raw_line!r}",
-                reason_code=REASON_INVALID_PROBE_OUTPUT,
+                sub_reason=SUB_REASON_INVALID_PROBE_OUTPUT,
             )
-        tool_name = normalize_tool_name(match.group(1))
+        try:
+            tool_name = normalize_tool_name(match.group(1))
+        except ToolchainBoundaryError as error:
+            raise ToolchainBoundaryError(
+                f"malformed tool name in probe line {line_no}: {raw_line!r}",
+                sub_reason=SUB_REASON_INVALID_PROBE_OUTPUT,
+            ) from error
         if tool_name not in PROBED_TOOLS:
             raise ToolchainBoundaryError(
                 f"unexpected tool in probe output at line {line_no}: {tool_name!r}",
-                reason_code=REASON_INVALID_PROBE_OUTPUT,
+                sub_reason=SUB_REASON_INVALID_PROBE_OUTPUT,
             )
         if tool_name in parsed:
             raise ToolchainBoundaryError(
                 f"duplicate probe entry for tool {tool_name!r} at line {line_no}",
-                reason_code=REASON_INVALID_PROBE_OUTPUT,
+                sub_reason=SUB_REASON_INVALID_PROBE_OUTPUT,
             )
         parsed[tool_name] = match.group(2) == "present"
 
@@ -360,7 +382,7 @@ def parse_toolchain_probe_output(output: str | bytes) -> ToolchainProbeReport:
     if missing_entries:
         raise ToolchainBoundaryError(
             f"incomplete probe output; missing entries for: {', '.join(missing_entries)}",
-            reason_code=REASON_INVALID_PROBE_OUTPUT,
+            sub_reason=SUB_REASON_INVALID_PROBE_OUTPUT,
         )
 
     available = frozenset(name for name, present in parsed.items() if present)
@@ -388,12 +410,12 @@ def build_toolchain_probe_command(
     validated_image, _ = validate_pinned_image_ref(
         image,
         label="image",
-        reason_code=REASON_TOOLCHAIN_PROBE_FAILED,
+        sub_reason=SUB_REASON_TOOLCHAIN_PROBE_FAILED,
     )
     if not isinstance(docker_bin, str) or not docker_bin.strip():
         raise ToolchainBoundaryError(
             "docker_bin must be a non-empty executable name or path",
-            reason_code=REASON_TOOLCHAIN_PROBE_FAILED,
+            sub_reason=SUB_REASON_TOOLCHAIN_PROBE_FAILED,
         )
     seccomp_file = (
         Path(seccomp_path) if seccomp_path is not None else sandbox.SECCOMP_PROFILE_PATH
@@ -401,22 +423,20 @@ def build_toolchain_probe_command(
     if not seccomp_file.is_file():
         raise ToolchainBoundaryError(
             f"pinned seccomp profile is missing: {seccomp_file}",
-            reason_code=REASON_TOOLCHAIN_PROBE_FAILED,
+            sub_reason=SUB_REASON_TOOLCHAIN_PROBE_FAILED,
         )
     try:
         profile_digest = sandbox.seccomp_profile_digest(seccomp_file)
     except sandbox.SandboxPolicyError as error:
         raise ToolchainBoundaryError(
             f"pinned seccomp profile is invalid: {error}",
-            reason_code=REASON_TOOLCHAIN_PROBE_FAILED,
+            sub_reason=SUB_REASON_TOOLCHAIN_PROBE_FAILED,
         ) from error
-    if (
-        seccomp_path is None
-        and profile_digest != sandbox.SECCOMP_PROFILE_DIGEST
-    ):
+    if profile_digest != sandbox.SECCOMP_PROFILE_DIGEST:
         raise ToolchainBoundaryError(
-            "default seccomp profile digest does not match pinned SECCOMP_PROFILE_DIGEST",
-            reason_code=REASON_TOOLCHAIN_PROBE_FAILED,
+            f"seccomp profile digest {profile_digest} does not match pinned "
+            f"SECCOMP_PROFILE_DIGEST ({sandbox.SECCOMP_PROFILE_DIGEST})",
+            sub_reason=SUB_REASON_TOOLCHAIN_PROBE_FAILED,
         )
 
     return [
@@ -438,6 +458,7 @@ def build_toolchain_probe_command(
         "--memory-swap=1024m",
         "--cpus=2",
         "--ipc=private",
+        "--log-driver=none",
         "--tmpfs",
         "/work:rw,noexec,nosuid,nodev,size=128m,mode=1777",
         "--tmpfs",
@@ -446,6 +467,8 @@ def build_toolchain_probe_command(
         "/work",
         "-e",
         "TMPDIR=/tmp",
+        "-e",
+        "HOME=/work",
         validated_image,
         "/bin/sh",
         "-c",
@@ -468,7 +491,7 @@ def verify_pinned_image_tool_boundary(
     ):
         raise ToolchainBoundaryError(
             f"timeout_seconds must be a positive finite number, got {timeout_seconds!r}",
-            reason_code=REASON_TOOLCHAIN_PROBE_FAILED,
+            sub_reason=SUB_REASON_TOOLCHAIN_PROBE_FAILED,
         )
     cmd = build_toolchain_probe_command(
         image=image,
@@ -486,12 +509,12 @@ def verify_pinned_image_tool_boundary(
     except subprocess.TimeoutExpired as error:
         raise ToolchainBoundaryError(
             f"toolchain probe container timed out after {timeout_seconds}s",
-            reason_code=REASON_TOOLCHAIN_PROBE_FAILED,
+            sub_reason=SUB_REASON_TOOLCHAIN_PROBE_FAILED,
         ) from error
     except OSError as error:
         raise ToolchainBoundaryError(
             f"failed to execute toolchain probe command: {error}",
-            reason_code=REASON_TOOLCHAIN_PROBE_FAILED,
+            sub_reason=SUB_REASON_TOOLCHAIN_PROBE_FAILED,
         ) from error
 
     if completed.returncode != 0:
@@ -499,6 +522,6 @@ def verify_pinned_image_tool_boundary(
         raise ToolchainBoundaryError(
             f"toolchain probe container exited with status {completed.returncode}: "
             f"{stderr_snippet or 'no stderr'}",
-            reason_code=REASON_TOOLCHAIN_PROBE_FAILED,
+            sub_reason=SUB_REASON_TOOLCHAIN_PROBE_FAILED,
         )
     return parse_toolchain_probe_output(completed.stdout)
