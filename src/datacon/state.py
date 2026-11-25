@@ -103,6 +103,7 @@ class BudgetDecision:
     reason_code: str | None
     hard_timeout_seconds: int
     next_round_no: int | None = None
+    sub_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1856,6 +1857,43 @@ def propose_envelope(
         _assert_envelope_not_expanded(normalized, job["request"])
         _assert_envelope_within_case_registry(normalized, job["request"])
 
+        ledger = connection.execute(
+            "SELECT max_total_seconds, max_fuzz_seconds, "
+            "remaining_total_seconds, remaining_fuzz_seconds "
+            "FROM budget_ledger WHERE family_id = %s FOR UPDATE",
+            (family_id,),
+        ).fetchone()
+        if ledger is not None:
+            totals = connection.execute(
+                "SELECT COALESCE(SUM(seconds), 0) AS spent_total, "
+                "COALESCE(SUM(fuzz_seconds), 0) AS spent_fuzz "
+                "FROM budget_charges WHERE family_id = %s",
+                (family_id,),
+            ).fetchone()
+            spent_total = int(totals["spent_total"])
+            spent_fuzz = int(totals["spent_fuzz"])
+            if (
+                int(ledger["max_total_seconds"])
+                - int(ledger["remaining_total_seconds"])
+                != spent_total
+                or int(ledger["max_fuzz_seconds"])
+                - int(ledger["remaining_fuzz_seconds"])
+                != spent_fuzz
+            ):
+                raise StateError(
+                    "budget ledger does not reconcile with budget_charges"
+                )
+            if normalized["max_total_seconds"] < spent_total:
+                raise StateError(
+                    "envelope.max_total_seconds is below already spent "
+                    f"family budget ({spent_total}s)"
+                )
+            if normalized["max_fuzz_seconds"] < spent_fuzz:
+                raise StateError(
+                    "envelope.max_fuzz_seconds is below already spent "
+                    f"family fuzz budget ({spent_fuzz}s)"
+                )
+
         try:
             inserted = connection.execute(
                 "INSERT INTO family_envelopes "
@@ -2618,6 +2656,8 @@ def record_admission(
 def _ceil_seconds(value: Any, label: str) -> int:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise StateError(f"{label} must be a number")
+    if not math.isfinite(value):
+        raise StateError(f"{label} must be finite")
     if value < 0:
         raise StateError(f"{label} must not be negative")
     return int(math.ceil(value))
@@ -2663,18 +2703,30 @@ def decide_next_round(
 ) -> BudgetDecision:
     """Decide whether a further round may be derived.
 
-    Budget exhaustion returns ``BUDGET_EXHAUSTED`` and no ``next_round_no``;
-    the orchestration layer must not create a round from a denied decision.
+    Budget or round exhaustion returns ``BUDGET_EXHAUSTED`` and no
+    ``next_round_no``; ``sub_reason`` distinguishes hitting ``max_rounds``
+    from draining the time budget. The orchestration layer must not create a
+    round from a denied decision.
     """
     if type(round_no) is not int or round_no < 0:
         raise StateError("round_no must be a non-negative integer")
     if type(max_rounds) is not int or max_rounds < 1:
         raise StateError("max_rounds must be a positive integer")
     if round_no >= max_rounds:
-        return BudgetDecision(False, "ROUND_BEYOND_MAX_ROUNDS", 0)
+        return BudgetDecision(
+            False,
+            BUDGET_EXHAUSTED,
+            0,
+            sub_reason="ROUND_BEYOND_MAX_ROUNDS",
+        )
     gate = budget_gate(ledger)
     if not gate.allowed:
-        return BudgetDecision(False, BUDGET_EXHAUSTED, 0)
+        return BudgetDecision(
+            False,
+            BUDGET_EXHAUSTED,
+            0,
+            sub_reason=BUDGET_EXHAUSTED,
+        )
     return BudgetDecision(
         True, None, gate.hard_timeout_seconds, next_round_no=round_no + 1
     )
@@ -2684,25 +2736,27 @@ def compute_budget_charge(
     ledger: Mapping[str, Any],
     *,
     charge_kind: str,
-    elapsed_seconds: int,
-    elapsed_fuzz_seconds: int = 0,
+    elapsed_seconds: Any,
+    elapsed_fuzz_seconds: Any = 0,
 ) -> tuple[int, int]:
     """Apply the normative charge formula without touching storage.
 
-    ``seconds = min(ceil(elapsed), remaining_total_seconds)``; a fuzz step
-    additionally charges ``min(max(1, ceil(fuzz_elapsed)), remaining_fuzz,
-    seconds)``. The fuzz amount never exceeds the total amount.
+    ``general`` charges ``min(ceil(elapsed), remaining_total_seconds)``.
+    A ``fuzz`` step charges ``charged_fuzz = min(max(1, ceil(fuzz_elapsed)),
+    remaining_fuzz, remaining_total)`` and ``charged = min(max(ceil(elapsed),
+    charged_fuzz), remaining_total)`` so ``0 < fuzz_seconds <= seconds``
+    without overdrawing either balance even when ``elapsed == 0``.
     """
     if charge_kind not in ("general", "fuzz"):
         raise StateError("charge_kind must be general or fuzz")
+    elapsed = _ceil_seconds(elapsed_seconds, "elapsed_seconds")
+    fuzz_elapsed = _ceil_seconds(elapsed_fuzz_seconds, "elapsed_fuzz_seconds")
     remaining_total = max(0, int(ledger["remaining_total_seconds"]))
-    charged = min(int(elapsed_seconds), remaining_total)
     if charge_kind == "general":
-        return charged, 0
+        return min(elapsed, remaining_total), 0
     remaining_fuzz = max(0, int(ledger["remaining_fuzz_seconds"]))
-    charged_fuzz = min(
-        max(1, int(elapsed_fuzz_seconds)), remaining_fuzz, charged
-    )
+    charged_fuzz = min(max(1, fuzz_elapsed), remaining_fuzz, remaining_total)
+    charged = min(max(elapsed, charged_fuzz), remaining_total)
     return charged, charged_fuzz
 
 
@@ -2797,17 +2851,29 @@ def budget_summary(
 
     ``budget_ledger.remaining_total_seconds`` is exposed as
     ``remaining_seconds``; the other five fields keep their DB names. Spending
-    is always rebuilt from ``budget_charges`` so evidence can be reconciled.
+    is always rebuilt from ``budget_charges`` and reconciled against the
+    ledger row (``spent + remaining == max``); any discrepancy fails closed.
     """
+    max_total_seconds = int(ledger["max_total_seconds"])
+    max_fuzz_seconds = int(ledger["max_fuzz_seconds"])
+    spent_seconds = sum(int(charge["seconds"]) for charge in charges)
+    spent_fuzz_seconds = sum(int(charge["fuzz_seconds"]) for charge in charges)
+    remaining_seconds = int(ledger["remaining_total_seconds"])
+    remaining_fuzz_seconds = int(ledger["remaining_fuzz_seconds"])
+    if (
+        spent_seconds + remaining_seconds != max_total_seconds
+        or spent_fuzz_seconds + remaining_fuzz_seconds != max_fuzz_seconds
+    ):
+        raise StateError(
+            "budget ledger does not reconcile with budget_charges"
+        )
     return {
-        "max_total_seconds": int(ledger["max_total_seconds"]),
-        "max_fuzz_seconds": int(ledger["max_fuzz_seconds"]),
-        "spent_seconds": sum(int(charge["seconds"]) for charge in charges),
-        "spent_fuzz_seconds": sum(
-            int(charge["fuzz_seconds"]) for charge in charges
-        ),
-        "remaining_seconds": int(ledger["remaining_total_seconds"]),
-        "remaining_fuzz_seconds": int(ledger["remaining_fuzz_seconds"]),
+        "max_total_seconds": max_total_seconds,
+        "max_fuzz_seconds": max_fuzz_seconds,
+        "spent_seconds": spent_seconds,
+        "spent_fuzz_seconds": spent_fuzz_seconds,
+        "remaining_seconds": remaining_seconds,
+        "remaining_fuzz_seconds": remaining_fuzz_seconds,
     }
 
 
@@ -2819,6 +2885,28 @@ _BUDGET_CHARGE_COLUMNS = (
     "charge_id, family_id, job_id, step_key, attempt_no, charge_kind, "
     "seconds, fuzz_seconds, created_at"
 )
+
+
+def _budget_charge_record(row: Mapping[str, Any]) -> dict[str, Any]:
+    """Render a ``budget_charges`` row with canonical JSON-serializable types."""
+    record: dict[str, Any] = {
+        "charge_id": str(row["charge_id"]),
+        "family_id": str(row["family_id"]),
+        "job_id": str(row["job_id"]),
+        "step_key": row["step_key"],
+        "attempt_no": int(row["attempt_no"]),
+        "charge_kind": row["charge_kind"],
+        "seconds": int(row["seconds"]),
+        "fuzz_seconds": int(row["fuzz_seconds"]),
+    }
+    if "created_at" in row and row["created_at"] is not None:
+        created_at = row["created_at"]
+        record["created_at"] = (
+            created_at
+            if isinstance(created_at, str)
+            else jsonutil.timestamp(created_at)
+        )
+    return record
 
 
 def _approved_envelope_budget(
@@ -2915,6 +3003,124 @@ def _initialize_budget_ledger_in_tx(
     return dict(row)
 
 
+def _sync_budget_ledger_on_approval_in_tx(
+    connection,
+    family_id: UUID | str,
+    *,
+    max_total_seconds: int,
+    max_fuzz_seconds: int,
+) -> dict[str, Any]:
+    """Create or re-approve a family's budget ledger inside the review tx.
+
+    First approval inserts the initial ledger with ``remaining = max``. A
+    changed-envelope re-approval locks the existing row, reconciles it against
+    ``budget_charges`` (``old_max - old_rem == spent``), and atomically
+    adjusts the ceilings while preserving all spent budget
+    (``new_remaining = new_max - spent``). Any cap below already-spent budget
+    or unreconciled ledger fails closed and rolls back the approval.
+    """
+    if type(max_total_seconds) is not int or max_total_seconds < 1:
+        raise StateError("max_total_seconds must be a positive integer")
+    if (
+        type(max_fuzz_seconds) is not int
+        or max_fuzz_seconds < 0
+        or max_fuzz_seconds > max_total_seconds
+    ):
+        raise StateError(
+            "max_fuzz_seconds must be between 0 and max_total_seconds"
+        )
+    try:
+        family_id = uuid.UUID(str(family_id))
+    except (TypeError, ValueError) as error:
+        raise StateError("family_id must be a UUID") from error
+
+    row = connection.execute(
+        "INSERT INTO budget_ledger "
+        "(family_id, max_total_seconds, max_fuzz_seconds, "
+        "remaining_total_seconds, remaining_fuzz_seconds) "
+        "VALUES (%s, %s, %s, %s, %s) "
+        "ON CONFLICT (family_id) DO NOTHING "
+        f"RETURNING {_BUDGET_LEDGER_COLUMNS}",
+        (
+            family_id,
+            max_total_seconds,
+            max_fuzz_seconds,
+            max_total_seconds,
+            max_fuzz_seconds,
+        ),
+    ).fetchone()
+    if row is not None:
+        return dict(row)
+
+    existing = connection.execute(
+        "SELECT " + _BUDGET_LEDGER_COLUMNS +
+        " FROM budget_ledger WHERE family_id = %s FOR UPDATE",
+        (family_id,),
+    ).fetchone()
+    if existing is None:
+        raise StateError("budget ledger could not be initialized")
+
+    totals = connection.execute(
+        "SELECT COALESCE(SUM(seconds), 0) AS spent_total, "
+        "COALESCE(SUM(fuzz_seconds), 0) AS spent_fuzz "
+        "FROM budget_charges WHERE family_id = %s",
+        (family_id,),
+    ).fetchone()
+    spent_total = int(totals["spent_total"])
+    spent_fuzz = int(totals["spent_fuzz"])
+
+    old_max_total = int(existing["max_total_seconds"])
+    old_rem_total = int(existing["remaining_total_seconds"])
+    old_max_fuzz = int(existing["max_fuzz_seconds"])
+    old_rem_fuzz = int(existing["remaining_fuzz_seconds"])
+    if (
+        old_max_total - old_rem_total != spent_total
+        or old_max_fuzz - old_rem_fuzz != spent_fuzz
+    ):
+        raise StateError(
+            "budget ledger does not reconcile with budget_charges"
+        )
+
+    if (
+        old_max_total == max_total_seconds
+        and old_max_fuzz == max_fuzz_seconds
+    ):
+        return dict(existing)
+
+    if max_total_seconds < spent_total:
+        raise StateError(
+            "approved max_total_seconds is below already spent family budget"
+        )
+    if max_fuzz_seconds < spent_fuzz:
+        raise StateError(
+            "approved max_fuzz_seconds is below already spent family fuzz "
+            "budget"
+        )
+
+    new_rem_total = max_total_seconds - spent_total
+    new_rem_fuzz = max_fuzz_seconds - spent_fuzz
+    updated = connection.execute(
+        "UPDATE budget_ledger SET "
+        "max_total_seconds = %s, "
+        "max_fuzz_seconds = %s, "
+        "remaining_total_seconds = %s, "
+        "remaining_fuzz_seconds = %s, "
+        "updated_at = clock_timestamp() "
+        "WHERE family_id = %s "
+        f"RETURNING {_BUDGET_LEDGER_COLUMNS}",
+        (
+            max_total_seconds,
+            max_fuzz_seconds,
+            new_rem_total,
+            new_rem_fuzz,
+            family_id,
+        ),
+    ).fetchone()
+    if updated is None:
+        raise StateError("budget ledger could not be updated on re-approval")
+    return dict(updated)
+
+
 def initialize_budget_ledger(
     dsn: str,
     family_id: UUID | str,
@@ -2982,6 +3188,26 @@ def charge_step_budget(
 
     with _connect(dsn) as connection:
         with connection.transaction():
+            job_row = connection.execute(
+                "SELECT job_id, job_contract_version, family_id, job_kind "
+                "FROM jobs WHERE job_id = %s",
+                (job_id,),
+            ).fetchone()
+            if job_row is None:
+                raise StateError("budget charge job does not exist")
+            if job_row["job_contract_version"] != 2:
+                raise StateError(
+                    "budget charge job must be on the v2 job contract"
+                )
+            if job_row["family_id"] != family_id:
+                raise StateError(
+                    "budget charge job does not belong to family_id"
+                )
+            if job_row["job_kind"] not in ("campaign", "round"):
+                raise StateError(
+                    "budget charge job_id must be a campaign or round child"
+                )
+
             ledger = connection.execute(
                 "SELECT " + _BUDGET_LEDGER_COLUMNS +
                 " FROM budget_ledger WHERE family_id = %s FOR UPDATE",
@@ -2996,8 +3222,15 @@ def charge_step_budget(
                 (job_id, step_key, attempt_no),
             ).fetchone()
             if existing is not None:
+                if existing["family_id"] != family_id:
+                    raise StateError(
+                        "existing budget charge belongs to a different family"
+                    )
                 return BudgetChargeOutcome(
-                    "recovered", None, dict(existing), dict(ledger)
+                    "recovered",
+                    None,
+                    _budget_charge_record(existing),
+                    dict(ledger),
                 )
 
             gate = budget_gate(ledger, fuzz=charge_kind == "fuzz")
@@ -3039,11 +3272,12 @@ def charge_step_budget(
                 )
 
             charge_id = uuid.uuid4()
-            connection.execute(
+            inserted = connection.execute(
                 "INSERT INTO budget_charges "
                 "(charge_id, family_id, job_id, step_key, attempt_no, "
                 "charge_kind, seconds, fuzz_seconds) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s) "
+                "RETURNING " + _BUDGET_CHARGE_COLUMNS,
                 (
                     charge_id,
                     family_id,
@@ -3054,17 +3288,10 @@ def charge_step_budget(
                     charged,
                     charged_fuzz,
                 ),
-            )
-            charge = {
-                "charge_id": str(charge_id),
-                "family_id": str(family_id),
-                "job_id": str(job_id),
-                "step_key": step_key,
-                "attempt_no": attempt_no,
-                "charge_kind": charge_kind,
-                "seconds": charged,
-                "fuzz_seconds": charged_fuzz,
-            }
+            ).fetchone()
+            if inserted is None:
+                raise StateError("budget charge could not be recorded")
+            charge = _budget_charge_record(inserted)
             exhausted = updated["remaining_total_seconds"] == 0 or (
                 charge_kind == "fuzz"
                 and updated["remaining_fuzz_seconds"] == 0
@@ -3084,18 +3311,22 @@ def family_budget_summary(dsn: str, family_id: UUID | str) -> dict[str, int]:
     except (TypeError, ValueError) as error:
         raise StateError("family_id must be a UUID") from error
     with _connect(dsn) as connection:
-        ledger = connection.execute(
-            "SELECT " + _BUDGET_LEDGER_COLUMNS +
-            " FROM budget_ledger WHERE family_id = %s",
-            (family_id,),
-        ).fetchone()
-        if ledger is None:
-            raise StateError("budget ledger does not exist")
-        charges = connection.execute(
-            "SELECT seconds, fuzz_seconds FROM budget_charges "
-            "WHERE family_id = %s",
-            (family_id,),
-        ).fetchall()
+        with connection.transaction():
+            connection.execute(
+                "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"
+            )
+            ledger = connection.execute(
+                "SELECT " + _BUDGET_LEDGER_COLUMNS +
+                " FROM budget_ledger WHERE family_id = %s",
+                (family_id,),
+            ).fetchone()
+            if ledger is None:
+                raise StateError("budget ledger does not exist")
+            charges = connection.execute(
+                "SELECT seconds, fuzz_seconds FROM budget_charges "
+                "WHERE family_id = %s",
+                (family_id,),
+            ).fetchall()
     return budget_summary(ledger, charges)
 
 
@@ -3449,17 +3680,17 @@ def _record_family_review(
         if decided_envelope is None:
             raise StateError("family envelope changed while recording the review")
         # The approved envelope is the budget authority for the whole family.
-        # Creating the ledger here makes approval and budget initialization one
-        # transaction, so a real family can charge its first step immediately.
-        # A changed envelope with different caps fails closed inside the helper
-        # rather than silently reusing the old budget.
+        # Syncing the ledger here makes approval and budget initialization or
+        # cap adjustment one transaction, preserving spent budget across
+        # changed-envelope re-approvals while failing closed if a cap drops
+        # below already-spent budget.
         envelope_body = envelope["envelope_json"]
         if not isinstance(envelope_body, Mapping):
             raise StateError("approved family envelope must be a JSON object")
         max_total_seconds, max_fuzz_seconds = _approved_envelope_budget(
             envelope_body
         )
-        _initialize_budget_ledger_in_tx(
+        _sync_budget_ledger_on_approval_in_tx(
             connection,
             job_id,
             max_total_seconds=max_total_seconds,
