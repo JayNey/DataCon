@@ -28,6 +28,9 @@ pytestmark = pytest.mark.postgres
 ENVELOPE_1 = "sha256:" + "1" * 64
 ENVELOPE_2 = "sha256:" + "2" * 64
 UNKNOWN_ENVELOPE = "sha256:" + "9" * 64
+# The seeded first plan and every stored envelope body share this harness so a
+# review can prove the frozen plan's harness is the approved one.
+ENVELOPE_HARNESS = "sha256:" + "c" * 64
 FIRST_PLAN_DIGEST = "sha256:" + "a" * 64
 OTHER_PLAN_DIGEST = "sha256:" + "b" * 64
 APPROVAL_1 = "sha256:" + "c" * 64
@@ -101,6 +104,8 @@ def _insert_envelope(
     review_deadline_at,
     reviewer_id=None,
     decided_at=None,
+    max_total_seconds=900,
+    max_fuzz_seconds=300,
 ):
     database.connection.execute(
         "INSERT INTO family_envelopes (envelope_id, family_id, envelope_digest, "
@@ -110,7 +115,32 @@ def _insert_envelope(
             uuid4(),
             family_id,
             envelope_digest,
-            Jsonb({"mode": "guided", "envelope_digest": envelope_digest}),
+            Jsonb(
+                {
+                    "mode": "guided",
+                    "allowed_mutation_families": ["byte_flip"],
+                    "mutation_limits": {
+                        "allowed_ops": ["append"],
+                        "max_input_bytes": 64,
+                    },
+                    "seed_corpus_digest": "sha256:" + "a" * 64,
+                    "fuzz_image_digest": "sha256:" + "b" * 64,
+                    "harness_digest": ENVELOPE_HARNESS,
+                    "max_rounds": 2,
+                    "max_total_seconds": max_total_seconds,
+                    "max_fuzz_seconds": max_fuzz_seconds,
+                    "accepted_signature_set": [
+                        {
+                            "error": "heap-buffer-overflow",
+                            "function": "parse_token",
+                            "source": "parser.c",
+                            "operation": "WRITE",
+                            "access_size": 1,
+                        }
+                    ],
+                    "admission_predicate_version": "admission-v1",
+                }
+            ),
             status_name,
             review_deadline_at,
             reviewer_id,
@@ -210,6 +240,7 @@ def _seed_family(
                     "round_no": round_no,
                     "parent_approval_digest": APPROVAL_1 if first_approval else None,
                     "envelope_digest": ENVELOPE_1,
+                    "harness_digest": ENVELOPE_HARNESS,
                     "build_ref": None,
                     "build_spec": BUILD_SPEC,
                     "compile_flags": ["-g"],
@@ -1411,6 +1442,7 @@ def _insert_plan(database, child_id, plan_digest, envelope_digest, round_no):
         "round_no": round_no,
         "parent_approval_digest": None,
         "envelope_digest": envelope_digest,
+        "harness_digest": ENVELOPE_HARNESS,
         "build_ref": None,
         "build_spec": BUILD_SPEC,
         "compile_flags": ["-g"],
@@ -1457,6 +1489,7 @@ def test_first_plan_freeze_inserts_pending_envelope_end_to_end(
     body = dict(GUIDED_ENVELOPE_BODY)
     digest = jsonutil.digest_json(body)
     plan = _v2_plan(family_id, round_no=None, envelope_digest=digest)
+    assert plan["harness_digest"] == body["harness_digest"]
     plan_digest = contracts.plan_digest(plan)
 
     with pytest.raises(state.StateError):
@@ -1551,6 +1584,186 @@ def test_first_plan_freeze_inserts_pending_envelope_end_to_end(
         isolated_database,
         "SELECT count(*) FROM family_envelopes WHERE family_id = %s",
         (family_2,),
+    )[0] == 0
+
+
+def test_first_plan_freeze_rejects_harness_mismatch(isolated_database):
+    family_id, child_id = _freeze_seed(
+        isolated_database, _family_request("guided"), job_kind="campaign"
+    )
+    body = deepcopy(GUIDED_ENVELOPE_BODY)
+    digest = jsonutil.digest_json(body)
+    plan = _v2_plan(family_id, round_no=None, envelope_digest=digest)
+    plan["harness_digest"] = "sha256:" + "2" * 64
+    assert plan["harness_digest"] != body["harness_digest"]
+
+    with pytest.raises(state.StateError, match="harness_digest"):
+        state.freeze_plan(
+            isolated_database.dsn,
+            child_id,
+            generation=1,
+            plan=plan,
+            plan_digest=contracts.plan_digest(plan),
+            summary={},
+            envelope=body,
+        )
+    _assert_no_freeze_rows(isolated_database, family_id, child_id)
+
+
+def test_first_plan_freeze_rejects_plan_signature_outside_envelope(
+    isolated_database,
+):
+    family_id, child_id = _freeze_seed(
+        isolated_database, _family_request("guided"), job_kind="campaign"
+    )
+    body = deepcopy(GUIDED_ENVELOPE_BODY)
+    digest = jsonutil.digest_json(body)
+    plan = _v2_plan(family_id, round_no=None, envelope_digest=digest)
+    plan["asan_signature"] = {
+        **PLAN_BASE["asan_signature"],
+        "function": "some_other_function",
+        "operation": "READ",
+        "access_size": 8,
+    }
+
+    with pytest.raises(state.StateError, match="asan_signature"):
+        state.freeze_plan(
+            isolated_database.dsn,
+            child_id,
+            generation=1,
+            plan=plan,
+            plan_digest=contracts.plan_digest(plan),
+            summary={},
+            envelope=body,
+        )
+    _assert_no_freeze_rows(isolated_database, family_id, child_id)
+
+
+def test_later_plan_freeze_rejects_plan_signature_outside_envelope(
+    isolated_database,
+):
+    seed = _seed_family(
+        isolated_database, first_approval=True, pending_envelope=None
+    )
+    family_id = seed["family_id"]
+    child_id = uuid4()
+    _insert_plain_job(
+        isolated_database,
+        child_id,
+        request=_family_request("guided"),
+        state_name="PREPARING",
+        family_id=family_id,
+        job_kind="round",
+        parent_job_id=family_id,
+        round_no=1,
+        lease=True,
+    )
+    plan = _v2_plan(
+        family_id,
+        round_no=1,
+        envelope_digest=ENVELOPE_1,
+        parent_approval_digest=APPROVAL_1,
+    )
+    plan["asan_signature"] = {
+        **PLAN_BASE["asan_signature"],
+        "function": "some_other_function",
+        "operation": "READ",
+        "access_size": 8,
+    }
+
+    with pytest.raises(state.StateError, match="asan_signature"):
+        state.freeze_plan(
+            isolated_database.dsn,
+            child_id,
+            generation=1,
+            plan=plan,
+            plan_digest=contracts.plan_digest(plan),
+            summary={},
+        )
+    assert _row(
+        isolated_database,
+        "SELECT count(*) FROM plans WHERE job_id = %s",
+        (child_id,),
+    )[0] == 0
+
+
+def test_first_plan_review_rejects_harness_mismatch(
+    isolated_database, tmp_path, monkeypatch
+):
+    monkeypatch.setenv("DATACON_EVIDENCE_ROOT", str(tmp_path / "evidence"))
+    seed = _seed_family(isolated_database)
+    family_id = seed["family_id"]
+    child_id = seed["child_id"]
+    tampered_digest = "sha256:" + "2" * 64
+    isolated_database.connection.execute(
+        "UPDATE plans SET plan = jsonb_set(plan, '{harness_digest}', "
+        "to_jsonb(%s::text)) WHERE job_id = %s",
+        (tampered_digest, child_id),
+    )
+
+    with pytest.raises(state.StateError, match="harness_digest"):
+        _review(isolated_database, seed, decision="approve")
+
+    assert _row(
+        isolated_database,
+        "SELECT state FROM jobs WHERE job_id = %s",
+        (family_id,),
+    )[0] == "AGGREGATING"
+    assert _row(
+        isolated_database,
+        "SELECT state FROM jobs WHERE job_id = %s",
+        (child_id,),
+    )[0] == "AWAITING_REVIEW"
+    assert _row(
+        isolated_database,
+        "SELECT count(*) FROM reviews WHERE job_id = %s",
+        (family_id,),
+    )[0] == 0
+    assert _row(
+        isolated_database,
+        "SELECT count(*) FROM family_approvals WHERE family_id = %s",
+        (family_id,),
+    )[0] == 0
+
+
+def test_freeze_later_plan_rejects_harness_mismatch(isolated_database):
+    seed = _seed_family(
+        isolated_database, first_approval=True, pending_envelope=None
+    )
+    family_id = seed["family_id"]
+    child_id = uuid4()
+    _insert_plain_job(
+        isolated_database,
+        child_id,
+        request=_family_request("guided"),
+        state_name="PREPARING",
+        family_id=family_id,
+        job_kind="round",
+        parent_job_id=family_id,
+        round_no=1,
+        lease=True,
+    )
+    plan = _v2_plan(
+        family_id,
+        round_no=1,
+        envelope_digest=ENVELOPE_1,
+        parent_approval_digest=APPROVAL_1,
+    )
+    plan["harness_digest"] = "sha256:" + "2" * 64
+
+    with pytest.raises(state.StateError, match="harness_digest"):
+        state.freeze_plan(
+            isolated_database.dsn,
+            child_id,
+            generation=1,
+            plan=plan,
+            plan_digest=contracts.plan_digest(plan),
+            summary={},
+        )
+    assert _row(
+        isolated_database,
+        "SELECT count(*) FROM plans WHERE job_id = %s",
+        (child_id,),
     )[0] == 0
 
 
@@ -2057,6 +2270,7 @@ def _v2_plan(
             "round_no": round_no,
             "parent_approval_digest": parent_approval_digest,
             "envelope_digest": envelope_digest,
+            "harness_digest": ENVELOPE_HARNESS,
             "build_ref": None,
             "build_spec": deepcopy(BUILD_SPEC),
             "compile_flags": ["-g"],
@@ -2119,7 +2333,8 @@ def _assert_no_freeze_rows(database, family_id, child_id, state_name="PREPARING"
     )[0] == 0
     assert _row(
         database,
-        "SELECT count(*) FROM family_envelopes WHERE family_id = %s",
+        "SELECT count(*) FROM family_envelopes WHERE family_id = %s "
+        "AND status = 'pending'",
         (family_id,),
     )[0] == 0
     assert _row(
@@ -2154,6 +2369,23 @@ def _insert_approval(
             supersedes,
         ),
     )
+    # A later plan's freeze reads the approved envelope body to bind the plan
+    # harness, so a hand-seeded approval must also seed the body it approved.
+    if _row(
+        database,
+        "SELECT envelope_id FROM family_envelopes WHERE family_id = %s "
+        "AND envelope_digest = %s",
+        (family_id, envelope_digest),
+    ) is None:
+        _insert_envelope(
+            database,
+            family_id,
+            envelope_digest,
+            status_name="approved",
+            review_deadline_at=_now() + timedelta(hours=24),
+            reviewer_id=reviewer_id,
+            decided_at=_now(),
+        )
     return approval_id
 
 
@@ -2197,7 +2429,8 @@ def test_freeze_guided_round_one_does_not_enter_review(isolated_database):
     )
     assert _row(
         isolated_database,
-        "SELECT count(*) FROM family_envelopes WHERE family_id = %s",
+        "SELECT count(*) FROM family_envelopes WHERE family_id = %s "
+        "AND status = 'pending'",
         (family_id,),
     )[0] == 0
     assert _row(
@@ -3296,3 +3529,585 @@ def test_explicit_digest_reapproval_still_idempotent(isolated_database):
         "SELECT count(*) FROM reviews WHERE job_id = %s",
         (seed["family_id"],),
     )[0] == 1
+
+
+def test_family_approval_initializes_budget_ledger(
+    isolated_database, tmp_path, monkeypatch
+):
+    monkeypatch.setenv("DATACON_EVIDENCE_ROOT", str(tmp_path / "evidence"))
+    seed = _seed_family(isolated_database)
+
+    outcome = _review(isolated_database, seed)
+
+    assert outcome.status == "applied", outcome.message
+    ledger = state.load_budget_ledger(isolated_database.dsn, seed["family_id"])
+    assert ledger is not None, "family approval did not initialize budget_ledger"
+    assert ledger["max_total_seconds"] == 900
+    assert ledger["max_fuzz_seconds"] == 300
+    assert ledger["remaining_total_seconds"] == 900
+    assert ledger["remaining_fuzz_seconds"] == 300
+
+    isolated_database.connection.execute(
+        "UPDATE jobs SET state = 'RUNNING', stage = 'execute', "
+        "lease_owner = 'worker-a', "
+        "lease_expires_at = clock_timestamp() + interval '10 minutes' "
+        "WHERE job_id = %s",
+        (seed["child_id"],),
+    )
+    charge = state.charge_step_budget(
+        isolated_database.dsn,
+        generation=2,
+        family_id=seed["family_id"],
+        job_id=seed["child_id"],
+        step_key="build",
+        attempt_no=1,
+        charge_kind="general",
+        elapsed_seconds=1,
+    )
+    assert charge.status == "charged", charge.status
+    summary = state.family_budget_summary(
+        isolated_database.dsn, seed["family_id"]
+    )
+    assert summary["remaining_seconds"] == 899
+
+    repeated = _review(isolated_database, seed)
+    assert repeated.status == "idempotent"
+    assert _row(
+        isolated_database,
+        "SELECT count(*) FROM budget_ledger WHERE family_id = %s",
+        (seed["family_id"],),
+    )[0] == 1, "re-approval inserted a second budget ledger row"
+    after = state.load_budget_ledger(isolated_database.dsn, seed["family_id"])
+    assert after["remaining_total_seconds"] == 899, (
+        "re-approval reset the spent budget"
+    )
+    assert state.family_budget_summary(
+        isolated_database.dsn, seed["family_id"]
+    )["spent_seconds"] == 1
+
+
+def test_reapproval_tightens_budget_ledger_and_propose_rejects_below_spent(
+    isolated_database, tmp_path, monkeypatch
+):
+    monkeypatch.setenv("DATACON_EVIDENCE_ROOT", str(tmp_path / "evidence"))
+    seed = _seed_family(isolated_database)
+    family_id = seed["family_id"]
+
+    first_approval = _review(isolated_database, seed)
+    assert first_approval.status == "applied", first_approval.message
+
+    isolated_database.connection.execute(
+        "UPDATE jobs SET state = 'RUNNING', stage = 'execute', "
+        "lease_owner = 'worker-a', "
+        "lease_expires_at = clock_timestamp() + interval '10 minutes' "
+        "WHERE job_id = %s",
+        (seed["child_id"],),
+    )
+    charge = state.charge_step_budget(
+        isolated_database.dsn,
+        generation=2,
+        family_id=family_id,
+        job_id=seed["child_id"],
+        step_key="fuzz",
+        attempt_no=1,
+        charge_kind="fuzz",
+        elapsed_seconds=10,
+        elapsed_fuzz_seconds=5,
+    )
+    assert charge.status == "charged", charge.status
+
+    # Move the child out of RUNNING/ARCHIVING before proposing a tightened cap.
+    isolated_database.connection.execute(
+        "UPDATE jobs SET state = 'READY', stage = 'ready' WHERE job_id = %s",
+        (seed["child_id"],),
+    )
+
+    tightened = deepcopy(GUIDED_ENVELOPE_BODY)
+    tightened["max_total_seconds"] = 600
+    tightened["max_fuzz_seconds"] = 200
+    tightened_digest = jsonutil.digest_json(tightened)
+    proposed = state.propose_envelope(
+        isolated_database.dsn, family_id, tightened
+    )
+    assert proposed["envelope_digest"] == tightened_digest
+
+    reapproved = state.record_review(
+        isolated_database.dsn,
+        family_id,
+        plan_digest=FIRST_PLAN_DIGEST,
+        decision="approve",
+        reviewer_id=REVIEWER_2,
+        envelope_digest=tightened_digest,
+    )
+    assert reapproved.status == "applied", reapproved.message
+
+    summary = state.family_budget_summary(isolated_database.dsn, family_id)
+    assert summary == {
+        "max_total_seconds": 600,
+        "max_fuzz_seconds": 200,
+        "spent_seconds": 10,
+        "spent_fuzz_seconds": 5,
+        "remaining_seconds": 590,
+        "remaining_fuzz_seconds": 195,
+    }
+
+    too_small_total = deepcopy(GUIDED_ENVELOPE_BODY)
+    too_small_total["max_total_seconds"] = 5
+    too_small_total["max_fuzz_seconds"] = 2
+    with pytest.raises(state.StateError, match="spent"):
+        state.propose_envelope(
+            isolated_database.dsn, family_id, too_small_total
+        )
+
+    too_small_fuzz = deepcopy(GUIDED_ENVELOPE_BODY)
+    too_small_fuzz["max_total_seconds"] = 50
+    too_small_fuzz["max_fuzz_seconds"] = 2
+    with pytest.raises(state.StateError, match="spent"):
+        state.propose_envelope(
+            isolated_database.dsn, family_id, too_small_fuzz
+        )
+
+    assert _row(
+        isolated_database,
+        "SELECT count(*) FROM family_envelopes WHERE family_id = %s "
+        "AND status = 'pending'",
+        (family_id,),
+    )[0] == 0, "unapprovable envelope left a stuck pending row"
+
+
+def test_reapproval_raises_budget_ledger_after_spend(
+    isolated_database, tmp_path, monkeypatch
+):
+    monkeypatch.setenv("DATACON_EVIDENCE_ROOT", str(tmp_path / "evidence"))
+    seed = _seed_family(isolated_database)
+    family_id = seed["family_id"]
+
+    first_approval = _review(isolated_database, seed)
+    assert first_approval.status == "applied", first_approval.message
+
+    isolated_database.connection.execute(
+        "UPDATE jobs SET state = 'RUNNING', stage = 'execute', "
+        "lease_owner = 'worker-a', "
+        "lease_expires_at = clock_timestamp() + interval '10 minutes' "
+        "WHERE job_id = %s",
+        (seed["child_id"],),
+    )
+    charge = state.charge_step_budget(
+        isolated_database.dsn,
+        generation=2,
+        family_id=family_id,
+        job_id=seed["child_id"],
+        step_key="fuzz",
+        attempt_no=1,
+        charge_kind="fuzz",
+        elapsed_seconds=10,
+        elapsed_fuzz_seconds=5,
+    )
+    assert charge.status == "charged", charge.status
+
+    # Tighten 900/300 -> 600/200 after 10/5 is already spent.
+    isolated_database.connection.execute(
+        "UPDATE jobs SET state = 'READY', stage = 'ready' WHERE job_id = %s",
+        (seed["child_id"],),
+    )
+    tightened = deepcopy(GUIDED_ENVELOPE_BODY)
+    tightened["max_total_seconds"] = 600
+    tightened["max_fuzz_seconds"] = 200
+    tightened_digest = jsonutil.digest_json(tightened)
+    proposed = state.propose_envelope(
+        isolated_database.dsn, family_id, tightened
+    )
+    assert proposed["envelope_digest"] == tightened_digest
+    tightened_review = state.record_review(
+        isolated_database.dsn,
+        family_id,
+        plan_digest=FIRST_PLAN_DIGEST,
+        decision="approve",
+        reviewer_id=REVIEWER_2,
+        envelope_digest=tightened_digest,
+    )
+    assert tightened_review.status == "applied", tightened_review.message
+    assert state.family_budget_summary(
+        isolated_database.dsn, family_id
+    ) == {
+        "max_total_seconds": 600,
+        "max_fuzz_seconds": 200,
+        "spent_seconds": 10,
+        "spent_fuzz_seconds": 5,
+        "remaining_seconds": 590,
+        "remaining_fuzz_seconds": 195,
+    }
+
+    # Raise 600/200 -> 900/300 again; the already-spent 10/5 must survive.
+    raised = deepcopy(GUIDED_ENVELOPE_BODY)
+    raised["max_total_seconds"] = 900
+    raised["max_fuzz_seconds"] = 300
+    raised_digest = jsonutil.digest_json(raised)
+    proposed = state.propose_envelope(
+        isolated_database.dsn, family_id, raised
+    )
+    assert proposed["envelope_digest"] == raised_digest
+    raised_review = state.record_review(
+        isolated_database.dsn,
+        family_id,
+        plan_digest=FIRST_PLAN_DIGEST,
+        decision="approve",
+        reviewer_id=REVIEWER_2,
+        envelope_digest=raised_digest,
+    )
+    assert raised_review.status == "applied", raised_review.message
+
+    assert state.family_budget_summary(
+        isolated_database.dsn, family_id
+    ) == {
+        "max_total_seconds": 900,
+        "max_fuzz_seconds": 300,
+        "spent_seconds": 10,
+        "spent_fuzz_seconds": 5,
+        "remaining_seconds": 890,
+        "remaining_fuzz_seconds": 295,
+    }
+    assert _row(
+        isolated_database,
+        "SELECT count(*) FROM budget_ledger WHERE family_id = %s",
+        (family_id,),
+    )[0] == 1, "raising caps inserted or dropped a budget ledger row"
+
+
+def test_freeze_plan_rejects_unsupported_admission_predicate_version(
+    isolated_database,
+):
+    family_id, child_id = _freeze_seed(
+        isolated_database, _family_request("guided")
+    )
+    body = deepcopy(GUIDED_ENVELOPE_BODY)
+    body["admission_predicate_version"] = "admission-v999"
+    digest = jsonutil.digest_json(body)
+    plan = _v2_plan(family_id, round_no=None, envelope_digest=digest)
+    plan_digest = contracts.plan_digest(plan)
+
+    with pytest.raises(state.StateError, match="admission_predicate_version"):
+        state.freeze_plan(
+            isolated_database.dsn,
+            child_id,
+            generation=1,
+            plan=plan,
+            plan_digest=plan_digest,
+            summary={},
+            envelope=body,
+        )
+    _assert_no_freeze_rows(isolated_database, family_id, child_id)
+
+
+def test_charge_step_budget_concurrent_with_propose_envelope_and_record_review_no_deadlock(
+    isolated_database, tmp_path, monkeypatch
+):
+    monkeypatch.setenv("DATACON_EVIDENCE_ROOT", str(tmp_path / "evidence"))
+    seed = _seed_family(
+        isolated_database,
+        first_approval=True,
+        pending_envelope=None,
+        child_state="RUNNING",
+        lease=True,
+    )
+    family_id = seed["family_id"]
+    child_id = seed["child_id"]
+    state.initialize_budget_ledger(
+        isolated_database.dsn,
+        family_id,
+        max_total_seconds=900,
+        max_fuzz_seconds=300,
+    )
+
+    for i in range(20):
+        non_tightening = deepcopy(GUIDED_ENVELOPE_BODY)
+        non_tightening["max_total_seconds"] = 900
+        non_tightening["max_fuzz_seconds"] = 300
+        non_tightening["mutation_limits"]["max_input_bytes"] = 4095 - i
+        tightened = deepcopy(GUIDED_ENVELOPE_BODY)
+        tightened["max_total_seconds"] = 899 - i
+        tightened["max_fuzz_seconds"] = 299 - i
+
+        # 1. Concurrent non-tightening propose_envelope + charge_step_budget
+        #    on a RUNNING child.
+        barrier = threading.Barrier(2)
+        results: dict[str, object] = {}
+        errors: list[BaseException] = []
+
+        def run_propose() -> None:
+            try:
+                barrier.wait(timeout=10)
+                results["propose"] = state.propose_envelope(
+                    isolated_database.dsn, family_id, non_tightening
+                )
+            except BaseException as error:  # pragma: no cover - surfaced below
+                errors.append(error)
+
+        def run_charge() -> None:
+            try:
+                barrier.wait(timeout=10)
+                results["charge"] = state.charge_step_budget(
+                    isolated_database.dsn,
+                    generation=1,
+                    family_id=family_id,
+                    job_id=child_id,
+                    step_key=f"propose-race-{i}",
+                    attempt_no=1,
+                    charge_kind="general",
+                    elapsed_seconds=1,
+                )
+            except BaseException as error:  # pragma: no cover - surfaced below
+                errors.append(error)
+
+        threads = [
+            threading.Thread(target=run_propose),
+            threading.Thread(target=run_charge),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=30)
+            assert not thread.is_alive(), (
+                f"propose+charge iteration {i} deadlocked"
+            )
+
+        assert not errors, f"propose+charge iteration {i} failed: {errors!r}"
+        proposed = results["propose"]
+        assert isinstance(proposed, dict)
+        assert proposed["status"] == "pending"
+        assert results["charge"].status == "charged"  # type: ignore[attr-defined]
+        pending_digest = proposed["envelope_digest"]
+
+        # 2. Concurrent record_review(approve) + charge_step_budget on the same
+        #    RUNNING child.
+        barrier = threading.Barrier(2)
+        results = {}
+        errors = []
+
+        def run_approve() -> None:
+            try:
+                barrier.wait(timeout=10)
+                results["review"] = state.record_review(
+                    isolated_database.dsn,
+                    family_id,
+                    plan_digest=FIRST_PLAN_DIGEST,
+                    decision="approve",
+                    reviewer_id=REVIEWER_2,
+                    envelope_digest=pending_digest,
+                )
+            except BaseException as error:  # pragma: no cover - surfaced below
+                errors.append(error)
+
+        def run_charge_review() -> None:
+            try:
+                barrier.wait(timeout=10)
+                results["charge"] = state.charge_step_budget(
+                    isolated_database.dsn,
+                    generation=1,
+                    family_id=family_id,
+                    job_id=child_id,
+                    step_key=f"review-race-{i}",
+                    attempt_no=1,
+                    charge_kind="general",
+                    elapsed_seconds=1,
+                )
+            except BaseException as error:  # pragma: no cover - surfaced below
+                errors.append(error)
+
+        threads = [
+            threading.Thread(target=run_approve),
+            threading.Thread(target=run_charge_review),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=30)
+            assert not thread.is_alive(), (
+                f"review+charge iteration {i} deadlocked"
+            )
+
+        assert not errors, f"review+charge iteration {i} failed: {errors!r}"
+        assert results["review"].status == "applied"  # type: ignore[attr-defined]
+        assert results["charge"].status == "charged"  # type: ignore[attr-defined]
+
+        # 3. Concurrent tightening propose_envelope (must be rejected while
+        #    child is RUNNING) + charge_step_budget: zero deadlock and active
+        #    child non-tightening invariant holds.
+        barrier = threading.Barrier(2)
+        results = {}
+        tighten_errors: list[BaseException] = []
+        charge_errors: list[BaseException] = []
+
+        def run_tighten_propose() -> None:
+            try:
+                barrier.wait(timeout=10)
+                results["tighten"] = state.propose_envelope(
+                    isolated_database.dsn, family_id, tightened
+                )
+            except BaseException as error:  # noqa: BLE001 - asserted below
+                tighten_errors.append(error)
+
+        def run_charge_tighten() -> None:
+            try:
+                barrier.wait(timeout=10)
+                results["charge"] = state.charge_step_budget(
+                    isolated_database.dsn,
+                    generation=1,
+                    family_id=family_id,
+                    job_id=child_id,
+                    step_key=f"tighten-race-{i}",
+                    attempt_no=1,
+                    charge_kind="general",
+                    elapsed_seconds=1,
+                )
+            except BaseException as error:  # pragma: no cover - surfaced below
+                charge_errors.append(error)
+
+        threads = [
+            threading.Thread(target=run_tighten_propose),
+            threading.Thread(target=run_charge_tighten),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=30)
+            assert not thread.is_alive(), (
+                f"tighten+charge iteration {i} deadlocked"
+            )
+
+        assert not charge_errors, (
+            f"tighten+charge iteration {i} charge failed: {charge_errors!r}"
+        )
+        assert results["charge"].status == "charged"  # type: ignore[attr-defined]
+        assert len(tighten_errors) == 1
+        assert isinstance(tighten_errors[0], state.StateError)
+        assert "RUNNING" in str(tighten_errors[0])
+        assert (
+            _row(
+                isolated_database,
+                "SELECT count(*) FROM family_envelopes "
+                "WHERE family_id = %s AND status = 'pending'",
+                (family_id,),
+            )[0]
+            == 0
+        )
+
+        expected_spent = 3 * (i + 1)
+        summary = state.family_budget_summary(isolated_database.dsn, family_id)
+        assert summary == {
+            "max_total_seconds": 900,
+            "max_fuzz_seconds": 300,
+            "spent_seconds": expected_spent,
+            "spent_fuzz_seconds": 0,
+            "remaining_seconds": 900 - expected_spent,
+            "remaining_fuzz_seconds": 300,
+        }
+
+
+@pytest.mark.parametrize("active_state", ["RUNNING", "ARCHIVING"])
+@pytest.mark.parametrize(
+    ("tightened_total", "tightened_fuzz"),
+    [
+        (600, 300),
+        (900, 200),
+    ],
+)
+def test_reapproval_rejects_budget_tightening_while_child_active(
+    isolated_database,
+    tmp_path,
+    monkeypatch,
+    active_state,
+    tightened_total,
+    tightened_fuzz,
+):
+    monkeypatch.setenv("DATACON_EVIDENCE_ROOT", str(tmp_path / "evidence"))
+    seed = _seed_family(
+        isolated_database,
+        first_approval=True,
+        pending_envelope=None,
+        child_state=active_state,
+    )
+    family_id = seed["family_id"]
+    child_id = seed["child_id"]
+    state.initialize_budget_ledger(
+        isolated_database.dsn,
+        family_id,
+        max_total_seconds=900,
+        max_fuzz_seconds=300,
+    )
+    _insert_envelope(
+        isolated_database,
+        family_id,
+        ENVELOPE_2,
+        status_name="pending",
+        review_deadline_at=seed["deadline"],
+        max_total_seconds=tightened_total,
+        max_fuzz_seconds=tightened_fuzz,
+    )
+
+    # Hold FOR UPDATE on the active child on another connection to also verify
+    # §9.1: changed-envelope re-approval only locks the family row and must not
+    # lock child rows.
+    with psycopg.connect(isolated_database.dsn, connect_timeout=5) as holder:
+        holder.execute(
+            "SELECT job_id FROM jobs WHERE job_id = %s FOR UPDATE",
+            (child_id,),
+        )
+        with pytest.raises(state.StateError, match="RUNNING|ARCHIVING"):
+            state.record_review(
+                isolated_database.dsn,
+                family_id,
+                plan_digest=FIRST_PLAN_DIGEST,
+                decision="approve",
+                reviewer_id=REVIEWER_2,
+                envelope_digest=ENVELOPE_2,
+            )
+        holder.rollback()
+
+    ledger = state.load_budget_ledger(isolated_database.dsn, family_id)
+    assert ledger is not None
+    assert ledger["max_total_seconds"] == 900
+    assert ledger["max_fuzz_seconds"] == 300
+    assert ledger["remaining_total_seconds"] == 900
+    assert ledger["remaining_fuzz_seconds"] == 300
+    assert _row(
+        isolated_database,
+        "SELECT count(*) FROM family_approvals WHERE family_id = %s",
+        (family_id,),
+    )[0] == 1
+    assert _row(
+        isolated_database,
+        "SELECT status FROM family_envelopes "
+        "WHERE family_id = %s AND envelope_digest = %s",
+        (family_id, ENVELOPE_2),
+    )[0] == "pending"
+    assert _row(
+        isolated_database,
+        "SELECT count(*) FROM audit_events "
+        "WHERE job_id = %s AND event_type = 'review_recorded'",
+        (family_id,),
+    )[0] == 0
+
+
+def test_freeze_plan_rejects_non_mapping_envelope_with_state_error(
+    isolated_database,
+):
+    family_id, child_id = _freeze_seed(
+        isolated_database, _family_request("guided")
+    )
+    digest = jsonutil.digest_json(GUIDED_ENVELOPE_BODY)
+    plan = _v2_plan(family_id, round_no=None, envelope_digest=digest)
+    plan_digest = contracts.plan_digest(plan)
+
+    for bad_envelope in (123, "not-a-mapping", [("mode", "guided")]):
+        with pytest.raises(state.StateError, match="envelope is invalid"):
+            state.freeze_plan(
+                isolated_database.dsn,
+                child_id,
+                generation=1,
+                plan=plan,
+                plan_digest=plan_digest,
+                summary={},
+                envelope=bad_envelope,  # type: ignore[arg-type]
+            )
+    _assert_no_freeze_rows(isolated_database, family_id, child_id)

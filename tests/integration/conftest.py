@@ -1,7 +1,12 @@
 import hashlib
 import os
 from pathlib import Path
+import sys
 import uuid
+
+# This directory is a package so test_admission.py cannot collide with
+# tests/contract/test_admission.py. Keep its historical flat imports working.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import psycopg
 from psycopg import sql
