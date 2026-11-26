@@ -1408,3 +1408,107 @@ def test_snapshot_records_source_url_without_credentials():
     # Provenance that carries no secret is kept exactly, query included.
     exact = build_snapshot(FetchResult(body=b"a", status=200, hops=(redirected,)), "X")
     assert exact["source_url"] == redirected
+
+
+def test_snapshot_provider_source_url_must_name_an_https_origin():
+    from datacon.tools.intel_provider import SnapshotIntelProvider
+
+    loader = _SnapshotLoader((INTEL_CASE_ID, INTEL_SOURCE_ID, PINNED_ADVISORY))
+    # A provenance URL is report and audit material: it must name an
+    # https origin. A bare word, another scheme, a javascript pseudo-URL,
+    # a hostless authority, an unparseable port, embedded whitespace or a
+    # control character name no trustworthy origin, so the source is
+    # refused before its snapshot is opened.
+    for bad_url in (
+        "not-a-url",
+        "http://advisory.example.com/cve-2099-0001.txt",
+        "javascript:alert(1)",
+        "https://",
+        "https://advisory.example.com:notaport/cve-2099-0001.txt",
+        "https://advisory.example.com/cve-2099-0001 .txt",
+        "https://advisory.example.com/cve-2099-0001\x01.txt",
+    ):
+        provider = SnapshotIntelProvider(
+            registry=_SourceRegistry(_intel_source(source_url=bad_url)),
+            snapshot_loader=loader,
+        )
+        result = provider.resolve_intel(
+            job_id=INTEL_JOB_ID, family_id=INTEL_FAMILY_ID, request=_request()
+        )
+        assert result.status == "blocked", bad_url
+        assert result.reason_code == "POLICY_DENIED", bad_url
+        assert result.summary["sub_reason"] == "SOURCE_URL_INVALID", bad_url
+        # Refused before the snapshot was opened.
+        assert loader.calls == [], bad_url
+
+
+def test_snapshot_provider_rejects_bytes_uses_as_a_license_denial():
+    from datacon.tools.intel_provider import SnapshotIntelProvider
+
+    loader = _SnapshotLoader((INTEL_CASE_ID, INTEL_SOURCE_ID, PINNED_ADVISORY))
+    # bytes and bytearray are Sequences, so ``SYSTEM_USE not in uses``
+    # would raise a TypeError that reads as unreadable material. A
+    # permission record that cannot name its permissions grants nothing:
+    # that is a policy refusal, matching intel_fetch's registry gate,
+    # which only accepts list/tuple/set/frozenset.
+    for bad_uses in (b"reproduction", bytearray(b"reproduction")):
+        provider = SnapshotIntelProvider(
+            registry=_SourceRegistry(_intel_source(permitted_uses=bad_uses)),
+            snapshot_loader=loader,
+        )
+        result = provider.resolve_intel(
+            job_id=INTEL_JOB_ID, family_id=INTEL_FAMILY_ID, request=_request()
+        )
+        assert result.status == "blocked", repr(bad_uses)
+        assert result.reason_code == "POLICY_DENIED", repr(bad_uses)
+        assert result.summary["sub_reason"] == "LICENSE_REJECTED", repr(bad_uses)
+
+
+def test_snapshot_provider_fails_closed_when_a_later_source_is_refused():
+    from datacon.tools.intel_provider import SnapshotIntelProvider
+
+    # Two sources registered for one case, each with its own pinned copy
+    # of the advisory. A second source with no license blocks the whole
+    # case - the first source's good material cannot carry it - and the
+    # refusal names the offending source.
+    first = _intel_source(source_id="advisory-primary")
+    second = _intel_source(
+        source_id="advisory-secondary", license=None
+    )
+    loader = _SnapshotLoader(
+        (INTEL_CASE_ID, "advisory-primary", PINNED_ADVISORY),
+        (INTEL_CASE_ID, "advisory-secondary", PINNED_ADVISORY),
+    )
+    provider = SnapshotIntelProvider(
+        registry=_SourceRegistry(first, second), snapshot_loader=loader
+    )
+    result = provider.resolve_intel(
+        job_id=INTEL_JOB_ID, family_id=INTEL_FAMILY_ID, request=_request()
+    )
+    assert result.status == "blocked", result
+    assert result.reason_code == "POLICY_DENIED", result
+    assert result.summary["sub_reason"] == "LICENSE_REJECTED", result
+    assert result.summary["source_id"] == "advisory-secondary", result
+
+    # When every registered source passes, the ready summary is the first
+    # source's: later sources are fallback material, never the speaker.
+    passing_second = _intel_source(
+        source_id="advisory-secondary",
+        source_url="https://mirror.example.org/cve-2099-0001.txt",
+    )
+    loader = _SnapshotLoader(
+        (INTEL_CASE_ID, "advisory-primary", PINNED_ADVISORY),
+        (INTEL_CASE_ID, "advisory-secondary", PINNED_ADVISORY),
+    )
+    provider = SnapshotIntelProvider(
+        registry=_SourceRegistry(first, passing_second), snapshot_loader=loader
+    )
+    result = provider.resolve_intel(
+        job_id=INTEL_JOB_ID, family_id=INTEL_FAMILY_ID, request=_request()
+    )
+    assert result.status == "ready", result
+    assert result.summary["source_url"] == INTEL_SOURCE_URL, result.summary
+    assert loader.calls == [
+        (INTEL_CASE_ID, "advisory-primary"),
+        (INTEL_CASE_ID, "advisory-secondary"),
+    ], loader.calls

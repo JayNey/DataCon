@@ -286,6 +286,9 @@ T15 实现新增坐标（P3）。下列坐标不在原计划表内，是实现�
 | `tests/contract/test_intel_fetch.py::test_snapshot_provider_maps_failures_to_reason_codes` | 读不到、读取出错、摘要不符、登记摘要格式非法、登记给别的案例各归其原因码与细因；provider 不抛异常 | 同上 |
 | `tests/contract/test_intel_fetch.py::test_snapshot_provider_reads_pinned_snapshots_without_network` | 离线案例只读固定快照，不触达抓取、连接层或 socket | 同上 |
 | `tests/contract/test_intel_fetch.py::test_snapshot_provider_summary_never_carries_url_credentials`（自审加固） | 就绪摘要里的来源 URL 不含账号口令；URL 缺失或无法解析为 `POLICY_DENIED` | `AssertionError: assert 'https://admi...0001.txt' == 'https://advi...0001.txt'` |
+| `tests/contract/test_intel_fetch.py::test_snapshot_provider_source_url_must_name_an_https_origin`（评审加固） | 来源 URL 必须是 https 源:裸词、他 scheme、`javascript:`、无主机、端口不可解析、空白与控制字符都 `SOURCE_URL_INVALID`,且在打开快照前拒绝 | `AssertionError: not-a-url` |
+| `tests/contract/test_intel_fetch.py::test_snapshot_provider_rejects_bytes_uses_as_a_license_denial`（评审加固） | `permitted_uses` 为 bytes/bytearray → `POLICY_DENIED`/`LICENSE_REJECTED`(只认 list/tuple/set/frozenset,与 intel_fetch 注册表门对齐),不再误归类为材料不可读 | `assert 'MATERIAL_MISSING' == 'POLICY_DENIED'` |
+| `tests/contract/test_intel_fetch.py::test_snapshot_provider_fails_closed_when_a_later_source_is_refused`（评审加固） | 多来源 fail-closed:第二个来源无许可整案阻断并点名来源;全通过时就绪摘要是第一个来源的 | ※ 未触发 RED(既有行为,评审建议加钉) |
 | `tests/contract/test_net_adapter.py::test_production_resolver_dedups_answers_preserving_order` | 生产 DNS 解析器答案去重且保序 | `ModuleNotFoundError: No module named 'datacon.tools.net_adapter'` |
 | `tests/contract/test_net_adapter.py::test_production_resolver_fails_closed_when_the_dns_budget_expires` | DNS 预算到期 → `DNS_TIMEOUT`，等待由预算而非查找本身结束 | 同上 |
 | `tests/contract/test_net_adapter.py::test_production_resolver_reports_unresolvable_hosts_fail_closed` | 名字不可解析 → `DNS_FAILED` | 同上 |
