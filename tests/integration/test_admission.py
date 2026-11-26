@@ -793,6 +793,70 @@ def test_idempotent_readmission_survives_envelope_reapproval(isolated_database):
     ]
 
 
+def test_readmission_after_cap_change_with_current_snapshot_is_denied(
+    isolated_database,
+):
+    seed = _seed_family(isolated_database)
+    family_id, child_id, envelope_1 = seed
+
+    first = _admit(isolated_database, seed)
+    assert first.admitted
+    assert len(_admissions(isolated_database, family_id, 2)) == 1
+    assert [event[0] for event in _events(isolated_database, child_id)] == [
+        "round_admitted"
+    ]
+
+    # Simulate a legitimate changed-envelope re-approval that tightened the
+    # caps from 900/300 to 600/200: the ledger now carries the re-based
+    # snapshot a worker would read for the next admission attempt.
+    isolated_database.connection.execute(
+        "UPDATE budget_ledger SET max_total_seconds = 600, "
+        "remaining_total_seconds = 600, max_fuzz_seconds = 200, "
+        "remaining_fuzz_seconds = 200, updated_at = clock_timestamp() "
+        "WHERE family_id = %s",
+        (family_id,),
+    )
+    current_snapshot = state.family_budget_summary(
+        isolated_database.dsn, family_id
+    )
+    assert current_snapshot["max_total_seconds"] == 600
+    assert current_snapshot["remaining_seconds"] == 600
+
+    # Old envelope + current ledger snapshot is a different-inputs conflict.
+    # The old envelope must not force the re-based snapshot's max_* fields to
+    # match its caps, which would surface as StateError instead of a denial.
+    denied = _admit(
+        isolated_database,
+        seed,
+        envelope=envelope_1,
+        budget_snapshot=current_snapshot,
+    )
+
+    assert not denied.admitted
+    assert denied.status == "denied"
+    assert denied.reason_code == "ADMISSION_DENIED"
+    assert denied.sub_reason == "ROUND_ALREADY_ADMITTED"
+    assert denied.admission is None
+    assert len(_admissions(isolated_database, family_id, 2)) == 1
+    events = _events(isolated_database, child_id)
+    assert [event[0] for event in events] == [
+        "round_admitted",
+        "round_admission_denied",
+    ]
+    assert events[-1][2]["sub_reason"] == "ROUND_ALREADY_ADMITTED"
+
+    # The original snapshot still matches the persisted admission inputs, so
+    # replaying it remains an idempotent no-op even after the denial.
+    replay = _admit(isolated_database, seed, envelope=envelope_1)
+    assert replay.status == "already_admitted"
+    assert replay.reason_code is None
+    assert len(_admissions(isolated_database, family_id, 2)) == 1
+    assert [event[0] for event in _events(isolated_database, child_id)] == [
+        "round_admitted",
+        "round_admission_denied",
+    ]
+
+
 def _valid_experiment(input_family: str = "length_boundary") -> dict:
     experiment = deepcopy(DEFAULT_EXPERIMENT)
     experiment["input_family"] = input_family
