@@ -167,6 +167,12 @@ T11 只验证图结构与节点幂等；policy 准入、轮次与预算容量的
 | `tests/contract/test_b04_hypothesis_quality.py::test_b04_annotation_set_is_versioned` | 标注集有 `annotation_version`、来源与样本量，版本冻结 | `KeyError: 'annotation_version'` |
 | `tests/contract/test_b04_hypothesis_quality.py::test_b04_reports_end_to_end_and_accepted_precision` | 真实 patch 标注集上产出 end-to-end precision、accepted precision、recall、rejection_rate 与样本量 | `KeyError: 'end_to_end_precision'` |
 | `tests/contract/test_b04_hypothesis_quality.py::test_b04_agent_scenarios_remain_release_gate` | B04-A 六类场景与路由/可追溯/越权指标仍是发布门禁，不被 B04-H 替换 | `AssertionError: B04-H replaced the B04-A gate` |
+| `tests/contract/test_safe_http.py::test_send_request_carries_the_exact_body_and_pinned_length` | 带正文的请求：`Content-Length` 按字节计算（调用方值被丢弃）、`Host` 仍钉住、正文作为独立写出逐字节上线 | `TypeError: GuardedConnection.send_request() got an unexpected keyword argument 'body'` |
+| `tests/contract/test_net_adapter.py::test_outlet_transport_posts_canonical_bytes_and_parses_strictly` | `OutletHttpTransport` 经守卫连接 POST canonical JSON（与 `request_digest` 同一字节基），响应严格解析为 JSON 对象 | `ModuleNotFoundError: No module named 'datacon.tools.net_adapter'` |
+| `tests/contract/test_net_adapter.py::test_outlet_transport_refuses_redirects_without_a_second_dial` | 3xx 一律 `OUTLET_REDIRECTED` 失败关闭，不跟随、不二次拨号（端点是精确白名单，重定向即漂移） | 同上 |
+| `tests/contract/test_net_adapter.py::test_outlet_transport_fails_closed_on_non_success_status` | 非 2xx/3xx → `OUTLET_HTTP_STATUS` | 同上 |
+| `tests/contract/test_net_adapter.py::test_outlet_transport_fails_closed_on_unframed_or_oversized_bodies` | 无单一 `Content-Length` → `RESPONSE_UNFRAMED`；声明超上限 → `OUTLET_RESPONSE_TOO_LARGE` 且正文流不启动 | 同上 |
+| `tests/contract/test_net_adapter.py::test_outlet_transport_surfaces_truncated_and_non_json_bodies` | 截断传播 `CONTENT_TRUNCATED`；非严格 JSON 或非对象 → `OUTLET_BAD_JSON` | 同上 |
 
 T14 实现新增坐标（P3）。下列 38 条不在原计划表内，是实现与自审过程中补上的，与上表同属 T14 验收。标注「自审加固」的坐标来自对 T14 三个模块的逐行自审：先用探针复现缺陷，再写成 RED，修复后转绿。原计划坐标 `test_model_finding_must_be_hypothesis` 已归位到上表登记的 `test_model_outlet.py`。带「†」的失败信息是 P3 用探针对当时的实现直接观察到的行为，不是 pytest 的输出行。
 
@@ -280,6 +286,18 @@ T15 实现新增坐标（P3）。下列坐标不在原计划表内，是实现�
 | `tests/contract/test_intel_fetch.py::test_snapshot_provider_maps_failures_to_reason_codes` | 读不到、读取出错、摘要不符、登记摘要格式非法、登记给别的案例各归其原因码与细因；provider 不抛异常 | 同上 |
 | `tests/contract/test_intel_fetch.py::test_snapshot_provider_reads_pinned_snapshots_without_network` | 离线案例只读固定快照，不触达抓取、连接层或 socket | 同上 |
 | `tests/contract/test_intel_fetch.py::test_snapshot_provider_summary_never_carries_url_credentials`（自审加固） | 就绪摘要里的来源 URL 不含账号口令；URL 缺失或无法解析为 `POLICY_DENIED` | `AssertionError: assert 'https://admi...0001.txt' == 'https://advi...0001.txt'` |
+| `tests/contract/test_net_adapter.py::test_production_resolver_dedups_answers_preserving_order` | 生产 DNS 解析器答案去重且保序 | `ModuleNotFoundError: No module named 'datacon.tools.net_adapter'` |
+| `tests/contract/test_net_adapter.py::test_production_resolver_fails_closed_when_the_dns_budget_expires` | DNS 预算到期 → `DNS_TIMEOUT`，等待由预算而非查找本身结束 | 同上 |
+| `tests/contract/test_net_adapter.py::test_production_resolver_reports_unresolvable_hosts_fail_closed` | 名字不可解析 → `DNS_FAILED` | 同上 |
+| `tests/contract/test_net_adapter.py::test_default_tls_context_never_disables_verification` | 默认 TLS 上下文 `check_hostname` 开且 `CERT_REQUIRED`，无任何关闭校验的调用形状 | 同上 |
+| `tests/contract/test_net_adapter.py::test_production_socket_pins_sni_and_applies_the_read_timeout` | TLS 挂载钉 SNI 主机名，挂载后施加读取预算 | 同上 |
+| `tests/contract/test_net_adapter.py::test_production_socket_refuses_to_mount_tls_without_sni` | 缺 SNI 拒绝挂载 | 同上 |
+| `tests/contract/test_net_adapter.py::test_production_socket_applies_the_connect_budget_before_dialing` | 连接预算在拨号前作为 socket 超时施加（真实本地 listener 实测） | 同上 |
+| `tests/contract/test_net_adapter.py::test_production_socket_recv_enforces_the_read_timeout` | 真实停摆对端上 `recv` 受读取预算约束（本地哑服务实测超时） | 同上 |
+| `tests/contract/test_net_adapter.py::test_production_socket_factory_defaults_match_the_fetch_budgets` | 工厂默认预算与 `intel_fetch` 逐跳预算同源，防配置漂移 | 同上 |
+| `tests/contract/test_net_adapter.py::test_production_guarded_transport_wires_the_production_faces` | `production_guarded_transport` 装配生产解析器与生产插座工厂 | 同上 |
+
+**传输适配层（T14/T15 共用，本 PR 落地）**：生产侧适配器 `datacon.tools.net_adapter` 补上 #44/#48 冻结的两个注入面的生产实现——`ProductionResolver`（真实 getaddrinfo，5s DNS 预算，超时 `DNS_TIMEOUT`、不可解析 `DNS_FAILED` 均失败关闭）与 `ProductionSocketFactory`（连接预算在拨号前作为 socket 超时施加、TLS 挂载强制 SNI 且只经 `ssl.create_default_context()`，无关闭校验的调用形状）；`OutletHttpTransport` 经 `connect_guarded` 以 canonical JSON 为字节基 POST 模型请求，不跟随重定向（`OUTLET_REDIRECTED`），响应须有单一 `Content-Length`、在 32 MiB 上限内、严格解析为 JSON 对象。预算口径说明：`SocketFactory` 面无逐调用参数，生产装配（`production_guarded_transport`）与 fetch 循环逐跳预算同源于 `intel_fetch` 的常量，由 `test_production_socket_factory_defaults_match_the_fetch_budgets` 防漂移。适配层尚未接任何调用方（workflow/execution 接入另立任务）。
 
 ## 3. 循环确定性策略
 
