@@ -577,3 +577,37 @@ def test_safe_http_errors_carry_a_reason_code():
     with pytest.raises(SafeHttpError) as excinfo:
         resolve_validated(HOST, resolver=FakeResolver({HOST: []}))
     assert excinfo.value.reason == "FETCH_FAILED"
+
+
+def test_send_request_carries_the_exact_body_and_pinned_length():
+    from datacon.tools.safe_http import connect_guarded
+
+    factory = FakeSocketFactory()
+    connection = connect_guarded(
+        f"https://{HOST}/v1/analyze",
+        resolver=FakeResolver({HOST: [PUBLIC_V4_PRIMARY]}),
+        socket_factory=factory,
+    )
+    body = b'{"a": 1}'
+
+    connection.send_request(
+        "POST",
+        "/v1/analyze",
+        {
+            "Content-Type": "application/json",
+            "Content-Length": "999",
+            "Host": "evil.example",
+        },
+        body=body,
+    )
+
+    sent = factory.sockets[0].sent
+    head = sent[0]
+    assert head.startswith(b"POST /v1/analyze HTTP/1.1\r\n")
+    assert f"Host: {HOST}\r\n".encode("ascii") in head
+    assert b"Host: evil.example" not in head
+    assert b"Content-Length: 8\r\n" in head
+    assert b"Content-Length: 999" not in head
+    assert head.endswith(b"\r\n\r\n")
+    # The body leaves as its own write, byte for byte.
+    assert sent[1] == body
