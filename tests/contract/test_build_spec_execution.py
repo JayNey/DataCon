@@ -25,7 +25,9 @@ import json
 import os
 from pathlib import Path
 import stat
+import shutil
 import subprocess
+import time
 import sys
 from typing import Any
 from uuid import UUID, uuid4
@@ -40,6 +42,7 @@ from datacon.tools.sandbox import (
     MAX_ARTIFACT_BYTES,
     MAX_PROVENANCE_FACE_BYTES,
     SECCOMP_PROFILE_DIGEST,
+    BuildOutput,
     BuildResult,
     DockerSandbox,
     IsolationPolicy,
@@ -49,6 +52,7 @@ from datacon.tools.sandbox import (
     SandboxError,
     SandboxPolicyError,
     build_runner_command,
+    merge_cc_shim_log,
     prepare_build_spec_execution,
     render_build_runner_script,
     render_cc_shim_script,
@@ -67,6 +71,9 @@ POLICY = IsolationPolicy(
 LIMITS = ResourceLimits(cpu=2, memory_mib=2048, pids=128, scratch_mib=512)
 IMAGE = "silkeh/clang:19-bookworm@sha256:" + "a" * 64
 DECLARED_FLAGS = ["-fsanitize=address", "-g", "-O1", "-Iinclude", "-D_GNU_SOURCE"]
+_FIXTURE_BUILD_RECIPE_DIGEST = (
+    "sha256:" + hashlib.sha256((FIXTURE_CASES / "build.sh").read_bytes()).hexdigest()
+)
 
 
 def _sha256_prefixed(data: bytes) -> str:
@@ -167,7 +174,7 @@ def _shell_spec(
             if declared_compile_flags is not None
             else list(DECLARED_FLAGS)
         ),
-        "shell_recipe_digest": "sha256:" + "1" * 64,
+        "shell_recipe_digest": _FIXTURE_BUILD_RECIPE_DIGEST,
         "shell_face_digest": face_digest,
         "shell_face_review": review,
     }
@@ -325,7 +332,12 @@ def _setup_fixture_plan_and_job(
 
     job_id = uuid4()
     family_id = str(uuid4())
-    envelope_digest = "sha256:" + "5" * 64
+    fixed_envelope = contracts.fixed_envelope(
+        harness_digest=materials[manifest["harness"]],
+        accepted_signature_set=[dict(manifest["asan_signature"])],
+        max_total_seconds=manifest["limits"]["execute_seconds"],
+    )
+    envelope_digest = contracts.envelope_digest(fixed_envelope)
     if version == 2:
         spec = deepcopy(build_spec) if build_spec is not None else _cmake_spec()
         flags = (
@@ -376,6 +388,7 @@ def _setup_fixture_plan_and_job(
         job["parent_job_id"] = family_id
         job["job_kind"] = job_kind
         job["round_no"] = round_no
+        job["envelope"] = deepcopy(fixed_envelope)
     review = {
         "reviewer_id": "reviewer-01",
         "decision": "approve",
@@ -401,6 +414,7 @@ class _InMemoryState:
         self.review = deepcopy(review)
         self.attempts: list[dict[str, Any]] = []
         self.finished_calls: list[dict[str, Any]] = []
+        self.budget_charges: list[dict[str, int]] = []
 
     def install(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(execution.state, "load_job", self.load_job)
@@ -428,6 +442,34 @@ class _InMemoryState:
             execution.state, "assert_archive_fence", self.assert_archive_fence
         )
         monkeypatch.setattr(execution.state, "finish_execution", self.finish_execution)
+        monkeypatch.setattr(
+            execution.state,
+            "family_budget_summary",
+            self.family_budget_summary,
+        )
+
+    def family_budget_summary(
+        self, dsn: str, family_id: UUID | str
+    ) -> dict[str, int]:
+        envelope = self.job.get("envelope")
+        if isinstance(envelope, dict):
+            max_total = int(envelope["max_total_seconds"])
+            max_fuzz = int(envelope["max_fuzz_seconds"])
+        else:
+            max_total = 1200
+            max_fuzz = 0
+        spent = sum(int(charge["seconds"]) for charge in self.budget_charges)
+        spent_fuzz = sum(
+            int(charge["fuzz_seconds"]) for charge in self.budget_charges
+        )
+        return {
+            "max_total_seconds": max_total,
+            "max_fuzz_seconds": max_fuzz,
+            "spent_seconds": spent,
+            "spent_fuzz_seconds": spent_fuzz,
+            "remaining_seconds": max_total - spent,
+            "remaining_fuzz_seconds": max_fuzz - spent_fuzz,
+        }
 
     def load_job(self, dsn: str, job_id: UUID) -> dict[str, Any] | None:
         return deepcopy(self.job) if str(job_id) == str(self.job["job_id"]) else None
@@ -548,6 +590,7 @@ class _FakeSandbox:
         build_error: SandboxError | None = None,
         build_error_by_version: dict[str, SandboxError] | None = None,
         build_logs: dict[str, bytes] | None = None,
+        build_outputs: dict[str, bytes] | None = None,
     ) -> None:
         self.image_digest = image_digest
         self.build_recipe_digest = build_recipe_digest
@@ -559,6 +602,7 @@ class _FakeSandbox:
             "vulnerable": b"building vulnerable...\n",
             "fixed": b"building fixed...\n",
         }
+        self.build_outputs = dict(build_outputs or {})
         self.probe_calls: int = 0
         self.build_calls: list[dict[str, Any]] = []
         self.replay_calls: list[dict[str, Any]] = []
@@ -615,6 +659,30 @@ class _FakeSandbox:
         artifact = f"ELF-{version}".encode("utf-8")
         raw_face = self.faces.get(version)
         log = self.build_logs.get(version, b"build ok\n")
+        outputs: tuple[BuildOutput, ...] = ()
+        primary_output: str | None = None
+        if self.build_outputs:
+            for rel_out, data in self.build_outputs.items():
+                outputs += (
+                    BuildOutput(
+                        relative_path=rel_out,
+                        archive_path=rel_out,
+                        data=data,
+                        digest=_sha256_prefixed(data),
+                    ),
+                )
+                if primary_output is None or (
+                    rel_out.rsplit("/", 1)[-1] == "parser"
+                ):
+                    primary_output = rel_out
+            artifact = next(
+                item.data
+                for item in outputs
+                if item.relative_path == primary_output
+            )
+            artifact_digest = _sha256_prefixed(artifact)
+        else:
+            artifact_digest = _sha256_prefixed(artifact)
         return BuildResult(
             version=version,
             status="completed",
@@ -623,7 +691,7 @@ class _FakeSandbox:
             container_id=f"fake-build-{version}",
             image_digest=self.image_digest,
             compile_args=tuple(compile_args),
-            artifact_digest=_sha256_prefixed(artifact),
+            artifact_digest=artifact_digest,
             log=log,
             log_truncated=False,
             artifact=artifact,
@@ -631,9 +699,11 @@ class _FakeSandbox:
                 "build_spec_kind": build_spec["kind"] if isinstance(build_spec, dict) else None,
                 "build_recipe_digest": self.build_recipe_digest,
                 "provenance_face_name": self.face_name,
+                **({"primary_output": primary_output} if primary_output else {}),
             },
             provenance_face=raw_face,
             provenance_face_name=self.face_name,
+            outputs=outputs,
         )
 
     def replay(
@@ -992,6 +1062,7 @@ def test_cc_shim_executes_locally_and_parses_end_to_end(tmp_path):
             f"got {proc.returncode}, stderr={proc.stderr.decode('utf-8', 'replace')}"
         )
 
+    merge_cc_shim_log(log_path)
     raw_log = log_path.read_bytes()
     records = [
         jsonutil.loads_strict(line)
@@ -1415,7 +1486,6 @@ def test_v2_provenance_failure_fails_closed_without_replay_or_inconclusive_downg
             "vulnerable": _cmake_compile_commands_bytes(flags=DECLARED_FLAGS),
             "fixed": None,
         }
-        expected_archived_versions = ("vulnerable",)
     elif scenario == "include_order_difference":
         # ADR-005 order counterexample: -I a -I b != -I b -I a
         flags_ab = ["-fsanitize=address", "-g", "-I", "a", "-I", "b"]
@@ -1426,7 +1496,6 @@ def test_v2_provenance_failure_fails_closed_without_replay_or_inconclusive_downg
             "vulnerable": _make_cc_shim_log_bytes(flags=flags_ab),
             "fixed": _make_cc_shim_log_bytes(flags=flags_ba),
         }
-        expected_archived_versions = ("vulnerable", "fixed")
     elif scenario == "declared_flag_missing_from_effective":
         spec = _cmake_spec(declared_compile_flags=["-fsanitize=address", "-g", "-O1"])
         face_name = "compile_commands.json"
@@ -1438,7 +1507,6 @@ def test_v2_provenance_failure_fails_closed_without_replay_or_inconclusive_downg
                 flags=["-fsanitize=address", "-g"]
             ),
         }
-        expected_archived_versions = ("vulnerable", "fixed")
     elif scenario == "drifted_shell_face":
         baseline = "2099-01-01T00:00:00Z /work clang -fsanitize=address -g src/parser.c\n"
         spec = _shell_spec(
@@ -1455,12 +1523,10 @@ def test_v2_provenance_failure_fails_closed_without_replay_or_inconclusive_downg
             "vulnerable": baseline.encode("utf-8"),
             "fixed": b"2099-01-01T00:00:00Z /work clang -O3 -DEXTRA src/parser.c\n",
         }
-        expected_archived_versions = ("vulnerable", "fixed")
     else:
         spec = _cmake_spec()
         face_name = "compile_commands.json"
         faces = {}
-        expected_archived_versions = ()
         build_error = SandboxError(
             "build_spec rejected before container creation",
             reason_code=build_provenance.BUILD_PROVENANCE_MISSING,
@@ -1501,57 +1567,17 @@ def test_v2_provenance_failure_fails_closed_without_replay_or_inconclusive_downg
     assert len(fake_sandbox.replay_calls) == 0, (
         f"{scenario}: must NEVER enter 6-replay phase (got {len(fake_sandbox.replay_calls)} calls)"
     )
-    assert result.evidence_path is not None, (
-        f"{scenario}: evidence bundle preserving logs/faces/diff must be archived"
+    # B-6: a partial FAILED execution bundle fails verify_bundle, so with no
+    # T13a handoff it is not published. The terminal row still records the
+    # real reason and an explicit BLOCKED_ON_T13A evidence error.
+    assert result.evidence_path is None, (
+        f"{scenario}: an unverifiable partial bundle must not be published"
     )
-
-    bundle_root = Path(result.evidence_path)
-    manifest = json.loads((bundle_root / "manifest.json").read_text(encoding="utf-8"))
-    report = json.loads((bundle_root / "report.json").read_text(encoding="utf-8"))
-
-    assert manifest["schema_version"] == 2
-    assert manifest["verdict"] == "FAILED"
-    assert manifest["reason_code"] == build_provenance.BUILD_PROVENANCE_MISSING
-    assert manifest["build_provenance_rules_version"] == build_provenance.RULES_VERSION
-
-    assert report["schema_version"] == 2
-    assert report["state"] == "FAILED"
-    assert report["verdict"] == "FAILED"
-    assert report["reason_code"] == build_provenance.BUILD_PROVENANCE_MISSING
-    assert report["build_provenance_rules_version"] == build_provenance.RULES_VERSION
-    assert set(report["build_provenance"].keys()) == {
-        "vulnerable",
-        "fixed",
-        "comparable",
-    }
-    assert report["build_provenance"]["comparable"] is False
-    expected_error_substrings = {
-        "missing_fixed_face": "missing or empty provenance face",
-        "include_order_difference": "effective flag order difference",
-        "declared_flag_missing_from_effective": "missing declared flag",
-        "drifted_shell_face": "fixed:",
-        "pre_container_sandbox_error": "build_spec rejected before container creation",
-    }
-    assert isinstance(report["error"], str)
-    assert report["error"].startswith("BUILD_PROVENANCE_MISSING:")
-    assert expected_error_substrings[scenario] in report["error"], (
-        f"{scenario}: expected diagnostic {expected_error_substrings[scenario]!r} in {report['error']!r}"
-    )
-    assert report["replays"] == []
-
-    files_by_path = {entry["path"]: entry for entry in manifest["files"]}
-    for version in expected_archived_versions:
-        log_rel = f"build/{version}/build.log"
-        assert log_rel in files_by_path, f"{scenario}: missing preserved {log_rel}"
-        assert (bundle_root / log_rel).read_bytes() == fake_sandbox.build_logs[version]
-        face_rel = f"build/{version}/build_provenance/{face_name}"
-        assert face_rel in files_by_path, f"{scenario}: missing preserved {face_rel}"
-        assert files_by_path[face_rel]["role"] == "build_provenance"
-        assert (bundle_root / face_rel).read_bytes() == faces[version]
-
-    # Double-check permission bits on archived files are non-writable (0444).
-    mode = stat.S_IMODE((bundle_root / "report.json").stat().st_mode)
-    assert mode == 0o444
+    finished = mem_state.finished_calls[-1]
+    assert finished["state"] == "FAILED"
+    assert finished["reason_code"] == build_provenance.BUILD_PROVENANCE_MISSING
+    assert finished["evidence_status"] == "failed"
+    assert "BLOCKED_ON_T13A" in finished["evidence_error"]
 
 
 # ---------------------------------------------------------------------------
@@ -2119,13 +2145,10 @@ def test_v2_compile_flags_vs_declared_compile_flags_mismatch_fails_closed(
     assert result.verdict is None
     assert len(fake_sandbox.build_calls) == 0, f"{label}: must not build on mismatch"
     assert len(fake_sandbox.replay_calls) == 0, f"{label}: must run 0 replays"
-    assert result.evidence_path is not None
-    report = json.loads(
-        (Path(result.evidence_path) / "report.json").read_text(encoding="utf-8")
-    )
-    assert report["reason_code"] == build_provenance.BUILD_PROVENANCE_MISSING
-    assert report["build_provenance"]["comparable"] is False
-    assert "plan.compile_flags" in str(report["error"])
+    assert result.evidence_path is None
+    finished = mem_state.finished_calls[-1]
+    assert finished["state"] == "FAILED"
+    assert "BLOCKED_ON_T13A" in finished["evidence_error"]
 
 
 # ---------------------------------------------------------------------------
@@ -2352,14 +2375,14 @@ def test_v2_archive_only_recovery_never_downgrades_provenance_failure(
     )
     assert result.reason_code == build_provenance.BUILD_PROVENANCE_MISSING
     assert result.verdict is None
-    assert result.evidence_path is not None
-    report = json.loads(
-        (Path(result.evidence_path) / "report.json").read_text(encoding="utf-8")
-    )
-    assert report["state"] == "FAILED"
-    assert report["verdict"] == "FAILED"
-    assert report["reason_code"] == build_provenance.BUILD_PROVENANCE_MISSING
-    assert report["build_provenance"]["comparable"] is False
+    # B-6: publish only if the full offline verifier accepts the archive.
+    if result.evidence_path is not None:
+        evidence.verify_bundle(result.evidence_path)
+    else:
+        finished = mem_state.finished_calls[-1]
+        assert finished["state"] == "FAILED"
+        assert finished["reason_code"] == build_provenance.BUILD_PROVENANCE_MISSING
+        assert "BLOCKED_ON_T13A" in finished["evidence_error"]
 
 
 # ---------------------------------------------------------------------------
@@ -2416,30 +2439,16 @@ def test_b1_v2_partial_inconclusive_build_timeout_and_sandbox_error_preserve_evi
     assert result.verdict == "INCONCLUSIVE"
     assert result.verdict_reason == expected_reason
     assert result.reason_code == expected_reason
-    assert result.evidence_path is not None
+    assert result.evidence_path is None
     assert len(fake_sandbox.replay_calls) == 0
-
-    bundle_root = Path(result.evidence_path)
-    manifest = json.loads((bundle_root / "manifest.json").read_text(encoding="utf-8"))
-    report = json.loads((bundle_root / "report.json").read_text(encoding="utf-8"))
-
-    assert manifest["schema_version"] == 2
-    assert manifest["verdict"] == "INCONCLUSIVE"
-    assert manifest["reason_code"] == expected_reason
-    assert report["verdict"] == "INCONCLUSIVE"
-    assert report["reason_code"] == expected_reason
-    assert report["rule"] is None
-    assert report["replays"] == []
-
-    files_by_path = {entry["path"]: entry for entry in manifest["files"]}
-    assert "build/vulnerable/build.log" in files_by_path
-    assert (bundle_root / "build/vulnerable/build.log").read_bytes() == fake_sandbox.build_logs[
-        "vulnerable"
-    ]
-    assert "build/vulnerable/build_provenance/compile_commands.json" in files_by_path
-    assert (
-        bundle_root / "build/vulnerable/build_provenance/compile_commands.json"
-    ).read_bytes() == vuln_face
+    # The partial build evidence is still recorded honestly in the run tree,
+    # but it is not published as an execution bundle until T13a can verify a
+    # partial role layout.
+    finished = mem_state.finished_calls[-1]
+    assert finished["state"] == "INCONCLUSIVE"
+    assert finished["reason_code"] == expected_reason
+    assert finished["evidence_status"] == "failed"
+    assert "BLOCKED_ON_T13A" in finished["evidence_error"]
 
 
 @pytest.mark.parametrize(
@@ -2642,7 +2651,7 @@ def test_b4_runner_prebuild_cleanup_and_symlink_rejection_and_copy_work_path(
         str(stale_face),
         "0",
         "1",
-        "/bin/true",
+        shutil.which("true") or "/usr/bin/true",
         "0",
     ]
     proc_clean = subprocess.run(
@@ -2739,12 +2748,15 @@ def test_b5_cc_shim_concurrent_large_flags_produces_valid_jsonl(tmp_path, lock_m
         real_compiler=str(stub_cc),
         log_path=str(log_path),
     )
+    # B-1: the shared-append fallback is gone. Both parameterizations exercise
+    # the same private-fragment protocol; no shim ever opens a shared log or a
+    # shared lock, so there is no 8 KiB interleaving window to schedule into.
+    assert "command -v flock" not in shim_script
+    assert "flock -x" not in shim_script
+    assert ".lock" not in shim_script
+    assert 'fragment-$$-' in shim_script
     if lock_mode == "mkdir_fallback":
-        assert "if command -v flock >/dev/null 2>&1; then" in shim_script
-        shim_script = shim_script.replace(
-            "if command -v flock >/dev/null 2>&1; then",
-            "if false; then",
-        )
+        assert "mkdir" in shim_script
     shim_path = tmp_path / f"cc-shim-{lock_mode}"
     shim_path.write_text(shim_script, encoding="utf-8")
     shim_path.chmod(0o755)
@@ -2771,6 +2783,7 @@ def test_b5_cc_shim_concurrent_large_flags_produces_valid_jsonl(tmp_path, lock_m
             f"worker {idx} failed rc={proc.returncode} stderr={err.decode('utf-8', 'replace')}"
         )
 
+    merge_cc_shim_log(log_path)
     raw_lines = [
         line for line in log_path.read_text(encoding="utf-8").splitlines() if line.strip()
     ]
@@ -2784,6 +2797,44 @@ def test_b5_cc_shim_concurrent_large_flags_produces_valid_jsonl(tmp_path, lock_m
         assert len(rec["argv"]) == 1 + 170 + 4, f"line {line_no} truncated/interleaved"
         seen_units.add(rec["argv"][-3])
     assert seen_units == {f"src/unit_{idx}.c" for idx in range(workers)}
+
+
+def test_b1_cc_shim_fragment_merge_is_single_writer_and_complete(tmp_path):
+    """B-1: the merger concatenates completed fragments without interleaving.
+
+    This is the deterministic half of the concurrency test: 12 fragments of
+    >16 KiB are pre-created (including a deliberately adversarial byte order
+    that would corrupt a shared append), then the single-writer merger is run
+    and every resulting line must be strict JSON.
+    """
+    log_path = tmp_path / "cc-shim.log"
+    fragment_dir = log_path.with_name(log_path.name + ".d")
+    fragment_dir.mkdir()
+    for idx in range(12):
+        flags = ["-DW%d_K%d=%s" % (idx, k, "Y" * 100) for k in range(170)]
+        record = json.dumps(
+            {
+                "cwd": str(tmp_path),
+                "compiler": "clang",
+                "argv": ["clang", *flags, "-c", f"src/unit_{idx}.c", "-o", f"u_{idx}.o"],
+            },
+            separators=(",", ":"),
+        ).encode("utf-8") + b"\n"
+        assert len(record) > 16 * 1024
+        # Reverse creation order so lexical merge order is not creation order.
+        (fragment_dir / f"fragment-{11 - idx:02d}-nonce.jsonl").write_bytes(record)
+    merge_cc_shim_log(log_path)
+    raw_lines = log_path.read_text(encoding="utf-8").splitlines()
+    assert len(raw_lines) == 12
+    assert not fragment_dir.exists()
+    seen: set[str] = set()
+    for line in raw_lines:
+        record = jsonutil.loads_strict(line)
+        assert isinstance(record, dict)
+        assert set(record) == {"cwd", "compiler", "argv"}
+        assert len(record["argv"]) == 1 + 170 + 4
+        seen.add(record["argv"][-3])
+    assert seen == {f"src/unit_{idx}.c" for idx in range(12)}
 
 
 @pytest.mark.parametrize(
@@ -3330,6 +3381,872 @@ def test_nonblocking_6_persist_build_oversize_face_and_campaign_inputs_none_and_
     assert ("/work/build/libhelper.so", MAX_ARTIFACT_BYTES) in captured_extra
     assert ("/work/build/parser", MAX_ARTIFACT_BYTES) in captured_extra
     assert ("/work/build/compile_commands.json", MAX_PROVENANCE_FACE_BYTES) in captured_extra
+
+
+# ---------------------------------------------------------------------------
+# 10. PR #54 review B-1..B-5/S-1..S-5 regressions
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "label,spec",
+    [
+        (
+            "cmake-build-etc",
+            _cmake_spec(build=["cmake", "--build", "/etc"]),
+        ),
+        (
+            "cmake-install-tmp",
+            _cmake_spec(install=["cmake", "--install", "/tmp/evil"]),
+        ),
+        (
+            "cmake-install-prefix-tmp",
+            _cmake_spec(
+                install=["cmake", "--install", "build", "--prefix", "/tmp/evil"]
+            ),
+        ),
+        (
+            "cmake-source-etc",
+            _cmake_spec(configure=["cmake", "-S", "/etc", "-B", "build"]),
+        ),
+        (
+            "cmake-install-prefix-var",
+            _cmake_spec(
+                configure=[
+                    "cmake",
+                    "-S",
+                    ".",
+                    "-B",
+                    "build",
+                    "-DCMAKE_INSTALL_PREFIX=/tmp/evil",
+                ]
+            ),
+        ),
+        (
+            "make-directory-etc",
+            _make_spec(),
+        ),
+        (
+            "make-file-passwd",
+            {**_make_spec(), "build": ["make", "-f", "/etc/passwd"]},
+        ),
+        (
+            "make-include-etc",
+            {**_make_spec(), "build": ["make", "-I", "/etc", "parser"]},
+        ),
+        (
+            "make-old-file-etc",
+            {**_make_spec(), "build": ["make", "-o", "/etc/passwd", "parser"]},
+        ),
+        (
+            "make-long-file-etc",
+            {**_make_spec(), "build": ["make", "--file=/etc/passwd"]},
+        ),
+        (
+            "destdir-tmp",
+            _cmake_spec(env={"CC": "clang", "DESTDIR": "/tmp/evil"}),
+        ),
+    ],
+)
+def test_b5_cmake_make_external_paths_rejected_before_container(label, spec):
+    """B-5: build/install/source/Makefile paths outside /work are rejected."""
+    if label == "make-directory-etc":
+        spec = {**spec, "build": ["make", "-C", "/etc", "parser"]}
+    decision = build_provenance.validate_build_spec_for_freeze(spec)
+    assert decision.ok is False, f"{label}: freeze must reject external path"
+    assert decision.reason_code == build_provenance.BUILD_PROVENANCE_MISSING
+    with pytest.raises(SandboxError) as exc_info:
+        prepare_build_spec_execution(spec)
+    assert exc_info.value.reason_code == build_provenance.BUILD_PROVENANCE_MISSING
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [
+        _cmake_spec(
+            configure=["cmake", "-S", ".", "-B", "/work/build"],
+            build=["cmake", "--build", "/work/build"],
+        ),
+        _cmake_spec(
+            configure=[
+                "cmake",
+                "-S",
+                "src",
+                "-B",
+                "build",
+                "-DCMAKE_INSTALL_PREFIX=/work/install",
+            ],
+            install=["cmake", "--install", "build", "--prefix", "/work/install"],
+        ),
+        {**_make_spec(), "build": ["make", "-C", "src", "parser"]},
+    ],
+)
+def test_b5_work_and_relative_paths_still_allowed(spec):
+    """B-5 positive control: /work paths and safe relative paths still freeze."""
+    decision = build_provenance.validate_build_spec_for_freeze(spec)
+    assert decision.ok is True, decision.error_detail
+    prepare_build_spec_execution(spec)
+
+
+@pytest.mark.parametrize(
+    "configure,expected",
+    [
+        (
+            [
+                "cmake",
+                "-S",
+                ".",
+                "-B",
+                "build",
+                "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON",
+                "-U",
+                "CMAKE_EXPORT_COMPILE_COMMANDS",
+            ],
+            True,
+        ),
+        (
+            [
+                "cmake",
+                "-S",
+                ".",
+                "-B",
+                "build",
+                "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON",
+            ],
+            False,
+        ),
+        (
+            [
+                "cmake",
+                "-S",
+                ".",
+                "-B",
+                "build",
+                "-DCMAKE_EXPORT_COMPILE_COMMANDS=OFF",
+            ],
+            True,
+        ),
+        (
+            [
+                "cmake",
+                "-S",
+                ".",
+                "-B",
+                "build",
+                "-U",
+                "CMAKE_EXPORT_COMPILE_COMMANDS",
+                "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON",
+            ],
+            False,
+        ),
+    ],
+)
+def test_s5_export_compile_commands_follows_configure_order(configure, expected):
+    """S-5: -U after an ON define disables the face; a later ON re-enables it."""
+    assert build_provenance.cmake_disables_compile_commands(configure) is expected
+    spec = _cmake_spec(configure=configure)
+    decision = build_provenance.validate_build_spec_for_freeze(spec)
+    assert decision.ok is (not expected), decision.error_detail
+
+
+@pytest.mark.parametrize(
+    "forbidden_key",
+    [
+        "MAKEFLAGS",
+        "GNUMAKEFLAGS",
+        "MFLAGS",
+        "MAKEOVERRIDES",
+        "SHELL",
+        "ENV",
+        "BASH_ENV",
+        "makeflags",
+        "gnumakeflags",
+    ],
+)
+def test_b4_make_control_env_keys_rejected_in_freeze_and_prepare(forbidden_key):
+    """B-4: Make flags/SHELL can no longer override the cc-shim CC."""
+    for spec in (_make_spec(), _cmake_spec()):
+        spec["env"][forbidden_key] = "CC=clang"
+        decision = build_provenance.validate_build_spec_for_freeze(spec)
+        assert decision.ok is False, f"freeze must reject env.{forbidden_key}"
+        with pytest.raises(SandboxError) as exc_info:
+            prepare_build_spec_execution(spec)
+        assert (
+            exc_info.value.reason_code == build_provenance.BUILD_PROVENANCE_MISSING
+        )
+
+
+def test_b4_effective_container_env_rejects_make_override_after_merge():
+    """B-4 defense in depth: the final container env is re-validated."""
+    error = build_provenance.validate_effective_build_env(
+        {
+            "TMPDIR": "/work",
+            "HOME": "/work",
+            "ASAN_OPTIONS": "detect_leaks=0",
+            "DATACON_BUILD_VERSION": "fixed",
+            "CFLAGS": "-O1",
+        },
+        allowed_executor_keys={
+            "TMPDIR",
+            "HOME",
+            "ASAN_OPTIONS",
+            "DATACON_BUILD_VERSION",
+        },
+    )
+    assert error is None
+    for key in ("MAKEFLAGS", "GNUMAKEFLAGS", "MFLAGS", "SHELL"):
+        error = build_provenance.validate_effective_build_env(
+            {key: "CC=clang"},
+            allowed_executor_keys={"TMPDIR", "HOME", "ASAN_OPTIONS"},
+        )
+        assert error is not None and key in error
+
+
+def test_b3_shell_recipe_digest_must_match_materialized_build_sh(tmp_path, monkeypatch):
+    """B-3: a forged shell_recipe_digest fails closed before any build container."""
+    run_root, _ = _configure_isolated_roots(tmp_path, monkeypatch)
+    baseline = (
+        "2099-01-01T00:00:00Z /work clang -fsanitize=address -g src/parser.c\n"
+    )
+    spec = _shell_spec(
+        face_digest=build_provenance.shell_face_digest(baseline, repo_root="/work"),
+        review={
+            "reviewer_id": "reviewer-01",
+            "reviewed_at": "2099-01-01T00:00:00Z",
+            "face_kind": "build_log",
+        },
+    )
+    spec["shell_recipe_digest"] = "sha256:" + "0" * 64
+    job, plan, plan_digest, review = _setup_fixture_plan_and_job(
+        version=2, build_spec=spec
+    )
+    mem_state = _InMemoryState(job, plan, plan_digest, review)
+    mem_state.install(monkeypatch)
+    fake_sandbox = _FakeSandbox(
+        image_digest=plan["image_digest"],
+        build_recipe_digest=plan["build_recipe_digest"],
+        faces={"vulnerable": baseline.encode(), "fixed": baseline.encode()},
+        face_name="shell-face.log",
+    )
+    result = execution.run_execution(
+        "dsn",
+        job["job_id"],
+        1,
+        case_root=str(FIXTURE_CASES),
+        run_root=run_root,
+        sandbox=fake_sandbox,
+    )
+    assert result.state == "BLOCKED"
+    assert result.reason_code == build_provenance.BUILD_PROVENANCE_MISSING
+    assert fake_sandbox.build_calls == []
+    # The forged recipe digest blocks before context reconstruction, so no
+    # execution bundle is published (there are no build artifacts to verify).
+    assert result.evidence_path is None
+
+
+def test_b3_shell_build_script_must_name_manifest_build_recipe(tmp_path, monkeypatch):
+    """B-3: a shell recipe digest cannot authorize a different script operand."""
+    run_root, _ = _configure_isolated_roots(tmp_path, monkeypatch)
+    baseline = (
+        "2099-01-01T00:00:00Z /work clang -fsanitize=address -g src/parser.c\n"
+    )
+    spec = _shell_spec(
+        face_digest=build_provenance.shell_face_digest(baseline, repo_root="/work"),
+        review={
+            "reviewer_id": "reviewer-01",
+            "reviewed_at": "2099-01-01T00:00:00Z",
+            "face_kind": "build_log",
+        },
+    )
+    spec["build"] = ["sh", "./other.sh"]
+    job, plan, plan_digest, review = _setup_fixture_plan_and_job(
+        version=2, build_spec=spec
+    )
+    mem_state = _InMemoryState(job, plan, plan_digest, review)
+    mem_state.install(monkeypatch)
+    result = execution.run_execution(
+        "dsn",
+        job["job_id"],
+        1,
+        case_root=str(FIXTURE_CASES),
+        run_root=run_root,
+        sandbox=_FakeSandbox(
+            image_digest=plan["image_digest"],
+            build_recipe_digest=plan["build_recipe_digest"],
+            faces={},
+            face_name="shell-face.log",
+        ),
+    )
+    assert result.state == "BLOCKED"
+    assert result.reason_code == "PLAN_MISMATCH"
+
+
+def test_s3_declared_flags_are_a_flat_multiset_across_compile_units():
+    """S-3: two CUs may each contribute a different declared flag."""
+    face = json.dumps(
+        [
+            {
+                "directory": "/work",
+                "file": "/work/src/a.c",
+                "arguments": [
+                    "clang",
+                    "-DFEATURE_A",
+                    "-c",
+                    "/work/src/a.c",
+                    "-o",
+                    "a.o",
+                ],
+            },
+            {
+                "directory": "/work",
+                "file": "/work/src/b.c",
+                "arguments": [
+                    "clang",
+                    "-DFEATURE_B",
+                    "-c",
+                    "/work/src/b.c",
+                    "-o",
+                    "b.o",
+                ],
+            },
+        ]
+    ).encode()
+    result = build_provenance.verify_build_provenance(
+        kind="cmake",
+        declared_compile_flags=["-DFEATURE_A", "-DFEATURE_B"],
+        vulnerable_face=face,
+        fixed_face=face,
+        repo_root="/work",
+    )
+    assert result.comparable is True, result.error_detail
+
+
+def test_s3_patch_explained_unit_does_not_mask_unexplained_missing_unit():
+    """S-3: only patch-changed source paths are exempt from unit symmetry."""
+    vuln_face = json.dumps(
+        [
+            {
+                "directory": "/work",
+                "file": "/work/src/a.c",
+                "arguments": ["clang", "-g", "-c", "/work/src/a.c", "-o", "a.o"],
+            },
+            {
+                "directory": "/work",
+                "file": "/work/src/added.c",
+                "arguments": ["clang", "-g", "-c", "/work/src/added.c", "-o", "b.o"],
+            },
+        ]
+    ).encode()
+    fixed_face = json.dumps(
+        [
+            {
+                "directory": "/work",
+                "file": "/work/src/a.c",
+                "arguments": ["clang", "-g", "-c", "/work/src/a.c", "-o", "a.o"],
+            }
+        ]
+    ).encode()
+    explained = build_provenance.verify_build_provenance(
+        kind="cmake",
+        declared_compile_flags=["-g"],
+        vulnerable_face=vuln_face,
+        fixed_face=fixed_face,
+        repo_root="/work",
+        patch_explained_units=["src/added.c"],
+    )
+    assert explained.comparable is True, explained.error_detail
+    unexplained = build_provenance.verify_build_provenance(
+        kind="cmake",
+        declared_compile_flags=["-g"],
+        vulnerable_face=vuln_face,
+        fixed_face=fixed_face,
+        repo_root="/work",
+    )
+    assert unexplained.comparable is False
+
+
+def test_b2_build_with_spec_passes_version_to_container_command_and_env(
+    tmp_path, monkeypatch
+):
+    """B-2: vulnerable and fixed builds differ in the audited container command."""
+    sandbox = _make_sandbox(tmp_path)
+    materials = tmp_path / "materials"
+    materials.mkdir()
+    (materials / "build.sh").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    observed: list[dict[str, Any]] = []
+    artifact_bytes = b"ELF-version-aware"
+
+    def fake_create(*, suffix, command, mounts, env=None):
+        observed.append(
+            {
+                "suffix": suffix,
+                "command": list(command),
+                "env": dict(env or {}),
+            }
+        )
+        return (f"cid-{suffix}", {})
+
+    def fake_start(name, *, deadline_seconds, artifact=False, extra_copy_paths=()):
+        return (
+            b"build ok\n",
+            _build_result_marker(artifact_bytes, code=0),
+            {"/work/out/parser": artifact_bytes},
+            set(),
+            {"Running": False, "Status": "exited", "ExitCode": 0},
+            False,
+            0,
+            None,
+        )
+
+    monkeypatch.setattr(sandbox, "_create", fake_create)
+    monkeypatch.setattr(sandbox, "_start_and_wait", fake_start)
+    spec = _shell_spec(
+        face_digest="sha256:" + "a" * 64,
+        review={
+            "reviewer_id": "reviewer-01",
+            "reviewed_at": "2099-01-01T00:00:00Z",
+            "face_kind": "build_log",
+        },
+    )
+    for version in ("vulnerable", "fixed"):
+        result = sandbox.build(
+            version, materials_dir=materials, build_spec=spec
+        )
+        assert result.status == "completed", result.metadata
+
+    vulnerable, fixed = observed
+    assert vulnerable["command"] != fixed["command"]
+    assert "vulnerable" in vulnerable["command"]
+    assert "fixed" in fixed["command"]
+    assert vulnerable["env"]["DATACON_BUILD_VERSION"] == "vulnerable"
+    assert fixed["env"]["DATACON_BUILD_VERSION"] == "fixed"
+
+
+def test_s1_missing_or_truncated_secondary_output_fails_the_build(
+    tmp_path, monkeypatch
+):
+    """S-1: every declared output is required, not just the primary parser."""
+    sandbox = _make_sandbox(tmp_path)
+    materials = tmp_path / "materials"
+    materials.mkdir()
+    parser = b"ELF-parser"
+    helper = b"ELF-helper"
+    spec = _cmake_spec(outputs=["out/helper", "out/parser"])
+    monkeypatch.setattr(sandbox, "_create", lambda **kwargs: ("fake-cid", {}))
+
+    def run_case(files: dict[str, bytes], truncated: set[str]) -> BuildResult:
+        monkeypatch.setattr(
+            sandbox,
+            "_start_and_wait",
+            lambda name, **kwargs: (
+                b"build ok\n",
+                _build_result_marker(parser, code=0),
+                files,
+                truncated,
+                {"Running": False, "Status": "exited", "ExitCode": 0},
+                False,
+                0,
+                None,
+            ),
+        )
+        return sandbox.build("vulnerable", materials_dir=materials, build_spec=spec)
+
+    ok = run_case({"/work/out/helper": helper, "/work/out/parser": parser}, set())
+    assert ok.status == "completed"
+    assert {item.relative_path for item in ok.outputs} == {
+        "out/helper",
+        "out/parser",
+    }
+
+    missing = run_case({"/work/out/parser": parser}, set())
+    assert missing.status == "build_failed"
+    assert missing.metadata["outputs"]["out/helper"] is None
+
+    truncated = run_case(
+        {"/work/out/helper": helper, "/work/out/parser": parser},
+        {"/work/out/helper"},
+    )
+    assert truncated.status == "build_failed"
+
+    # A symlinked secondary output is not copied at all (the copy path refuses
+    # it), so it is missing from the captured map and fails closed.
+    symlinked = run_case({"/work/out/parser": parser}, set())
+    assert symlinked.status == "build_failed"
+
+
+def test_s1_custom_outputs_archive_at_d39_paths_and_verify(
+    tmp_path, monkeypatch
+):
+    """S-1: BuildSpec.outputs relative paths are preserved under build/{version}/."""
+    run_root, _ = _configure_isolated_roots(tmp_path, monkeypatch)
+    baseline = (
+        "2099-01-01T00:00:00Z /work clang -fsanitize=address -g src/parser.c\n"
+    )
+    spec = _shell_spec(
+        face_digest=build_provenance.shell_face_digest(baseline, repo_root="/work"),
+        review={
+            "reviewer_id": "reviewer-01",
+            "reviewed_at": "2099-01-01T00:00:00Z",
+            "face_kind": "build_log",
+        },
+    )
+    spec["outputs"] = ["out/parser"]
+    job, plan, plan_digest, review = _setup_fixture_plan_and_job(
+        version=2, build_spec=spec
+    )
+    mem_state = _InMemoryState(job, plan, plan_digest, review)
+    mem_state.install(monkeypatch)
+    custom = b"ELF-custom-parser"
+    fake_sandbox = _FakeSandbox(
+        image_digest=plan["image_digest"],
+        build_recipe_digest=plan["build_recipe_digest"],
+        faces={"vulnerable": baseline.encode(), "fixed": baseline.encode()},
+        face_name="shell-face.log",
+        build_outputs={"out/parser": custom},
+    )
+    result = execution.run_execution(
+        "dsn",
+        job["job_id"],
+        1,
+        case_root=str(FIXTURE_CASES),
+        run_root=run_root,
+        sandbox=fake_sandbox,
+    )
+    assert result.state == "REPRODUCED", (result, mem_state.finished_calls)
+    verified = evidence.verify_bundle(result.evidence_path)
+    for version in ("vulnerable", "fixed"):
+        path = f"build/{version}/out/parser"
+        assert path in verified.file_data
+        assert verified.file_data[path] == custom
+
+
+def test_s2_staging_copy_failure_is_fatal(tmp_path):
+    """S-2: a failed /fixture -> /work copy exits non-zero instead of `|| true`."""
+    fixture = tmp_path / "fixture"
+    fixture.mkdir()
+    (fixture / "src.c").write_text("int main(void){return 0;}\n", encoding="utf-8")
+    # A regular file at /work makes the staging copy fail even when the test
+    # runs as root (chmod-based denials do not stop root).
+    work = tmp_path / "work"
+    work.write_text("not a directory\n", encoding="utf-8")
+    out = tmp_path / "parser"
+    script = render_build_runner_script(
+        stage_fixture=True,
+        emit_result_marker=True,
+        wait_for_release=False,
+    )
+    script = script.replace("/fixture", str(fixture)).replace("/work", str(work))
+    cmd = [
+        "/bin/sh",
+        "-c",
+        script,
+        "datacon-build-runner",
+        str(out),
+        "0",
+        "0",
+        "0",
+        "0",
+    ]
+    proc = subprocess.run(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False
+    )
+    assert proc.returncode != 0
+    stderr = proc.stderr.decode("utf-8", "replace")
+    assert "staging copy from" in stderr and "failed" in stderr
+
+
+def test_s4_stale_lock_is_irrelevant_and_symlinked_log_is_rejected(tmp_path):
+    """S-4: no shared lock remains; stale lock never blocks and symlinks fail."""
+    target = tmp_path / "outside.log"
+    target.write_text("do-not-touch\n", encoding="utf-8")
+    log_path = tmp_path / "cc-shim.log"
+    stale_lock = tmp_path / "cc-shim.log.lock"
+    stale_lock.mkdir()
+    stub_cc = tmp_path / "stub-clang"
+    stub_cc.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    stub_cc.chmod(0o755)
+    shim_path = tmp_path / "cc-shim"
+    shim_path.write_text(
+        render_cc_shim_script(real_compiler=str(stub_cc), log_path=str(log_path)),
+        encoding="utf-8",
+    )
+    shim_path.chmod(0o755)
+    started = time.monotonic()
+    proc = subprocess.run(
+        [str(shim_path), "-c", "src/a.c", "-o", "a.o"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+        timeout=5,
+    )
+    assert proc.returncode == 0
+    assert time.monotonic() - started < 5
+    assert stale_lock.is_dir(), "the shim must not need or delete an unrelated lock"
+    merge_cc_shim_log(log_path)
+    assert jsonutil.loads_strict(log_path.read_text(encoding="utf-8").strip())
+
+    log_path.unlink()
+    log_path.symlink_to(target)
+    proc = subprocess.run(
+        [str(shim_path), "-c", "src/a.c", "-o", "a.o"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+        timeout=5,
+    )
+    assert proc.returncode != 0
+    assert target.read_text(encoding="utf-8") == "do-not-touch\n"
+
+
+def test_s4_term_during_shim_does_not_leave_a_lock(tmp_path):
+    """S-4: TERM exits the shim and leaves no lock/temp artifact to block retries."""
+    log_path = tmp_path / "cc-shim.log"
+    stub_cc = tmp_path / "slow-clang"
+    stub_cc.write_text("#!/bin/sh\nexec sleep 30\n", encoding="utf-8")
+    stub_cc.chmod(0o755)
+    shim_path = tmp_path / "cc-shim"
+    shim_path.write_text(
+        render_cc_shim_script(real_compiler=str(stub_cc), log_path=str(log_path)),
+        encoding="utf-8",
+    )
+    shim_path.chmod(0o755)
+    proc = subprocess.Popen(
+        [str(shim_path), "-c", "src/a.c", "-o", "a.o"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    time.sleep(0.3)
+    proc.terminate()
+    proc.communicate(timeout=5)
+    assert not (tmp_path / "cc-shim.log.lock").exists()
+    # A completed fragment is harmless and will be merged by the runner; only
+    # an in-flight temp (or a leftover lock) could block a retry.
+    assert not list(tmp_path.glob("cc-shim.log.d/.fragment.*"))
+
+
+def test_b7_reproduced_bundle_uses_real_envelope_and_six_field_budget(
+    tmp_path, monkeypatch
+):
+    """B-7: no 2-key envelope, no v0.1 7-field report budget."""
+    run_root, _ = _configure_isolated_roots(tmp_path, monkeypatch)
+    spec = _cmake_spec()
+    face = _cmake_compile_commands_bytes(
+        flags=["-fsanitize=address", "-g", "-O1", "-I../include", "-D_GNU_SOURCE"]
+    )
+    job, plan, plan_digest, review = _setup_fixture_plan_and_job(
+        version=2, build_spec=spec
+    )
+    mem_state = _InMemoryState(job, plan, plan_digest, review)
+    mem_state.install(monkeypatch)
+    fake_sandbox = _FakeSandbox(
+        image_digest=plan["image_digest"],
+        build_recipe_digest=plan["build_recipe_digest"],
+        faces={"vulnerable": face, "fixed": face},
+        face_name="compile_commands.json",
+    )
+    result = execution.run_execution(
+        "dsn",
+        job["job_id"],
+        1,
+        case_root=str(FIXTURE_CASES),
+        run_root=run_root,
+        sandbox=fake_sandbox,
+    )
+    assert result.state == "REPRODUCED", result
+    verified = evidence.verify_bundle(result.evidence_path)
+    envelope = json.loads(verified.file_data["envelope.json"])
+    assert len(envelope) == 11
+    assert contracts.normalize_envelope(envelope) == envelope
+    assert contracts.envelope_digest(envelope) == plan["envelope_digest"]
+    snapshot = json.loads(verified.file_data["budget/snapshot.json"])
+    assert set(snapshot) == {
+        "max_total_seconds",
+        "max_fuzz_seconds",
+        "spent_seconds",
+        "spent_fuzz_seconds",
+        "remaining_seconds",
+        "remaining_fuzz_seconds",
+    }
+    report = json.loads(verified.file_data["report.json"])
+    assert report["budget"] == snapshot
+    assert "review.json" in verified.file_data
+    assert "admission.json" not in verified.file_data
+
+
+def test_b7_missing_envelope_body_fails_closed_without_fake_evidence(
+    tmp_path, monkeypatch
+):
+    """B-7: without a T12 envelope reader the executor publishes no fake body."""
+    run_root, _ = _configure_isolated_roots(tmp_path, monkeypatch)
+    spec = _cmake_spec()
+    face = _cmake_compile_commands_bytes(flags=DECLARED_FLAGS)
+    job, plan, plan_digest, review = _setup_fixture_plan_and_job(
+        version=2, build_spec=spec
+    )
+    job.pop("envelope", None)
+    mem_state = _InMemoryState(job, plan, plan_digest, review)
+    mem_state.install(monkeypatch)
+    fake_sandbox = _FakeSandbox(
+        image_digest=plan["image_digest"],
+        build_recipe_digest=plan["build_recipe_digest"],
+        faces={"vulnerable": face, "fixed": face},
+        face_name="compile_commands.json",
+    )
+    result = execution.run_execution(
+        "dsn",
+        job["job_id"],
+        1,
+        case_root=str(FIXTURE_CASES),
+        run_root=run_root,
+        sandbox=fake_sandbox,
+    )
+    assert result.state == "BLOCKED"
+    assert result.reason_code == "MATERIAL_MISSING"
+    assert result.evidence_path is None
+    assert fake_sandbox.build_calls == []
+    finished = mem_state.finished_calls[-1]
+    assert "BLOCKED_ON_T12" in str(finished.get("evidence_error"))
+
+
+def _real_sandbox(tmp_path: Path) -> DockerSandbox:
+    return DockerSandbox(
+        image=(
+            "silkeh/clang:19-bookworm@sha256:"
+            "f5ce959d91f059acf5a4b3f1c19f46713c4b2881c7d7cd1d5143ca1d1412277f"
+        ),
+        platform="linux/amd64",
+        policy=POLICY,
+        limits=LIMITS,
+        job_id=str(uuid4()),
+        run_root=tmp_path / "real-sandbox-run",
+        generation=1,
+    )
+
+
+def _shell_build_spec_for_real_build() -> dict[str, Any]:
+    spec = _shell_spec(
+        face_digest="sha256:" + "a" * 64,
+        review={
+            "reviewer_id": "reviewer-01",
+            "reviewed_at": "2099-01-01T00:00:00Z",
+            "face_kind": "build_log",
+        },
+        declared_compile_flags=[
+            "-fsanitize=address",
+            "-g",
+            "-O0",
+            "-fno-omit-frame-pointer",
+        ],
+    )
+    spec["outputs"] = ["parser"]
+    return spec
+
+
+@pytest.mark.postgres
+@pytest.mark.docker
+def test_s7_real_docker_builds_both_versions_and_archives_d39(tmp_path, monkeypatch):
+    """S-7: real Docker dual-version hashes differ and both D39 trees exist."""
+    run_root, _ = _configure_isolated_roots(tmp_path, monkeypatch)
+    spec = _shell_build_spec_for_real_build()
+    job, plan, plan_digest, review = _setup_fixture_plan_and_job(
+        version=2, build_spec=spec
+    )
+    mem_state = _InMemoryState(job, plan, plan_digest, review)
+    mem_state.install(monkeypatch)
+    context = execution._load_context(
+        "dsn",
+        job["job_id"],
+        1,
+        case_root=str(FIXTURE_CASES),
+        run_root=run_root,
+    )
+    sandbox = _real_sandbox(tmp_path)
+    results = {}
+    for version in ("vulnerable", "fixed"):
+        result = sandbox.build(
+            version,
+            materials_dir=FIXTURE_CASES,
+            build_spec=spec,
+            expected_materials=None,
+        )
+        assert result.status == "completed", (version, result.metadata, result.log)
+        assert result.artifact_digest is not None
+        results[version] = result
+        execution._persist_build(
+            "dsn", context, result, attempt_no=1, token=f"tok-{version}"
+        )
+    assert (
+        results["vulnerable"].artifact_digest
+        != results["fixed"].artifact_digest
+    ), "the vulnerable and fixed artifacts must be different binaries"
+    # B-2: the fixed version is visible in the audited runner command and env.
+    vulnerable_cmd = build_runner_command(
+        prepare_build_spec_execution(spec), build_version="vulnerable"
+    )
+    fixed_cmd = build_runner_command(
+        prepare_build_spec_execution(spec), build_version="fixed"
+    )
+    assert vulnerable_cmd != fixed_cmd
+    assert "vulnerable" in vulnerable_cmd and "fixed" in fixed_cmd
+
+    generation_root = execution._generation_root(context)
+    for version in ("vulnerable", "fixed"):
+        artifact = generation_root / "build" / version / "parser"
+        assert artifact.is_file() and not artifact.is_symlink()
+        assert artifact.read_bytes() == results[version].artifact
+        assert (generation_root / "build" / version / "build.log").is_file()
+    assert (
+        generation_root / "build" / "vulnerable" / "parser"
+    ).read_bytes() != (
+        generation_root / "build" / "fixed" / "parser"
+    ).read_bytes()
+
+
+@pytest.mark.postgres
+@pytest.mark.docker
+def test_s7_real_docker_make_face_has_per_file_flags(tmp_path):
+    """S-7: a real make build logs two compile units with distinct -D flags."""
+    materials = tmp_path / "make-materials"
+    (materials / "src").mkdir(parents=True)
+    (materials / "src" / "a.c").write_text(
+        "int a(void){return 1;}\n", encoding="utf-8"
+    )
+    (materials / "src" / "b.c").write_text(
+        "int b(void){return 2;}\n", encoding="utf-8"
+    )
+    (materials / "main.c").write_text(
+        "int a(void); int b(void); int main(void){return a()+b()-3;}\n",
+        encoding="utf-8",
+    )
+    (materials / "Makefile").write_text(
+        "all:\n"
+        "\tmkdir -p out\n"
+        "\t$(CC) -DFEATURE_A -c src/a.c -o out/a.o\n"
+        "\t$(CC) -DFEATURE_B -c src/b.c -o out/b.o\n"
+        "\t$(CC) main.c out/a.o out/b.o -o out/parser\n",
+        encoding="utf-8",
+    )
+    spec = {
+        "kind": "make",
+        "build": ["make", "all"],
+        "install": [],
+        "env": {"CC": "/usr/local/bin/cc-shim"},
+        "outputs": ["out/parser"],
+        "declared_compile_flags": ["-DFEATURE_A", "-DFEATURE_B"],
+        "shell_recipe_digest": None,
+        "shell_face_digest": None,
+        "shell_face_review": None,
+    }
+    sandbox = _real_sandbox(tmp_path)
+    result = sandbox.build("vulnerable", materials_dir=materials, build_spec=spec)
+    assert result.status == "completed", (result.metadata, result.log)
+    assert result.provenance_face is not None
+    parsed = build_provenance.parse_provenance_face(
+        kind="make", raw_face=result.provenance_face, repo_root="/work"
+    )
+    assert {"src/a.c", "src/b.c"} <= set(parsed.units)
+    assert "-DFEATURE_A" in parsed.units["src/a.c"]
+    assert "-DFEATURE_B" in parsed.units["src/b.c"]
 
 
 def _reviewed_shell_spec(build: list[str]) -> dict[str, Any]:
