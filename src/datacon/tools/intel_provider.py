@@ -57,6 +57,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Mapping, Protocol, Sequence, runtime_checkable
 
+from urllib.parse import urlsplit
+
 from datacon import jsonutil
 from datacon.orchestration import IntelResult
 from datacon.tools.intel_fetch import MAX_WIRE_BYTES, SYSTEM_USE, strip_url_credentials
@@ -162,10 +164,13 @@ def _public_source_url(source: IntelSource) -> str:
     """Return ``source``'s URL as it may appear in a summary, or refuse.
 
     The ready summary is report and audit material, so the provenance URL
-    is recorded without any ``user:password@`` part. A registration whose
-    URL is missing, not text or unparseable names no provenance at all and
-    is refused before its snapshot is opened: material that cannot be
-    attributed to a source is policy, not content.
+    is recorded without any ``user:password@`` part, and it must name an
+    https origin: a bare word, another scheme, a javascript pseudo-URL, a
+    hostless authority, an unparseable port, embedded whitespace or a
+    control character each name no trustworthy origin. A registration
+    whose URL is missing, not text or unparseable names no provenance at
+    all, and is refused before its snapshot is opened: material that
+    cannot be attributed to a source is policy, not content.
     """
     url = source.source_url
     if not isinstance(url, str) or not url.strip():
@@ -175,16 +180,33 @@ def _public_source_url(source: IntelSource) -> str:
             f"intel source {_source_id(source)!r} registers no source URL",
             _source_id(source),
         )
+    if any(character.isspace() or ord(character) < 0x20 for character in url):
+        raise _Blocked(
+            "POLICY_DENIED",
+            "SOURCE_URL_INVALID",
+            f"intel source {_source_id(source)!r} registers a source URL"
+            " carrying whitespace or a control character",
+            _source_id(source),
+        )
     try:
-        return strip_url_credentials(url)
+        stripped = strip_url_credentials(url)
+        parts = urlsplit(stripped)
+        # Reading ``port`` is what turns an unparseable port into a
+        # ValueError; username/password cannot survive the stripping.
+        _ = parts.port
+        if parts.scheme != "https" or not parts.hostname:
+            raise ValueError("the URL names no https origin")
+        if parts.username is not None or parts.password is not None:
+            raise ValueError("credentials survived the stripping")
     except ValueError as error:
         raise _Blocked(
             "POLICY_DENIED",
             "SOURCE_URL_INVALID",
             f"intel source {_source_id(source)!r} registers a source URL"
-            " that cannot be parsed",
+            f" that cannot be parsed: {error}",
             _source_id(source),
         ) from error
+    return stripped
 
 
 def _license_rejection(source: IntelSource) -> str | None:
@@ -201,9 +223,11 @@ def _license_rejection(source: IntelSource) -> str | None:
     if not isinstance(license_id, str) or not license_id.strip():
         return "no license is registered"
     uses = source.permitted_uses
-    # ``in`` on a text value is a substring test, and a malformed record
-    # grants nothing: only a sequence that names the system use passes.
-    if isinstance(uses, str) or not isinstance(uses, Sequence):
+    # ``in`` on a text value is a substring test, and on bytes/bytearray it
+    # is a TypeError that would read as unreadable material; a malformed
+    # record grants nothing either way. Only list/tuple/set/frozenset name
+    # permissions, exactly like intel_fetch's registry gate.
+    if not isinstance(uses, (list, tuple, set, frozenset)):
         return "its permitted uses are not registered as a list"
     if SYSTEM_USE not in uses:
         return f"its license does not permit {SYSTEM_USE!r}"
