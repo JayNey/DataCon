@@ -4485,14 +4485,13 @@ def _record_family_review(
                 "INSERT INTO reviews "
                 "(review_id, job_id, plan_digest, reviewer_id, decision, "
                 "review_deadline_at, decided_at) "
-                "VALUES (%s, %s, %s, %s, 'approve', %s, %s)",
+                "VALUES (%s, %s, %s, %s, 'approve', %s, clock_timestamp())",
                 (
                     uuid.uuid4(),
                     job_id,
                     first_plan_digest,
                     reviewer_id,
                     envelope["review_deadline_at"],
-                    decision_at,
                 ),
             )
         # The chain tail is the approval no later row supersedes. Appending
@@ -4592,14 +4591,13 @@ def _record_family_review(
             "INSERT INTO reviews "
             "(review_id, job_id, plan_digest, reviewer_id, decision, "
             "review_deadline_at, decided_at) "
-            "VALUES (%s, %s, %s, %s, 'reject', %s, %s)",
+            "VALUES (%s, %s, %s, %s, 'reject', %s, clock_timestamp())",
             (
                 uuid.uuid4(),
                 job_id,
                 first_plan_digest,
                 reviewer_id,
                 envelope["review_deadline_at"],
-                decision_at,
             ),
         )
     decided_envelope = connection.execute(
