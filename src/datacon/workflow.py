@@ -29,6 +29,8 @@ from datacon.orchestration import (
     AdmissionDecision as AdmissionDecision,
     ArchiveRecord as ArchiveRecord,
     AttemptStore as AttemptStore,
+    AuditEventRecord as AuditEventRecord,
+    AuditEventStore as AuditEventStore,
     BudgetChargeRecord as BudgetChargeRecord,
     BuildDiagnoser as BuildDiagnoser,
     BuildDiagnosis as BuildDiagnosis,

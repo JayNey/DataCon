@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from functools import partial
 import hashlib
+import inspect
 import math
 import threading
 from typing import (
@@ -1000,6 +1001,43 @@ class ArchiveRecord:
     reason_code: str | None
     archive_digest: str
     recorded_at: str
+    intel_summary: Mapping[str, Any] | None = None
+
+
+@dataclass(frozen=True)
+class AuditEventRecord:
+    """Idempotent audit event keyed by ``(job_id, stage, step_key, attempt_no, event_type)``."""
+
+    job_id: str
+    family_id: str
+    stage: str
+    step_key: str
+    attempt_no: int
+    event_type: str
+    reason_code: str | None
+    detail: Mapping[str, Any]
+    recorded_at: str
+
+
+@runtime_checkable
+class AuditEventStore(Protocol):
+    """Minimal persistence contract for idempotent orchestration audit events."""
+
+    def record_audit_event(
+        self,
+        *,
+        job_id: str,
+        family_id: str,
+        stage: str,
+        step_key: str,
+        attempt_no: int,
+        event_type: str,
+        reason_code: str | None,
+        detail: Mapping[str, Any] | None = None,
+        recorded_at: str,
+    ) -> bool: ...
+
+    def audit_events_for_job(self, job_id: str) -> tuple[AuditEventRecord, ...]: ...
 
 
 @runtime_checkable
@@ -1044,11 +1082,13 @@ class ChargeArchiveStore(Protocol):
 class NodeReentryLedger:
     """In-memory persistence ledger enforcing node re-entry no-op semantics.
 
-    Satisfies both :class:`AttemptStore` and :class:`ChargeArchiveStore`.
+    Satisfies :class:`AttemptStore`, :class:`ChargeArchiveStore`, and
+    :class:`AuditEventStore`.
     Node outcomes are keyed by ``(job_id, stage, step_key, attempt_no, generation)``
     per ``test-plan-delta.md`` §3. Budget charges are additionally deduplicated on
-    ``(job_id, step_key, attempt_no)`` per ``README.md`` §7 invariant 7, and
-    archive writes are first-write-wins per ``job_id``.
+    ``(job_id, step_key, attempt_no)`` per ``README.md`` §7 invariant 7, audit
+    events are deduplicated on ``(job_id, stage, step_key, attempt_no, event_type)``,
+    and archive writes are first-write-wins per ``job_id``.
     """
 
     def __init__(self) -> None:
@@ -1058,6 +1098,8 @@ class NodeReentryLedger:
         self._charges_by_job: dict[str, list[BudgetChargeRecord]] = {}
         self._charges_by_family: dict[str, list[BudgetChargeRecord]] = {}
         self._archives_by_job: dict[str, list[ArchiveRecord]] = {}
+        self._audit_keys: set[tuple[str, str, str, int, str]] = set()
+        self._audit_events_by_job: dict[str, list[AuditEventRecord]] = {}
 
     def get_completed(self, key: StepKey) -> dict[str, Any] | None:
         step_key = key if isinstance(key, StepKey) else StepKey(*key)
@@ -1150,7 +1192,11 @@ class NodeReentryLedger:
         reason_code: str | None,
         archive_digest: str,
         recorded_at: str,
+        intel_summary: Mapping[str, Any] | None = None,
     ) -> ArchiveRecord:
+        intel_snapshot = (
+            copy.deepcopy(dict(intel_summary)) if intel_summary is not None else None
+        )
         entry = ArchiveRecord(
             job_id=job_id,
             family_id=family_id,
@@ -1160,13 +1206,14 @@ class NodeReentryLedger:
             reason_code=reason_code,
             archive_digest=archive_digest,
             recorded_at=recorded_at,
+            intel_summary=intel_snapshot,
         )
         with self._lock:
             existing = self._archives_by_job.get(job_id)
             if existing:
-                return existing[0]
+                return copy.deepcopy(existing[0])
             self._archives_by_job[job_id] = [entry]
-        return entry
+        return copy.deepcopy(entry)
 
     def archive_count(self, job_id: str) -> int:
         with self._lock:
@@ -1174,7 +1221,50 @@ class NodeReentryLedger:
 
     def archives_for_job(self, job_id: str) -> tuple[ArchiveRecord, ...]:
         with self._lock:
-            return tuple(self._archives_by_job.get(job_id, ()))
+            return tuple(
+                copy.deepcopy(record)
+                for record in self._archives_by_job.get(job_id, ())
+            )
+
+    def record_audit_event(
+        self,
+        *,
+        job_id: str,
+        family_id: str,
+        stage: str,
+        step_key: str,
+        attempt_no: int,
+        event_type: str,
+        reason_code: str | None,
+        detail: Mapping[str, Any] | None = None,
+        recorded_at: str,
+    ) -> bool:
+        audit_key = (job_id, stage, step_key, attempt_no, event_type)
+        detail_snapshot = copy.deepcopy(dict(detail)) if detail is not None else {}
+        with self._lock:
+            if audit_key in self._audit_keys:
+                return False
+            self._audit_keys.add(audit_key)
+            entry = AuditEventRecord(
+                job_id=job_id,
+                family_id=family_id,
+                stage=stage,
+                step_key=step_key,
+                attempt_no=attempt_no,
+                event_type=event_type,
+                reason_code=reason_code,
+                detail=detail_snapshot,
+                recorded_at=recorded_at,
+            )
+            self._audit_events_by_job.setdefault(job_id, []).append(entry)
+            return True
+
+    def audit_events_for_job(self, job_id: str) -> tuple[AuditEventRecord, ...]:
+        with self._lock:
+            return tuple(
+                copy.deepcopy(event)
+                for event in self._audit_events_by_job.get(job_id, ())
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -1205,7 +1295,7 @@ class OrchestrationState(TypedDict, total=False):
     build_artifacts: dict[str, dict[str, Any]]
     build_retry_count: int
     max_build_retries: int
-    intel_summary: dict[str, Any]
+    intel_summary: dict[str, Any] | None
     version_pair: dict[str, str]
     route_facts: dict[str, Any]
     experiment_spec: dict[str, Any]
@@ -1239,6 +1329,37 @@ class NodeContext:
     verdict_policy: verdict_mod.VerdictPolicy
     ledger: ChargeArchiveStore
     attempt_store: AttemptStore
+    audit_store: AuditEventStore | None = None
+
+
+def _resolve_audit_store(
+    audit_store: AuditEventStore | None,
+    ledger: ChargeArchiveStore,
+    attempt_store: AttemptStore,
+) -> AuditEventStore:
+    if audit_store is not None:
+        return audit_store
+    if isinstance(ledger, AuditEventStore):
+        return ledger
+    if isinstance(attempt_store, AuditEventStore):
+        return attempt_store
+    return NodeReentryLedger()
+
+
+def _accepts_keyword_arg(fn: Callable[..., Any], arg_name: str) -> bool:
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return False
+    for param in sig.parameters.values():
+        if param.kind is inspect.Parameter.VAR_KEYWORD:
+            return True
+        if param.name == arg_name and param.kind in (
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.KEYWORD_ONLY,
+        ):
+            return True
+    return False
 
 
 NodeFn = Callable[[OrchestrationState], dict[str, Any]]
@@ -1442,21 +1563,35 @@ def _node_intel(ctx: NodeContext, state: OrchestrationState) -> dict[str, Any]:
 
     def _action() -> dict[str, Any]:
         request = state.get("request") or {}
+        job_id = state["job_id"]
+        family_id = state["family_id"]
+        audit_store = _resolve_audit_store(
+            ctx.audit_store, ctx.ledger, ctx.attempt_store
+        )
         try:
             result = ctx.intel_provider.resolve_intel(
-                job_id=state["job_id"],
-                family_id=state["family_id"],
+                job_id=job_id,
+                family_id=family_id,
                 request=request,
             )
         except Exception as error:  # noqa: BLE001 - normalize intel block reasons
             reason = getattr(error, "reason_code", None)
-            if not isinstance(reason, str) or not reason:
+            if not isinstance(reason, str) or not reason.strip():
                 raise
+            normalized_reason = reason.strip()
+            error_summary: dict[str, Any] = {}
+            sub_reason = getattr(error, "sub_reason", None)
+            if isinstance(sub_reason, str) and sub_reason.strip():
+                error_summary["sub_reason"] = sub_reason.strip()
+            source_id = getattr(error, "source_id", None)
+            if isinstance(source_id, str) and source_id.strip():
+                error_summary["source_id"] = source_id.strip()
             result = IntelResult(
                 status="blocked",
                 snapshot_digest=None,
-                reason_code=reason,
-                message=str(error),
+                reason_code=normalized_reason,
+                message=f"intel blocked with {normalized_reason}",
+                summary=error_summary,
             )
 
         snapshot_digest = (
@@ -1465,8 +1600,18 @@ def _node_intel(ctx: NodeContext, state: OrchestrationState) -> dict[str, Any]:
             else ""
         )
         if result.status != "ready" or not snapshot_digest:
+            blocked_summary: dict[str, Any] = (
+                copy.deepcopy(dict(result.summary))
+                if isinstance(result.summary, Mapping)
+                else {}
+            )
             if result.status != "ready":
-                reason_code = result.reason_code or "MATERIAL_MISSING"
+                raw_reason = result.reason_code
+                reason_code = (
+                    raw_reason.strip()
+                    if isinstance(raw_reason, str) and raw_reason.strip()
+                    else "MATERIAL_MISSING"
+                )
                 error_message = result.message
             else:
                 # Edge #6 fail-closed: ready status without a valid snapshot_digest
@@ -1475,17 +1620,46 @@ def _node_intel(ctx: NodeContext, state: OrchestrationState) -> dict[str, Any]:
                 error_message = (
                     result.message or "intel snapshot_digest is missing or blank"
                 )
+                existing_sub = blocked_summary.get("sub_reason")
+                if not isinstance(existing_sub, str) or not existing_sub.strip():
+                    blocked_summary["sub_reason"] = "SNAPSHOT_DIGEST_MISSING"
+            audit_store.record_audit_event(
+                job_id=job_id,
+                family_id=family_id,
+                stage="intel",
+                step_key=key.step_key,
+                attempt_no=key.attempt_no,
+                event_type="intel_blocked",
+                reason_code=reason_code,
+                detail=blocked_summary,
+                recorded_at=ctx.clock.timestamp(),
+            )
             return {
                 "state": "BLOCKED",
                 "reason_code": reason_code,
                 "error_message": error_message,
-                "intel_summary": dict(result.summary),
+                "intel_summary": blocked_summary,
                 "next_route": "archive",
                 "visited_nodes": _append_visited(state, "intel"),
             }
 
-        summary = dict(result.summary)
+        summary: dict[str, Any] = (
+            copy.deepcopy(dict(result.summary))
+            if isinstance(result.summary, Mapping)
+            else {}
+        )
         summary["snapshot_digest"] = snapshot_digest
+        audit_store.record_audit_event(
+            job_id=job_id,
+            family_id=family_id,
+            stage="intel",
+            step_key=key.step_key,
+            attempt_no=key.attempt_no,
+            event_type="intel_resolved",
+            reason_code=None,
+            detail=summary,
+            recorded_at=ctx.clock.timestamp(),
+        )
         return {
             "intel_summary": summary,
             "next_route": "version",
@@ -1986,6 +2160,15 @@ def _node_archive(ctx: NodeContext, state: OrchestrationState) -> dict[str, Any]
             final_verdict = None
             final_reason = None
 
+        raw_intel = state.get("intel_summary")
+        intel_summary: dict[str, Any] | None = (
+            copy.deepcopy(dict(raw_intel))
+            if job_kind != "family"
+            and isinstance(raw_intel, Mapping)
+            and len(raw_intel) > 0
+            else None
+        )
+
         archive_payload = {
             "job_id": state["job_id"],
             "family_id": state["family_id"],
@@ -1996,22 +2179,38 @@ def _node_archive(ctx: NodeContext, state: OrchestrationState) -> dict[str, Any]
             "reason_code": final_reason,
             "campaign_bundle_digest": state.get("campaign_bundle_digest"),
             "family_summary": state.get("family_summary"),
+            "intel": intel_summary,
         }
         archive_digest = jsonutil.digest_json(archive_payload)
-        recorded = ctx.ledger.record_archive(
-            job_id=state["job_id"],
-            family_id=state["family_id"],
-            job_kind=job_kind,
-            state=final_state,
-            verdict=final_verdict,
-            reason_code=final_reason,
-            archive_digest=archive_digest,
-            recorded_at=ctx.clock.timestamp(),
-        )
+        archive_kwargs: dict[str, Any] = {
+            "job_id": state["job_id"],
+            "family_id": state["family_id"],
+            "job_kind": job_kind,
+            "state": final_state,
+            "verdict": final_verdict,
+            "reason_code": final_reason,
+            "archive_digest": archive_digest,
+            "recorded_at": ctx.clock.timestamp(),
+        }
+        if _accepts_keyword_arg(ctx.ledger.record_archive, "intel_summary"):
+            archive_kwargs["intel_summary"] = intel_summary
+        record_archive_fn: Callable[..., ArchiveRecord] = ctx.ledger.record_archive
+        recorded = record_archive_fn(**archive_kwargs)
+        if isinstance(recorded.intel_summary, Mapping):
+            recorded_intel: dict[str, Any] | None = (
+                copy.deepcopy(dict(recorded.intel_summary))
+                if len(recorded.intel_summary) > 0
+                else None
+            )
+        elif recorded.archive_digest == archive_digest and intel_summary is not None:
+            recorded_intel = copy.deepcopy(intel_summary)
+        else:
+            recorded_intel = None
         return {
             "state": recorded.state,
             "verdict": recorded.verdict,
             "reason_code": recorded.reason_code,
+            "intel_summary": recorded_intel,
             "terminal_node": "archive",
             "archive_digest": recorded.archive_digest,
             "next_route": "done",
@@ -2127,6 +2326,7 @@ def build_v2_graph(
     verdict_policy: verdict_mod.VerdictPolicy | None = None,
     ledger: ChargeArchiveStore | None = None,
     attempt_store: AttemptStore | None = None,
+    audit_store: AuditEventStore | None = None,
     node_map: Mapping[str, NodeFn] | None = None,
 ) -> Any:
     """Compile the v0.2 14-node LangGraph ``StateGraph`` (24 in-job edges).
@@ -2152,6 +2352,9 @@ def build_v2_graph(
             else NodeReentryLedger()
         )
     )
+    active_audit_store = _resolve_audit_store(
+        audit_store, active_ledger, active_attempt_store
+    )
     ctx = NodeContext(
         sandbox=sandbox,
         clock=active_clock,
@@ -2164,6 +2367,7 @@ def build_v2_graph(
         verdict_policy=verdict_policy or DEFAULT_VERDICT_POLICY,
         ledger=active_ledger,
         attempt_store=active_attempt_store,
+        audit_store=active_audit_store,
     )
     return _compile_v2_graph(_bind_v2_node_map(ctx), checkpointer=checkpointer)
 
@@ -2206,6 +2410,8 @@ class ChildRunOutcome:
     archive_digest: str | None = None
     started_at: datetime | None = None
     finished_at: datetime | None = None
+    intel_summary: Mapping[str, Any] | None = None
+    audit_events: tuple[AuditEventRecord, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -2246,6 +2452,7 @@ class OrchestrationRunner:
         verdict_policy: verdict_mod.VerdictPolicy | None = None,
         ledger: ChargeArchiveStore | None = None,
         attempt_store: AttemptStore | None = None,
+        audit_store: AuditEventStore | None = None,
         max_build_retries: int = 1,
     ) -> None:
         self.clock: ClockProtocol = clock or DeterministicClock()
@@ -2281,6 +2488,9 @@ class OrchestrationRunner:
                 else NodeReentryLedger()
             )
         )
+        self.audit_store: AuditEventStore = _resolve_audit_store(
+            audit_store, self.ledger, self.attempt_store
+        )
         self._slot_table_lock = threading.Lock()
         self._family_locks: dict[str, threading.Lock] = {}
         self._active_children_by_family: dict[str, int] = {}
@@ -2297,6 +2507,7 @@ class OrchestrationRunner:
             verdict_policy=self.verdict_policy,
             ledger=self.ledger,
             attempt_store=self.attempt_store,
+            audit_store=self.audit_store,
         )
         self._node_map = _bind_v2_node_map(self._context)
         self.graph = build_v2_graph(node_map=self._node_map)
@@ -2306,6 +2517,9 @@ class OrchestrationRunner:
 
     def archive_count(self, job_id: str) -> int:
         return self.ledger.archive_count(job_id)
+
+    def audit_events(self, job_id: str) -> tuple[AuditEventRecord, ...]:
+        return self.audit_store.audit_events_for_job(job_id)
 
     def _family_slot_lock(self, family_id: str) -> threading.Lock:
         with self._slot_table_lock:
@@ -2433,6 +2647,12 @@ class OrchestrationRunner:
                 with self._slot_table_lock:
                     self._active_children_by_family[family_id] -= 1
 
+        raw_intel_summary = final_state.get("intel_summary")
+        outcome_intel_summary = (
+            copy.deepcopy(dict(raw_intel_summary))
+            if isinstance(raw_intel_summary, Mapping) and len(raw_intel_summary) > 0
+            else None
+        )
         return ChildRunOutcome(
             job_id=job_id,
             family_id=family_id,
@@ -2452,6 +2672,8 @@ class OrchestrationRunner:
             archive_digest=final_state.get("archive_digest"),
             started_at=started_at,
             finished_at=finished_at,
+            intel_summary=outcome_intel_summary,
+            audit_events=self.audit_events(job_id),
         )
 
     def run_family_guided(
@@ -2752,6 +2974,8 @@ __all__ = [
     "AdmissionDecision",
     "ArchiveRecord",
     "AttemptStore",
+    "AuditEventRecord",
+    "AuditEventStore",
     "BudgetChargeRecord",
     "BuildDiagnoser",
     "BuildDiagnosis",
