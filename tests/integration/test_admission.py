@@ -1376,3 +1376,224 @@ def test_record_admission_binds_budget_snapshot_family_id_and_caps(
     assert [event[0] for event in _events(isolated_database, child_id)] == [
         "round_admitted"
     ]
+
+
+def _envelope_with_caps(*, max_total_seconds: int, max_fuzz_seconds: int) -> dict:
+    return contracts.guided_envelope(
+        allowed_mutation_families=["byte_flip", "length_boundary"],
+        mutation_limits={
+            "allowed_ops": ["append", "truncate", "byte_flip"],
+            "max_input_bytes": 4096,
+        },
+        seed_corpus_digest=SEED_CORPUS_DIGEST,
+        toolchain_image_digest=TOOLCHAIN_IMAGE_DIGEST,
+        harness_digest=HARNESS_DIGEST,
+        max_rounds=8,
+        max_total_seconds=max_total_seconds,
+        max_fuzz_seconds=max_fuzz_seconds,
+        accepted_signature_set=[dict(SIGNATURE)],
+        admission_predicate_version="admission-v1",
+    )
+
+
+def test_record_admission_reconciles_spent_when_snapshot_omits_max(
+    isolated_database,
+):
+    # S-2: without max_* the snapshot is reconciled against the persisted
+    # ledger caps (== approved envelope caps 900/300).
+    seed = _seed_family(isolated_database)
+    family_id, child_id, _ = seed
+    bad_snapshots = [
+        {
+            "remaining_total_seconds": 500,
+            "spent_seconds": 999999,
+            "remaining_fuzz_seconds": 100,
+            "spent_fuzz_seconds": 999999,
+        },
+        {"remaining_total_seconds": 900, "spent_seconds": 1},
+        {
+            "remaining_total_seconds": 900,
+            "remaining_fuzz_seconds": 300,
+            "spent_fuzz_seconds": 1,
+        },
+        {"remaining_total_seconds": 900, "spent_fuzz_seconds": 301},
+    ]
+    for bad in bad_snapshots:
+        with pytest.raises(state.StateError):
+            _admit(isolated_database, seed, budget_snapshot=bad)
+    assert _admissions(isolated_database, family_id, 2) == []
+    assert _events(isolated_database, child_id) == []
+
+    admitted = _admit(
+        isolated_database,
+        seed,
+        budget_snapshot={
+            "remaining_total_seconds": 900,
+            "spent_seconds": 0,
+            "remaining_fuzz_seconds": 300,
+            "spent_fuzz_seconds": 0,
+        },
+    )
+    assert admitted.admitted
+    assert len(_admissions(isolated_database, family_id, 2)) == 1
+
+
+@pytest.mark.parametrize(
+    ("max_total_seconds", "max_fuzz_seconds"),
+    [(600, 300), (1200, 300), (900, 200)],
+)
+@pytest.mark.parametrize("snapshot_shape", ["ledger", "minimal"])
+def test_record_admission_denies_unapproved_cap_change_with_real_snapshot(
+    isolated_database, max_total_seconds, max_fuzz_seconds, snapshot_shape
+):
+    # S-3: the snapshot is the genuine family ledger; only the envelope is
+    # unapproved. The decision must be a persisted ADMISSION_DENIED.
+    seed = _seed_family(isolated_database)
+    family_id, child_id, approved_envelope = seed
+    unapproved = _envelope_with_caps(
+        max_total_seconds=max_total_seconds, max_fuzz_seconds=max_fuzz_seconds
+    )
+    assert contracts.envelope_digest(unapproved) != contracts.envelope_digest(
+        approved_envelope
+    )
+    if snapshot_shape == "ledger":
+        snapshot = state.load_budget_ledger(isolated_database.dsn, family_id)
+        assert snapshot is not None
+        assert snapshot["max_total_seconds"] == 900
+        assert snapshot["max_fuzz_seconds"] == 300
+    else:
+        snapshot = {"remaining_total_seconds": 900, "remaining_fuzz_seconds": 300}
+
+    outcome = _admit(
+        isolated_database, seed, envelope=unapproved, budget_snapshot=snapshot
+    )
+
+    assert outcome.status == "denied"
+    assert not outcome.admitted
+    assert outcome.reason_code == "ADMISSION_DENIED"
+    assert outcome.sub_reason == "PARENT_APPROVAL_ENVELOPE_MISMATCH"
+    assert _admissions(isolated_database, family_id, 2) == []
+    events = _events(isolated_database, child_id)
+    assert [event[0] for event in events] == ["round_admission_denied"]
+    assert events[0][1] == "ADMISSION_DENIED"
+    assert events[0][2]["sub_reason"] == "PARENT_APPROVAL_ENVELOPE_MISMATCH"
+
+
+def _make_round_ready(database, family_id, child_id, *, mode, workflow_synced):
+    database.connection.execute(
+        "UPDATE jobs SET request = %s WHERE job_id = %s",
+        (
+            Jsonb({"schema_version": 2, "exploration": {"mode": mode}}),
+            family_id,
+        ),
+    )
+    database.connection.execute(
+        "UPDATE jobs SET state = 'READY', stage = 'ready', request = %s, "
+        "workflow_synced = %s, lease_owner = NULL, lease_expires_at = NULL "
+        "WHERE job_id = %s",
+        (
+            Jsonb({"schema_version": 2, "limits": {"execute_seconds": 600}}),
+            workflow_synced,
+            child_id,
+        ),
+    )
+
+
+def _job_state(database, job_id):
+    return database.connection.execute(
+        "SELECT state FROM jobs WHERE job_id = %s", (job_id,)
+    ).fetchone()[0]
+
+
+def _assert_round_not_startable(database, family_id, child_id, *, mode):
+    # claim_next must not promote the READY+synced round to RUNNING.
+    _make_round_ready(database, family_id, child_id, mode=mode, workflow_synced=True)
+    assert (
+        state.claim_next(database.dsn, "v2-worker", job_contract_version=2)
+        is None
+    ), "claim_next started a round without a policy admission"
+    assert _job_state(database, child_id) == "READY"
+
+    # begin_execution under a live sync claim must refuse as well.
+    _make_round_ready(database, family_id, child_id, mode=mode, workflow_synced=False)
+    claimed = state.claim_next(database.dsn, "v2-worker", job_contract_version=2)
+    assert claimed is not None and claimed["job_id"] == child_id
+    assert claimed["state"] == "READY"
+    with pytest.raises(state.StateError, match="policy-admitted"):
+        state.begin_execution(
+            database.dsn, child_id, generation=claimed["generation"]
+        )
+    assert _job_state(database, child_id) == "READY"
+
+
+@pytest.mark.parametrize(
+    ("mode", "round_no"), [("guided", 1), ("guided", 2), ("fixed", 2)]
+)
+@pytest.mark.parametrize("entry", ["claim_next", "begin_execution"])
+def test_non_first_round_requires_policy_admission_before_running(
+    isolated_database, tmp_path, monkeypatch, mode, round_no, entry
+):
+    # S-1: a policy-admitted round may only start once its admissions row is
+    # persisted; a missing or denied admission keeps it READY.
+    monkeypatch.setenv("DATACON_EVIDENCE_ROOT", str(tmp_path / "evidence"))
+    seed = _seed_family(isolated_database, round_no=round_no)
+    family_id, child_id, _approved = seed
+
+    _assert_round_not_startable(isolated_database, family_id, child_id, mode=mode)
+
+    denied = _admit(
+        isolated_database,
+        seed,
+        round_no=round_no,
+        envelope=_envelope(max_rounds=7),
+    )
+    assert denied.status == "denied"
+    assert _admissions(isolated_database, family_id, round_no) == []
+    _assert_round_not_startable(isolated_database, family_id, child_id, mode=mode)
+
+    admitted = _admit(isolated_database, seed, round_no=round_no)
+    assert admitted.admitted
+    assert len(_admissions(isolated_database, family_id, round_no)) == 1
+
+    if entry == "claim_next":
+        _make_round_ready(
+            isolated_database, family_id, child_id, mode=mode, workflow_synced=True
+        )
+        claimed = state.claim_next(
+            isolated_database.dsn, "v2-worker", job_contract_version=2
+        )
+        assert claimed is not None and claimed["job_id"] == child_id
+        assert claimed["state"] == "RUNNING"
+    else:
+        _make_round_ready(
+            isolated_database, family_id, child_id, mode=mode, workflow_synced=False
+        )
+        claimed = state.claim_next(
+            isolated_database.dsn, "v2-worker", job_contract_version=2
+        )
+        assert claimed is not None and claimed["state"] == "READY"
+        assert state.begin_execution(
+            isolated_database.dsn, child_id, generation=claimed["generation"]
+        )
+    assert _job_state(isolated_database, child_id) == "RUNNING"
+
+
+def test_fixed_first_round_runs_without_admission_row(
+    isolated_database, tmp_path, monkeypatch
+):
+    # Compatibility: a fixed round 1 is human-approved and needs no
+    # admissions row.
+    monkeypatch.setenv("DATACON_EVIDENCE_ROOT", str(tmp_path / "evidence"))
+    family_id, child_id, _ = _seed_family(isolated_database, round_no=1)
+    _make_round_ready(
+        isolated_database, family_id, child_id, mode="fixed", workflow_synced=False
+    )
+    claimed = state.claim_next(
+        isolated_database.dsn, "v2-worker", job_contract_version=2
+    )
+    assert claimed is not None and claimed["state"] == "READY"
+    assert state.begin_execution(
+        isolated_database.dsn, child_id, generation=claimed["generation"]
+    )
+    assert _job_state(isolated_database, child_id) == "RUNNING"
+    assert _admissions(isolated_database, family_id, 1) == []

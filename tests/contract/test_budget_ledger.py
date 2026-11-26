@@ -1306,3 +1306,242 @@ def test_postgres_charge_step_budget_guards_charge_kind_recovery_and_input_valid
         "remaining_seconds": 80,
         "remaining_fuzz_seconds": 56,
     }
+
+
+def test_fuzz_charge_rejects_fuzz_elapsed_exceeding_elapsed():
+    # S-4: a fuzz sub-span longer than its step must fail closed instead of
+    # silently inflating the total charge to the fuzz elapsed time.
+    ledger = _ledger()
+    charges: list[dict] = []
+    for elapsed, fuzz_elapsed in ((5, 20), (1.0, 1.1), (0, 0.5)):
+        with pytest.raises(
+            state.StateError, match="must not exceed elapsed_seconds"
+        ):
+            state.compute_budget_charge(
+                ledger,
+                charge_kind="fuzz",
+                elapsed_seconds=elapsed,
+                elapsed_fuzz_seconds=fuzz_elapsed,
+            )
+        with pytest.raises(
+            state.StateError, match="must not exceed elapsed_seconds"
+        ):
+            _charge(
+                ledger,
+                charges,
+                step_key="fuzz-overlong",
+                charge_kind="fuzz",
+                elapsed_seconds=elapsed,
+                elapsed_fuzz_seconds=fuzz_elapsed,
+            )
+    assert ledger["remaining_total_seconds"] == 100
+    assert ledger["remaining_fuzz_seconds"] == 60
+    assert charges == []
+
+    # Boundary cases keep the normative formula.
+    assert state.compute_budget_charge(
+        ledger, charge_kind="fuzz", elapsed_seconds=5, elapsed_fuzz_seconds=5
+    ) == (5, 5)
+    assert state.compute_budget_charge(
+        ledger, charge_kind="fuzz", elapsed_seconds=0, elapsed_fuzz_seconds=0
+    ) == (1, 1)
+    assert state.compute_budget_charge(
+        ledger, charge_kind="fuzz", elapsed_seconds=1.1, elapsed_fuzz_seconds=1.0
+    ) == (2, 1)
+    assert state.compute_budget_charge(
+        _ledger(remaining_total_seconds=3, remaining_fuzz_seconds=60),
+        charge_kind="fuzz",
+        elapsed_seconds=10,
+        elapsed_fuzz_seconds=8,
+    ) == (3, 3)
+
+
+def _insert_family_and_children(connection):
+    family_id = uuid.uuid4()
+    campaign_id = uuid.uuid4()
+    round_id = uuid.uuid4()
+    v1_id = uuid.uuid4()
+    connection.execute(
+        "INSERT INTO jobs (job_id, request, state, stage, submitted_at, "
+        "job_contract_version, family_id, job_kind, parent_job_id, round_no, "
+        "generation, workflow_synced) "
+        "VALUES (%s, %s, 'AGGREGATING', 'family', clock_timestamp(), 2, %s, "
+        "'family', NULL, NULL, 1, true)",
+        (family_id, Jsonb({"schema_version": 2}), family_id),
+    )
+    connection.execute(
+        "INSERT INTO jobs (job_id, request, state, stage, submitted_at, "
+        "job_contract_version, family_id, job_kind, parent_job_id, round_no, "
+        "generation) "
+        "VALUES (%s, %s, 'RUNNING', 'build', clock_timestamp(), 2, %s, "
+        "'campaign', %s, NULL, 1)",
+        (campaign_id, Jsonb({"schema_version": 2}), family_id, family_id),
+    )
+    connection.execute(
+        "INSERT INTO jobs (job_id, request, state, stage, submitted_at, "
+        "job_contract_version, family_id, job_kind, parent_job_id, round_no, "
+        "generation) "
+        "VALUES (%s, %s, 'RUNNING', 'build', clock_timestamp(), 2, %s, "
+        "'round', %s, 2, 1)",
+        (round_id, Jsonb({"schema_version": 2}), family_id, family_id),
+    )
+    connection.execute(
+        "INSERT INTO jobs (job_id, request, state, stage, submitted_at) "
+        "VALUES (%s, %s, 'QUEUED', 'prepare', clock_timestamp())",
+        (v1_id, Jsonb({"schema_version": 1})),
+    )
+    return family_id, campaign_id, round_id, v1_id
+
+
+@pytest.mark.postgres
+def test_postgres_charge_step_budget_rejects_fuzz_elapsed_exceeding_elapsed(
+    budget_database,
+):
+    family_id, _campaign_id, round_id, _v1_id = _insert_family_and_children(
+        budget_database.connection
+    )
+    state.initialize_budget_ledger(
+        budget_database.dsn,
+        family_id,
+        max_total_seconds=100,
+        max_fuzz_seconds=60,
+    )
+    for attempt_no, (elapsed, fuzz_elapsed) in enumerate(
+        ((5, 20), (1.0, 1.1)), start=1
+    ):
+        with pytest.raises(
+            state.StateError, match="must not exceed elapsed_seconds"
+        ):
+            state.charge_step_budget(
+                budget_database.dsn,
+                family_id=family_id,
+                job_id=round_id,
+                step_key="fuzz-overlong",
+                attempt_no=attempt_no,
+                charge_kind="fuzz",
+                elapsed_seconds=elapsed,
+                elapsed_fuzz_seconds=fuzz_elapsed,
+            )
+    assert budget_database.connection.execute(
+        "SELECT count(*) FROM budget_charges WHERE family_id = %s",
+        (family_id,),
+    ).fetchone()[0] == 0
+    assert state.family_budget_summary(budget_database.dsn, family_id) == {
+        "max_total_seconds": 100,
+        "max_fuzz_seconds": 60,
+        "spent_seconds": 0,
+        "spent_fuzz_seconds": 0,
+        "remaining_seconds": 100,
+        "remaining_fuzz_seconds": 60,
+    }
+
+
+@pytest.mark.postgres
+def test_postgres_initialize_budget_ledger_requires_a_v2_family(
+    budget_database,
+):
+    # S-5: only a v2 family job may own a budget ledger.
+    family_id, campaign_id, round_id, v1_id = _insert_family_and_children(
+        budget_database.connection
+    )
+    with pytest.raises(state.StateError, match="does not exist"):
+        state.initialize_budget_ledger(
+            budget_database.dsn,
+            uuid.uuid4(),
+            max_total_seconds=100,
+            max_fuzz_seconds=60,
+        )
+    for target in (v1_id, campaign_id, round_id):
+        with pytest.raises(state.StateError, match="v2 family job"):
+            state.initialize_budget_ledger(
+                budget_database.dsn,
+                target,
+                max_total_seconds=100,
+                max_fuzz_seconds=60,
+            )
+    assert budget_database.connection.execute(
+        "SELECT count(*) FROM budget_ledger"
+    ).fetchone()[0] == 0
+
+    ledger = state.initialize_budget_ledger(
+        budget_database.dsn,
+        family_id,
+        max_total_seconds=100,
+        max_fuzz_seconds=60,
+    )
+    assert ledger["family_id"] == str(family_id)
+    assert budget_database.connection.execute(
+        "SELECT count(*) FROM budget_ledger"
+    ).fetchone()[0] == 1
+
+
+def test_budget_summary_validates_charge_family_id_and_charge_kind():
+    # N-1: cross-family charges and inconsistent charge_kind/fuzz_seconds fail closed.
+    ledger = _ledger(remaining_total_seconds=90, remaining_fuzz_seconds=55)
+    other_family = str(uuid.uuid4())
+    with pytest.raises(state.StateError, match="family_id"):
+        state.budget_summary(
+            ledger,
+            [
+                {
+                    "family_id": other_family,
+                    "charge_kind": "fuzz",
+                    "seconds": 10,
+                    "fuzz_seconds": 5,
+                }
+            ],
+        )
+    with pytest.raises(state.StateError, match="general charge"):
+        state.budget_summary(
+            ledger,
+            [
+                {
+                    "family_id": FAMILY_ID,
+                    "charge_kind": "general",
+                    "seconds": 10,
+                    "fuzz_seconds": 5,
+                }
+            ],
+        )
+    with pytest.raises(state.StateError, match="fuzz charge"):
+        state.budget_summary(
+            _ledger(remaining_total_seconds=90, remaining_fuzz_seconds=60),
+            [
+                {
+                    "family_id": FAMILY_ID,
+                    "charge_kind": "fuzz",
+                    "seconds": 10,
+                    "fuzz_seconds": 0,
+                }
+            ],
+        )
+    with pytest.raises(state.StateError, match="charge_kind"):
+        state.budget_summary(
+            ledger,
+            [
+                {
+                    "family_id": FAMILY_ID,
+                    "charge_kind": "unknown",
+                    "seconds": 10,
+                    "fuzz_seconds": 5,
+                }
+            ],
+        )
+    assert state.budget_summary(
+        ledger,
+        [
+            {
+                "family_id": FAMILY_ID,
+                "charge_kind": "fuzz",
+                "seconds": 10,
+                "fuzz_seconds": 5,
+            }
+        ],
+    ) == {
+        "max_total_seconds": 100,
+        "max_fuzz_seconds": 60,
+        "spent_seconds": 10,
+        "spent_fuzz_seconds": 5,
+        "remaining_seconds": 90,
+        "remaining_fuzz_seconds": 55,
+    }

@@ -301,6 +301,29 @@ def claim_next(
                                         AND pending_env.status = 'pending'
                                   )
                               )
+                              AND NOT (
+                                  state = 'READY'
+                                  AND workflow_synced = true
+                                  AND job_kind = 'round'
+                                  AND (
+                                      round_no > 1
+                                      OR EXISTS (
+                                          SELECT 1 FROM jobs mode_parent
+                                          WHERE mode_parent.job_id = jobs.parent_job_id
+                                            AND COALESCE(
+                                                mode_parent.request->'exploration'->>'mode',
+                                                'fixed'
+                                            ) = 'guided'
+                                      )
+                                  )
+                                  AND NOT EXISTS (
+                                      SELECT 1 FROM admissions a
+                                      WHERE a.parent_job_id = jobs.parent_job_id
+                                        AND a.round_no = jobs.round_no
+                                        AND a.job_id = jobs.job_id
+                                        AND a.approval_kind = 'policy'
+                                  )
+                              )
                           )
                       ))
               )"""
@@ -1057,7 +1080,7 @@ def begin_execution(dsn: str, job_id: UUID, *, generation: int) -> bool:
     """Move a READY job to RUNNING under the current claim's generation."""
     with _connect(dsn) as connection:
         identity = connection.execute(
-            "SELECT job_contract_version, job_kind, family_id "
+            "SELECT job_contract_version, job_kind, family_id, round_no "
             "FROM jobs WHERE job_id = %s",
             (job_id,),
         ).fetchone()
@@ -1078,7 +1101,9 @@ def begin_execution(dsn: str, job_id: UUID, *, generation: int) -> bool:
             # envelopes and family rejection while allowing concurrent v2
             # children and budget charges to proceed without deadlocks.
             family = connection.execute(
-                "SELECT job_id, job_kind, job_contract_version, state "
+                "SELECT job_id, job_kind, job_contract_version, state, "
+                "COALESCE(request->'exploration'->>'mode', 'fixed') "
+                "AS exploration_mode "
                 "FROM jobs WHERE job_id = %s FOR KEY SHARE",
                 (family_id,),
             ).fetchone()
@@ -1110,6 +1135,29 @@ def begin_execution(dsn: str, job_id: UUID, *, generation: int) -> bool:
                 )
         if job["state"] != "READY":
             raise StateError(f"cannot start execution while the job is {job['state']}")
+        if (
+            is_v2_child
+            and job["job_kind"] == "round"
+            and (
+                family["exploration_mode"] == "guided"
+                or (job["round_no"] or 0) > 1
+            )
+        ):
+            # A non-first round (guided rounds, or fixed rounds after the
+            # first) is policy-admitted, never human-approved: it may only
+            # run once its admissions row is persisted. Lock order stays
+            # jobs(family) -> jobs(child) -> admissions; this is a plain read.
+            admitted = connection.execute(
+                "SELECT 1 FROM admissions "
+                "WHERE parent_job_id = %s AND round_no = %s "
+                "AND job_id = %s AND approval_kind = 'policy'",
+                (family_id, job["round_no"], job_id),
+            ).fetchone()
+            if admitted is None:
+                raise StateError(
+                    "cannot start execution of a round that has not been "
+                    "policy-admitted (no admissions row)"
+                )
         updated = connection.execute(
             "UPDATE jobs SET state = 'RUNNING', stage = 'execute', "
             "execute_deadline_at = COALESCE("
@@ -2212,34 +2260,47 @@ def _validate_budget_snapshot(
             "budget_snapshot.spent_fuzz_seconds must not exceed spent_seconds"
         )
 
-    if max_total is not None:
-        if available_total > max_total:
+    # Reconcile spent/remaining against the snapshot's own caps, or against
+    # the authoritative caps supplied by the caller when the snapshot omits
+    # max_* fields; omitting a cap must not bypass the spent + remaining check.
+    effective_max_total = (
+        max_total if max_total is not None else expected_max_total_seconds
+    )
+    effective_max_fuzz = (
+        max_fuzz if max_fuzz is not None else expected_max_fuzz_seconds
+    )
+
+    if effective_max_total is not None:
+        if available_total > effective_max_total:
             raise StateError(
                 "budget_snapshot remaining total must not exceed "
                 "max_total_seconds"
             )
-        if spent_total is not None and spent_total + available_total != max_total:
+        if (
+            spent_total is not None
+            and spent_total + available_total != effective_max_total
+        ):
             raise StateError(
                 "budget_snapshot spent_seconds + remaining total must equal "
                 "max_total_seconds"
             )
 
-    if max_fuzz is not None:
+    if effective_max_fuzz is not None:
         if remaining_fuzz is not None:
-            if remaining_fuzz > max_fuzz:
+            if remaining_fuzz > effective_max_fuzz:
                 raise StateError(
                     "budget_snapshot.remaining_fuzz_seconds must not exceed "
                     "max_fuzz_seconds"
                 )
             if (
                 spent_fuzz is not None
-                and spent_fuzz + remaining_fuzz != max_fuzz
+                and spent_fuzz + remaining_fuzz != effective_max_fuzz
             ):
                 raise StateError(
                     "budget_snapshot spent_fuzz_seconds + "
                     "remaining_fuzz_seconds must equal max_fuzz_seconds"
                 )
-        elif spent_fuzz is not None and spent_fuzz > max_fuzz:
+        elif spent_fuzz is not None and spent_fuzz > effective_max_fuzz:
             raise StateError(
                 "budget_snapshot.spent_fuzz_seconds must not exceed "
                 "max_fuzz_seconds"
@@ -2437,25 +2498,42 @@ def policy_admit_round(
         ) from error
     if not budget_snapshot:
         raise StateError("budget_snapshot must not be empty")
+    # Structural/self-consistency/family binding first. The caller's envelope
+    # caps are not yet trusted: an unapproved envelope that changed max_* must
+    # surface as a recorded ADMISSION_DENIED, not as a StateError that drops
+    # the round_admission_denied audit event.
     snapshot_remaining_total, snapshot_remaining_fuzz = (
+        _validate_budget_snapshot(
+            budget_snapshot,
+            expected_family_id=parent_job_id,
+        )
+    )
+    envelope_is_bound = (
+        approved_envelope_digest is None
+        or approved_envelope_digest == envelope_digest
+    ) and (
+        not plan_envelope_checked or plan_envelope_digest == envelope_digest
+    )
+    if envelope_is_bound:
+        if snapshot_remaining_total > normalized_envelope["max_total_seconds"]:
+            raise StateError(
+                "budget_snapshot remaining total exceeds envelope "
+                "max_total_seconds"
+            )
+        if (
+            snapshot_remaining_fuzz is not None
+            and snapshot_remaining_fuzz
+            > normalized_envelope["max_fuzz_seconds"]
+        ):
+            raise StateError(
+                "budget_snapshot remaining fuzz exceeds envelope "
+                "max_fuzz_seconds"
+            )
         _validate_budget_snapshot(
             budget_snapshot,
             expected_family_id=parent_job_id,
             expected_max_total_seconds=normalized_envelope["max_total_seconds"],
             expected_max_fuzz_seconds=normalized_envelope["max_fuzz_seconds"],
-        )
-    )
-    if snapshot_remaining_total > normalized_envelope["max_total_seconds"]:
-        raise StateError(
-            "budget_snapshot remaining total exceeds envelope "
-            "max_total_seconds"
-        )
-    if (
-        snapshot_remaining_fuzz is not None
-        and snapshot_remaining_fuzz > normalized_envelope["max_fuzz_seconds"]
-    ):
-        raise StateError(
-            "budget_snapshot remaining fuzz exceeds envelope max_fuzz_seconds"
         )
     if ledger_remaining_total_seconds is not None:
         if (
@@ -2768,26 +2846,16 @@ def record_admission(
         ) from error
     if not budget_snapshot:
         raise StateError("budget_snapshot must not be empty")
+    # Outside the transaction only validate structure, self-consistency and the
+    # family binding: the caller's envelope caps are unverified until the
+    # approval chain is read, so they must not reject a genuine ledger snapshot
+    # before an unapproved envelope can be denied and audited.
     snapshot_remaining_total, snapshot_remaining_fuzz = (
         _validate_budget_snapshot(
             budget_snapshot,
             expected_family_id=family_id,
-            expected_max_total_seconds=normalized_envelope["max_total_seconds"],
-            expected_max_fuzz_seconds=normalized_envelope["max_fuzz_seconds"],
         )
     )
-    if snapshot_remaining_total > normalized_envelope["max_total_seconds"]:
-        raise StateError(
-            "budget_snapshot remaining total exceeds envelope "
-            "max_total_seconds"
-        )
-    if (
-        snapshot_remaining_fuzz is not None
-        and snapshot_remaining_fuzz > normalized_envelope["max_fuzz_seconds"]
-    ):
-        raise StateError(
-            "budget_snapshot remaining fuzz exceeds envelope max_fuzz_seconds"
-        )
 
     supporting_bundle_digest = (
         None if recomputable else campaign_bundle_digest
@@ -2935,6 +3003,36 @@ def record_admission(
             ).fetchone()
 
             if existing is not None:
+                # Idempotent re-entry keeps the historical semantics: the
+                # snapshot is bounded by this round's envelope caps before any
+                # comparison, so an over-cap snapshot never writes an event.
+                if (
+                    snapshot_remaining_total
+                    > normalized_envelope["max_total_seconds"]
+                ):
+                    raise StateError(
+                        "budget_snapshot remaining total exceeds envelope "
+                        "max_total_seconds"
+                    )
+                if (
+                    snapshot_remaining_fuzz is not None
+                    and snapshot_remaining_fuzz
+                    > normalized_envelope["max_fuzz_seconds"]
+                ):
+                    raise StateError(
+                        "budget_snapshot remaining fuzz exceeds envelope "
+                        "max_fuzz_seconds"
+                    )
+                _validate_budget_snapshot(
+                    budget_snapshot,
+                    expected_family_id=family_id,
+                    expected_max_total_seconds=normalized_envelope[
+                        "max_total_seconds"
+                    ],
+                    expected_max_fuzz_seconds=normalized_envelope[
+                        "max_fuzz_seconds"
+                    ],
+                )
                 existing_detail = _admitted_audit_detail(
                     connection, existing["job_id"], round_no
                 ) or {}
@@ -3088,6 +3186,16 @@ def record_admission(
                     "budget_snapshot.max_fuzz_seconds does not match family "
                     "budget_ledger"
                 )
+            # The persisted ledger caps are the authority for the snapshot:
+            # reconcile spent/remaining against them even when the snapshot
+            # omits max_* fields. The caller's envelope caps are only applied
+            # by the predicate once the envelope is proven approved.
+            _validate_budget_snapshot(
+                budget_snapshot,
+                expected_family_id=family_id,
+                expected_max_total_seconds=ledger_max_total,
+                expected_max_fuzz_seconds=ledger_max_fuzz,
+            )
             if ledger_remaining_total >= 1:
                 if snapshot_remaining_total > ledger_remaining_total:
                     raise StateError(
@@ -3208,6 +3316,12 @@ def _validate_charge_input(
             "general budget charge must not specify positive "
             "elapsed_fuzz_seconds"
         )
+    if charge_kind == "fuzz" and elapsed_fuzz_seconds > elapsed_seconds:
+        # Compare the validated raw values so 1.1 > 1.0 is rejected too; the
+        # fuzz sub-span can never be longer than the step it belongs to.
+        raise StateError(
+            "fuzz elapsed_fuzz_seconds must not exceed elapsed_seconds"
+        )
     return charge_kind, attempt_no, elapsed, fuzz_elapsed
 
 
@@ -3281,10 +3395,11 @@ def compute_budget_charge(
     """Apply the normative charge formula without touching storage.
 
     ``general`` charges ``min(ceil(elapsed), remaining_total_seconds)``.
-    A ``fuzz`` step charges ``charged_fuzz = min(max(1, ceil(fuzz_elapsed)),
-    remaining_fuzz, remaining_total)`` and ``charged = min(max(ceil(elapsed),
-    charged_fuzz), remaining_total)`` so ``0 < fuzz_seconds <= seconds``
-    without overdrawing either balance even when ``elapsed == 0``.
+    A ``fuzz`` step requires ``elapsed_fuzz <= elapsed`` and charges
+    ``charged = min(max(1, ceil(elapsed)), remaining_total)`` and
+    ``charged_fuzz = min(max(1, ceil(fuzz_elapsed)), remaining_fuzz, charged)``
+    so ``0 < fuzz_seconds <= seconds`` without overdrawing either balance even
+    when ``elapsed == 0``.
     """
     if not isinstance(ledger, Mapping):
         raise StateError("budget ledger must be a mapping")
@@ -3296,6 +3411,12 @@ def compute_budget_charge(
         raise StateError(
             "general budget charge must not specify positive "
             "elapsed_fuzz_seconds"
+        )
+    if charge_kind == "fuzz" and elapsed_fuzz_seconds > elapsed_seconds:
+        # Compare the validated raw values so 1.1 > 1.0 is rejected too; the
+        # fuzz sub-span can never be longer than the step it belongs to.
+        raise StateError(
+            "fuzz elapsed_fuzz_seconds must not exceed elapsed_seconds"
         )
     remaining_total = _require_budget_int(
         ledger, "remaining_total_seconds", "remaining_total_seconds"
@@ -3309,8 +3430,11 @@ def compute_budget_charge(
     )
     if remaining_fuzz < 0:
         raise StateError("remaining_fuzz_seconds must be non-negative")
-    charged_fuzz = min(max(1, fuzz_elapsed), remaining_fuzz, remaining_total)
-    charged = min(max(elapsed, charged_fuzz), remaining_total)
+    # elapsed_fuzz <= elapsed is enforced above; a zero-length fuzz step still
+    # rounds up to one second so 0 < charged_fuzz <= charged <= remaining_total.
+    effective_elapsed = max(1, elapsed)
+    charged = min(effective_elapsed, remaining_total)
+    charged_fuzz = min(max(1, fuzz_elapsed), remaining_fuzz, charged)
     return charged, charged_fuzz
 
 
@@ -3470,11 +3594,25 @@ def budget_summary(
             "max_fuzz_seconds"
         )
 
+    ledger_family_id = (
+        str(ledger["family_id"])
+        if "family_id" in ledger and ledger["family_id"] is not None
+        else None
+    )
     spent_seconds = 0
     spent_fuzz_seconds = 0
     for index, charge in enumerate(charges):
         if not isinstance(charge, Mapping):
             raise StateError(f"charges[{index}] must be a mapping")
+        if (
+            ledger_family_id is not None
+            and "family_id" in charge
+            and charge["family_id"] is not None
+            and str(charge["family_id"]) != ledger_family_id
+        ):
+            raise StateError(
+                f"charges[{index}].family_id does not match ledger.family_id"
+            )
         seconds = _require_budget_int(
             charge, "seconds", f"charges[{index}].seconds"
         )
@@ -3487,6 +3625,24 @@ def budget_summary(
             raise StateError(
                 f"charges[{index}].fuzz_seconds must be between 0 and seconds"
             )
+        if "charge_kind" in charge:
+            kind = charge["charge_kind"]
+            if kind == "general":
+                if fuzz_seconds != 0:
+                    raise StateError(
+                        f"charges[{index}] general charge must have "
+                        "fuzz_seconds == 0"
+                    )
+            elif kind == "fuzz":
+                if fuzz_seconds <= 0:
+                    raise StateError(
+                        f"charges[{index}] fuzz charge must have "
+                        "fuzz_seconds > 0"
+                    )
+            else:
+                raise StateError(
+                    f"charges[{index}].charge_kind must be general or fuzz"
+                )
         spent_seconds += seconds
         spent_fuzz_seconds += fuzz_seconds
 
@@ -3614,6 +3770,18 @@ def _initialize_budget_ledger_in_tx(
         family_id = uuid.UUID(str(family_id))
     except (TypeError, ValueError) as error:
         raise StateError("family_id must be a UUID") from error
+
+    # Global lock order: jobs(family) before budget_ledger(family). Only a v2
+    # family job may own a budget ledger.
+    target = connection.execute(
+        "SELECT job_contract_version, job_kind "
+        "FROM jobs WHERE job_id = %s FOR KEY SHARE",
+        (family_id,),
+    ).fetchone()
+    if target is None:
+        raise StateError("budget ledger family does not exist")
+    if target["job_contract_version"] != 2 or target["job_kind"] != "family":
+        raise StateError("budget ledger target must be a v2 family job")
 
     row = connection.execute(
         "INSERT INTO budget_ledger "
@@ -4317,13 +4485,14 @@ def _record_family_review(
                 "INSERT INTO reviews "
                 "(review_id, job_id, plan_digest, reviewer_id, decision, "
                 "review_deadline_at, decided_at) "
-                "VALUES (%s, %s, %s, %s, 'approve', %s, clock_timestamp())",
+                "VALUES (%s, %s, %s, %s, 'approve', %s, %s)",
                 (
                     uuid.uuid4(),
                     job_id,
                     first_plan_digest,
                     reviewer_id,
                     envelope["review_deadline_at"],
+                    decision_at,
                 ),
             )
         # The chain tail is the approval no later row supersedes. Appending
@@ -4423,13 +4592,14 @@ def _record_family_review(
             "INSERT INTO reviews "
             "(review_id, job_id, plan_digest, reviewer_id, decision, "
             "review_deadline_at, decided_at) "
-            "VALUES (%s, %s, %s, %s, 'reject', %s, clock_timestamp())",
+            "VALUES (%s, %s, %s, %s, 'reject', %s, %s)",
             (
                 uuid.uuid4(),
                 job_id,
                 first_plan_digest,
                 reviewer_id,
                 envelope["review_deadline_at"],
+                decision_at,
             ),
         )
     decided_envelope = connection.execute(

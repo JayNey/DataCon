@@ -500,3 +500,32 @@ def test_check_mutation_constraints_accepts_readonly_mapping():
     )
     with pytest.raises(contracts.EnvelopeViolation, match="allowed_ops"):
         contracts.check_mutation_constraints(bad_readonly, envelope)
+
+
+def test_envelope_rejects_duplicate_signatures_and_int32_overflow():
+    # N-3: duplicate signature objects and int32-overflowing budget/round caps
+    # must be rejected by normalize_envelope.
+    dup_env = _guided_envelope()
+    dup_env["accepted_signature_set"] = [dict(SIGNATURE), dict(SIGNATURE)]
+    with pytest.raises(ValueError, match="duplicates"):
+        contracts.normalize_envelope(dup_env)
+
+    too_big = 2**31
+    for field in ("max_rounds", "max_total_seconds", "max_fuzz_seconds"):
+        overflow = _guided_envelope()
+        if field == "max_fuzz_seconds":
+            overflow["max_total_seconds"] = too_big
+        overflow[field] = too_big
+        with pytest.raises(ValueError):
+            contracts.normalize_envelope(overflow)
+
+    # Boundary 2**31 - 1 is accepted.
+    max_int32 = 2**31 - 1
+    at_limit = _guided_envelope(
+        max_rounds=max_int32,
+        max_total_seconds=max_int32,
+        max_fuzz_seconds=max_int32,
+    )
+    assert at_limit["max_rounds"] == max_int32
+    assert at_limit["max_total_seconds"] == max_int32
+    assert at_limit["max_fuzz_seconds"] == max_int32

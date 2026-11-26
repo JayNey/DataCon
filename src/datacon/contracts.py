@@ -130,7 +130,8 @@ _ENVELOPE_MUTATION_LIMIT_FIELDS = frozenset({"allowed_ops", "max_input_bytes"})
 _ENVELOPE_SIGNATURE_FIELDS = frozenset({"error", "function", "source"})
 _ENVELOPE_SIGNATURE_OPTIONAL = frozenset({"operation", "access_size"})
 _ENVELOPE_MODES = frozenset({"fixed", "guided"})
-_ENVELOPE_MAX_ACCESS_SIZE = 2**31 - 1
+_PG_INT32_MAX = 2**31 - 1
+_ENVELOPE_MAX_ACCESS_SIZE = _PG_INT32_MAX
 
 
 class InvalidRequest(ValueError):
@@ -243,6 +244,7 @@ def _envelope_signature_set(value: Any) -> list[dict[str, Any]]:
     if not value:
         raise ValueError("envelope.accepted_signature_set must not be empty")
     normalized: list[dict[str, Any]] = []
+    seen: set[bytes] = set()
     for index, item in enumerate(value):
         label = f"accepted_signature_set[{index}]"
         raw_item = dict(item) if isinstance(item, Mapping) else item
@@ -273,6 +275,12 @@ def _envelope_signature_set(value: Any) -> list[dict[str, Any]]:
                     f"{_ENVELOPE_MAX_ACCESS_SIZE}"
                 )
             entry["access_size"] = access_size
+        canonical_entry = jsonutil.canonical_bytes(entry)
+        if canonical_entry in seen:
+            raise ValueError(
+                "envelope.accepted_signature_set must not contain duplicates"
+            )
+        seen.add(canonical_entry)
         normalized.append(entry)
     return normalized
 
@@ -330,17 +338,22 @@ def normalize_envelope(
     )
 
     max_rounds = value["max_rounds"]
-    if type(max_rounds) is not int or max_rounds < 1:
-        raise ValueError("envelope.max_rounds must be a positive integer")
-    max_total_seconds = value["max_total_seconds"]
-    if type(max_total_seconds) is not int or max_total_seconds < 1:
+    if type(max_rounds) is not int or not 1 <= max_rounds <= _PG_INT32_MAX:
         raise ValueError(
-            "envelope.max_total_seconds must be a positive integer"
+            "envelope.max_rounds must be a positive 32-bit integer"
+        )
+    max_total_seconds = value["max_total_seconds"]
+    if (
+        type(max_total_seconds) is not int
+        or not 1 <= max_total_seconds <= _PG_INT32_MAX
+    ):
+        raise ValueError(
+            "envelope.max_total_seconds must be a positive 32-bit integer"
         )
     max_fuzz_seconds = value["max_fuzz_seconds"]
     if (
         type(max_fuzz_seconds) is not int
-        or not 0 <= max_fuzz_seconds <= max_total_seconds
+        or not 0 <= max_fuzz_seconds <= min(max_total_seconds, _PG_INT32_MAX)
     ):
         raise ValueError(
             "envelope.max_fuzz_seconds must be an integer between 0 and "

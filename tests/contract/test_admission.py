@@ -863,3 +863,190 @@ def test_admission_binds_budget_snapshot_family_id_and_envelope_caps():
             admission_id=ADMISSION_ID,
         )
         assert outcome.admitted
+
+
+def _guided_envelope_with_caps(*, max_total_seconds: int, max_fuzz_seconds: int):
+    return contracts.guided_envelope(
+        allowed_mutation_families=["byte_flip", "length_boundary"],
+        mutation_limits={
+            "allowed_ops": ["append", "truncate", "byte_flip"],
+            "max_input_bytes": 4096,
+        },
+        seed_corpus_digest=SEED_CORPUS_DIGEST,
+        toolchain_image_digest=TOOLCHAIN_IMAGE_DIGEST,
+        harness_digest=HARNESS_DIGEST,
+        max_rounds=8,
+        max_total_seconds=max_total_seconds,
+        max_fuzz_seconds=max_fuzz_seconds,
+        accepted_signature_set=[dict(SIGNATURE)],
+        admission_predicate_version="admission-v1",
+    )
+
+
+def test_admission_reconciles_spent_against_envelope_caps_when_max_omitted():
+    # S-2: omitting max_total_seconds/max_fuzz_seconds must not bypass the
+    # spent + remaining == max reconciliation against the envelope caps.
+    envelope = _guided_envelope()
+    unreconciled_snapshots = [
+        {
+            "remaining_total_seconds": 500,
+            "spent_seconds": 999999,
+            "remaining_fuzz_seconds": 100,
+            "spent_fuzz_seconds": 999999,
+        },
+        # spent_seconds + remaining != envelope.max_total_seconds (900).
+        {"remaining_total_seconds": 500, "spent_seconds": 300},
+        {"remaining_seconds": 500, "spent_seconds": 401},
+        # spent_fuzz + remaining_fuzz != envelope.max_fuzz_seconds (300).
+        {
+            "remaining_total_seconds": 900,
+            "remaining_fuzz_seconds": 100,
+            "spent_fuzz_seconds": 100,
+        },
+        # Only spent_fuzz_seconds, exceeding envelope.max_fuzz_seconds.
+        {"remaining_total_seconds": 900, "spent_fuzz_seconds": 301},
+    ]
+    for bad in unreconciled_snapshots:
+        store = RecordingAdmissionStore()
+        with pytest.raises(state.StateError):
+            state.policy_admit_round(
+                store=store,
+                clock=FakeClock(),
+                job_id=JOB_ID,
+                parent_job_id=FAMILY_ID,
+                envelope=envelope,
+                parent_approval_digest=APPROVAL_DIGEST,
+                approval_chain_tail_digest=APPROVAL_DIGEST,
+                seed_digest=SEED_CORPUS_DIGEST,
+                round_no=2,
+                budget_snapshot=bad,
+                admission_id=ADMISSION_ID,
+                approved_envelope_digest=contracts.envelope_digest(envelope),
+            )
+        assert store.admissions == [], bad
+        assert store.events == [], bad
+
+    # Reconciled snapshots without max_* fields still admit.
+    for good in (
+        {
+            "remaining_total_seconds": 500,
+            "spent_seconds": 400,
+            "remaining_fuzz_seconds": 100,
+            "spent_fuzz_seconds": 200,
+        },
+        {"remaining_total_seconds": 900, "spent_fuzz_seconds": 300},
+    ):
+        outcome = state.policy_admit_round(
+            clock=FakeClock(),
+            job_id=JOB_ID,
+            parent_job_id=FAMILY_ID,
+            envelope=envelope,
+            parent_approval_digest=APPROVAL_DIGEST,
+            approval_chain_tail_digest=APPROVAL_DIGEST,
+            seed_digest=SEED_CORPUS_DIGEST,
+            round_no=2,
+            budget_snapshot=good,
+            admission_id=ADMISSION_ID,
+        )
+        assert outcome.admitted, good
+
+
+@pytest.mark.parametrize(
+    ("max_total_seconds", "max_fuzz_seconds"),
+    [(600, 300), (1200, 300), (900, 200)],
+)
+@pytest.mark.parametrize("snapshot_shape", ["ledger", "minimal"])
+def test_unapproved_envelope_cap_change_with_real_snapshot_is_denied(
+    max_total_seconds, max_fuzz_seconds, snapshot_shape
+):
+    # S-3: the approved envelope is 900/300 and the snapshot is the real
+    # family ledger. An unapproved envelope that changed a cap must be a
+    # recorded ADMISSION_DENIED, not a StateError that drops the audit event.
+    approved_digest = contracts.envelope_digest(_guided_envelope())
+    unapproved = _guided_envelope_with_caps(
+        max_total_seconds=max_total_seconds, max_fuzz_seconds=max_fuzz_seconds
+    )
+    assert contracts.envelope_digest(unapproved) != approved_digest
+    if snapshot_shape == "ledger":
+        snapshot = {
+            "family_id": FAMILY_ID,
+            "max_total_seconds": 900,
+            "max_fuzz_seconds": 300,
+            "remaining_total_seconds": 900,
+            "remaining_fuzz_seconds": 300,
+            "updated_at": "2099-01-01T00:00:00Z",
+        }
+    else:
+        snapshot = {"remaining_total_seconds": 900, "remaining_fuzz_seconds": 300}
+
+    for binding in (
+        {"approved_envelope_digest": approved_digest},
+        {
+            "approved_envelope_digest": approved_digest,
+            "plan_envelope_digest": approved_digest,
+        },
+    ):
+        store = RecordingAdmissionStore()
+        outcome = state.policy_admit_round(
+            store=store,
+            clock=FakeClock(),
+            job_id=JOB_ID,
+            parent_job_id=FAMILY_ID,
+            envelope=unapproved,
+            parent_approval_digest=APPROVAL_DIGEST,
+            approval_chain_tail_digest=APPROVAL_DIGEST,
+            seed_digest=SEED_CORPUS_DIGEST,
+            round_no=2,
+            budget_snapshot=snapshot,
+            admission_id=ADMISSION_ID,
+            **binding,
+        )
+        assert outcome.status == "denied"
+        assert not outcome.admitted
+        assert outcome.reason_code == "ADMISSION_DENIED"
+        assert outcome.sub_reason == "PARENT_APPROVAL_ENVELOPE_MISMATCH"
+        assert outcome.event_type == "round_admission_denied"
+        assert store.admissions == []
+        assert [event["event_type"] for event in store.events] == [
+            "round_admission_denied"
+        ]
+
+    # A plan bound to the approved envelope also denies a cap-changed one.
+    store = RecordingAdmissionStore()
+    outcome = state.policy_admit_round(
+        store=store,
+        clock=FakeClock(),
+        job_id=JOB_ID,
+        parent_job_id=FAMILY_ID,
+        envelope=unapproved,
+        parent_approval_digest=APPROVAL_DIGEST,
+        approval_chain_tail_digest=APPROVAL_DIGEST,
+        seed_digest=SEED_CORPUS_DIGEST,
+        round_no=2,
+        budget_snapshot=snapshot,
+        admission_id=ADMISSION_ID,
+        plan_envelope_digest=approved_digest,
+    )
+    assert outcome.reason_code == "ADMISSION_DENIED"
+    assert outcome.sub_reason == "PLAN_ENVELOPE_MISMATCH"
+    assert store.admissions == []
+    assert [event["event_type"] for event in store.events] == [
+        "round_admission_denied"
+    ]
+
+    # Once the envelope is the approved one, its caps are enforced strictly.
+    if snapshot_shape == "ledger":
+        with pytest.raises(state.StateError):
+            state.policy_admit_round(
+                clock=FakeClock(),
+                job_id=JOB_ID,
+                parent_job_id=FAMILY_ID,
+                envelope=unapproved,
+                parent_approval_digest=APPROVAL_DIGEST,
+                approval_chain_tail_digest=APPROVAL_DIGEST,
+                seed_digest=SEED_CORPUS_DIGEST,
+                round_no=2,
+                budget_snapshot=snapshot,
+                admission_id=ADMISSION_ID,
+                approved_envelope_digest=contracts.envelope_digest(unapproved),
+            )
