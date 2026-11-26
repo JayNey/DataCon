@@ -12,14 +12,23 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+import re
 import shutil
 import tempfile
-from typing import Any, Callable, Iterable, cast
+from typing import Any, Callable, Iterable, Mapping, Sequence, cast
 
 from datacon import jsonutil
 from datacon.agent_contracts import AnalysisModel, AgentOutput, ModelContext, ModelSuggestion
 from datacon.agents.analysis import AnalysisBlocked, analyze_case
 from datacon.contracts import DEFAULT_LIMITS
+from datacon.experiment_spec import (
+    signature_matches,
+    validate_case_id,
+    validate_input_family,
+    validate_signature,
+    validate_target_path,
+    validate_target_symbol,
+)
 
 ALLOWED_ANALYSIS_TOOLS = frozenset({"git.resolve", "git.diff", "tree_sitter.extract"})
 REQUIRED_CATEGORIES = frozenset(
@@ -413,3 +422,250 @@ def run_b04_evaluation(
             metrics=summary,
         )
     return summary
+
+
+_ANNOTATION_VERSION_PREFIX = "b04-annotations-v1+"
+# The version label: ``b04-annotations-v1``, one plus sign, then the
+# ``sha256`` digest of the samples (64 lower-case hex digits), per the
+# ``<label>+<digest>`` format frozen in ADR-003 item 12. One annotation set
+# has exactly one label, which is what ``annotation_set_version`` builds.
+_ANNOTATION_VERSION = re.compile(
+    r"b04-annotations-v1\+(?P<digest>sha256:[0-9a-f]{64})"
+)
+# The same ceiling as an ExperimentSpec target line.
+_ANNOTATION_MAX_LINE = 2**31 - 1
+_ANNOTATION_SAMPLE_FIELDS = (
+    "case_id",
+    "target_symbol",
+    "target_path",
+    "target_line_start",
+    "target_line_end",
+    "accepted_signature",
+    "input_family",
+)
+
+
+def _annotation_invalid(message: str) -> B04GateError:
+    return B04GateError(message, reason_code="ANNOTATION_INVALID")
+
+
+def _annotation_line(value: Any, label: str) -> int:
+    """Require a source line number: an integer from 1 to 2**31 - 1, not a bool/float."""
+    if type(value) is not int or not 1 <= value <= _ANNOTATION_MAX_LINE:
+        raise ValueError(
+            f"{label} must be an integer between 1 and {_ANNOTATION_MAX_LINE}"
+        )
+    return value
+
+
+def _validate_annotation_sample(sample: Any, label: str) -> None:
+    """Check one annotation sample; raise ``ValueError`` on any defect.
+
+    ``case_id``, ``target_symbol``, ``target_path``, ``input_family`` and
+    ``accepted_signature`` follow the ExperimentSpec rules for the fields
+    of the same name, all through the shared ``experiment_spec``
+    validators.
+    """
+    if not isinstance(sample, dict):
+        raise ValueError(f"{label} must be a JSON object")
+    missing = [field for field in _ANNOTATION_SAMPLE_FIELDS if field not in sample]
+    if missing:
+        raise ValueError(f"{label} is missing field(s): {', '.join(missing)}")
+    validate_case_id(sample["case_id"], f"{label}.case_id")
+    validate_target_symbol(sample["target_symbol"], f"{label}.target_symbol")
+    validate_target_path(sample["target_path"], f"{label}.target_path")
+    validate_input_family(sample["input_family"], f"{label}.input_family")
+    start = _annotation_line(sample["target_line_start"], f"{label}.target_line_start")
+    end = _annotation_line(sample["target_line_end"], f"{label}.target_line_end")
+    if start > end:
+        raise ValueError(f"{label}.target_line_start must not exceed target_line_end")
+    validate_signature(sample["accepted_signature"])
+
+
+def annotation_set_version(samples: Sequence[Mapping[str, Any]]) -> str:
+    """Return the ``b04-annotations-v1`` label that binds ``samples`` by digest.
+
+    The label ``load_annotation_set`` accepts for exactly these samples:
+    editing a sample or adding one changes it.
+    """
+    return _ANNOTATION_VERSION_PREFIX + jsonutil.digest_json(samples)
+
+
+def load_annotation_set(path: Path) -> dict[str, Any]:
+    """Load a frozen B04-H annotation set (REQ-13, TC-13).
+
+    The annotation set is written once and frozen, so every load of the
+    same file reports the same ``annotation_version`` and historical
+    B04-H quality reports stay reproducible. Whatever is wrong with the
+    file is reported as one ``B04GateError`` with the reason code
+    ``ANNOTATION_INVALID``:
+
+    - the file cannot be read, is not strict UTF-8 JSON, or is not an
+      object;
+    - ``annotation_version`` is not ``b04-annotations-v1`` followed by the
+      ``sha256`` digest of the file's ``samples`` - the label
+      ``annotation_set_version`` builds - so an edited or extended set
+      cannot keep the version of the set it replaced;
+    - ``source`` is not a non-empty string;
+    - ``samples`` is not a non-empty list, or one sample is not an object
+      carrying a non-empty ``case_id``, an ExperimentSpec-conformant
+      ``target_symbol``/``target_path``/``input_family`` and
+      ``accepted_signature``, and ``target_line_start``/``target_line_end``
+      integers with ``1 <= start <= end``.
+
+    The samples are returned exactly as digested. Keys beyond the
+    annotation fields are not interpreted, but they are covered by the
+    digest like everything else in a sample.
+    """
+    try:
+        document = jsonutil.loads_strict(Path(path).read_bytes())
+    except (OSError, jsonutil.StrictJsonError) as error:
+        raise _annotation_invalid(
+            f"annotation set cannot be read strictly: {error}"
+        ) from error
+    if not isinstance(document, dict):
+        raise _annotation_invalid("annotation set must be a JSON object")
+    version = document.get("annotation_version")
+    match = _ANNOTATION_VERSION.fullmatch(version) if isinstance(version, str) else None
+    if match is None:
+        raise _annotation_invalid(
+            "annotation set requires an annotation_version of the form "
+            "b04-annotations-v1+sha256:<64 lower-case hex digits>"
+        )
+    source = document.get("source")
+    if not isinstance(source, str) or not source:
+        raise _annotation_invalid("annotation set requires a non-empty source string")
+    samples = document.get("samples")
+    if not isinstance(samples, list) or not samples:
+        raise _annotation_invalid("annotation set samples must be a non-empty list")
+    for index, sample in enumerate(samples):
+        try:
+            _validate_annotation_sample(sample, f"annotation sample [{index}]")
+        except ValueError as error:
+            raise _annotation_invalid(str(error)) from error
+    try:
+        digest = jsonutil.digest_json(samples)
+    except (ValueError, RecursionError) as error:
+        raise _annotation_invalid(
+            f"annotation set samples cannot be digested: {error}"
+        ) from error
+    if match["digest"] != digest:
+        raise _annotation_invalid(
+            "annotation_version digest does not match the annotation set samples"
+        )
+    return {
+        "annotation_version": version,
+        "source": source,
+        "samples": samples,
+    }
+
+
+# A hypothesis line counts as on-target when it falls inside the annotated
+# range or within three lines of it (test-plan delta 4.2).
+_HYPOTHESIS_LINE_TOLERANCE = 3
+
+
+def _hypothesis_hits_annotation(
+    hypothesis: Mapping[str, Any], sample: Mapping[str, Any]
+) -> bool:
+    """Whether one hypothesis hits one annotation (test-plan delta 4.2).
+
+    Case, symbol, path and input family must match exactly - annotations
+    belong to their case, so the same upstream file reused by another case
+    never cross-matches; the hypothesis line
+    must fall inside the annotated range (plus or minus the tolerance); the
+    signature must match as a full signature through
+    ``experiment_spec.signature_matches`` - optional fields participate
+    through their presence, never through defaults. A hypothesis outside
+    every annotated file is a miss.
+    """
+    for field in ("case_id", "target_symbol", "target_path", "input_family"):
+        if hypothesis.get(field) != sample.get(field):
+            return False
+    line = hypothesis.get("target_line")
+    start = sample.get("target_line_start")
+    end = sample.get("target_line_end")
+    if type(line) is not int or type(start) is not int or type(end) is not int:
+        return False
+    if not (
+        start - _HYPOTHESIS_LINE_TOLERANCE
+        <= line
+        <= end + _HYPOTHESIS_LINE_TOLERANCE
+    ):
+        return False
+    expected_signature = hypothesis.get("expected_signature")
+    accepted_signature = sample.get("accepted_signature")
+    if not isinstance(expected_signature, dict) or not isinstance(
+        accepted_signature, dict
+    ):
+        return False
+    return signature_matches(expected_signature, accepted_signature)
+
+
+def evaluate_hypothesis_quality(
+    annotation_set_path: Path,
+    *,
+    hypotheses: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Report B04-H hypothesis quality against a frozen annotation set.
+
+    An additive quality report beside the B04-A gate, never its
+    replacement: the vocabulary here (end-to-end and accepted precision,
+    recall, rejection rate) never feeds a ``REPRODUCED`` decision. The
+    admission-rejected entries stay in the end-to-end denominator so
+    rejecting cannot inflate the score, and never count as hits; recall
+    counts each annotation at most once no matter how many hypotheses hit
+    it. The sample sizes report the hypothesis total, the annotation count
+    and the number of distinct annotated cases (distinct ``case_id``
+    values, so several annotations of one case count once). The frozen
+    ``annotation_version`` passes through unchanged so historical reports
+    stay reproducible.
+    """
+    annotation_set = load_annotation_set(Path(annotation_set_path))
+    # Every sample is a validated object with a non-empty ``case_id``.
+    samples = cast(list[dict[str, Any]], annotation_set["samples"])
+
+    admitted: list[Mapping[str, Any]] = []
+    rejection_reasons: dict[str, int] = {}
+    for hypothesis in hypotheses:
+        admission = hypothesis.get("admission")
+        status = (
+            admission.get("status") if isinstance(admission, Mapping) else None
+        )
+        if status == "rejected":
+            reason = (
+                admission.get("reason_code")
+                if isinstance(admission, Mapping)
+                else None
+            )
+            token = str(reason) if isinstance(reason, str) and reason else "UNKNOWN"
+            rejection_reasons[token] = rejection_reasons.get(token, 0) + 1
+            continue
+        admitted.append(hypothesis)
+
+    hits = sum(
+        1
+        for hypothesis in admitted
+        if any(_hypothesis_hits_annotation(hypothesis, sample) for sample in samples)
+    )
+    hit_annotations = sum(
+        1
+        for sample in samples
+        if any(_hypothesis_hits_annotation(hypothesis, sample) for hypothesis in admitted)
+    )
+    total = len(hypotheses)
+    case_count = len({sample["case_id"] for sample in samples})
+
+    return {
+        "end_to_end_precision": hits / total if total else 0.0,
+        "accepted_precision": hits / len(admitted) if admitted else 0.0,
+        "recall": (
+            hit_annotations / len(samples) if samples else 0.0
+        ),
+        "rejection_rate": (total - len(admitted)) / total if total else 0.0,
+        "hypothesis_total": total,
+        "annotation_count": len(samples),
+        "case_count": case_count,
+        "rejection_reasons": rejection_reasons,
+        "annotation_version": annotation_set["annotation_version"],
+    }
