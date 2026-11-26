@@ -17,6 +17,7 @@ import pytest
 
 from datacon import contracts
 from datacon import jsonutil
+from datacon import orchestration
 from datacon import state as state_store
 from datacon import verdict as verdict_mod
 from datacon import workflow
@@ -1601,3 +1602,881 @@ def test_family_children_execute_serially():
     )
     assert indep_runner.max_concurrent_children(fam_a) == 1
     assert indep_runner.max_concurrent_children(fam_b) == 1
+
+
+@pytest.mark.parametrize(
+    ("reason_code", "sub_reason", "source_id"),
+    [
+        ("MATERIAL_MISSING", "FETCH_TIMEOUT", "nvd-api"),
+        ("MATERIAL_MISSING", "REDIRECT_LIMIT_EXCEEDED", "github-advisory"),
+        ("SOURCE_CONFLICT", "DIGEST_MISMATCH", "debian-tracker"),
+        ("POLICY_DENIED", "LICENSE_REJECTED", "proprietary-feed"),
+    ],
+)
+def test_intel_blocked_preserves_sub_reason_in_archive_and_audit(
+    reason_code: str,
+    sub_reason: str,
+    source_id: str,
+):
+    class _BlockedIntelProvider:
+        def resolve_intel(
+            self,
+            *,
+            job_id: str,
+            family_id: str,
+            request: Mapping[str, Any],
+        ) -> workflow.IntelResult:
+            del job_id, family_id, request
+            return workflow.IntelResult(
+                status="blocked",
+                snapshot_digest=None,
+                reason_code=reason_code,
+                message=f"intel blocked: {reason_code}",
+                summary={"sub_reason": sub_reason, "source_id": source_id},
+            )
+
+    clock = FakeClock()
+    sandbox = FakeSandbox(clock=clock)
+    ledger = workflow.NodeReentryLedger()
+    runner = workflow.OrchestrationRunner(
+        sandbox=sandbox,
+        clock=clock,
+        intel_provider=_BlockedIntelProvider(),
+        ledger=ledger,
+    )
+    job_id = str(uuid4())
+    family_id = str(uuid4())
+    outcome = runner.run_child(
+        job_id=job_id,
+        family_id=family_id,
+        job_kind="round",
+        round_no=1,
+        target_kind="source",
+    )
+
+    assert outcome.terminal_node == "archive"
+    assert outcome.state == "BLOCKED"
+    assert outcome.reason_code == reason_code
+    assert "version" not in outcome.visited_nodes
+    assert len(sandbox.build_calls) == 0
+
+    expected_summary = {"sub_reason": sub_reason, "source_id": source_id}
+    assert outcome.intel_summary == expected_summary
+
+    archives = ledger.archives_for_job(job_id)
+    assert len(archives) == 1
+    assert archives[0].intel_summary == expected_summary
+
+    events = runner.audit_events(job_id)
+    assert len(events) == 1
+    assert outcome.audit_events == events
+    event = events[0]
+    assert isinstance(event, workflow.AuditEventRecord)
+    assert event.job_id == job_id
+    assert event.family_id == family_id
+    assert event.stage == "intel"
+    assert event.step_key == "intel"
+    assert event.attempt_no == 1
+    assert event.event_type == "intel_blocked"
+    assert event.reason_code == reason_code
+    assert event.detail == expected_summary
+    assert event.recorded_at
+
+    # Mutating returned snapshots must not corrupt ledger internals.
+    assert isinstance(outcome.intel_summary, dict)
+    outcome.intel_summary["sub_reason"] = "MUTATED"
+    assert isinstance(event.detail, dict)
+    event.detail["sub_reason"] = "MUTATED"
+    assert ledger.archives_for_job(job_id)[0].intel_summary == expected_summary
+    assert runner.audit_events(job_id)[0].detail == expected_summary
+
+
+def test_intel_ready_preserves_summary_digest_and_audit():
+    digest_a = "sha256:" + "a" * 64
+    digest_b = "sha256:" + "b" * 64
+    redirect_digest = "sha256:" + "c" * 64
+
+    class _ReadyIntelProvider:
+        def __init__(self, snapshot_digest: str, license_id: str) -> None:
+            self._snapshot_digest = snapshot_digest
+            self._license_id = license_id
+
+        def resolve_intel(
+            self,
+            *,
+            job_id: str,
+            family_id: str,
+            request: Mapping[str, Any],
+        ) -> workflow.IntelResult:
+            del job_id, family_id, request
+            return workflow.IntelResult(
+                status="ready",
+                snapshot_digest=self._snapshot_digest,
+                summary={
+                    "license": self._license_id,
+                    "source_url": "https://advisories.example.org/cve-2099-0001",
+                    "redirect_chain_digest": redirect_digest,
+                },
+            )
+
+    job_id = str(uuid4())
+    family_id = str(uuid4())
+
+    def _run_with(snapshot_digest: str, license_id: str):
+        clock = FakeClock()
+        sandbox = FakeSandbox(clock=clock)
+        ledger = workflow.NodeReentryLedger()
+        runner = workflow.OrchestrationRunner(
+            sandbox=sandbox,
+            clock=clock,
+            intel_provider=_ReadyIntelProvider(snapshot_digest, license_id),
+            review_gate=FakeReviewGate(clock=clock, decision="approve"),
+            envelope_policy=FakeEnvelopePolicy(clock=clock, default_admit=True),
+            ledger=ledger,
+        )
+        outcome = runner.run_child(
+            job_id=job_id,
+            family_id=family_id,
+            job_kind="round",
+            round_no=1,
+            target_kind="source",
+            is_first_plan=True,
+        )
+        return runner, ledger, outcome
+
+    runner_a, ledger_a, outcome_a = _run_with(digest_a, "MIT")
+    expected_summary_a = {
+        "snapshot_digest": digest_a,
+        "license": "MIT",
+        "source_url": "https://advisories.example.org/cve-2099-0001",
+        "redirect_chain_digest": redirect_digest,
+    }
+    assert outcome_a.terminal_node == "archive"
+    assert "version" in outcome_a.visited_nodes
+    assert "verify" in outcome_a.visited_nodes
+    assert outcome_a.intel_summary == expected_summary_a
+
+    archives_a = ledger_a.archives_for_job(job_id)
+    assert len(archives_a) == 1
+    assert archives_a[0].intel_summary == expected_summary_a
+
+    events_a = runner_a.audit_events(job_id)
+    assert len(events_a) == 1
+    assert outcome_a.audit_events == events_a
+    assert events_a[0].event_type == "intel_resolved"
+    assert events_a[0].reason_code is None
+    assert events_a[0].stage == "intel"
+    assert events_a[0].detail == expected_summary_a
+
+    # Deterministic archive_digest changes when intel_summary changes and stays
+    # identical when intel_summary is unchanged.
+    _, _, outcome_a_repeat = _run_with(digest_a, "MIT")
+    assert outcome_a_repeat.archive_digest == outcome_a.archive_digest
+
+    _, _, outcome_b = _run_with(digest_b, "Apache-2.0")
+    assert outcome_b.archive_digest != outcome_a.archive_digest
+    assert outcome_b.intel_summary is not None
+    assert outcome_b.intel_summary["snapshot_digest"] == digest_b
+    assert outcome_b.intel_summary["license"] == "Apache-2.0"
+
+
+def test_intel_exception_and_blank_snapshot_digest_fail_closed():
+    sensitive_body = "RAW_ADVISORY_SECRET_BODY_TOKEN_98765"
+
+    class _StructuredIntelError(RuntimeError):
+        def __init__(
+            self,
+            message: str,
+            *,
+            reason_code: str | None = None,
+            sub_reason: Any = None,
+            source_id: Any = None,
+        ) -> None:
+            super().__init__(message)
+            self.reason_code = reason_code
+            self.sub_reason = sub_reason
+            self.source_id = source_id
+
+    class _RaisingIntelProvider:
+        def __init__(self, exc: Exception) -> None:
+            self._exc = exc
+
+        def resolve_intel(
+            self,
+            *,
+            job_id: str,
+            family_id: str,
+            request: Mapping[str, Any],
+        ) -> workflow.IntelResult:
+            del job_id, family_id, request
+            raise self._exc
+
+    clock = FakeClock()
+    sandbox = FakeSandbox(clock=clock)
+    ledger = workflow.NodeReentryLedger()
+    runner = workflow.OrchestrationRunner(
+        sandbox=sandbox,
+        clock=clock,
+        intel_provider=_RaisingIntelProvider(
+            _StructuredIntelError(
+                f"upstream rejected payload: {sensitive_body}",
+                reason_code="POLICY_DENIED",
+                sub_reason="LICENSE_REJECTED",
+                source_id="restricted-mirror",
+            )
+        ),
+        ledger=ledger,
+    )
+    job_id = str(uuid4())
+    outcome = runner.run_child(
+        job_id=job_id,
+        family_id=str(uuid4()),
+        job_kind="round",
+        round_no=1,
+        target_kind="source",
+    )
+    assert outcome.terminal_node == "archive"
+    assert outcome.state == "BLOCKED"
+    assert outcome.reason_code == "POLICY_DENIED"
+    assert outcome.intel_summary == {
+        "sub_reason": "LICENSE_REJECTED",
+        "source_id": "restricted-mirror",
+    }
+    archives = ledger.archives_for_job(job_id)
+    assert len(archives) == 1
+    assert archives[0].intel_summary == outcome.intel_summary
+    assert len(outcome.audit_events) == 1
+    event = outcome.audit_events[0]
+    assert event.event_type == "intel_blocked"
+    assert event.reason_code == "POLICY_DENIED"
+    assert event.detail == {
+        "sub_reason": "LICENSE_REJECTED",
+        "source_id": "restricted-mirror",
+    }
+    assert sensitive_body not in repr(outcome.intel_summary)
+    assert sensitive_body not in repr(archives[0].intel_summary)
+    assert sensitive_body not in repr(event.detail)
+
+    # Blank/non-string sub_reason and source_id are omitted without leaking str(error).
+    blank_ledger = workflow.NodeReentryLedger()
+    blank_runner = workflow.OrchestrationRunner(
+        sandbox=FakeSandbox(clock=FakeClock()),
+        clock=FakeClock(),
+        intel_provider=_RaisingIntelProvider(
+            _StructuredIntelError(
+                f"timeout with body {sensitive_body}",
+                reason_code="MATERIAL_MISSING",
+                sub_reason="   ",
+                source_id=None,
+            )
+        ),
+        ledger=blank_ledger,
+    )
+    blank_job_id = str(uuid4())
+    blank_outcome = blank_runner.run_child(
+        job_id=blank_job_id,
+        family_id=str(uuid4()),
+        job_kind="round",
+        round_no=1,
+        target_kind="source",
+    )
+    assert blank_outcome.state == "BLOCKED"
+    assert blank_outcome.reason_code == "MATERIAL_MISSING"
+    assert blank_outcome.intel_summary is None
+    assert len(blank_outcome.audit_events) == 1
+    assert blank_outcome.audit_events[0].detail == {}
+    assert sensitive_body not in repr(blank_outcome.audit_events[0].detail)
+
+    # Unstructured exception without reason_code propagates.
+    unstructured_runner = workflow.OrchestrationRunner(
+        sandbox=FakeSandbox(clock=FakeClock()),
+        clock=FakeClock(),
+        intel_provider=_RaisingIntelProvider(RuntimeError("unexpected crash")),
+    )
+    with pytest.raises(RuntimeError, match="unexpected crash"):
+        unstructured_runner.run_child(
+            job_id=str(uuid4()),
+            family_id=str(uuid4()),
+            job_kind="round",
+            round_no=1,
+            target_kind="source",
+        )
+
+    # status="ready" with missing/blank snapshot_digest fails closed with
+    # MATERIAL_MISSING, preserves existing summary fields, and populates
+    # detail["sub_reason"] == "SNAPSHOT_DIGEST_MISSING".
+    for bad_digest in (None, "", "   "):
+
+        class _BlankDigestProvider:
+            def __init__(self, digest: str | None) -> None:
+                self._digest = digest
+
+            def resolve_intel(
+                self,
+                *,
+                job_id: str,
+                family_id: str,
+                request: Mapping[str, Any],
+            ) -> workflow.IntelResult:
+                del job_id, family_id, request
+                return workflow.IntelResult(
+                    status="ready",
+                    snapshot_digest=self._digest,
+                    summary={"source": "unverified", "license": "MIT"},
+                )
+
+        bd_ledger = workflow.NodeReentryLedger()
+        bd_runner = workflow.OrchestrationRunner(
+            sandbox=FakeSandbox(clock=FakeClock()),
+            clock=FakeClock(),
+            intel_provider=_BlankDigestProvider(bad_digest),
+            ledger=bd_ledger,
+        )
+        bd_job_id = str(uuid4())
+        bd_outcome = bd_runner.run_child(
+            job_id=bd_job_id,
+            family_id=str(uuid4()),
+            job_kind="round",
+            round_no=1,
+            target_kind="source",
+        )
+        expected_bd_summary = {
+            "source": "unverified",
+            "license": "MIT",
+            "sub_reason": "SNAPSHOT_DIGEST_MISSING",
+        }
+        assert bd_outcome.terminal_node == "archive"
+        assert bd_outcome.state == "BLOCKED"
+        assert bd_outcome.reason_code == "MATERIAL_MISSING"
+        assert bd_outcome.intel_summary == expected_bd_summary
+        assert bd_ledger.archives_for_job(bd_job_id)[0].intel_summary == expected_bd_summary
+        assert len(bd_outcome.audit_events) == 1
+        assert bd_outcome.audit_events[0].event_type == "intel_blocked"
+        assert bd_outcome.audit_events[0].reason_code == "MATERIAL_MISSING"
+        assert bd_outcome.audit_events[0].detail == expected_bd_summary
+
+
+def test_intel_and_archive_reentry_deduplicates_audit_and_preserves_first_write():
+    digest_1 = "sha256:" + "1" * 64
+    digest_2 = "sha256:" + "2" * 64
+
+    class _CountingIntelProvider:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.current_digest = digest_1
+            self.current_license = "MIT"
+
+        def resolve_intel(
+            self,
+            *,
+            job_id: str,
+            family_id: str,
+            request: Mapping[str, Any],
+        ) -> workflow.IntelResult:
+            del job_id, family_id, request
+            self.calls += 1
+            return workflow.IntelResult(
+                status="ready",
+                snapshot_digest=self.current_digest,
+                summary={"license": self.current_license, "call": self.calls},
+            )
+
+    provider = _CountingIntelProvider()
+    clock = FakeClock()
+    sandbox = FakeSandbox(clock=clock)
+    ledger = workflow.NodeReentryLedger()
+    runner = workflow.OrchestrationRunner(
+        sandbox=sandbox,
+        clock=clock,
+        intel_provider=provider,
+        review_gate=FakeReviewGate(clock=clock, decision="approve"),
+        envelope_policy=FakeEnvelopePolicy(clock=clock, default_admit=True),
+        ledger=ledger,
+    )
+    job_id = str(uuid4())
+    family_id = str(uuid4())
+
+    first = runner.run_child(
+        job_id=job_id,
+        family_id=family_id,
+        job_kind="round",
+        round_no=1,
+        generation=1,
+        is_first_plan=True,
+    )
+    assert provider.calls == 1
+    assert len(runner.audit_events(job_id)) == 1
+    assert runner.archive_count(job_id) == 1
+    assert first.intel_summary == {
+        "snapshot_digest": digest_1,
+        "license": "MIT",
+        "call": 1,
+    }
+
+    # Same StepKey re-entry must be a pure no-op: no duplicate audit event,
+    # no second resolve_intel call, and identical archive digest/summary.
+    second = runner.run_child(
+        job_id=job_id,
+        family_id=family_id,
+        job_kind="round",
+        round_no=1,
+        generation=1,
+        is_first_plan=True,
+    )
+    assert provider.calls == 1
+    assert len(runner.audit_events(job_id)) == 1
+    assert runner.archive_count(job_id) == 1
+    assert second.archive_digest == first.archive_digest
+    assert second.intel_summary == first.intel_summary
+    assert second.audit_events == first.audit_events
+
+    # Cross-generation re-entry with changed provider output still preserves
+    # first-write-wins archive_digest, ArchiveRecord.intel_summary, and
+    # deduplicates audit_events on (job_id, stage, step_key, attempt_no, event_type).
+    provider.current_digest = digest_2
+    provider.current_license = "BSD-3-Clause"
+    gen2 = runner.run_child(
+        job_id=job_id,
+        family_id=family_id,
+        job_kind="round",
+        round_no=1,
+        generation=2,
+        is_first_plan=True,
+    )
+    assert provider.calls == 2
+    assert len(runner.audit_events(job_id)) == 1
+    assert runner.audit_events(job_id)[0].detail == first.intel_summary
+    assert runner.archive_count(job_id) == 1
+    assert gen2.archive_digest == first.archive_digest
+    assert gen2.intel_summary == first.intel_summary
+    assert ledger.archives_for_job(job_id)[0].intel_summary == first.intel_summary
+
+    # Direct execute_node re-entry on intel and archive with same StepKey.
+    node_job_id = str(uuid4())
+    intel_key = (node_job_id, "intel", "intel_step", 1, 1)
+    first_intel = runner.execute_node(family_id=family_id, idempotency_key=intel_key)
+    second_intel = runner.execute_node(family_id=family_id, idempotency_key=intel_key)
+    assert second_intel == first_intel
+    assert len(runner.audit_events(node_job_id)) == 1
+
+    # Direct AuditEventStore idempotency contract on NodeReentryLedger.
+    direct_job = str(uuid4())
+    assert (
+        ledger.record_audit_event(
+            job_id=direct_job,
+            family_id=family_id,
+            stage="intel",
+            step_key="intel",
+            attempt_no=1,
+            event_type="intel_resolved",
+            reason_code=None,
+            detail={"snapshot_digest": digest_1},
+            recorded_at=clock.timestamp(),
+        )
+        is True
+    )
+    assert (
+        ledger.record_audit_event(
+            job_id=direct_job,
+            family_id=family_id,
+            stage="intel",
+            step_key="intel",
+            attempt_no=1,
+            event_type="intel_resolved",
+            reason_code=None,
+            detail={"snapshot_digest": digest_2},
+            recorded_at=clock.timestamp(),
+        )
+        is False
+    )
+    assert len(ledger.audit_events_for_job(direct_job)) == 1
+    assert ledger.audit_events_for_job(direct_job)[0].detail == {
+        "snapshot_digest": digest_1
+    }
+
+    # Regression: first-write-wins when gen 1 archives with intel_summary=None
+    # (blocked with empty summary) and gen 2 re-enters with non-empty intel_summary.
+    class _ToggleIntelProvider:
+        def __init__(self) -> None:
+            self.ready = False
+
+        def resolve_intel(
+            self,
+            *,
+            job_id: str,
+            family_id: str,
+            request: Mapping[str, Any],
+        ) -> workflow.IntelResult:
+            del job_id, family_id, request
+            if not self.ready:
+                return workflow.IntelResult(
+                    status="blocked",
+                    snapshot_digest=None,
+                    reason_code="MATERIAL_MISSING",
+                    summary={},
+                )
+            return workflow.IntelResult(
+                status="ready",
+                snapshot_digest=digest_2,
+                summary={"license": "MIT"},
+            )
+
+    toggle_provider = _ToggleIntelProvider()
+    toggle_clock = FakeClock()
+    toggle_ledger = workflow.NodeReentryLedger()
+    toggle_runner = workflow.OrchestrationRunner(
+        sandbox=FakeSandbox(clock=toggle_clock),
+        clock=toggle_clock,
+        intel_provider=toggle_provider,
+        review_gate=FakeReviewGate(clock=toggle_clock, decision="approve"),
+        envelope_policy=FakeEnvelopePolicy(clock=toggle_clock, default_admit=True),
+        ledger=toggle_ledger,
+    )
+    toggle_job_id = str(uuid4())
+    toggle_gen1 = toggle_runner.run_child(
+        job_id=toggle_job_id,
+        family_id=family_id,
+        job_kind="round",
+        round_no=1,
+        generation=1,
+        is_first_plan=True,
+    )
+    assert toggle_gen1.state == "BLOCKED"
+    assert toggle_gen1.intel_summary is None
+    assert toggle_ledger.archives_for_job(toggle_job_id)[0].intel_summary is None
+
+    toggle_provider.ready = True
+    toggle_gen2 = toggle_runner.run_child(
+        job_id=toggle_job_id,
+        family_id=family_id,
+        job_kind="round",
+        round_no=1,
+        generation=2,
+        is_first_plan=True,
+    )
+    assert toggle_gen2.archive_digest == toggle_gen1.archive_digest
+    assert toggle_gen2.state == toggle_gen1.state
+    assert toggle_gen2.intel_summary is None
+    assert toggle_ledger.archives_for_job(toggle_job_id)[0].intel_summary is None
+
+
+def test_intel_archive_audit_backward_compatibility_and_exports():
+    # Export parity between orchestration and workflow.
+    assert workflow.AuditEventRecord is orchestration.AuditEventRecord
+    assert workflow.AuditEventStore is orchestration.AuditEventStore
+    assert "AuditEventRecord" in orchestration.__all__
+    assert "AuditEventStore" in orchestration.__all__
+    assert isinstance(workflow.NodeReentryLedger(), workflow.AuditEventStore)
+
+    # Legacy 8-positional-arg ArchiveRecord construction still defaults intel_summary=None.
+    legacy_rec = workflow.ArchiveRecord(
+        "job-1",
+        "fam-1",
+        "round",
+        "REPRODUCED",
+        "REPRODUCED",
+        "ASAN_SIGNATURE_MATCHED",
+        "sha256:" + "0" * 64,
+        "2099-01-01T00:00:00Z",
+    )
+    assert legacy_rec.intel_summary is None
+
+    # 1. Legacy ChargeArchiveStore (no AuditEventStore, no intel_summary param)
+    #    paired with a custom AttemptStore (no AuditEventStore) -> falls back
+    #    cleanly to a fresh AuditEventStore.
+    class _LegacyChargeArchiveStore:
+        def __init__(self) -> None:
+            self.archives: dict[str, workflow.ArchiveRecord] = {}
+            self.charges: list[tuple[str, float]] = []
+
+        def record_charge(
+            self,
+            *,
+            job_id: str,
+            family_id: str,
+            step_key: str,
+            attempt_no: int,
+            seconds: float,
+            recorded_at: str,
+            fuzz_seconds: float = 0.0,
+            charge_kind: str = "general",
+        ) -> bool:
+            del family_id, step_key, attempt_no, recorded_at, fuzz_seconds, charge_kind
+            self.charges.append((job_id, float(seconds)))
+            return True
+
+        def charge_count(self, job_id: str) -> int:
+            return sum(1 for jid, _ in self.charges if jid == job_id)
+
+        def total_charged_seconds(self, family_id: str) -> float:
+            del family_id
+            return sum(sec for _, sec in self.charges)
+
+        def total_fuzz_seconds(self, family_id: str) -> float:
+            del family_id
+            return 0.0
+
+        def record_archive(
+            self,
+            *,
+            job_id: str,
+            family_id: str,
+            job_kind: str,
+            state: str,
+            verdict: str | None,
+            reason_code: str | None,
+            archive_digest: str,
+            recorded_at: str,
+        ) -> workflow.ArchiveRecord:
+            rec = workflow.ArchiveRecord(
+                job_id=job_id,
+                family_id=family_id,
+                job_kind=job_kind,
+                state=state,
+                verdict=verdict,
+                reason_code=reason_code,
+                archive_digest=archive_digest,
+                recorded_at=recorded_at,
+            )
+            self.archives.setdefault(job_id, rec)
+            return self.archives[job_id]
+
+        def archive_count(self, job_id: str) -> int:
+            return 1 if job_id in self.archives else 0
+
+    class _AttemptOnlyStore:
+        def __init__(self) -> None:
+            self.records: dict[workflow.StepKey, dict[str, Any]] = {}
+
+        def get_completed(self, key: workflow.StepKey) -> dict[str, Any] | None:
+            cached = self.records.get(key)
+            return dict(cached) if cached is not None else None
+
+        def record_completed(
+            self,
+            key: workflow.StepKey,
+            result: Mapping[str, Any],
+        ) -> dict[str, Any]:
+            self.records[key] = dict(result)
+            return dict(result)
+
+    legacy_store = _LegacyChargeArchiveStore()
+    attempt_only = _AttemptOnlyStore()
+    assert not isinstance(legacy_store, workflow.AuditEventStore)
+    assert not isinstance(attempt_only, workflow.AuditEventStore)
+    legacy_clock = FakeClock()
+    legacy_runner = workflow.OrchestrationRunner(
+        sandbox=FakeSandbox(clock=legacy_clock),
+        clock=legacy_clock,
+        ledger=legacy_store,
+        attempt_store=attempt_only,
+    )
+    legacy_job = str(uuid4())
+    legacy_outcome = legacy_runner.run_child(
+        job_id=legacy_job,
+        family_id=str(uuid4()),
+        job_kind="round",
+        round_no=1,
+        is_first_plan=True,
+    )
+    assert legacy_outcome.terminal_node == "archive"
+    assert legacy_store.archive_count(legacy_job) == 1
+    assert legacy_outcome.intel_summary is not None
+    assert "snapshot_digest" in legacy_outcome.intel_summary
+    assert len(legacy_outcome.audit_events) == 1
+    assert legacy_outcome.audit_events[0].event_type == "intel_resolved"
+
+    # Tier-2 fallback: ledger is NOT AuditEventStore, attempt_store IS AuditEventStore ->
+    # audit events land on attempt_store.
+    tier2_legacy_store = _LegacyChargeArchiveStore()
+    tier2_attempt_ledger = workflow.NodeReentryLedger()
+    tier2_clock = FakeClock()
+    tier2_runner = workflow.OrchestrationRunner(
+        sandbox=FakeSandbox(clock=tier2_clock),
+        clock=tier2_clock,
+        ledger=tier2_legacy_store,
+        attempt_store=tier2_attempt_ledger,
+    )
+    assert tier2_runner.audit_store is tier2_attempt_ledger
+    tier2_job = str(uuid4())
+    tier2_outcome = tier2_runner.run_child(
+        job_id=tier2_job,
+        family_id=str(uuid4()),
+        job_kind="round",
+        round_no=1,
+        is_first_plan=True,
+    )
+    assert len(tier2_attempt_ledger.audit_events_for_job(tier2_job)) == 1
+    assert tier2_outcome.audit_events == tier2_attempt_ledger.audit_events_for_job(
+        tier2_job
+    )
+
+    # 2. NodeReentryLedger subclass overriding record_archive WITHOUT intel_summary
+    #    (matching PR #45 _RecordingLedger pattern) must work seamlessly.
+    class _RecordingLedger(workflow.NodeReentryLedger):
+        def __init__(self) -> None:
+            super().__init__()
+            self.recorded_archives: list[str] = []
+
+        def record_archive(
+            self,
+            *,
+            job_id: str,
+            family_id: str,
+            job_kind: str,
+            state: str,
+            verdict: str | None,
+            reason_code: str | None,
+            archive_digest: str,
+            recorded_at: str,
+        ) -> workflow.ArchiveRecord:
+            self.recorded_archives.append(job_id)
+            return super().record_archive(
+                job_id=job_id,
+                family_id=family_id,
+                job_kind=job_kind,
+                state=state,
+                verdict=verdict,
+                reason_code=reason_code,
+                archive_digest=archive_digest,
+                recorded_at=recorded_at,
+            )
+
+    rec_ledger = _RecordingLedger()
+    rec_clock = FakeClock()
+    rec_runner = workflow.OrchestrationRunner(
+        sandbox=FakeSandbox(clock=rec_clock),
+        clock=rec_clock,
+        ledger=rec_ledger,
+    )
+    rec_job = str(uuid4())
+    rec_outcome = rec_runner.run_child(
+        job_id=rec_job,
+        family_id=str(uuid4()),
+        job_kind="round",
+        round_no=1,
+        is_first_plan=True,
+    )
+    assert rec_outcome.terminal_node == "archive"
+    assert rec_ledger.recorded_archives == [rec_job]
+    assert rec_outcome.intel_summary is not None
+    assert "snapshot_digest" in rec_outcome.intel_summary
+    assert len(rec_runner.audit_events(rec_job)) == 1
+
+    # 3. Standalone injected AuditEventStore receives events instead of ledger.
+    class _StandaloneAuditStore:
+        def __init__(self) -> None:
+            self._keys: set[tuple[str, str, str, int, str]] = set()
+            self._events: dict[str, list[workflow.AuditEventRecord]] = {}
+
+        def record_audit_event(
+            self,
+            *,
+            job_id: str,
+            family_id: str,
+            stage: str,
+            step_key: str,
+            attempt_no: int,
+            event_type: str,
+            reason_code: str | None,
+            detail: Mapping[str, Any] | None = None,
+            recorded_at: str,
+        ) -> bool:
+            key = (job_id, stage, step_key, attempt_no, event_type)
+            if key in self._keys:
+                return False
+            self._keys.add(key)
+            rec = workflow.AuditEventRecord(
+                job_id=job_id,
+                family_id=family_id,
+                stage=stage,
+                step_key=step_key,
+                attempt_no=attempt_no,
+                event_type=event_type,
+                reason_code=reason_code,
+                detail=dict(detail or {}),
+                recorded_at=recorded_at,
+            )
+            self._events.setdefault(job_id, []).append(rec)
+            return True
+
+        def audit_events_for_job(
+            self, job_id: str
+        ) -> tuple[workflow.AuditEventRecord, ...]:
+            return tuple(self._events.get(job_id, ()))
+
+    standalone_audit = _StandaloneAuditStore()
+    assert isinstance(standalone_audit, workflow.AuditEventStore)
+    sa_ledger = workflow.NodeReentryLedger()
+    sa_clock = FakeClock()
+    sa_runner = workflow.OrchestrationRunner(
+        sandbox=FakeSandbox(clock=sa_clock),
+        clock=sa_clock,
+        ledger=sa_ledger,
+        audit_store=standalone_audit,
+    )
+    sa_job = str(uuid4())
+    sa_outcome = sa_runner.run_child(
+        job_id=sa_job,
+        family_id=str(uuid4()),
+        job_kind="round",
+        round_no=1,
+        is_first_plan=True,
+    )
+    assert len(standalone_audit.audit_events_for_job(sa_job)) == 1
+    assert sa_outcome.audit_events == standalone_audit.audit_events_for_job(sa_job)
+    assert sa_runner.audit_events(sa_job) == sa_outcome.audit_events
+    assert sa_ledger.audit_events_for_job(sa_job) == ()
+    assert (
+        workflow.build_v2_graph(
+            sandbox=FakeSandbox(clock=sa_clock),
+            clock=sa_clock,
+            ledger=legacy_store,
+            audit_store=standalone_audit,
+        )
+        is not None
+    )
+
+    # 4. Family node archive must NOT pollute intel_summary (stays None).
+    fam_clock = FakeClock()
+    fam_ledger = workflow.NodeReentryLedger()
+    fam_runner = workflow.OrchestrationRunner(
+        sandbox=FakeSandbox(clock=fam_clock),
+        clock=fam_clock,
+        review_gate=FakeReviewGate(clock=fam_clock, decision="approve"),
+        envelope_policy=FakeEnvelopePolicy(clock=fam_clock, default_admit=True),
+        ledger=fam_ledger,
+    )
+    fam_id = str(uuid4())
+    fam_run = fam_runner.run_family_guided(
+        family_id=fam_id,
+        candidate_seeds=[b"seed-family-1"],
+        max_rounds=1,
+    )
+    assert fam_run.state == "COMPLETED"
+    fam_archives = fam_ledger.archives_for_job(fam_id)
+    assert len(fam_archives) == 1
+    assert fam_archives[0].intel_summary is None
+    assert fam_run.campaign_child.intel_summary is not None
+    assert "snapshot_digest" in fam_run.campaign_child.intel_summary
+    assert len(fam_run.round_children) == 1
+    assert fam_run.round_children[0].intel_summary is not None
+
+    # Even if a family graph state carries a stale intel_summary, _node_archive
+    # must ignore it for job_kind="family".
+    stale_fam_id = str(uuid4())
+    stale_fam_state = fam_runner.graph.invoke(
+        {
+            "job_id": stale_fam_id,
+            "family_id": stale_fam_id,
+            "parent_job_id": None,
+            "job_kind": "family",
+            "round_no": None,
+            "generation": 1,
+            "intel_summary": {"snapshot_digest": "sha256:" + "9" * 64},
+            "family_summary": {"kind": "family_index", "family_id": stale_fam_id},
+            "visited_nodes": [],
+        }
+    )
+    assert stale_fam_state["intel_summary"] is None
+    assert fam_ledger.archives_for_job(stale_fam_id)[0].intel_summary is None
