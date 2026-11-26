@@ -976,3 +976,70 @@ def test_begin_execution_races_propose_envelope_and_record_review_without_deadlo
                 )[0]
                 == "RUNNING"
             )
+
+
+def test_begin_execution_idempotent_for_running_child_during_non_tightening_pending_envelope(
+    isolated_database, tmp_path, monkeypatch
+):
+    monkeypatch.setenv("DATACON_EVIDENCE_ROOT", str(tmp_path / "evidence"))
+    seed = _approved_family(isolated_database)
+    family_id = seed["family_id"]
+    child_id = seed["child_id"]
+    state.initialize_budget_ledger(
+        isolated_database.dsn,
+        family_id,
+        max_total_seconds=900,
+        max_fuzz_seconds=300,
+    )
+    isolated_database.connection.execute(
+        "UPDATE jobs SET state = 'READY', workflow_synced = true, "
+        "request = %s WHERE job_id = %s",
+        (Jsonb({"schema_version": 2, "limits": {"execute_seconds": 600}}), child_id),
+    )
+
+    claimed = state.claim_next(
+        isolated_database.dsn, "v2-worker", job_contract_version=2
+    )
+    assert claimed is not None
+    assert claimed["job_id"] == child_id
+    assert claimed["state"] == "RUNNING"
+
+    # A non-tightening envelope change (same budget ceilings) is allowed while
+    # a child is RUNNING; idempotent re-entry to begin_execution must return True.
+    proposed = state.propose_envelope(
+        isolated_database.dsn,
+        family_id,
+        _envelope(max_rounds=6, max_total_seconds=900, max_fuzz_seconds=300),
+    )
+    assert proposed["status"] == "pending"
+
+    assert (
+        state.begin_execution(
+            isolated_database.dsn, child_id, generation=claimed["generation"]
+        )
+        is True
+    )
+    assert (
+        _row(
+            isolated_database,
+            "SELECT state FROM jobs WHERE job_id = %s",
+            (child_id,),
+        )[0]
+        == "RUNNING"
+    )
+
+    # Rejecting the family still blocks begin_execution because the family
+    # AGGREGATING check stays before the RUNNING idempotency return.
+    rejected = state.record_review(
+        isolated_database.dsn,
+        family_id,
+        plan_digest=FIRST_PLAN_DIGEST,
+        decision="reject",
+        reviewer_id=REVIEWER_2,
+        envelope_digest=proposed["envelope_digest"],
+    )
+    assert rejected.status == "applied", rejected.message
+    with pytest.raises(state.StateError, match="BLOCKED"):
+        state.begin_execution(
+            isolated_database.dsn, child_id, generation=claimed["generation"]
+        )

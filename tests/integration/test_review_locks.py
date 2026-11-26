@@ -3752,3 +3752,27 @@ def test_reapproval_rejects_budget_tightening_while_child_active(
         "WHERE job_id = %s AND event_type = 'review_recorded'",
         (family_id,),
     )[0] == 0
+
+
+def test_freeze_plan_rejects_non_mapping_envelope_with_state_error(
+    isolated_database,
+):
+    family_id, child_id = _freeze_seed(
+        isolated_database, _family_request("guided")
+    )
+    digest = jsonutil.digest_json(GUIDED_ENVELOPE_BODY)
+    plan = _v2_plan(family_id, round_no=None, envelope_digest=digest)
+    plan_digest = contracts.plan_digest(plan)
+
+    for bad_envelope in (123, "not-a-mapping", [("mode", "guided")]):
+        with pytest.raises(state.StateError, match="envelope is invalid"):
+            state.freeze_plan(
+                isolated_database.dsn,
+                child_id,
+                generation=1,
+                plan=plan,
+                plan_digest=plan_digest,
+                summary={},
+                envelope=bad_envelope,  # type: ignore[arg-type]
+            )
+    _assert_no_freeze_rows(isolated_database, family_id, child_id)

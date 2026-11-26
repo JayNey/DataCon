@@ -768,3 +768,98 @@ def test_admission_budget_snapshot_closed_keyset_and_reconciliation():
             admission_id=ADMISSION_ID,
         )
         assert admitted.admitted
+
+
+def test_admission_binds_budget_snapshot_family_id_and_envelope_caps():
+    other_family_id = str(uuid.uuid4())
+    envelope = _guided_envelope()
+
+    bad_snapshots = [
+        # Cross-family budget_snapshot.family_id must fail closed.
+        {
+            "family_id": other_family_id,
+            "max_total_seconds": envelope["max_total_seconds"],
+            "max_fuzz_seconds": envelope["max_fuzz_seconds"],
+            "remaining_total_seconds": 800,
+            "remaining_fuzz_seconds": 250,
+            "updated_at": "2099-01-01T00:00:00Z",
+        },
+        # max_total_seconds differing from envelope (lower and higher).
+        {
+            "family_id": FAMILY_ID,
+            "max_total_seconds": envelope["max_total_seconds"] - 100,
+            "max_fuzz_seconds": envelope["max_fuzz_seconds"],
+            "remaining_total_seconds": 800,
+            "remaining_fuzz_seconds": 250,
+        },
+        {
+            "family_id": FAMILY_ID,
+            "max_total_seconds": envelope["max_total_seconds"] + 100,
+            "max_fuzz_seconds": envelope["max_fuzz_seconds"],
+            "remaining_total_seconds": 800,
+            "remaining_fuzz_seconds": 250,
+        },
+        # max_fuzz_seconds differing from envelope (lower and higher).
+        {
+            "family_id": FAMILY_ID,
+            "max_total_seconds": envelope["max_total_seconds"],
+            "max_fuzz_seconds": envelope["max_fuzz_seconds"] - 50,
+            "remaining_total_seconds": 800,
+            "remaining_fuzz_seconds": 250,
+        },
+        {
+            "family_id": FAMILY_ID,
+            "max_total_seconds": envelope["max_total_seconds"],
+            "max_fuzz_seconds": envelope["max_fuzz_seconds"] + 50,
+            "remaining_total_seconds": 800,
+            "remaining_fuzz_seconds": 250,
+        },
+    ]
+    for bad in bad_snapshots:
+        with pytest.raises(state.StateError):
+            state.policy_admit_round(
+                clock=FakeClock(),
+                job_id=JOB_ID,
+                parent_job_id=FAMILY_ID,
+                envelope=envelope,
+                parent_approval_digest=APPROVAL_DIGEST,
+                approval_chain_tail_digest=APPROVAL_DIGEST,
+                seed_digest=SEED_CORPUS_DIGEST,
+                round_no=2,
+                budget_snapshot=bad,
+                admission_id=ADMISSION_ID,
+            )
+
+    # Full 6-field snapshots bound to the target family and envelope caps pass.
+    matching_snapshots = [
+        {
+            "family_id": FAMILY_ID,
+            "max_total_seconds": envelope["max_total_seconds"],
+            "max_fuzz_seconds": envelope["max_fuzz_seconds"],
+            "remaining_total_seconds": 800,
+            "remaining_fuzz_seconds": 250,
+            "updated_at": "2099-01-01T00:00:00Z",
+        },
+        {
+            "max_total_seconds": envelope["max_total_seconds"],
+            "max_fuzz_seconds": envelope["max_fuzz_seconds"],
+            "spent_seconds": 100,
+            "spent_fuzz_seconds": 50,
+            "remaining_seconds": 800,
+            "remaining_fuzz_seconds": 250,
+        },
+    ]
+    for good in matching_snapshots:
+        outcome = state.policy_admit_round(
+            clock=FakeClock(),
+            job_id=JOB_ID,
+            parent_job_id=FAMILY_ID,
+            envelope=envelope,
+            parent_approval_digest=APPROVAL_DIGEST,
+            approval_chain_tail_digest=APPROVAL_DIGEST,
+            seed_digest=SEED_CORPUS_DIGEST,
+            round_no=2,
+            budget_snapshot=good,
+            admission_id=ADMISSION_ID,
+        )
+        assert outcome.admitted

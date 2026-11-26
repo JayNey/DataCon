@@ -1229,3 +1229,150 @@ def test_record_admission_rejects_unreconciled_or_unknown_key_budget_snapshot(
             _admit(isolated_database, seed, budget_snapshot=bad)
     assert _admissions(isolated_database, family_id, 2) == []
     assert _events(isolated_database, child_id) == []
+
+
+def test_record_admission_binds_budget_snapshot_family_id_and_caps(
+    isolated_database,
+):
+    seed = _seed_family(isolated_database)
+    family_id, child_id, envelope = seed
+    other_family_id = str(uuid4())
+
+    # 1. Cross-family family_id and envelope cap mismatches fail closed with
+    #    0 admissions rows and 0 dirty audit events.
+    mismatched_snapshots = [
+        {
+            "family_id": other_family_id,
+            "max_total_seconds": envelope["max_total_seconds"],
+            "max_fuzz_seconds": envelope["max_fuzz_seconds"],
+            "remaining_total_seconds": 900,
+            "remaining_fuzz_seconds": 300,
+            "updated_at": "2099-01-01T00:00:00Z",
+        },
+        {
+            "family_id": str(family_id),
+            "max_total_seconds": 800,
+            "max_fuzz_seconds": 300,
+            "remaining_total_seconds": 800,
+            "remaining_fuzz_seconds": 300,
+        },
+        {
+            "family_id": str(family_id),
+            "max_total_seconds": 1000,
+            "max_fuzz_seconds": 300,
+            "remaining_total_seconds": 900,
+            "remaining_fuzz_seconds": 300,
+        },
+        {
+            "family_id": str(family_id),
+            "max_total_seconds": 900,
+            "max_fuzz_seconds": 200,
+            "remaining_total_seconds": 900,
+            "remaining_fuzz_seconds": 200,
+        },
+        {
+            "family_id": str(family_id),
+            "max_total_seconds": 900,
+            "max_fuzz_seconds": 400,
+            "remaining_total_seconds": 900,
+            "remaining_fuzz_seconds": 300,
+        },
+    ]
+    for bad in mismatched_snapshots:
+        with pytest.raises(state.StateError):
+            _admit(isolated_database, seed, budget_snapshot=bad)
+    assert _admissions(isolated_database, family_id, 2) == []
+    assert _events(isolated_database, child_id) == []
+
+    # 2. Snapshot matching an unapproved envelope's caps but differing from
+    #    the persisted budget_ledger max_* must also raise StateError with
+    #    0 admissions rows and 0 dirty audit events.
+    different_total_env = contracts.guided_envelope(
+        allowed_mutation_families=["byte_flip", "length_boundary"],
+        mutation_limits={
+            "allowed_ops": ["append", "truncate", "byte_flip"],
+            "max_input_bytes": 4096,
+        },
+        seed_corpus_digest=SEED_CORPUS_DIGEST,
+        toolchain_image_digest=TOOLCHAIN_IMAGE_DIGEST,
+        harness_digest=HARNESS_DIGEST,
+        max_rounds=8,
+        max_total_seconds=800,
+        max_fuzz_seconds=300,
+        accepted_signature_set=[dict(SIGNATURE)],
+        admission_predicate_version="admission-v1",
+    )
+    with pytest.raises(state.StateError, match="max_total_seconds"):
+        _admit(
+            isolated_database,
+            seed,
+            envelope=different_total_env,
+            budget_snapshot={
+                "family_id": str(family_id),
+                "max_total_seconds": 800,
+                "max_fuzz_seconds": 300,
+                "remaining_total_seconds": 800,
+                "remaining_fuzz_seconds": 300,
+            },
+        )
+    different_fuzz_env = contracts.guided_envelope(
+        allowed_mutation_families=["byte_flip", "length_boundary"],
+        mutation_limits={
+            "allowed_ops": ["append", "truncate", "byte_flip"],
+            "max_input_bytes": 4096,
+        },
+        seed_corpus_digest=SEED_CORPUS_DIGEST,
+        toolchain_image_digest=TOOLCHAIN_IMAGE_DIGEST,
+        harness_digest=HARNESS_DIGEST,
+        max_rounds=8,
+        max_total_seconds=900,
+        max_fuzz_seconds=200,
+        accepted_signature_set=[dict(SIGNATURE)],
+        admission_predicate_version="admission-v1",
+    )
+    with pytest.raises(state.StateError, match="max_fuzz_seconds"):
+        _admit(
+            isolated_database,
+            seed,
+            envelope=different_fuzz_env,
+            budget_snapshot={
+                "family_id": str(family_id),
+                "max_total_seconds": 900,
+                "max_fuzz_seconds": 200,
+                "remaining_total_seconds": 900,
+                "remaining_fuzz_seconds": 200,
+            },
+        )
+    assert _admissions(isolated_database, family_id, 2) == []
+    assert _events(isolated_database, child_id) == []
+
+    # 3. Full 6-field snapshot matching family_id, envelope, and ledger caps
+    #    is admitted cleanly, and historical same-input re-entry remains
+    #    already_admitted even after a later envelope/ledger cap change.
+    full_snapshot = {
+        "family_id": str(family_id),
+        "max_total_seconds": 900,
+        "max_fuzz_seconds": 300,
+        "remaining_total_seconds": 900,
+        "remaining_fuzz_seconds": 300,
+        "updated_at": "2099-01-01T00:00:00Z",
+    }
+    admitted = _admit(isolated_database, seed, budget_snapshot=full_snapshot)
+    assert admitted.admitted
+    assert len(_admissions(isolated_database, family_id, 2)) == 1
+    assert [event[0] for event in _events(isolated_database, child_id)] == [
+        "round_admitted"
+    ]
+
+    isolated_database.connection.execute(
+        "UPDATE budget_ledger SET max_total_seconds = 600, "
+        "remaining_total_seconds = 600, max_fuzz_seconds = 200, "
+        "remaining_fuzz_seconds = 200 WHERE family_id = %s",
+        (family_id,),
+    )
+    reentered = _admit(isolated_database, seed, budget_snapshot=full_snapshot)
+    assert not reentered.admitted
+    assert reentered.status == "already_admitted"
+    assert [event[0] for event in _events(isolated_database, child_id)] == [
+        "round_admitted"
+    ]

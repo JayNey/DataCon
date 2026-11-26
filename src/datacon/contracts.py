@@ -501,6 +501,8 @@ def check_mutation_constraints(
 ) -> None:
     """Require ``ExperimentSpec.mutation_constraints`` to be a subset (§4)."""
     normalized = normalize_envelope(envelope)
+    if isinstance(constraints, Mapping):
+        constraints = dict(constraints)
     try:
         constraints = _object(
             constraints,

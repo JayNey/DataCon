@@ -469,3 +469,34 @@ def test_normalize_envelope_accepts_readonly_mapping():
     assert contracts.normalize_envelope(readonly_nested) == expected
     assert contracts.envelope_digest(readonly_top) == contracts.envelope_digest(raw)
     assert contracts.envelope_digest(readonly_nested) == contracts.envelope_digest(raw)
+
+
+def test_check_mutation_constraints_accepts_readonly_mapping():
+    from types import MappingProxyType
+
+    envelope = MappingProxyType(_guided_envelope())
+    readonly_constraints = MappingProxyType(
+        {
+            "allowed_ops": ["append", "truncate"],
+            "max_input_bytes": 2048,
+        }
+    )
+    contracts.check_mutation_constraints(readonly_constraints, envelope)
+
+    readonly_experiment = MappingProxyType(
+        {
+            "input_family": "length_boundary",
+            "mutation_constraints": readonly_constraints,
+            "expected_signature": MappingProxyType(SIGNATURE),
+        }
+    )
+    contracts.check_experiment_against_envelope(readonly_experiment, envelope)
+
+    bad_readonly = MappingProxyType(
+        {
+            "allowed_ops": ["append", "freeform"],
+            "max_input_bytes": 2048,
+        }
+    )
+    with pytest.raises(contracts.EnvelopeViolation, match="allowed_ops"):
+        contracts.check_mutation_constraints(bad_readonly, envelope)

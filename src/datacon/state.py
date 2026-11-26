@@ -630,7 +630,7 @@ def freeze_plan(
                     "a v2 first plan requires the reviewed envelope body"
                 )
             try:
-                normalized_envelope = _validate_envelope(dict(envelope))
+                normalized_envelope = _validate_envelope(envelope)
             except ValueError as error:
                 raise StateError(f"envelope is invalid: {error}") from error
             if (
@@ -1095,6 +1095,8 @@ def begin_execution(dsn: str, job_id: UUID, *, generation: int) -> bool:
                     f"{family['state']}"
                 )
         job = _locked_job(connection, job_id, generation=generation)
+        if job["state"] == "RUNNING":
+            return True
         if is_v2_child:
             pending_envelope = connection.execute(
                 "SELECT 1 FROM family_envelopes "
@@ -1106,8 +1108,6 @@ def begin_execution(dsn: str, job_id: UUID, *, generation: int) -> bool:
                     "cannot start execution while a family envelope "
                     "re-approval is pending"
                 )
-        if job["state"] == "RUNNING":
-            return True
         if job["state"] != "READY":
             raise StateError(f"cannot start execution while the job is {job['state']}")
         updated = connection.execute(
@@ -2074,6 +2074,10 @@ _BUDGET_SNAPSHOT_ALLOWED_KEYS = frozenset(
 
 def _validate_budget_snapshot(
     budget_snapshot: Mapping[str, Any],
+    *,
+    expected_family_id: UUID | str | None = None,
+    expected_max_total_seconds: int | None = None,
+    expected_max_fuzz_seconds: int | None = None,
 ) -> tuple[int, int | None]:
     """Validate admission budget_snapshot structure and return balances.
 
@@ -2161,6 +2165,24 @@ def _validate_budget_snapshot(
             "budget_snapshot.max_fuzz_seconds must not exceed "
             "max_total_seconds"
         )
+    if (
+        max_total is not None
+        and expected_max_total_seconds is not None
+        and max_total != expected_max_total_seconds
+    ):
+        raise StateError(
+            "budget_snapshot.max_total_seconds must match envelope "
+            "max_total_seconds"
+        )
+    if (
+        max_fuzz is not None
+        and expected_max_fuzz_seconds is not None
+        and max_fuzz != expected_max_fuzz_seconds
+    ):
+        raise StateError(
+            "budget_snapshot.max_fuzz_seconds must match envelope "
+            "max_fuzz_seconds"
+        )
 
     spent_total: int | None = None
     if "spent_seconds" in budget_snapshot:
@@ -2228,11 +2250,21 @@ def _validate_budget_snapshot(
         if not isinstance(raw_family_id, str):
             raise StateError("budget_snapshot.family_id must be a UUID string")
         try:
-            uuid.UUID(raw_family_id)
+            parsed_family_id = uuid.UUID(raw_family_id)
         except ValueError as error:
             raise StateError(
                 "budget_snapshot.family_id must be a valid UUID string"
             ) from error
+        if expected_family_id is not None:
+            expected_uuid = (
+                expected_family_id
+                if isinstance(expected_family_id, UUID)
+                else uuid.UUID(str(expected_family_id))
+            )
+            if parsed_family_id != expected_uuid:
+                raise StateError(
+                    "budget_snapshot.family_id does not match the target family"
+                )
 
     if "updated_at" in budget_snapshot:
         try:
@@ -2406,7 +2438,12 @@ def policy_admit_round(
     if not budget_snapshot:
         raise StateError("budget_snapshot must not be empty")
     snapshot_remaining_total, snapshot_remaining_fuzz = (
-        _validate_budget_snapshot(budget_snapshot)
+        _validate_budget_snapshot(
+            budget_snapshot,
+            expected_family_id=parent_job_id,
+            expected_max_total_seconds=normalized_envelope["max_total_seconds"],
+            expected_max_fuzz_seconds=normalized_envelope["max_fuzz_seconds"],
+        )
     )
     if snapshot_remaining_total > normalized_envelope["max_total_seconds"]:
         raise StateError(
@@ -2732,7 +2769,12 @@ def record_admission(
     if not budget_snapshot:
         raise StateError("budget_snapshot must not be empty")
     snapshot_remaining_total, snapshot_remaining_fuzz = (
-        _validate_budget_snapshot(budget_snapshot)
+        _validate_budget_snapshot(
+            budget_snapshot,
+            expected_family_id=family_id,
+            expected_max_total_seconds=normalized_envelope["max_total_seconds"],
+            expected_max_fuzz_seconds=normalized_envelope["max_fuzz_seconds"],
+        )
     )
     if snapshot_remaining_total > normalized_envelope["max_total_seconds"]:
         raise StateError(
@@ -3019,14 +3061,33 @@ def record_admission(
                     "is pending"
                 )
             ledger = connection.execute(
-                "SELECT remaining_total_seconds, remaining_fuzz_seconds "
+                "SELECT max_total_seconds, max_fuzz_seconds, "
+                "remaining_total_seconds, remaining_fuzz_seconds "
                 "FROM budget_ledger WHERE family_id = %s FOR UPDATE",
                 (family_id,),
             ).fetchone()
             if ledger is None:
                 raise StateError("admission family has no budget ledger")
+            ledger_max_total = int(ledger["max_total_seconds"])
+            ledger_max_fuzz = int(ledger["max_fuzz_seconds"])
             ledger_remaining_total = int(ledger["remaining_total_seconds"])
             ledger_remaining_fuzz = int(ledger["remaining_fuzz_seconds"])
+            if (
+                "max_total_seconds" in budget_snapshot
+                and budget_snapshot["max_total_seconds"] != ledger_max_total
+            ):
+                raise StateError(
+                    "budget_snapshot.max_total_seconds does not match family "
+                    "budget_ledger"
+                )
+            if (
+                "max_fuzz_seconds" in budget_snapshot
+                and budget_snapshot["max_fuzz_seconds"] != ledger_max_fuzz
+            ):
+                raise StateError(
+                    "budget_snapshot.max_fuzz_seconds does not match family "
+                    "budget_ledger"
+                )
             if ledger_remaining_total >= 1:
                 if snapshot_remaining_total > ledger_remaining_total:
                     raise StateError(
@@ -3132,14 +3193,21 @@ def _validate_charge_input(
     elapsed_seconds: Any,
     elapsed_fuzz_seconds: Any,
 ) -> tuple[str, int, int, int]:
-    if not isinstance(step_key, str) or not step_key.strip():
-        raise StateError("step_key must be a non-empty string")
+    try:
+        jsonutil.require_text(step_key, "step_key")
+    except ValueError as error:
+        raise StateError(str(error)) from error
     if type(attempt_no) is not int or attempt_no < 1:
         raise StateError("attempt_no must be a positive integer")
     if charge_kind not in ("general", "fuzz"):
         raise StateError("charge_kind must be general or fuzz")
     elapsed = _ceil_seconds(elapsed_seconds, "elapsed_seconds")
     fuzz_elapsed = _ceil_seconds(elapsed_fuzz_seconds, "elapsed_fuzz_seconds")
+    if charge_kind == "general" and fuzz_elapsed > 0:
+        raise StateError(
+            "general budget charge must not specify positive "
+            "elapsed_fuzz_seconds"
+        )
     return charge_kind, attempt_no, elapsed, fuzz_elapsed
 
 
@@ -3224,6 +3292,11 @@ def compute_budget_charge(
         raise StateError("charge_kind must be general or fuzz")
     elapsed = _ceil_seconds(elapsed_seconds, "elapsed_seconds")
     fuzz_elapsed = _ceil_seconds(elapsed_fuzz_seconds, "elapsed_fuzz_seconds")
+    if charge_kind == "general" and fuzz_elapsed > 0:
+        raise StateError(
+            "general budget charge must not specify positive "
+            "elapsed_fuzz_seconds"
+        )
     remaining_total = _require_budget_int(
         ledger, "remaining_total_seconds", "remaining_total_seconds"
     )
@@ -3281,6 +3354,10 @@ def charge_budget_local(
             if str(charge.get("family_id")) != family_text:
                 raise StateError(
                     "existing budget charge belongs to a different family"
+                )
+            if charge.get("charge_kind") != charge_kind:
+                raise StateError(
+                    "existing budget charge has a different charge_kind"
                 )
             return BudgetChargeOutcome(
                 "recovered", None, dict(charge), dict(ledger)
@@ -3823,6 +3900,10 @@ def charge_step_budget(
                 if existing["family_id"] != family_id:
                     raise StateError(
                         "existing budget charge belongs to a different family"
+                    )
+                if existing["charge_kind"] != charge_kind:
+                    raise StateError(
+                        "existing budget charge has a different charge_kind"
                     )
                 return BudgetChargeOutcome(
                     "recovered",

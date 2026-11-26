@@ -1103,3 +1103,206 @@ def test_postgres_charge_step_budget_whitelist_allows_running_archiving_and_reje
     final_summary = state.family_budget_summary(budget_database.dsn, family_id)
     assert final_summary["spent_seconds"] == 18
     assert final_summary["remaining_seconds"] == 82
+
+
+def test_charge_budget_local_guards_charge_kind_recovery_and_input_validation():
+    ledger = _ledger()
+    charges: list[dict] = []
+
+    # 1. general -> fuzz re-entry on same (job_id, step_key, attempt_no) raises StateError
+    first_general = _charge(
+        ledger,
+        charges,
+        step_key="shared-step",
+        attempt_no=1,
+        charge_kind="general",
+        elapsed_seconds=10,
+    )
+    assert first_general.status == "charged"
+    with pytest.raises(state.StateError, match="charge_kind"):
+        _charge(
+            ledger,
+            charges,
+            step_key="shared-step",
+            attempt_no=1,
+            charge_kind="fuzz",
+            elapsed_seconds=10,
+            elapsed_fuzz_seconds=5,
+        )
+    assert ledger["remaining_total_seconds"] == 90
+    assert ledger["remaining_fuzz_seconds"] == 60
+    assert len(charges) == 1
+
+    # 2. fuzz -> general re-entry on same (job_id, step_key, attempt_no) raises StateError
+    first_fuzz = _charge(
+        ledger,
+        charges,
+        step_key="fuzz-step",
+        attempt_no=1,
+        charge_kind="fuzz",
+        elapsed_seconds=10,
+        elapsed_fuzz_seconds=4,
+    )
+    assert first_fuzz.status == "charged"
+    with pytest.raises(state.StateError, match="charge_kind"):
+        _charge(
+            ledger,
+            charges,
+            step_key="fuzz-step",
+            attempt_no=1,
+            charge_kind="general",
+            elapsed_seconds=10,
+        )
+    assert ledger["remaining_total_seconds"] == 80
+    assert ledger["remaining_fuzz_seconds"] == 56
+    assert len(charges) == 2
+
+    # 3. general charge with positive elapsed_fuzz_seconds raises StateError
+    for positive_fuzz in (1, 0.1, 1e-6):
+        with pytest.raises(state.StateError, match="elapsed_fuzz_seconds"):
+            _charge(
+                ledger,
+                charges,
+                step_key="bad-general",
+                attempt_no=1,
+                charge_kind="general",
+                elapsed_seconds=5,
+                elapsed_fuzz_seconds=positive_fuzz,
+            )
+        with pytest.raises(state.StateError, match="elapsed_fuzz_seconds"):
+            state.compute_budget_charge(
+                ledger,
+                charge_kind="general",
+                elapsed_seconds=5,
+                elapsed_fuzz_seconds=positive_fuzz,
+            )
+    assert state.compute_budget_charge(
+        ledger, charge_kind="general", elapsed_seconds=5, elapsed_fuzz_seconds=0
+    ) == (5, 0)
+    assert ledger["remaining_total_seconds"] == 80
+    assert ledger["remaining_fuzz_seconds"] == 56
+
+    # 4. step_key containing NUL or control characters raises StateError
+    for bad_step_key in ("build\x00x", "build\x01", "build\x1f", "build\x7f"):
+        with pytest.raises(state.StateError, match="step_key"):
+            _charge(
+                ledger,
+                charges,
+                step_key=bad_step_key,
+                attempt_no=1,
+                charge_kind="general",
+                elapsed_seconds=5,
+            )
+    assert len(charges) == 2
+
+
+@pytest.mark.postgres
+def test_postgres_charge_step_budget_guards_charge_kind_recovery_and_input_validation(
+    budget_database,
+):
+    family_id = uuid.uuid4()
+    child_id = uuid.uuid4()
+    budget_database.connection.execute(
+        "INSERT INTO jobs (job_id, request, state, stage, submitted_at, "
+        "job_contract_version, family_id, job_kind, parent_job_id, round_no, "
+        "generation, workflow_synced) "
+        "VALUES (%s, %s, 'AGGREGATING', 'family', clock_timestamp(), 2, %s, "
+        "'family', NULL, NULL, 1, true)",
+        (family_id, Jsonb({"schema_version": 2}), family_id),
+    )
+    budget_database.connection.execute(
+        "INSERT INTO jobs (job_id, request, state, stage, submitted_at, "
+        "job_contract_version, family_id, job_kind, parent_job_id, round_no, "
+        "generation) "
+        "VALUES (%s, %s, 'RUNNING', 'build', clock_timestamp(), 2, %s, "
+        "'round', %s, 1, 1)",
+        (child_id, Jsonb({"schema_version": 2}), family_id, family_id),
+    )
+    state.initialize_budget_ledger(
+        budget_database.dsn,
+        family_id,
+        max_total_seconds=100,
+        max_fuzz_seconds=60,
+    )
+
+    # 1. general -> fuzz mismatch on same idempotency key raises StateError
+    first_general = state.charge_step_budget(
+        budget_database.dsn,
+        family_id=family_id,
+        job_id=child_id,
+        step_key="shared-step",
+        attempt_no=1,
+        charge_kind="general",
+        elapsed_seconds=10,
+    )
+    assert first_general.status == "charged"
+    with pytest.raises(state.StateError, match="charge_kind"):
+        state.charge_step_budget(
+            budget_database.dsn,
+            family_id=family_id,
+            job_id=child_id,
+            step_key="shared-step",
+            attempt_no=1,
+            charge_kind="fuzz",
+            elapsed_seconds=10,
+            elapsed_fuzz_seconds=5,
+        )
+
+    # 2. fuzz -> general mismatch on same idempotency key raises StateError
+    first_fuzz = state.charge_step_budget(
+        budget_database.dsn,
+        family_id=family_id,
+        job_id=child_id,
+        step_key="fuzz-step",
+        attempt_no=1,
+        charge_kind="fuzz",
+        elapsed_seconds=10,
+        elapsed_fuzz_seconds=4,
+    )
+    assert first_fuzz.status == "charged"
+    with pytest.raises(state.StateError, match="charge_kind"):
+        state.charge_step_budget(
+            budget_database.dsn,
+            family_id=family_id,
+            job_id=child_id,
+            step_key="fuzz-step",
+            attempt_no=1,
+            charge_kind="general",
+            elapsed_seconds=10,
+        )
+
+    # 3. general with positive elapsed_fuzz_seconds raises StateError
+    with pytest.raises(state.StateError, match="elapsed_fuzz_seconds"):
+        state.charge_step_budget(
+            budget_database.dsn,
+            family_id=family_id,
+            job_id=child_id,
+            step_key="general-with-fuzz",
+            attempt_no=1,
+            charge_kind="general",
+            elapsed_seconds=5,
+            elapsed_fuzz_seconds=1,
+        )
+
+    # 4. step_key with NUL or control chars raises StateError (not psycopg.DataError)
+    for bad_step_key in ("build\x00x", "build\x01", "build\x1f", "build\x7f"):
+        with pytest.raises(state.StateError, match="step_key"):
+            state.charge_step_budget(
+                budget_database.dsn,
+                family_id=family_id,
+                job_id=child_id,
+                step_key=bad_step_key,
+                attempt_no=1,
+                charge_kind="general",
+                elapsed_seconds=5,
+            )
+
+    summary = state.family_budget_summary(budget_database.dsn, family_id)
+    assert summary == {
+        "max_total_seconds": 100,
+        "max_fuzz_seconds": 60,
+        "spent_seconds": 20,
+        "spent_fuzz_seconds": 4,
+        "remaining_seconds": 80,
+        "remaining_fuzz_seconds": 56,
+    }
