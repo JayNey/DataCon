@@ -277,8 +277,17 @@ def decide_verdict(
     *,
     builds: Mapping[str, Mapping[str, Any]] | None = None,
     expected_inputs: Mapping[str | tuple[str, str], str] | None = None,
+    hypotheses: Sequence[Mapping[str, Any]] = (),
 ) -> VerdictDecision:
-    """Apply the SRS priority order to the six required observations."""
+    """Apply the SRS priority order to the six required observations.
+
+    ``hypotheses`` is accepted so a caller can pass the whole model output
+    through one entry point, but it is deliberately unread: hypothesis text
+    never changes the verdict (REQ-13). The decision stays a product of the
+    six replay observations and the deterministic rules below; quality
+    reporting on hypotheses is B04-H's job, never the verdict's.
+    """
+    _ = hypotheses
     checks: dict[str, Any] = {
         "priority": list(PRIORITY),
         "runs": len(runs),
