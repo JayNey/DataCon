@@ -60,6 +60,7 @@ def test_toolchain_boundary_error_enforces_closed_v2_blocked_enum():
         sub_reason=toolchain.SUB_REASON_TOOLCHAIN_V2_REQUIRED,
     )
     _assert_blocked_policy_error(err, toolchain.SUB_REASON_TOOLCHAIN_V2_REQUIRED)
+    assert err.message == err.detail == "missing tool"
 
     with pytest.raises(ValueError, match="reason_code"):
         toolchain.ToolchainBoundaryError(
@@ -71,10 +72,24 @@ def test_toolchain_boundary_error_enforces_closed_v2_blocked_enum():
     with pytest.raises(ValueError, match="sub_reason"):
         toolchain.ToolchainBoundaryError("missing sub_reason", sub_reason="   ")
 
+    with pytest.raises(TypeError, match="missing_v1_tools"):
+        toolchain.ToolchainBoundaryError(
+            "bad missing tools",
+            sub_reason=toolchain.SUB_REASON_TOOLCHAIN_V2_REQUIRED,
+            missing_v1_tools="git",
+        )
+
+    with pytest.raises(TypeError, match="unknown_tools"):
+        toolchain.ToolchainBoundaryError(
+            "bad unknown tools",
+            sub_reason=toolchain.SUB_REASON_TOOLCHAIN_V2_REQUIRED,
+            unknown_tools=b"meson",  # type: ignore[arg-type]
+        )
+
 
 def test_v1_capability_sets_are_disjoint_and_complete():
     assert toolchain.V1_AVAILABLE_TOOLS.isdisjoint(toolchain.V1_MISSING_TOOLS)
-    assert {"cmake", "make", "autoconf", "automake", "libfuzzer", "clang"} <= set(
+    assert {"cmake", "make", "autoconf", "automake", "libfuzzer", "clang"} == set(
         toolchain.V1_AVAILABLE_TOOLS
     )
     assert {"pkg-config", "libtool", "ninja", "git"} == set(toolchain.V1_MISSING_TOOLS)
@@ -134,8 +149,29 @@ def test_tool_name_normalization_handles_libfuzzer_casing(variant: str):
     assert selection.required_tools == ("cmake", "make", "libfuzzer")
 
 
-@pytest.mark.parametrize("bad_tool", ["", "   ", "\t\n", "clang -O2", "make\n", 123, None])
+@pytest.mark.parametrize(
+    "bad_tool",
+    [
+        "",
+        "   ",
+        "\t\n",
+        "clang -O2",
+        "make\n",
+        "cma\u212ae",
+        "$(id)",
+        "--flag",
+        "foo\x9bbar",
+        123,
+        None,
+    ],
+)
 def test_invalid_tool_names_fail_closed(bad_tool: object):
+    with pytest.raises(toolchain.ToolchainBoundaryError) as norm_caught:
+        toolchain.normalize_tool_name(bad_tool)
+    _assert_blocked_policy_error(
+        norm_caught.value, toolchain.SUB_REASON_INVALID_TOOL_REQUIREMENT
+    )
+
     with pytest.raises(toolchain.ToolchainBoundaryError) as caught:
         toolchain.select_toolchain_image([bad_tool])  # type: ignore[list-item]
     _assert_blocked_policy_error(
@@ -143,9 +179,20 @@ def test_invalid_tool_names_fail_closed(bad_tool: object):
     )
 
 
-def test_non_sequence_or_string_required_tools_fail_closed():
+@pytest.mark.parametrize(
+    "bad_required_tools",
+    [
+        "cmake",
+        b"cmake",
+        bytearray(b"cmake"),
+        memoryview(b"cmake"),
+        {"cmake"},
+        123,
+    ],
+)
+def test_non_sequence_or_string_required_tools_fail_closed(bad_required_tools: Any):
     with pytest.raises(toolchain.ToolchainBoundaryError) as caught:
-        toolchain.select_toolchain_image("cmake")
+        toolchain.select_toolchain_image(bad_required_tools)
     _assert_blocked_policy_error(
         caught.value, toolchain.SUB_REASON_INVALID_TOOL_REQUIREMENT
     )
@@ -203,6 +250,7 @@ def test_unknown_tool_fails_closed_without_v2_and_routes_with_pinned_v2():
         f"internal-reg:1/datacon/toolchain-v2:2.0@{_V2_DIGEST}",
         f"internal-reg:65535/toolchain-v2@{_V2_DIGEST}",
         f"datacon/toolchain-v2@{_V2_DIGEST}",
+        f"ghcr.io/my--org/my__tool@{_V2_DIGEST}",
     ],
 )
 def test_valid_pinned_v2_image_refs_including_internal_registries(valid_v2: str):
@@ -248,23 +296,19 @@ def test_valid_pinned_v2_image_refs_including_internal_registries(valid_v2: str)
             toolchain.SUB_REASON_INVALID_TOOLCHAIN_V2,
         ),
         (
-            f"registry:65536/datacon/toolchain-v2@{_V2_DIGEST}",
-            toolchain.SUB_REASON_INVALID_TOOLCHAIN_V2,
-        ),
-        (
-            f"registry:99999/datacon/toolchain-v2@{_V2_DIGEST}",
-            toolchain.SUB_REASON_INVALID_TOOLCHAIN_V2,
-        ),
-        (
-            f"ghcr.io:0/datacon/toolchain-v2@{_V2_DIGEST}",
-            toolchain.SUB_REASON_INVALID_TOOLCHAIN_V2,
-        ),
-        (
             f"ghcr.io:65536/datacon/toolchain-v2@{_V2_DIGEST}",
             toolchain.SUB_REASON_INVALID_TOOLCHAIN_V2,
         ),
         (
             f"localhost:99999/datacon/toolchain-v2@{_V2_DIGEST}",
+            toolchain.SUB_REASON_INVALID_TOOLCHAIN_V2,
+        ),
+        (
+            f"ghcr.io/my___tool@{_V2_DIGEST}",
+            toolchain.SUB_REASON_INVALID_TOOLCHAIN_V2,
+        ),
+        (
+            f"ghcr.io/MyOrg/tool@{_V2_DIGEST}",
             toolchain.SUB_REASON_INVALID_TOOLCHAIN_V2,
         ),
         (
@@ -301,14 +345,12 @@ def test_probe_script_checks_libfuzzer_via_clang_and_never_installs_packages():
     assert "-fsanitize=fuzzer" in script
     assert "LLVMFuzzerTestOneInput" in script
     # Keep stdout protocol pure while allowing clang compile diagnostics on stderr.
-    assert (
-        "clang -fsanitize=fuzzer /work/fuzzer_probe.c -o /work/fuzzer_probe >/dev/null;"
-        in script
-    )
-    assert (
-        "clang -fsanitize=fuzzer /work/fuzzer_probe.c -o /work/fuzzer_probe >/dev/null 2>&1"
-        not in script
-    )
+    fuzzer_compile_lines = [
+        line for line in script.splitlines() if "clang -fsanitize=fuzzer" in line
+    ]
+    assert len(fuzzer_compile_lines) == 1
+    assert re.search(r">/dev/null(?:\s|;|$)", fuzzer_compile_lines[0])
+    assert "2>&1" not in fuzzer_compile_lines[0]
     stdout_printfs = [
         line.strip()
         for line in script.splitlines()
@@ -318,7 +360,7 @@ def test_probe_script_checks_libfuzzer_via_clang_and_never_installs_packages():
     assert all(line.startswith("printf 'TOOL ") for line in stdout_printfs)
     for forbidden in ("apt-get", "apt ", "dpkg ", "pip ", "curl ", "wget "):
         assert forbidden not in script
-    for tool in ("cmake", "make", "autoconf", "automake", "pkg-config", "libtool", "ninja", "git"):
+    for tool in sorted(toolchain.PROBED_TOOLS - {"libfuzzer"}):
         assert tool in script
 
 
@@ -329,9 +371,15 @@ def test_probe_command_enforces_sandbox_isolation_flags():
     assert "--read-only" in cmd
     assert "--cap-drop=ALL" in cmd
     assert "--security-opt=no-new-privileges:true" in cmd
-    assert f"--security-opt=seccomp={sandbox.SECCOMP_PROFILE_PATH}" in cmd
+    assert f"--security-opt=seccomp={sandbox.SECCOMP_PROFILE_PATH.resolve()}" in cmd
     assert "--user=65534:65534" in cmd
+    assert "--pids-limit=128" in cmd
+    assert "--memory=1024m" in cmd
+    assert "--memory-swap=1024m" in cmd
+    assert "--cpus=2" in cmd
+    assert "--ipc=private" in cmd
     assert "--log-driver=none" in cmd
+    assert "-w" in cmd and cmd[cmd.index("-w") + 1] == "/work"
     assert "--pull" in cmd and cmd[cmd.index("--pull") + 1] == "never"
     assert "--platform" in cmd and cmd[cmd.index("--platform") + 1] == "linux/amd64"
     env_values = [cmd[i + 1] for i, token in enumerate(cmd) if token == "-e"]
@@ -355,12 +403,54 @@ def test_probe_command_enforces_sandbox_isolation_flags():
     )
 
 
-def test_probe_command_enforces_seccomp_digest_for_explicit_paths(tmp_path: Path):
+@pytest.mark.parametrize(
+    "bad_docker_bin",
+    ["", "   ", " docker", "docker ", "docker\x00", "docker\n", 123],
+)
+def test_probe_command_rejects_invalid_docker_bin(bad_docker_bin: Any):
+    with pytest.raises(toolchain.ToolchainBoundaryError) as caught:
+        toolchain.build_toolchain_probe_command(docker_bin=bad_docker_bin)
+    _assert_blocked_policy_error(
+        caught.value, toolchain.SUB_REASON_TOOLCHAIN_PROBE_FAILED
+    )
+
+
+@pytest.mark.parametrize("bad_seccomp", [123, "", "   ", "seccomp\x00.json"])
+def test_probe_command_rejects_invalid_seccomp_path_types_and_controls(bad_seccomp: Any):
+    with pytest.raises(toolchain.ToolchainBoundaryError) as caught:
+        toolchain.build_toolchain_probe_command(seccomp_path=bad_seccomp)
+    _assert_blocked_policy_error(
+        caught.value, toolchain.SUB_REASON_TOOLCHAIN_PROBE_FAILED
+    )
+
+
+def test_probe_command_enforces_seccomp_digest_for_explicit_paths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
     # A verbatim copy of the pinned seccomp profile passes digest verification.
     valid_copy = tmp_path / "pinned-seccomp.json"
     shutil.copyfile(sandbox.SECCOMP_PROFILE_PATH, valid_copy)
     cmd = toolchain.build_toolchain_probe_command(seccomp_path=valid_copy)
-    assert f"--security-opt=seccomp={valid_copy}" in cmd
+    assert f"--security-opt=seccomp={valid_copy.resolve()}" in cmd
+
+    # Symlink seccomp paths fail closed before resolving.
+    symlink_path = tmp_path / "seccomp-link.json"
+    symlink_path.symlink_to(valid_copy)
+    with pytest.raises(toolchain.ToolchainBoundaryError, match="symlink") as link_err:
+        toolchain.build_toolchain_probe_command(seccomp_path=symlink_path)
+    _assert_blocked_policy_error(
+        link_err.value, toolchain.SUB_REASON_TOOLCHAIN_PROBE_FAILED
+    )
+
+    # Relative path named "unconfined" resolves to an absolute path so Docker
+    # cannot interpret it as the seccomp=unconfined keyword.
+    unconfined_file = tmp_path / "unconfined"
+    shutil.copyfile(sandbox.SECCOMP_PROFILE_PATH, unconfined_file)
+    monkeypatch.chdir(tmp_path)
+    rel_cmd = toolchain.build_toolchain_probe_command(seccomp_path="unconfined")
+    assert "--security-opt=seccomp=unconfined" not in rel_cmd
+    assert f"--security-opt=seccomp={unconfined_file.resolve()}" in rel_cmd
 
     # A tampered explicit seccomp profile fails closed even if syntactically valid JSON.
     tampered = tmp_path / "tampered-seccomp.json"
@@ -372,6 +462,15 @@ def test_probe_command_enforces_seccomp_digest_for_explicit_paths(tmp_path: Path
         toolchain.build_toolchain_probe_command(seccomp_path=tampered)
     _assert_blocked_policy_error(
         caught.value, toolchain.SUB_REASON_TOOLCHAIN_PROBE_FAILED
+    )
+
+    # Malformed/non-JSON seccomp profile maps SandboxPolicyError to ToolchainBoundaryError.
+    malformed = tmp_path / "malformed-seccomp.json"
+    malformed.write_text("{not valid json", encoding="utf-8")
+    with pytest.raises(toolchain.ToolchainBoundaryError) as malformed_err:
+        toolchain.build_toolchain_probe_command(seccomp_path=malformed)
+    _assert_blocked_policy_error(
+        malformed_err.value, toolchain.SUB_REASON_TOOLCHAIN_PROBE_FAILED
     )
 
     # Missing explicit seccomp file fails closed.
@@ -413,14 +512,17 @@ def test_parse_toolchain_probe_output_positive_and_boundary_drift():
         "",
         "   \n\n",
         "TOOL cmake present\n",  # incomplete
+        "TOOL cma\u212ae present\n",  # Kelvin sign non-ASCII tool name
+        _valid_probe_lines().replace("cmake", "cma\u212ae"),  # full set with Kelvin sign
         _valid_probe_lines() + "TOOL cmake present\n",  # duplicate
         _valid_probe_lines() + "TOOL unknown_tool present\n",  # unknown tool
         _valid_probe_lines() + "TOOL cmake maybe\n",  # bad status
         _valid_probe_lines() + "garbage line\n",  # malformed line
         b"\xff\xfe",  # invalid UTF-8
+        123,  # non-str/bytes
     ],
 )
-def test_parse_toolchain_probe_output_fails_closed_on_malformed_data(bad_output: str | bytes):
+def test_parse_toolchain_probe_output_fails_closed_on_malformed_data(bad_output: Any):
     with pytest.raises(toolchain.ToolchainBoundaryError) as caught:
         toolchain.parse_toolchain_probe_output(bad_output)
     _assert_blocked_policy_error(
@@ -476,20 +578,21 @@ def test_verify_pinned_image_handles_oserror_offline(
 
 
 @pytest.mark.parametrize(
-    ("stderr_text", "expected_snippet"),
+    ("stderr_bytes", "expected_snippet"),
     [
-        ("permission denied while connecting to Docker daemon\n", "permission denied"),
-        ("   \n", "no stderr"),
+        (b"permission denied while connecting to Docker daemon\n", "permission denied"),
+        (b"   \n", "no stderr"),
+        (b"docker daemon error \xff\xfe binary tail\n", "binary tail"),
     ],
 )
 def test_verify_pinned_image_handles_nonzero_exit_offline(
     monkeypatch: pytest.MonkeyPatch,
-    stderr_text: str,
+    stderr_bytes: bytes,
     expected_snippet: str,
 ):
-    def _fake_run(cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+    def _fake_run(cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess[bytes]:
         return subprocess.CompletedProcess(
-            args=cmd, returncode=125, stdout="", stderr=stderr_text
+            args=cmd, returncode=125, stdout=b"", stderr=stderr_bytes
         )
 
     monkeypatch.setattr(subprocess, "run", _fake_run)
@@ -507,14 +610,14 @@ def test_verify_pinned_image_success_offline_checks_subprocess_kwargs(
 ):
     captured: dict[str, Any] = {}
 
-    def _fake_run(cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+    def _fake_run(cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess[bytes]:
         captured["cmd"] = cmd
         captured["kwargs"] = kwargs
         return subprocess.CompletedProcess(
             args=cmd,
             returncode=0,
-            stdout=_valid_probe_lines(),
-            stderr="clang diagnostic on stderr is tolerated\n",
+            stdout=_valid_probe_lines().encode("utf-8"),
+            stderr=b"clang diagnostic on stderr is tolerated\n",
         )
 
     monkeypatch.setattr(subprocess, "run", _fake_run)
@@ -528,12 +631,51 @@ def test_verify_pinned_image_success_offline_checks_subprocess_kwargs(
         seccomp_path=None,
         docker_bin="/usr/bin/docker",
     )
-    assert captured["kwargs"] == {
-        "capture_output": True,
-        "text": True,
-        "timeout": 45.0,
-        "check": False,
-    }
+    kwargs = captured["kwargs"]
+    assert kwargs.get("capture_output") is True
+    assert not kwargs.get("text", False)
+    assert kwargs.get("check") is False
+    assert kwargs.get("timeout") == 45.0
+    assert not kwargs.get("shell", False)
     assert report.matches_v1_boundary is True
     assert report.available == toolchain.V1_AVAILABLE_TOOLS
     assert report.missing == toolchain.V1_MISSING_TOOLS
+    assert report.stderr == "clang diagnostic on stderr is tolerated"
+
+
+def test_verify_pinned_image_rejects_non_utf8_stdout_offline(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    def _fake_run(cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess[bytes]:
+        return subprocess.CompletedProcess(
+            args=cmd,
+            returncode=0,
+            stdout=b"TOOL cmake present\n\xff\xfe",
+            stderr=b"",
+        )
+
+    monkeypatch.setattr(subprocess, "run", _fake_run)
+    with pytest.raises(toolchain.ToolchainBoundaryError) as caught:
+        toolchain.verify_pinned_image_tool_boundary()
+    _assert_blocked_policy_error(
+        caught.value, toolchain.SUB_REASON_INVALID_PROBE_OUTPUT
+    )
+
+
+def test_verify_pinned_image_surfaces_clang_stderr_on_libfuzzer_absent_offline(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    def _fake_run(cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess[bytes]:
+        return subprocess.CompletedProcess(
+            args=cmd,
+            returncode=0,
+            stdout=_valid_probe_lines(overrides={"libfuzzer": "absent"}).encode("utf-8"),
+            stderr=b"clang: error: unable to link libclang_rt.fuzzer \xff\xfe\n",
+        )
+
+    monkeypatch.setattr(subprocess, "run", _fake_run)
+    report = toolchain.verify_pinned_image_tool_boundary()
+    assert report.matches_v1_boundary is False
+    assert report.unexpected_missing == frozenset({"libfuzzer"})
+    assert "clang: error: unable to link libclang_rt.fuzzer" in report.stderr
+    assert "\ufffd" in report.stderr

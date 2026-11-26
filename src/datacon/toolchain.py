@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import math
 from pathlib import Path
 import re
@@ -49,26 +49,16 @@ _REGISTRY_PREFIX_RE = (
     rf"(?:(?:(?:{_FQDN_RE}|localhost)(?::(?P<fqdn_port>[0-9]+))?)"
     rf"|(?:{_DNS_LABEL_RE}:(?P<label_port>[0-9]+)))/"
 )
-_REPO_PATH_RE = r"[a-z0-9]+(?:[._-][a-z0-9]+)*(?:/[a-z0-9]+(?:[._-][a-z0-9]+)*)*"
+_REPO_PATH_RE = (
+    r"[a-z0-9]+(?:(?:[._]|__|[-]+)[a-z0-9]+)*"
+    r"(?:/[a-z0-9]+(?:(?:[._]|__|[-]+)[a-z0-9]+)*)*"
+)
 _IMAGE_TAG_RE = r"(?::[A-Za-z0-9_][A-Za-z0-9._-]{0,127})?"
 _IMAGE_REPO_RE = re.compile(
     f"^(?:{_REGISTRY_PREFIX_RE})?{_REPO_PATH_RE}{_IMAGE_TAG_RE}$"
 )
+_TOOL_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._+-]{0,63}$")
 _PROBE_LINE_RE = re.compile(r"^TOOL\s+(\S+)\s+(present|absent)$")
-
-_PROBE_COMMAND_TOOLS_PRESENT: tuple[str, ...] = (
-    "clang",
-    "cmake",
-    "make",
-    "autoconf",
-    "automake",
-)
-_PROBE_COMMAND_TOOLS_ABSENT: tuple[str, ...] = (
-    "pkg-config",
-    "libtool",
-    "ninja",
-    "git",
-)
 
 
 class ToolchainBoundaryError(ValueError):
@@ -96,12 +86,28 @@ class ToolchainBoundaryError(ValueError):
             )
         if not isinstance(sub_reason, str) or not sub_reason.strip():
             raise ValueError("sub_reason must be a non-empty string")
+        for field_name, field_value in (
+            ("missing_v1_tools", missing_v1_tools),
+            ("unknown_tools", unknown_tools),
+        ):
+            if isinstance(
+                field_value, (str, bytes, bytearray, memoryview)
+            ) or not isinstance(field_value, Sequence):
+                raise TypeError(
+                    f"{field_name} must be a sequence of tool names, "
+                    f"got {type(field_value).__name__}"
+                )
         self.reason_code = reason_code
         self.sub_reason = sub_reason
         self.missing_v1_tools = tuple(missing_v1_tools)
         self.unknown_tools = tuple(unknown_tools)
         self.detail = detail
         super().__init__(f"{reason_code} ({sub_reason}): {detail}")
+
+    @property
+    def message(self) -> str:
+        """Return the detail message (consistent with SandboxError/ExecutionBlocked)."""
+        return self.detail
 
 
 @dataclass(frozen=True)
@@ -127,6 +133,7 @@ class ToolchainProbeReport:
     matches_v1_boundary: bool
     unexpected_missing: frozenset[str]
     unexpected_present: frozenset[str]
+    stderr: str = ""
 
 
 def normalize_tool_name(name: Any) -> str:
@@ -134,6 +141,11 @@ def normalize_tool_name(name: Any) -> str:
     if not isinstance(name, str):
         raise ToolchainBoundaryError(
             f"tool requirement must be a string, got {type(name).__name__}",
+            sub_reason=SUB_REASON_INVALID_TOOL_REQUIREMENT,
+        )
+    if not name.isascii():
+        raise ToolchainBoundaryError(
+            f"tool requirement must be ASCII: {name!r}",
             sub_reason=SUB_REASON_INVALID_TOOL_REQUIREMENT,
         )
     if any(ord(ch) < 32 or ord(ch) == 127 for ch in name):
@@ -147,9 +159,9 @@ def normalize_tool_name(name: Any) -> str:
             "tool requirement must be a non-empty string",
             sub_reason=SUB_REASON_INVALID_TOOL_REQUIREMENT,
         )
-    if any(ch.isspace() for ch in normalized):
+    if not _TOOL_NAME_RE.fullmatch(normalized):
         raise ToolchainBoundaryError(
-            f"tool requirement contains internal whitespace: {name!r}",
+            f"tool requirement contains invalid characters: {name!r}",
             sub_reason=SUB_REASON_INVALID_TOOL_REQUIREMENT,
         )
     return normalized
@@ -212,9 +224,9 @@ def select_toolchain_image(
     an explicitly configured, digest-pinned ``toolchain_image_v2`` distinct from
     ``release.TOOLCHAIN_IMAGE_DIGEST``.
     """
-    if isinstance(required_tools, (str, bytes)) or not isinstance(
-        required_tools, Sequence
-    ):
+    if isinstance(
+        required_tools, (str, bytes, bytearray, memoryview)
+    ) or not isinstance(required_tools, Sequence):
         raise ToolchainBoundaryError(
             "required_tools must be a sequence of tool names",
             sub_reason=SUB_REASON_INVALID_TOOL_REQUIREMENT,
@@ -291,12 +303,11 @@ def render_toolchain_probe_script() -> str:
     ``LLVMFuzzerTestOneInput`` target with ``clang -fsanitize=fuzzer`` in ``/work``.
     Never installs any package.
     """
-    present_list = " ".join(_PROBE_COMMAND_TOOLS_PRESENT)
-    absent_list = " ".join(_PROBE_COMMAND_TOOLS_ABSENT)
+    cli_tools = " ".join(sorted(PROBED_TOOLS - {"libfuzzer"}))
     return "\n".join(
         [
             "set -eu",
-            f"for tool in {present_list}; do",
+            f"for tool in {cli_tools}; do",
             '  if command -v "$tool" >/dev/null 2>&1; then',
             "    printf 'TOOL %s present\\n' \"$tool\"",
             "  else",
@@ -319,13 +330,6 @@ def render_toolchain_probe_script() -> str:
             "else",
             "  printf 'TOOL libfuzzer absent\\n'",
             "fi",
-            f"for tool in {absent_list}; do",
-            '  if command -v "$tool" >/dev/null 2>&1; then',
-            "    printf 'TOOL %s present\\n' \"$tool\"",
-            "  else",
-            "    printf 'TOOL %s absent\\n' \"$tool\"",
-            "  fi",
-            "done",
         ]
     )
 
@@ -359,13 +363,13 @@ def parse_toolchain_probe_output(output: str | bytes) -> ToolchainProbeReport:
                 f"malformed probe line {line_no}: {raw_line!r}",
                 sub_reason=SUB_REASON_INVALID_PROBE_OUTPUT,
             )
-        try:
-            tool_name = normalize_tool_name(match.group(1))
-        except ToolchainBoundaryError as error:
+        raw_tool = match.group(1)
+        if not raw_tool.isascii():
             raise ToolchainBoundaryError(
-                f"malformed tool name in probe line {line_no}: {raw_line!r}",
+                f"non-ASCII tool name in probe line {line_no}: {raw_line!r}",
                 sub_reason=SUB_REASON_INVALID_PROBE_OUTPUT,
-            ) from error
+            )
+        tool_name = raw_tool.lower()
         if tool_name not in PROBED_TOOLS:
             raise ToolchainBoundaryError(
                 f"unexpected tool in probe output at line {line_no}: {tool_name!r}",
@@ -412,17 +416,51 @@ def build_toolchain_probe_command(
         label="image",
         sub_reason=SUB_REASON_TOOLCHAIN_PROBE_FAILED,
     )
-    if not isinstance(docker_bin, str) or not docker_bin.strip():
+    if (
+        not isinstance(docker_bin, str)
+        or not docker_bin
+        or docker_bin != docker_bin.strip()
+        or any(ord(ch) < 32 or ord(ch) == 127 for ch in docker_bin)
+    ):
         raise ToolchainBoundaryError(
-            "docker_bin must be a non-empty executable name or path",
+            "docker_bin must be a non-empty executable name or path without "
+            "leading/trailing whitespace or control characters",
             sub_reason=SUB_REASON_TOOLCHAIN_PROBE_FAILED,
         )
-    seccomp_file = (
-        Path(seccomp_path) if seccomp_path is not None else sandbox.SECCOMP_PROFILE_PATH
-    )
+    if seccomp_path is None:
+        raw_path = sandbox.SECCOMP_PROFILE_PATH
+    else:
+        if not isinstance(seccomp_path, (str, Path)):
+            raise ToolchainBoundaryError(
+                f"seccomp_path must be a str or Path, got {type(seccomp_path).__name__}",
+                sub_reason=SUB_REASON_TOOLCHAIN_PROBE_FAILED,
+            )
+        if isinstance(seccomp_path, str) and (
+            not seccomp_path.strip()
+            or any(ord(ch) < 32 or ord(ch) == 127 for ch in seccomp_path)
+        ):
+            raise ToolchainBoundaryError(
+                "seccomp_path must be a non-empty path without control characters",
+                sub_reason=SUB_REASON_TOOLCHAIN_PROBE_FAILED,
+            )
+        raw_path = Path(seccomp_path)
+    try:
+        if raw_path.is_symlink():
+            raise ToolchainBoundaryError(
+                f"pinned seccomp profile path must not be a symlink: {raw_path}",
+                sub_reason=SUB_REASON_TOOLCHAIN_PROBE_FAILED,
+            )
+        seccomp_file = raw_path.resolve(strict=True)
+    except (OSError, ValueError) as error:
+        if isinstance(error, ToolchainBoundaryError):
+            raise
+        raise ToolchainBoundaryError(
+            f"pinned seccomp profile is missing or unreadable: {raw_path} ({error})",
+            sub_reason=SUB_REASON_TOOLCHAIN_PROBE_FAILED,
+        ) from error
     if not seccomp_file.is_file():
         raise ToolchainBoundaryError(
-            f"pinned seccomp profile is missing: {seccomp_file}",
+            f"pinned seccomp profile is not a regular file: {seccomp_file}",
             sub_reason=SUB_REASON_TOOLCHAIN_PROBE_FAILED,
         )
     try:
@@ -502,7 +540,6 @@ def verify_pinned_image_tool_boundary(
         completed = subprocess.run(
             cmd,
             capture_output=True,
-            text=True,
             timeout=timeout_seconds,
             check=False,
         )
@@ -517,11 +554,19 @@ def verify_pinned_image_tool_boundary(
             sub_reason=SUB_REASON_TOOLCHAIN_PROBE_FAILED,
         ) from error
 
+    raw_stderr: Any = completed.stderr
+    if isinstance(raw_stderr, bytes):
+        stderr_text = raw_stderr.decode("utf-8", "replace").strip()
+    elif isinstance(raw_stderr, str):
+        stderr_text = raw_stderr.strip()
+    else:
+        stderr_text = ""
+
     if completed.returncode != 0:
-        stderr_snippet = completed.stderr.strip()[:500]
         raise ToolchainBoundaryError(
             f"toolchain probe container exited with status {completed.returncode}: "
-            f"{stderr_snippet or 'no stderr'}",
+            f"{stderr_text[:500] or 'no stderr'}",
             sub_reason=SUB_REASON_TOOLCHAIN_PROBE_FAILED,
         )
-    return parse_toolchain_probe_output(completed.stdout)
+    report = parse_toolchain_probe_output(completed.stdout)
+    return replace(report, stderr=stderr_text[:2000])

@@ -72,7 +72,8 @@ def test_oniguruma_case_uses_existing_toolchain_image(
     assert v1_probe_report.matches_v1_boundary is True, (
         f"pinned image drifted from v1 boundary: "
         f"unexpected_missing={sorted(v1_probe_report.unexpected_missing)}, "
-        f"unexpected_present={sorted(v1_probe_report.unexpected_present)}"
+        f"unexpected_present={sorted(v1_probe_report.unexpected_present)}, "
+        f"stderr={v1_probe_report.stderr!r}"
     )
     expected_oniguruma = {
         toolchain.normalize_tool_name(tool)
@@ -106,7 +107,7 @@ def test_missing_tool_requires_toolchain_image_v2(
         assert blocked.value.reason_code == toolchain.REASON_POLICY_DENIED
         assert verdict.reason_allowed_v2("BLOCKED", blocked.value.reason_code)
         assert blocked.value.sub_reason == toolchain.SUB_REASON_TOOLCHAIN_V2_REQUIRED
-        assert missing_tool in blocked.value.missing_v1_tools
+        assert blocked.value.missing_v1_tools == (missing_tool,)
 
         routed = toolchain.select_toolchain_image(
             [*toolchain.ONIGURUMA_REQUIRED_TOOLS, missing_tool],
