@@ -154,6 +154,7 @@ def _write_validation(
     )
     report = {
         "schema_version": 2,
+        "plan_digest": manifest["plan_digest"],
         "build_ref": resolved_report_build_ref,
         "reuse_origin": resolved_report_origin,
     }
@@ -176,6 +177,51 @@ def _rewrite_manifested_file(root, relative: str, data: bytes) -> None:
             break
     else:
         raise AssertionError(f"{relative} is not listed in the manifest")
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+
+def _rename_manifested_file(root, old: str, new: str) -> None:
+    source = root / old
+    target = root / new
+    target.parent.mkdir(parents=True, exist_ok=True)
+    source.rename(target)
+    manifest_path = root / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    for entry in manifest["files"]:
+        if entry["path"] == old:
+            entry["path"] = new
+            break
+    else:
+        raise AssertionError(f"{old} is not listed in the manifest")
+    manifest["files"].sort(key=lambda item: item["path"])
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+
+def _add_manifested_file(root, relative: str, data: bytes) -> None:
+    target = root / relative
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(data)
+    manifest_path = root / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["files"].append(
+        {
+            "path": relative,
+            "role": "build_artifact",
+            "size_bytes": len(data),
+            "sha256": hashlib.sha256(data).hexdigest(),
+        }
+    )
+    manifest["files"].sort(key=lambda item: item["path"])
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+
+def _remove_manifested_file(root, relative: str) -> None:
+    (root / relative).unlink()
+    manifest_path = root / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["files"] = [
+        entry for entry in manifest["files"] if entry["path"] != relative
+    ]
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
 
 
@@ -276,3 +322,49 @@ def test_validation_plan_digest_and_report_are_bound(tmp_path):
     with pytest.raises(BundleError) as raised:
         verify_bundle(report_mismatch_root)
     assert raised.value.reason_code == "REUSE_MISMATCH"
+
+
+    # report.plan_digest must agree with manifest/plan, not just build_ref.
+    report_plan_digest_root = _write_validation(
+        tmp_path, "reuse-report-plan-digest"
+    )
+    report = json.loads(
+        (report_plan_digest_root / "report.json").read_text(encoding="utf-8")
+    )
+    report["plan_digest"] = "sha256:" + "c" * 64
+    _rewrite_manifested_file(
+        report_plan_digest_root,
+        "report.json",
+        json.dumps(report, sort_keys=True).encode() + b"\n",
+    )
+    with pytest.raises(BundleError, match="report.plan_digest"):
+        verify_bundle(report_plan_digest_root)
+
+
+def test_validation_rejects_non_default_build_artifact_layout(tmp_path):
+    """Custom/multi-output binding is deferred to T13, but must fail closed."""
+    # Single custom output: no default parser.
+    custom_root = _write_validation(tmp_path, "reuse-custom-artifact")
+    _rename_manifested_file(
+        custom_root,
+        "build/vulnerable/parser",
+        "build/vulnerable/custom-parser",
+    )
+    with pytest.raises(BundleError, match="default parser"):
+        verify_bundle(custom_root)
+
+    # Default parser plus an additional artifact: the extra bytes are unbound.
+    extra_root = _write_validation(tmp_path, "reuse-extra-artifact")
+    _add_manifested_file(
+        extra_root,
+        "build/vulnerable/second-parser",
+        b"second parser\n",
+    )
+    with pytest.raises(BundleError, match="default parser"):
+        verify_bundle(extra_root)
+
+    # Missing parser and no other artifact: deterministic rejection, no KeyError.
+    missing_root = _write_validation(tmp_path, "reuse-missing-artifact")
+    _remove_manifested_file(missing_root, "build/vulnerable/parser")
+    with pytest.raises(BundleError):
+        verify_bundle(missing_root)

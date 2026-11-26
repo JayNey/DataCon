@@ -1063,6 +1063,27 @@ def test_v2_blocked_build_metadata_rejects_input_aliases(tmp_path):
         verify_bundle(root)
 
 
+def test_v2_blocked_build_metadata_rejects_arbitrary_path(tmp_path):
+    """D39 applies to blocked bundles: build roles belong under build/<version>/."""
+    manifest = _manifest("blocked")
+    files = _blocked_files(manifest)
+    files["evil/metadata.json"] = (
+        "build_metadata",
+        json.dumps(
+            {
+                "version": "vulnerable",
+                "staged_materials": {"inputs/normal.txt": DIGEST},
+            }
+        ).encode()
+        + b"\n",
+    )
+    root = _write_v2_bundle(
+        tmp_path, manifest, files, name="blocked-arbitrary-build-path"
+    )
+    with pytest.raises(BundleError, match="fixed build path"):
+        verify_bundle(root)
+
+
 def test_v2_build_record_with_material_only_is_accepted(tmp_path):
     """D4 only rejects the two aliases, not ordinary build materials."""
     files = _base_files(execution=True, campaign=False)
@@ -1110,6 +1131,23 @@ def test_v2_non_reuse_plan_and_report_must_not_claim_build_ref(tmp_path):
     )
     with pytest.raises(BundleError, match="non-reuse report"):
         verify_bundle(report_root)
+
+
+@pytest.mark.parametrize("field", ["verdict", "reason_code", "state"])
+def test_campaign_report_must_not_carry_verdict_fields(tmp_path, field):
+    """Campaign evidence must not carry a reproduction conclusion."""
+    manifest = _manifest("campaign", verdict=None, reason=None)
+    files = _base_files(execution=False, campaign=True)
+    report = {"schema_version": 2, "bundle_kind": "campaign", field: "REPRODUCED"}
+    files["report.json"] = (
+        "report_json",
+        json.dumps(report).encode() + b"\n",
+    )
+    root = _write_v2_bundle(
+        tmp_path, manifest, files, name="campaign-report-" + field
+    )
+    with pytest.raises(BundleError, match=field):
+        verify_bundle(root)
 
 
 def test_v2_build_provenance_faces_are_fixed(tmp_path):
@@ -1640,7 +1678,12 @@ def test_verify_v2_partial_bundle_rejects_wrong_build_role(tmp_path):
         files,
         name="bad-build-role",
     )
-    with pytest.raises(BundleError, match="must carry the build_artifact role"):
+    # D39 narrows build roles to their fixed paths before the role layout
+    # check runs, so this wrong-role carrier is rejected as a misplaced build
+    # log. It is still rejected before any partial evidence is accepted.
+    with pytest.raises(
+        BundleError, match="must live at build/<version>/build.log"
+    ):
         verify_bundle(root)
 
 

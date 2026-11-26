@@ -3681,7 +3681,9 @@ def _check_v2_build_list(builds: Any, label: str) -> None:
         _check_v2_build_record(build, f"{label}[{index}]")
 
 
-def _verify_v2_build_records(data: Mapping[str, bytes]) -> None:
+def _verify_v2_build_records(
+    listed: Mapping[str, Mapping[str, Any]], data: Mapping[str, bytes]
+) -> None:
     """Reject v1-only input aliases in every v2 build-record carrier.
 
     D4 applies to the archived build metadata and the execution metadata as
@@ -3701,12 +3703,12 @@ def _verify_v2_build_records(data: Mapping[str, bytes]) -> None:
                 execution["builds"], "metadata/execution.json.builds"
             )
 
-    for version in _REPLAY_VERSIONS:
-        relative = f"build/{version}/metadata.json"
-        if relative in data:
-            _check_v2_build_record(
-                _parse_json_file(data, relative), relative
-            )
+    # Scan every build_metadata role entry, not only the two fixed default
+    # paths: a blocked bundle could otherwise place a build record elsewhere
+    # and bypass both D4 and the D39 path check.
+    for path, entry in listed.items():
+        if entry["role"] == "build_metadata":
+            _check_v2_build_record(_parse_json_file(data, path), path)
 
 
 def _verify_v2_reuse_artifacts(
@@ -3721,10 +3723,29 @@ def _verify_v2_reuse_artifacts(
     """
     artifacts = plan_build_ref["artifacts"]
     for version in _REPLAY_VERSIONS:
+        prefix = f"build/{version}/"
+        shipped_artifacts = sorted(
+            path
+            for path in data
+            if path.startswith(prefix)
+            and path
+            not in (prefix + "metadata.json", prefix + "build.log")
+            and not path.startswith(prefix + "build_provenance/")
+        )
+        default_artifact = prefix + "parser"
+        if shipped_artifacts != [default_artifact]:
+            # Custom BuildSpec.outputs/multi-artifact binding belongs to T13.
+            # Until it lands, fail closed instead of raising KeyError or
+            # silently verifying only the default parser.
+            raise BundleError(
+                "INVALID_MANIFEST",
+                f"{version} build artifact layout is not the default parser; "
+                "custom/multi-artifact binding is not supported yet",
+            )
         expected = artifacts[version]
         for field, relative in (
-            ("build_log_digest", f"build/{version}/build.log"),
-            ("artifact_digest", f"build/{version}/parser"),
+            ("build_log_digest", prefix + "build.log"),
+            ("artifact_digest", default_artifact),
         ):
             actual = _digest(data[relative])
             if actual != expected[field]:
@@ -3784,6 +3805,11 @@ def _verify_v2_reuse_plan(
     _verify_v2_reuse_artifacts(normalized_plan_ref, data)
 
     report = _parse_json_file(data, "report.json")
+    if report.get("plan_digest") != manifest.get("plan_digest"):
+        raise BundleError(
+            "INVALID_MANIFEST",
+            "report.plan_digest does not match manifest/plan",
+        )
     if report.get("build_ref") != manifest.get("build_ref"):
         raise BundleError(
             "REUSE_MISMATCH", "report.build_ref does not match manifest"
@@ -3794,7 +3820,7 @@ def _verify_v2_reuse_plan(
         )
 
 
-def _verify_v2_non_reuse(data: Mapping[str, bytes]) -> None:
+def _verify_v2_non_reuse(data: Mapping[str, bytes], bundle_kind: str) -> None:
     """A fixed/non-reuse plan and report must not claim a reused campaign."""
     plan = _parse_json_file(data, "plan.json")
     if plan.get("build_ref") is not None:
@@ -3807,6 +3833,66 @@ def _verify_v2_non_reuse(data: Mapping[str, bytes]) -> None:
             "INVALID_MANIFEST",
             "a non-reuse report must not carry build_ref/reuse_origin",
         )
+    if bundle_kind == "campaign":
+        for field in ("verdict", "reason_code", "state"):
+            if report.get(field) is not None:
+                raise BundleError(
+                    "INVALID_MANIFEST",
+                    f"campaign report must not carry {field}",
+                )
+
+
+def _verify_v2_build_role_paths(
+    listed: Mapping[str, Mapping[str, Any]]
+) -> None:
+    """D39 role+path check for every build role, including blocked bundles.
+
+    A blocked bundle only relaxes identity fields; it does not allow a build
+    role at an arbitrary path. Non-default artifact names are allowed at the
+    path level because BuildSpec.outputs may name them; reuse byte binding
+    rejects unsupported layouts separately.
+    """
+    for path, entry in listed.items():
+        role = entry["role"]
+        if role not in _V2_BUILD_ROLES:
+            continue
+        parts = PurePosixPath(path).parts
+        if len(parts) < 3 or parts[0] != "build" or parts[1] not in _REPLAY_VERSIONS:
+            raise BundleError(
+                "INVALID_MANIFEST",
+                f"build evidence {path} is not at a fixed build path",
+            )
+        relative = "/".join(parts[2:])
+        if role == "build_metadata" and relative != "metadata.json":
+            raise BundleError(
+                "INVALID_MANIFEST",
+                f"build metadata {path} must live at build/<version>/metadata.json",
+            )
+        if role == "build_log" and relative != "build.log":
+            raise BundleError(
+                "INVALID_MANIFEST",
+                f"build log {path} must live at build/<version>/build.log",
+            )
+        if role == "build_artifact" and (
+            relative in ("metadata.json", "build.log")
+            or relative.startswith("build_provenance/")
+        ):
+            raise BundleError(
+                "INVALID_MANIFEST",
+                f"build artifact {path} collides with a non-artifact build role",
+            )
+        if role == "build_provenance":
+            if not relative.startswith("build_provenance/"):
+                raise BundleError(
+                    "INVALID_MANIFEST",
+                    f"build provenance {path} must live under build/<version>/build_provenance/",
+                )
+            face = relative[len("build_provenance/") :]
+            if face not in _V2_BUILD_PROVENANCE_FACES:
+                raise BundleError(
+                    "INVALID_MANIFEST",
+                    f"build provenance face {path} is not at a fixed face path",
+                )
 
 
 def _verify_v2_build_layout(
@@ -3956,6 +4042,7 @@ def _verify_v2_layout(
     *,
     partial_execution: bool = False,
 ) -> None:
+    _verify_v2_build_role_paths(listed)
     for path, role in _V2_FIXED_PATH_ROLES.items():
         entry = listed.get(path)
         if entry is not None and entry["role"] != role:
@@ -4192,14 +4279,14 @@ def _verify_bundle_v2(
     )
     if data is None:
         data = _read_listed_files(root_path, listed)
-    _verify_v2_build_records(data)
+    _verify_v2_build_records(listed, data)
     if bundle_kind == "execution":
         if manifest.get("reuse_origin") is not None:
             _verify_v2_reuse_plan(manifest, data)
         else:
-            _verify_v2_non_reuse(data)
+            _verify_v2_non_reuse(data, bundle_kind)
     elif bundle_kind == "campaign":
-        _verify_v2_non_reuse(data)
+        _verify_v2_non_reuse(data, bundle_kind)
     if bundle_kind == "blocked":
         _verify_v2_blocked_semantics(
             job_id=job_id,
