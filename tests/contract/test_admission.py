@@ -9,6 +9,7 @@ next round child and reuse remain out of scope for this T12 increment.
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from typing import Any
 import uuid
 
 import pytest
@@ -29,6 +30,7 @@ FAMILY_ID = "2f1c0f5e-3d7a-4b6c-9f10-2a4b6c8d0e11"
 JOB_ID = "0f8fad5b-d9cb-469f-a165-70867728950e"
 ADMISSION_ID = uuid.UUID("7c9e6679-7425-40de-944b-e07fc1f90ae7")
 DECIDED_AT = datetime(2099, 1, 1, tzinfo=timezone.utc)
+_UNSET = object()
 
 SIGNATURE = {
     "error": "heap-buffer-overflow",
@@ -115,12 +117,15 @@ def _admit(
     existing_rounds: tuple[int, ...] = (),
     approved_envelope_digest: str | None = None,
     plan_envelope_digest: str | None = None,
+    plan_harness_digest: Any = _UNSET,
 ):
     binding_options = {}
     if approved_envelope_digest is not None:
         binding_options["approved_envelope_digest"] = approved_envelope_digest
     if plan_envelope_digest is not None:
         binding_options["plan_envelope_digest"] = plan_envelope_digest
+    if plan_harness_digest is not _UNSET:
+        binding_options["plan_harness_digest"] = plan_harness_digest
     return state.policy_admit_round(
         store=store,
         clock=clock or FakeClock(),
@@ -238,6 +243,68 @@ def test_admission_plan_envelope_must_match():
         "round_admission_denied"
     ]
     assert store.events[0]["detail"]["sub_reason"] == "PLAN_ENVELOPE_MISMATCH"
+
+
+def test_admission_plan_harness_mismatch_is_rejected():
+    store = RecordingAdmissionStore()
+    actual_harness_digest = _digest("9")
+
+    outcome = _admit(
+        store=store, plan_harness_digest=actual_harness_digest
+    )
+
+    assert not outcome.admitted
+    assert outcome.status == "denied"
+    assert outcome.reason_code == "HARNESS_REJECTED"
+    assert outcome.sub_reason == "PLAN_HARNESS_MISMATCH"
+    assert not store.admissions, "harness mismatch wrote an admissions row"
+    assert [event["event_type"] for event in store.events] == [
+        "round_admission_denied"
+    ]
+    event = store.events[0]
+    assert event["reason_code"] == "HARNESS_REJECTED"
+    assert event["detail"]["sub_reason"] == "PLAN_HARNESS_MISMATCH"
+    assert event["detail"]["expected_harness_digest"] == HARNESS_DIGEST
+    assert (
+        event["detail"]["actual_harness_digest"] == actual_harness_digest
+    )
+
+
+def test_admission_plan_harness_requires_valid_digest():
+    for bad_harness_digest in (None, "", "not-a-digest", 123, True):
+        with pytest.raises(state.StateError, match="plan_harness_digest"):
+            _admit(plan_harness_digest=bad_harness_digest)
+
+
+def test_admission_plan_harness_match_is_admitted():
+    store = RecordingAdmissionStore()
+
+    outcome = _admit(store=store, plan_harness_digest=HARNESS_DIGEST)
+
+    assert outcome.admitted
+    assert outcome.reason_code is None
+    assert len(store.admissions) == 1
+    assert [event["event_type"] for event in store.events] == [
+        "round_admitted"
+    ]
+
+
+def test_unapproved_envelope_precedes_plan_harness_rejection():
+    store = RecordingAdmissionStore()
+
+    outcome = _admit(
+        store=store,
+        approved_envelope_digest=_digest("b"),
+        plan_harness_digest=_digest("9"),
+    )
+
+    assert not outcome.admitted
+    assert outcome.reason_code == "ADMISSION_DENIED"
+    assert outcome.sub_reason == "PARENT_APPROVAL_ENVELOPE_MISMATCH"
+    assert not store.admissions
+    assert [event["reason_code"] for event in store.events] == [
+        "ADMISSION_DENIED"
+    ]
 
 
 def test_round_beyond_max_rounds_is_denied():

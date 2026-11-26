@@ -2360,6 +2360,7 @@ def policy_admit_round(
     plan_envelope_digest: Any = _ADMISSION_BINDING_UNSET,
     plan_seed_digest: Any = _ADMISSION_BINDING_UNSET,
     plan_experiment_digest: Any = _ADMISSION_BINDING_UNSET,
+    plan_harness_digest: Any = _ADMISSION_BINDING_UNSET,
     ledger_remaining_total_seconds: int | None = None,
 ) -> AdmissionOutcome:
     """Decide one policy round and emit exactly one admission audit event.
@@ -2374,7 +2375,10 @@ def policy_admit_round(
     ``UNIQUE(parent_job_id, round_no)`` backstop. Optional binding inputs let
     callers pass the persisted approval/plan envelope digests; when supplied,
     the predicate denies an envelope that is not the approved one or not the
-    frozen plan's one. Omitting them keeps the historical predicate behavior.
+    frozen plan's one. A supplied ``plan_harness_digest`` must equal the
+    envelope's frozen harness digest; a mismatch is rejected as
+    ``HARNESS_REJECTED`` only after the approval/envelope binding checks.
+    Omitting the binding inputs keeps the historical predicate behavior.
     """
     if not isinstance(envelope, Mapping):
         raise StateError("envelope must be a JSON object")
@@ -2458,6 +2462,16 @@ def policy_admit_round(
         try:
             plan_experiment_digest = jsonutil.require_digest(
                 plan_experiment_digest, "plan_experiment_digest"
+            )
+        except ValueError as error:
+            raise StateError(str(error)) from error
+    plan_harness_checked = (
+        plan_harness_digest is not _ADMISSION_BINDING_UNSET
+    )
+    if plan_harness_checked:
+        try:
+            plan_harness_digest = jsonutil.require_digest(
+                plan_harness_digest, "plan_harness_digest"
             )
         except ValueError as error:
             raise StateError(str(error)) from error
@@ -2605,6 +2619,12 @@ def policy_admit_round(
     ):
         reason_code = "ADMISSION_DENIED"
         sub_reason = "PLAN_ENVELOPE_MISMATCH"
+    elif (
+        plan_harness_checked
+        and plan_harness_digest != normalized_envelope["harness_digest"]
+    ):
+        reason_code = "HARNESS_REJECTED"
+        sub_reason = "PLAN_HARNESS_MISMATCH"
     elif plan_seed_checked and plan_seed_digest != seed_digest:
         reason_code = "ADMISSION_DENIED"
         sub_reason = "PLAN_SEED_MISMATCH"
@@ -2665,6 +2685,9 @@ def policy_admit_round(
     elif sub_reason == "PLAN_ENVELOPE_MISMATCH":
         detail["expected_envelope_digest"] = plan_envelope_digest
         detail["actual_envelope_digest"] = envelope_digest
+    elif sub_reason == "PLAN_HARNESS_MISMATCH":
+        detail["expected_harness_digest"] = normalized_envelope["harness_digest"]
+        detail["actual_harness_digest"] = plan_harness_digest
     elif sub_reason == "PLAN_SEED_MISMATCH":
         detail["expected_seed_digest"] = plan_seed_digest
         detail["actual_seed_digest"] = seed_digest
@@ -2802,7 +2825,10 @@ def record_admission(
     ``already_admitted`` no-op that returns the persisted admission. A different
     decision for that round is a real ``ADMISSION_DENIED`` whose audit detail
     carries ``sub_reason=ROUND_ALREADY_ADMITTED``. The comparison includes the
-    budget snapshot digest read from the existing round_admitted detail.
+    budget snapshot digest read from the existing round_admitted detail. The
+    frozen plan's ``harness_digest`` is mandatory and must match the approved
+    envelope; a tampered value is a ``HARNESS_REJECTED`` denial, never an
+    ``already_admitted`` no-op.
     """
     if not isinstance(envelope, Mapping):
         raise StateError("envelope must be a JSON object")
@@ -2993,6 +3019,14 @@ def record_admission(
                     )
                 except ValueError as error:
                     raise StateError(str(error)) from error
+            try:
+                plan_harness_digest = jsonutil.require_digest(
+                    plan_body["harness_digest"], "plan.harness_digest"
+                )
+            except (KeyError, ValueError) as error:
+                raise StateError(
+                    "admission plan requires harness_digest"
+                ) from error
             existing = connection.execute(
                 "SELECT admission_id, job_id, parent_job_id, round_no, "
                 "approval_kind, envelope_digest, parent_approval_digest, "
@@ -3068,6 +3102,8 @@ def record_admission(
                     and str(existing["job_id"]) == str(job_id)
                     and existing["envelope_digest"] == envelope_digest
                     and plan_envelope_digest == envelope_digest
+                    and plan_harness_digest
+                    == normalized_envelope["harness_digest"]
                     and plan_seed_digest == seed_digest
                     and plan_experiment_digest == experiment_digest
                     and plan_approval_belongs_to_family
@@ -3102,16 +3138,26 @@ def record_admission(
                         "admission round job is in terminal state "
                         f"{round_job['state']}"
                     )
-                denied_reason_code = (
-                    "ENVELOPE_VIOLATION"
-                    if experiment_violation is not None
-                    else "ADMISSION_DENIED"
+                harness_mismatch = (
+                    experiment_violation is None
+                    and envelope_is_bound
+                    and plan_harness_digest
+                    != normalized_envelope["harness_digest"]
                 )
-                denied_sub_reason = (
-                    experiment_violation
-                    if experiment_violation is not None
-                    else "ROUND_ALREADY_ADMITTED"
-                )
+                if harness_mismatch:
+                    denied_reason_code = "HARNESS_REJECTED"
+                    denied_sub_reason = "PLAN_HARNESS_MISMATCH"
+                else:
+                    denied_reason_code = (
+                        "ENVELOPE_VIOLATION"
+                        if experiment_violation is not None
+                        else "ADMISSION_DENIED"
+                    )
+                    denied_sub_reason = (
+                        experiment_violation
+                        if experiment_violation is not None
+                        else "ROUND_ALREADY_ADMITTED"
+                    )
                 denied_detail = {
                     "job_id": str(job_id),
                     "parent_job_id": str(family_id),
@@ -3128,6 +3174,13 @@ def record_admission(
                     "reason_code": denied_reason_code,
                     "sub_reason": denied_sub_reason,
                 }
+                if harness_mismatch:
+                    denied_detail["expected_harness_digest"] = (
+                        normalized_envelope["harness_digest"]
+                    )
+                    denied_detail["actual_harness_digest"] = (
+                        plan_harness_digest
+                    )
                 _audit(
                     connection,
                     job_id,
@@ -3239,6 +3292,7 @@ def record_admission(
                 plan_envelope_digest=plan_envelope_digest,
                 plan_seed_digest=plan_seed_digest,
                 plan_experiment_digest=plan_experiment_digest,
+                plan_harness_digest=plan_harness_digest,
                 ledger_remaining_total_seconds=ledger_remaining_total,
             )
 
@@ -4005,6 +4059,7 @@ def charge_step_budget(
     charge_kind: str,
     elapsed_seconds: Any,
     elapsed_fuzz_seconds: Any = 0,
+    generation: int | None = None,
 ) -> BudgetChargeOutcome:
     """Charge one step in an independent short transaction.
 
@@ -4012,7 +4067,16 @@ def charge_step_budget(
     idempotency key is checked before any write, and the conditional
     ``UPDATE ... WHERE remaining >= charged`` is the only mutation, so a
     concurrent or timed-out charge can never overdraw the family budget.
+
+    When ``generation`` is supplied, a new charge is additionally fenced by the
+    worker's generation and lease under the job row lock. An already-recorded
+    charge is still recovered by its idempotency key: a lease change or a
+    terminal state must not erase an accounted step.
     """
+    if generation is not None and (
+        type(generation) is not int or generation < 1
+    ):
+        raise StateError("generation must be a positive integer")
     charge_kind, attempt_no, elapsed, fuzz_elapsed = _validate_charge_input(
         step_key=step_key,
         attempt_no=attempt_no,
@@ -4040,7 +4104,8 @@ def charge_step_budget(
             ).fetchone()
             job_row = connection.execute(
                 "SELECT job_id, job_contract_version, family_id, job_kind, "
-                "state FROM jobs WHERE job_id = %s FOR KEY SHARE",
+                "state, generation, lease_expires_at "
+                "FROM jobs WHERE job_id = %s FOR KEY SHARE",
                 (job_id,),
             ).fetchone()
             if job_row is None:
@@ -4091,6 +4156,25 @@ def charge_step_budget(
                     "cannot charge budget while job is in state "
                     f"{job_row['state']}"
                 )
+            if generation is not None:
+                # Evaluate the database clock only after both row locks are
+                # held. A transaction-start now() could predate the lock wait
+                # and would let a worker whose lease expired during the wait
+                # still pass the fence.
+                db_now = connection.execute(
+                    "SELECT clock_timestamp() AS db_now"
+                ).fetchone()["db_now"]
+                if job_row["generation"] != generation:
+                    raise StaleGeneration(
+                        "execution generation is no longer current"
+                    )
+                if (
+                    job_row["lease_expires_at"] is None
+                    or job_row["lease_expires_at"] <= db_now
+                ):
+                    raise StaleGeneration(
+                        "the worker lease is no longer active"
+                    )
 
             gate = budget_gate(ledger, fuzz=charge_kind == "fuzz")
             if not gate.allowed:

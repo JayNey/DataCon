@@ -74,6 +74,7 @@ def _seed_family(
     plan_parent_approval_digest: Any = _UNSET,
     plan_experiment_digest: str | None = None,
     plan_seed_digest: str = SEED_CORPUS_DIGEST,
+    plan_harness_digest: Any = _UNSET,
     envelope: dict | None = None,
     family_state: str = "AGGREGATING",
 ):
@@ -86,6 +87,11 @@ def _seed_family(
         if plan_parent_approval_digest is _UNSET
         else plan_parent_approval_digest
     )
+    resolved_plan_harness = (
+        envelope["harness_digest"]
+        if plan_harness_digest is _UNSET
+        else plan_harness_digest
+    )
     plan = {
         "schema_version": 2,
         "family_id": str(family_id),
@@ -93,6 +99,7 @@ def _seed_family(
         "round_no": round_no,
         "envelope_digest": plan_envelope_digest or envelope_digest,
         "parent_approval_digest": resolved_plan_parent,
+        "harness_digest": resolved_plan_harness,
         "inputs": {
             "normal": _digest("1"),
             "candidate": plan_seed_digest,
@@ -159,6 +166,35 @@ def _seed_family(
         max_fuzz_seconds=envelope["max_fuzz_seconds"],
     )
     return family_id, child_id, envelope
+
+
+def _full_plan(
+    family_id,
+    envelope,
+    approval_digest,
+    *,
+    round_no=2,
+    harness_digest=_UNSET,
+):
+    resolved_harness_digest = (
+        envelope["harness_digest"]
+        if harness_digest is _UNSET
+        else harness_digest
+    )
+    return {
+        "schema_version": 2,
+        "family_id": str(family_id),
+        "parent_job_id": str(family_id),
+        "round_no": round_no,
+        "envelope_digest": contracts.envelope_digest(envelope),
+        "parent_approval_digest": approval_digest,
+        "harness_digest": resolved_harness_digest,
+        "inputs": {
+            "normal": _digest("1"),
+            "candidate": SEED_CORPUS_DIGEST,
+        },
+        "experiment_digest": None,
+    }
 
 
 def _admit(
@@ -777,6 +813,128 @@ def test_readmission_rejects_plan_envelope_digest_mismatch(isolated_database):
     assert len(_admissions(isolated_database, family_id, 2)) == 1
 
 
+def test_record_admission_requires_valid_plan_harness_digest(
+    isolated_database,
+):
+    seed = _seed_family(isolated_database)
+    family_id, child_id, _envelope_value = seed
+
+    isolated_database.connection.execute(
+        "UPDATE plans SET plan = plan - 'harness_digest' WHERE job_id = %s",
+        (child_id,),
+    )
+    with pytest.raises(state.StateError, match="harness_digest"):
+        _admit(isolated_database, seed)
+    assert _admissions(isolated_database, family_id, 2) == []
+    assert _events(isolated_database, child_id) == []
+
+    for bad_harness_digest in (None, "", "not-a-digest", 123):
+        isolated_database.connection.execute(
+            "UPDATE plans SET plan = jsonb_set(plan, '{harness_digest}', %s) "
+            "WHERE job_id = %s",
+            (Jsonb(bad_harness_digest), child_id),
+        )
+        with pytest.raises(state.StateError, match="harness_digest"):
+            _admit(isolated_database, seed)
+        assert _admissions(isolated_database, family_id, 2) == []
+        assert _events(isolated_database, child_id) == []
+
+
+def test_record_admission_denies_plan_harness_mismatch(isolated_database):
+    mismatch_digest = _digest("9")
+    seed = _seed_family(
+        isolated_database, plan_harness_digest=mismatch_digest
+    )
+    family_id, child_id, envelope = seed
+    reviews_before = isolated_database.connection.execute(
+        "SELECT count(*) FROM reviews WHERE job_id IN (%s, %s)",
+        (family_id, child_id),
+    ).fetchone()[0]
+    approvals_before = isolated_database.connection.execute(
+        "SELECT count(*) FROM family_approvals WHERE family_id = %s",
+        (family_id,),
+    ).fetchone()[0]
+
+    outcome = _admit(isolated_database, seed)
+
+    assert not outcome.admitted
+    assert outcome.status == "denied"
+    assert outcome.reason_code == "HARNESS_REJECTED"
+    assert outcome.sub_reason == "PLAN_HARNESS_MISMATCH"
+    assert _admissions(isolated_database, family_id, 2) == []
+    events = _events(isolated_database, child_id)
+    assert [event[0] for event in events] == ["round_admission_denied"]
+    assert events[0][1] == "HARNESS_REJECTED"
+    assert events[0][2]["sub_reason"] == "PLAN_HARNESS_MISMATCH"
+    assert (
+        events[0][2]["expected_harness_digest"]
+        == envelope["harness_digest"]
+    )
+    assert events[0][2]["actual_harness_digest"] == mismatch_digest
+
+    reviews_after = isolated_database.connection.execute(
+        "SELECT count(*) FROM reviews WHERE job_id IN (%s, %s)",
+        (family_id, child_id),
+    ).fetchone()[0]
+    approvals_after = isolated_database.connection.execute(
+        "SELECT count(*) FROM family_approvals WHERE family_id = %s",
+        (family_id,),
+    ).fetchone()[0]
+    assert reviews_after == reviews_before
+    assert approvals_after == approvals_before
+
+
+def test_readmission_after_plan_harness_tamper_is_denied_not_already_admitted(
+    isolated_database,
+):
+    seed = _seed_family(isolated_database)
+    family_id, child_id, envelope = seed
+
+    first = _admit(isolated_database, seed)
+    assert first.admitted
+    assert len(_admissions(isolated_database, family_id, 2)) == 1
+    assert [event[0] for event in _events(isolated_database, child_id)] == [
+        "round_admitted"
+    ]
+
+    tampered_digest = _digest("9")
+    isolated_database.connection.execute(
+        "UPDATE plans SET plan = jsonb_set(plan, '{harness_digest}', "
+        "to_jsonb(%s::text)) WHERE job_id = %s",
+        (tampered_digest, child_id),
+    )
+
+    second = _admit(isolated_database, seed)
+
+    assert not second.admitted
+    assert second.status == "denied"
+    assert second.status != "already_admitted"
+    assert second.reason_code == "HARNESS_REJECTED"
+    assert second.sub_reason == "PLAN_HARNESS_MISMATCH"
+    assert len(_admissions(isolated_database, family_id, 2)) == 1
+    events = _events(isolated_database, child_id)
+    assert [event[0] for event in events] == [
+        "round_admitted",
+        "round_admission_denied",
+    ]
+    assert events[1][1] == "HARNESS_REJECTED"
+    assert (
+        events[1][2]["expected_harness_digest"]
+        == envelope["harness_digest"]
+    )
+    assert events[1][2]["actual_harness_digest"] == tampered_digest
+
+    # Terminal protection still wins: no dirty denial audit is appended.
+    isolated_database.connection.execute(
+        "UPDATE jobs SET state = 'BLOCKED' WHERE job_id = %s",
+        (family_id,),
+    )
+    with pytest.raises(state.StateError, match="AGGREGATING"):
+        _admit(isolated_database, seed)
+    assert len(_events(isolated_database, child_id)) == 2
+    assert len(_admissions(isolated_database, family_id, 2)) == 1
+
+
 @pytest.mark.parametrize("terminal_state", ["BLOCKED", "COMPLETED"])
 def test_readmission_on_terminal_family_blocks_dirty_audit(
     isolated_database, terminal_state
@@ -1116,21 +1274,6 @@ def test_record_admission_validates_plan_experiment_digest_when_present(
 def test_record_admission_requires_plan_v2_binding_fields_and_fails_closed_uniformly(
     isolated_database,
 ):
-    def _full_plan(family_id, envelope_digest, approval_digest, *, round_no=2):
-        return {
-            "schema_version": 2,
-            "family_id": str(family_id),
-            "parent_job_id": str(family_id),
-            "round_no": round_no,
-            "envelope_digest": envelope_digest,
-            "parent_approval_digest": approval_digest,
-            "inputs": {
-                "normal": _digest("1"),
-                "candidate": SEED_CORPUS_DIGEST,
-            },
-            "experiment_digest": None,
-        }
-
     # 1. Missing required binding fields or null inputs fail closed on first admission.
     missing_cases = [
         ("missing_family_id", lambda p: p.pop("family_id")),
@@ -1152,7 +1295,7 @@ def test_record_admission_requires_plan_v2_binding_fields_and_fails_closed_unifo
         approval = f"sha256:{idx:064x}"
         seed = _seed_family(isolated_database, approval_digest=approval)
         family_id, child_id, envelope = seed
-        plan = _full_plan(family_id, contracts.envelope_digest(envelope), approval)
+        plan = _full_plan(family_id, envelope, approval)
         mutate(plan)
         isolated_database.connection.execute(
             "UPDATE plans SET plan = %s WHERE job_id = %s",
@@ -1167,7 +1310,7 @@ def test_record_admission_requires_plan_v2_binding_fields_and_fails_closed_unifo
     #    must ALSO raise StateError with zero dirty round_admission_denied events.
     seed_readmit = _seed_family(isolated_database, approval_digest=_digest("7"))
     family_id, child_id, envelope = seed_readmit
-    valid_plan = _full_plan(family_id, contracts.envelope_digest(envelope), _digest("7"))
+    valid_plan = _full_plan(family_id, envelope, _digest("7"))
     isolated_database.connection.execute(
         "UPDATE plans SET plan = %s WHERE job_id = %s",
         (Jsonb(valid_plan), child_id),

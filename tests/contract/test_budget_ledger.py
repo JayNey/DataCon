@@ -1105,6 +1105,213 @@ def test_postgres_charge_step_budget_whitelist_allows_running_archiving_and_reje
     assert final_summary["remaining_seconds"] == 82
 
 
+def _seed_running_child_for_fencing(database, *, generation: int = 2):
+    """Seed a RUNNING round child whose lease is currently active."""
+    family_id = uuid.uuid4()
+    child_id = uuid.uuid4()
+    database.connection.execute(
+        "INSERT INTO jobs (job_id, request, state, stage, submitted_at, "
+        "job_contract_version, family_id, job_kind, parent_job_id, round_no, "
+        "generation, workflow_synced) "
+        "VALUES (%s, %s, 'AGGREGATING', 'family', clock_timestamp(), 2, %s, "
+        "'family', NULL, NULL, 1, true)",
+        (family_id, Jsonb({"schema_version": 2}), family_id),
+    )
+    database.connection.execute(
+        "INSERT INTO jobs (job_id, request, state, stage, submitted_at, "
+        "job_contract_version, family_id, job_kind, parent_job_id, round_no, "
+        "generation, lease_owner, lease_expires_at) "
+        "VALUES (%s, %s, 'RUNNING', 'build', clock_timestamp(), 2, %s, "
+        "'round', %s, 2, %s, 'worker-a', "
+        "clock_timestamp() + interval '1 hour')",
+        (
+            child_id,
+            Jsonb({"schema_version": 2}),
+            family_id,
+            family_id,
+            generation,
+        ),
+    )
+    state.initialize_budget_ledger(
+        database.dsn,
+        family_id,
+        max_total_seconds=100,
+        max_fuzz_seconds=60,
+    )
+    return family_id, child_id
+
+
+@pytest.mark.postgres
+def test_postgres_charge_step_budget_rejects_invalid_generation(budget_database):
+    family_id, child_id = _seed_running_child_for_fencing(budget_database)
+
+    for index, bad_generation in enumerate((True, 0, -1, "1", 1.0)):
+        with pytest.raises(state.StateError, match="generation"):
+            state.charge_step_budget(
+                budget_database.dsn,
+                family_id=family_id,
+                job_id=child_id,
+                step_key=f"invalid-generation-{index}",
+                attempt_no=1,
+                charge_kind="general",
+                elapsed_seconds=5,
+                generation=bad_generation,  # type: ignore[arg-type]
+            )
+
+    summary = state.family_budget_summary(budget_database.dsn, family_id)
+    assert summary["spent_seconds"] == 0
+    assert summary["remaining_seconds"] == 100
+
+
+@pytest.mark.postgres
+def test_postgres_charge_step_budget_fences_stale_generation_and_inactive_lease(
+    budget_database,
+):
+    family_id, child_id = _seed_running_child_for_fencing(
+        budget_database, generation=2
+    )
+
+    with pytest.raises(
+        state.StaleGeneration,
+        match="execution generation is no longer current",
+    ):
+        state.charge_step_budget(
+            budget_database.dsn,
+            family_id=family_id,
+            job_id=child_id,
+            step_key="stale-generation",
+            attempt_no=1,
+            charge_kind="general",
+            elapsed_seconds=5,
+            generation=1,
+        )
+    summary = state.family_budget_summary(budget_database.dsn, family_id)
+    assert summary["spent_seconds"] == 0
+    assert summary["remaining_seconds"] == 100
+
+    budget_database.connection.execute(
+        "UPDATE jobs SET lease_expires_at = clock_timestamp() "
+        "- interval '1 second' WHERE job_id = %s",
+        (child_id,),
+    )
+    with pytest.raises(
+        state.StaleGeneration, match="the worker lease is no longer active"
+    ):
+        state.charge_step_budget(
+            budget_database.dsn,
+            family_id=family_id,
+            job_id=child_id,
+            step_key="expired-lease",
+            attempt_no=1,
+            charge_kind="general",
+            elapsed_seconds=5,
+            generation=2,
+        )
+    summary = state.family_budget_summary(budget_database.dsn, family_id)
+    assert summary["spent_seconds"] == 0
+    assert summary["remaining_seconds"] == 100
+
+    budget_database.connection.execute(
+        "UPDATE jobs SET lease_expires_at = NULL WHERE job_id = %s",
+        (child_id,),
+    )
+    with pytest.raises(
+        state.StaleGeneration, match="the worker lease is no longer active"
+    ):
+        state.charge_step_budget(
+            budget_database.dsn,
+            family_id=family_id,
+            job_id=child_id,
+            step_key="missing-lease",
+            attempt_no=1,
+            charge_kind="general",
+            elapsed_seconds=5,
+            generation=2,
+        )
+    summary = state.family_budget_summary(budget_database.dsn, family_id)
+    assert summary["spent_seconds"] == 0
+    assert summary["remaining_seconds"] == 100
+    assert (
+        budget_database.connection.execute(
+            "SELECT count(*) FROM budget_charges WHERE family_id = %s",
+            (family_id,),
+        ).fetchone()[0]
+        == 0
+    )
+
+    budget_database.connection.execute(
+        "UPDATE jobs SET lease_expires_at = clock_timestamp() "
+        "+ interval '1 hour' WHERE job_id = %s",
+        (child_id,),
+    )
+    charged = state.charge_step_budget(
+        budget_database.dsn,
+        family_id=family_id,
+        job_id=child_id,
+        step_key="active-generation",
+        attempt_no=1,
+        charge_kind="general",
+        elapsed_seconds=5,
+        generation=2,
+    )
+    assert charged.status == "charged"
+    summary = state.family_budget_summary(budget_database.dsn, family_id)
+    assert summary["spent_seconds"] == 5
+    assert summary["remaining_seconds"] == 95
+
+
+@pytest.mark.postgres
+def test_postgres_charge_step_budget_recovers_after_generation_and_lease_change(
+    budget_database,
+):
+    family_id, child_id = _seed_running_child_for_fencing(
+        budget_database, generation=2
+    )
+
+    first = state.charge_step_budget(
+        budget_database.dsn,
+        family_id=family_id,
+        job_id=child_id,
+        step_key="build",
+        attempt_no=1,
+        charge_kind="general",
+        elapsed_seconds=10,
+        generation=2,
+    )
+    assert first.status == "charged"
+
+    # The worker lost its lease and another worker took over the child. The
+    # already-recorded charge must still be recoverable by its idempotency key.
+    budget_database.connection.execute(
+        "UPDATE jobs SET generation = 3, lease_expires_at = NULL "
+        "WHERE job_id = %s",
+        (child_id,),
+    )
+    recovered = state.charge_step_budget(
+        budget_database.dsn,
+        family_id=family_id,
+        job_id=child_id,
+        step_key="build",
+        attempt_no=1,
+        charge_kind="general",
+        elapsed_seconds=10,
+        generation=1,
+    )
+    assert recovered.status == "recovered"
+    assert recovered.charge == first.charge
+
+    summary = state.family_budget_summary(budget_database.dsn, family_id)
+    assert summary["spent_seconds"] == 10
+    assert summary["remaining_seconds"] == 90
+    assert (
+        budget_database.connection.execute(
+            "SELECT count(*) FROM budget_charges WHERE family_id = %s",
+            (family_id,),
+        ).fetchone()[0]
+        == 1
+    )
+
+
 def test_charge_budget_local_guards_charge_kind_recovery_and_input_validation():
     ledger = _ledger()
     charges: list[dict] = []
