@@ -3003,36 +3003,43 @@ def record_admission(
             ).fetchone()
 
             if existing is not None:
-                # Idempotent re-entry keeps the historical semantics: the
-                # snapshot is bounded by this round's envelope caps before any
-                # comparison, so an over-cap snapshot never writes an event.
-                if (
-                    snapshot_remaining_total
-                    > normalized_envelope["max_total_seconds"]
-                ):
-                    raise StateError(
-                        "budget_snapshot remaining total exceeds envelope "
-                        "max_total_seconds"
-                    )
-                if (
-                    snapshot_remaining_fuzz is not None
-                    and snapshot_remaining_fuzz
-                    > normalized_envelope["max_fuzz_seconds"]
-                ):
-                    raise StateError(
-                        "budget_snapshot remaining fuzz exceeds envelope "
-                        "max_fuzz_seconds"
-                    )
-                _validate_budget_snapshot(
-                    budget_snapshot,
-                    expected_family_id=family_id,
-                    expected_max_total_seconds=normalized_envelope[
-                        "max_total_seconds"
-                    ],
-                    expected_max_fuzz_seconds=normalized_envelope[
-                        "max_fuzz_seconds"
-                    ],
+                # Only apply the caller's envelope caps when the envelope
+                # matches both the persisted admission and frozen plan; an
+                # unbound conflicting envelope with modified max_* caps must
+                # fall through to a persisted ADMISSION_DENIED rather than
+                # raising StateError against a genuine ledger snapshot.
+                envelope_is_bound = (
+                    existing["envelope_digest"] == envelope_digest
+                    and plan_envelope_digest == envelope_digest
                 )
+                if envelope_is_bound:
+                    if (
+                        snapshot_remaining_total
+                        > normalized_envelope["max_total_seconds"]
+                    ):
+                        raise StateError(
+                            "budget_snapshot remaining total exceeds envelope "
+                            "max_total_seconds"
+                        )
+                    if (
+                        snapshot_remaining_fuzz is not None
+                        and snapshot_remaining_fuzz
+                        > normalized_envelope["max_fuzz_seconds"]
+                    ):
+                        raise StateError(
+                            "budget_snapshot remaining fuzz exceeds envelope "
+                            "max_fuzz_seconds"
+                        )
+                    _validate_budget_snapshot(
+                        budget_snapshot,
+                        expected_family_id=family_id,
+                        expected_max_total_seconds=normalized_envelope[
+                            "max_total_seconds"
+                        ],
+                        expected_max_fuzz_seconds=normalized_envelope[
+                            "max_fuzz_seconds"
+                        ],
+                    )
                 existing_detail = _admitted_audit_detail(
                     connection, existing["job_id"], round_no
                 ) or {}

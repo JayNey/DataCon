@@ -1479,6 +1479,71 @@ def test_record_admission_denies_unapproved_cap_change_with_real_snapshot(
     assert events[0][2]["sub_reason"] == "PARENT_APPROVAL_ENVELOPE_MISMATCH"
 
 
+@pytest.mark.parametrize(
+    ("max_total_seconds", "max_fuzz_seconds"),
+    [(600, 300), (1200, 300), (900, 200)],
+)
+@pytest.mark.parametrize("snapshot_shape", ["ledger", "minimal"])
+def test_readmission_denies_conflicting_cap_change_with_real_snapshot(
+    isolated_database, max_total_seconds, max_fuzz_seconds, snapshot_shape
+):
+    # S-1: re-entering an already admitted round with a genuine family ledger
+    # snapshot and a conflicting envelope that changes max_* caps must persist
+    # ADMISSION_DENIED (ROUND_ALREADY_ADMITTED), not raise StateError.
+    seed = _seed_family(isolated_database)
+    family_id, child_id, approved_envelope = seed
+    if snapshot_shape == "ledger":
+        snapshot = state.load_budget_ledger(isolated_database.dsn, family_id)
+        assert snapshot is not None
+        assert snapshot["max_total_seconds"] == 900
+        assert snapshot["max_fuzz_seconds"] == 300
+    else:
+        snapshot = {"remaining_total_seconds": 900, "remaining_fuzz_seconds": 300}
+
+    first = _admit(isolated_database, seed, budget_snapshot=snapshot)
+    assert first.admitted
+    assert len(_admissions(isolated_database, family_id, 2)) == 1
+    assert [event[0] for event in _events(isolated_database, child_id)] == [
+        "round_admitted"
+    ]
+
+    conflicting = _envelope_with_caps(
+        max_total_seconds=max_total_seconds, max_fuzz_seconds=max_fuzz_seconds
+    )
+    assert contracts.envelope_digest(conflicting) != contracts.envelope_digest(
+        approved_envelope
+    )
+
+    second = _admit(
+        isolated_database,
+        seed,
+        envelope=conflicting,
+        budget_snapshot=snapshot,
+    )
+
+    assert not second.admitted
+    assert second.status == "denied"
+    assert second.reason_code == "ADMISSION_DENIED"
+    assert second.sub_reason == "ROUND_ALREADY_ADMITTED"
+    assert second.admission is None
+    assert second.event_type == "round_admission_denied"
+
+    rows = _admissions(isolated_database, family_id, 2)
+    assert len(rows) == 1
+    assert rows[0][5] == contracts.envelope_digest(approved_envelope)
+
+    events = _events(isolated_database, child_id)
+    assert [event[0] for event in events] == [
+        "round_admitted",
+        "round_admission_denied",
+    ]
+    assert events[-1][1] == "ADMISSION_DENIED"
+    assert events[-1][2]["sub_reason"] == "ROUND_ALREADY_ADMITTED"
+    assert events[-1][2]["envelope_digest"] == contracts.envelope_digest(
+        conflicting
+    )
+
+
 def _make_round_ready(database, family_id, child_id, *, mode, workflow_synced):
     database.connection.execute(
         "UPDATE jobs SET request = %s WHERE job_id = %s",
