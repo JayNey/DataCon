@@ -1056,7 +1056,56 @@ def analysis_progress(
 def begin_execution(dsn: str, job_id: UUID, *, generation: int) -> bool:
     """Move a READY job to RUNNING under the current claim's generation."""
     with _connect(dsn) as connection:
+        identity = connection.execute(
+            "SELECT job_contract_version, job_kind, family_id "
+            "FROM jobs WHERE job_id = %s",
+            (job_id,),
+        ).fetchone()
+        if identity is None:
+            raise StateError("job does not exist")
+        is_v2_child = (
+            identity["job_contract_version"] == 2
+            and identity["job_kind"] in ("campaign", "round")
+        )
+        family_id: UUID | None = None
+        if is_v2_child:
+            family_id = identity["family_id"]
+            if family_id is None:
+                raise StateError("a v2 child requires a family")
+            # Follow the global lock order jobs(family) -> jobs(child).
+            # FOR KEY SHARE conflicts with FOR UPDATE held by propose_envelope
+            # and record_review, serializing child promotion against pending
+            # envelopes and family rejection while allowing concurrent v2
+            # children and budget charges to proceed without deadlocks.
+            family = connection.execute(
+                "SELECT job_id, job_kind, job_contract_version, state "
+                "FROM jobs WHERE job_id = %s FOR KEY SHARE",
+                (family_id,),
+            ).fetchone()
+            if family is None:
+                raise StateError("the child family does not exist")
+            if (
+                family["job_contract_version"] != 2
+                or family["job_kind"] != "family"
+            ):
+                raise StateError("the child parent is not a v2 family")
+            if family["state"] != "AGGREGATING":
+                raise StateError(
+                    "cannot start execution while the family is "
+                    f"{family['state']}"
+                )
         job = _locked_job(connection, job_id, generation=generation)
+        if is_v2_child:
+            pending_envelope = connection.execute(
+                "SELECT 1 FROM family_envelopes "
+                "WHERE family_id = %s AND status = 'pending' LIMIT 1",
+                (family_id,),
+            ).fetchone()
+            if pending_envelope is not None:
+                raise StateError(
+                    "cannot start execution while a family envelope "
+                    "re-approval is pending"
+                )
         if job["state"] == "RUNNING":
             return True
         if job["state"] != "READY":
@@ -2008,16 +2057,37 @@ def propose_envelope(
     }
 
 
+_BUDGET_SNAPSHOT_ALLOWED_KEYS = frozenset(
+    {
+        "remaining_total_seconds",
+        "remaining_seconds",
+        "remaining_fuzz_seconds",
+        "max_total_seconds",
+        "max_fuzz_seconds",
+        "spent_seconds",
+        "spent_fuzz_seconds",
+        "family_id",
+        "updated_at",
+    }
+)
+
+
 def _validate_budget_snapshot(
     budget_snapshot: Mapping[str, Any],
 ) -> tuple[int, int | None]:
     """Validate admission budget_snapshot structure and return balances.
 
-    Accepts the DB/ledger key ``remaining_total_seconds`` and/or the
-    report/JSON key ``remaining_seconds``. Fails closed if neither is present,
-    if either is non-integer (including bool) or negative, if both are present
-    with conflicting values, or if ``remaining_fuzz_seconds`` is invalid.
+    Enforces a closed key set covering standard budget ledger/summary fields,
+    strict integer/type/range checks, and cross-field reconciliation. Fails
+    closed on unknown keys, missing balances, conflicting total fields,
+    out-of-range values, or unreconciled spent + remaining != max equations.
     """
+    unknown = set(budget_snapshot) - _BUDGET_SNAPSHOT_ALLOWED_KEYS
+    if unknown:
+        raise StateError(
+            "budget_snapshot has unknown field(s): "
+            + ", ".join(sorted(str(key) for key in unknown))
+        )
     has_total = "remaining_total_seconds" in budget_snapshot
     has_remaining = "remaining_seconds" in budget_snapshot
     if not has_total and not has_remaining:
@@ -2066,6 +2136,112 @@ def _validate_budget_snapshot(
                 "non-negative integer"
             )
         remaining_fuzz = raw_fuzz
+
+    max_total: int | None = None
+    if "max_total_seconds" in budget_snapshot:
+        raw_max_total = budget_snapshot["max_total_seconds"]
+        if type(raw_max_total) is not int or raw_max_total < 1:
+            raise StateError(
+                "budget_snapshot.max_total_seconds must be a positive integer"
+            )
+        max_total = raw_max_total
+
+    max_fuzz: int | None = None
+    if "max_fuzz_seconds" in budget_snapshot:
+        raw_max_fuzz = budget_snapshot["max_fuzz_seconds"]
+        if type(raw_max_fuzz) is not int or raw_max_fuzz < 0:
+            raise StateError(
+                "budget_snapshot.max_fuzz_seconds must be a non-negative "
+                "integer"
+            )
+        max_fuzz = raw_max_fuzz
+
+    if max_total is not None and max_fuzz is not None and max_fuzz > max_total:
+        raise StateError(
+            "budget_snapshot.max_fuzz_seconds must not exceed "
+            "max_total_seconds"
+        )
+
+    spent_total: int | None = None
+    if "spent_seconds" in budget_snapshot:
+        raw_spent_total = budget_snapshot["spent_seconds"]
+        if type(raw_spent_total) is not int or raw_spent_total < 0:
+            raise StateError(
+                "budget_snapshot.spent_seconds must be a non-negative integer"
+            )
+        spent_total = raw_spent_total
+
+    spent_fuzz: int | None = None
+    if "spent_fuzz_seconds" in budget_snapshot:
+        raw_spent_fuzz = budget_snapshot["spent_fuzz_seconds"]
+        if type(raw_spent_fuzz) is not int or raw_spent_fuzz < 0:
+            raise StateError(
+                "budget_snapshot.spent_fuzz_seconds must be a non-negative "
+                "integer"
+            )
+        spent_fuzz = raw_spent_fuzz
+
+    if (
+        spent_total is not None
+        and spent_fuzz is not None
+        and spent_fuzz > spent_total
+    ):
+        raise StateError(
+            "budget_snapshot.spent_fuzz_seconds must not exceed spent_seconds"
+        )
+
+    if max_total is not None:
+        if available_total > max_total:
+            raise StateError(
+                "budget_snapshot remaining total must not exceed "
+                "max_total_seconds"
+            )
+        if spent_total is not None and spent_total + available_total != max_total:
+            raise StateError(
+                "budget_snapshot spent_seconds + remaining total must equal "
+                "max_total_seconds"
+            )
+
+    if max_fuzz is not None:
+        if remaining_fuzz is not None:
+            if remaining_fuzz > max_fuzz:
+                raise StateError(
+                    "budget_snapshot.remaining_fuzz_seconds must not exceed "
+                    "max_fuzz_seconds"
+                )
+            if (
+                spent_fuzz is not None
+                and spent_fuzz + remaining_fuzz != max_fuzz
+            ):
+                raise StateError(
+                    "budget_snapshot spent_fuzz_seconds + "
+                    "remaining_fuzz_seconds must equal max_fuzz_seconds"
+                )
+        elif spent_fuzz is not None and spent_fuzz > max_fuzz:
+            raise StateError(
+                "budget_snapshot.spent_fuzz_seconds must not exceed "
+                "max_fuzz_seconds"
+            )
+
+    if "family_id" in budget_snapshot:
+        raw_family_id = budget_snapshot["family_id"]
+        if not isinstance(raw_family_id, str):
+            raise StateError("budget_snapshot.family_id must be a UUID string")
+        try:
+            uuid.UUID(raw_family_id)
+        except ValueError as error:
+            raise StateError(
+                "budget_snapshot.family_id must be a valid UUID string"
+            ) from error
+
+    if "updated_at" in budget_snapshot:
+        try:
+            jsonutil.require_rfc3339(
+                budget_snapshot["updated_at"], "budget_snapshot.updated_at"
+            )
+        except ValueError as error:
+            raise StateError(str(error)) from error
+
     return available_total, remaining_fuzz
 
 
@@ -2636,44 +2812,77 @@ def record_admission(
             plan_body = plan_row["plan"]
             if not isinstance(plan_body, Mapping):
                 raise StateError("admission plan must be a JSON object")
-            if "round_no" in plan_body and (
-                type(plan_body["round_no"]) is not int
-                or plan_body["round_no"] != round_no
-            ):
-                raise StateError(
-                    "admission plan round_no does not match round_no"
-                )
-            if "family_id" in plan_body and (
-                not isinstance(plan_body["family_id"], str)
+            if (
+                "family_id" not in plan_body
+                or not isinstance(plan_body["family_id"], str)
                 or plan_body["family_id"] != str(family_id)
             ):
                 raise StateError(
-                    "admission plan family_id does not match family_id"
+                    "admission plan family_id must match family_id"
                 )
-            if "parent_job_id" in plan_body and (
-                not isinstance(plan_body["parent_job_id"], str)
+            if (
+                "parent_job_id" not in plan_body
+                or not isinstance(plan_body["parent_job_id"], str)
                 or plan_body["parent_job_id"] != str(family_id)
             ):
                 raise StateError(
-                    "admission plan parent_job_id does not match family_id"
+                    "admission plan parent_job_id must match family_id"
                 )
-            plan_envelope_digest = plan_body.get("envelope_digest")
-            plan_parent_approval_digest = plan_body.get(
-                "parent_approval_digest"
-            )
+            if (
+                "round_no" not in plan_body
+                or type(plan_body["round_no"]) is not int
+                or plan_body["round_no"] != round_no
+            ):
+                raise StateError(
+                    "admission plan round_no must match round_no"
+                )
+            if "envelope_digest" not in plan_body:
+                raise StateError("admission plan requires envelope_digest")
+            try:
+                plan_envelope_digest = jsonutil.require_digest(
+                    plan_body["envelope_digest"], "plan.envelope_digest"
+                )
+            except ValueError as error:
+                raise StateError(str(error)) from error
+            if "parent_approval_digest" not in plan_body:
+                raise StateError(
+                    "admission plan requires parent_approval_digest"
+                )
+            raw_plan_parent_approval = plan_body["parent_approval_digest"]
+            if raw_plan_parent_approval is None:
+                plan_parent_approval_digest: str | None = None
+            else:
+                try:
+                    plan_parent_approval_digest = jsonutil.require_digest(
+                        raw_plan_parent_approval,
+                        "plan.parent_approval_digest",
+                    )
+                except ValueError as error:
+                    raise StateError(str(error)) from error
             plan_inputs = plan_body.get("inputs")
-            if isinstance(plan_inputs, Mapping) and "candidate" in plan_inputs:
-                has_plan_seed = True
-                plan_seed_digest: Any = plan_inputs["candidate"]
+            if (
+                not isinstance(plan_inputs, Mapping)
+                or "candidate" not in plan_inputs
+            ):
+                raise StateError("admission plan requires inputs.candidate")
+            try:
+                plan_seed_digest = jsonutil.require_digest(
+                    plan_inputs["candidate"], "plan.inputs.candidate"
+                )
+            except ValueError as error:
+                raise StateError(str(error)) from error
+            if "experiment_digest" not in plan_body:
+                raise StateError("admission plan requires experiment_digest")
+            raw_plan_experiment = plan_body["experiment_digest"]
+            if raw_plan_experiment is None:
+                plan_experiment_digest: str | None = None
             else:
-                has_plan_seed = False
-                plan_seed_digest = _ADMISSION_BINDING_UNSET
-            if "experiment_digest" in plan_body:
-                has_plan_experiment = True
-                plan_experiment_digest: Any = plan_body["experiment_digest"]
-            else:
-                has_plan_experiment = False
-                plan_experiment_digest = _ADMISSION_BINDING_UNSET
+                try:
+                    plan_experiment_digest = jsonutil.require_digest(
+                        raw_plan_experiment, "plan.experiment_digest"
+                    )
+                except ValueError as error:
+                    raise StateError(str(error)) from error
             existing = connection.execute(
                 "SELECT admission_id, job_id, parent_job_id, round_no, "
                 "approval_kind, envelope_digest, parent_approval_digest, "
@@ -2712,11 +2921,8 @@ def record_admission(
                     and str(existing["job_id"]) == str(job_id)
                     and existing["envelope_digest"] == envelope_digest
                     and plan_envelope_digest == envelope_digest
-                    and (not has_plan_seed or plan_seed_digest == seed_digest)
-                    and (
-                        not has_plan_experiment
-                        or plan_experiment_digest == experiment_digest
-                    )
+                    and plan_seed_digest == seed_digest
+                    and plan_experiment_digest == experiment_digest
                     and plan_approval_belongs_to_family
                     and existing["parent_approval_digest"]
                     == plan_parent_approval_digest
@@ -3624,10 +3830,7 @@ def charge_step_budget(
                     _budget_charge_record(existing),
                     _budget_ledger_record(ledger),
                 )
-            if (
-                job_row["state"] == "AWAITING_REVIEW"
-                or job_row["state"] in _TERMINAL_JOB_STATES
-            ):
+            if job_row["state"] not in ("RUNNING", "ARCHIVING"):
                 raise StateError(
                     "cannot charge budget while job is in state "
                     f"{job_row['state']}"

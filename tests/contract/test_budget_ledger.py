@@ -282,7 +282,7 @@ def test_concurrent_charge_cannot_overdraw_family_budget(budget_database):
         "INSERT INTO jobs (job_id, request, state, stage, submitted_at, "
         "job_contract_version, family_id, job_kind, parent_job_id, round_no, "
         "generation) "
-        "VALUES (%s, %s, 'QUEUED', 'admission', clock_timestamp(), 2, %s, "
+        "VALUES (%s, %s, 'RUNNING', 'build', clock_timestamp(), 2, %s, "
         "'round', %s, 2, 1)",
         (child_id, Jsonb({"schema_version": 2}), family_id, family_id),
     )
@@ -965,3 +965,141 @@ def test_postgres_charge_step_budget_rejects_awaiting_review_and_terminal_new_ch
     )
     assert recovered_completed.status == "recovered"
     assert recovered_completed.charge == first.charge
+
+
+@pytest.mark.postgres
+def test_postgres_charge_step_budget_whitelist_allows_running_archiving_and_rejects_non_active_states(
+    budget_database,
+):
+    family_id = uuid.uuid4()
+    child_id = uuid.uuid4()
+    budget_database.connection.execute(
+        "INSERT INTO jobs (job_id, request, state, stage, submitted_at, "
+        "job_contract_version, family_id, job_kind, parent_job_id, round_no, "
+        "generation, workflow_synced) "
+        "VALUES (%s, %s, 'AGGREGATING', 'family', clock_timestamp(), 2, %s, "
+        "'family', NULL, NULL, 1, true)",
+        (family_id, Jsonb({"schema_version": 2}), family_id),
+    )
+    budget_database.connection.execute(
+        "INSERT INTO jobs (job_id, request, state, stage, submitted_at, "
+        "job_contract_version, family_id, job_kind, parent_job_id, round_no, "
+        "generation) "
+        "VALUES (%s, %s, 'QUEUED', 'admission', clock_timestamp(), 2, %s, "
+        "'round', %s, 1, 1)",
+        (child_id, Jsonb({"schema_version": 2}), family_id, family_id),
+    )
+    state.initialize_budget_ledger(
+        budget_database.dsn,
+        family_id,
+        max_total_seconds=100,
+        max_fuzz_seconds=60,
+    )
+
+    for pre_active_state in ("QUEUED", "PREPARING", "READY"):
+        budget_database.connection.execute(
+            "UPDATE jobs SET state = %s WHERE job_id = %s",
+            (pre_active_state, child_id),
+        )
+        with pytest.raises(state.StateError, match=pre_active_state):
+            state.charge_step_budget(
+                budget_database.dsn,
+                family_id=family_id,
+                job_id=child_id,
+                step_key=f"charge-in-{pre_active_state.lower()}",
+                attempt_no=1,
+                charge_kind="general",
+                elapsed_seconds=5,
+            )
+        summary = state.family_budget_summary(budget_database.dsn, family_id)
+        assert summary["spent_seconds"] == 0
+        assert summary["remaining_seconds"] == 100
+
+    # RUNNING and ARCHIVING are allowed.
+    budget_database.connection.execute(
+        "UPDATE jobs SET state = 'RUNNING' WHERE job_id = %s",
+        (child_id,),
+    )
+    running_charge = state.charge_step_budget(
+        budget_database.dsn,
+        family_id=family_id,
+        job_id=child_id,
+        step_key="build",
+        attempt_no=1,
+        charge_kind="general",
+        elapsed_seconds=10,
+    )
+    assert running_charge.status == "charged"
+
+    budget_database.connection.execute(
+        "UPDATE jobs SET state = 'ARCHIVING' WHERE job_id = %s",
+        (child_id,),
+    )
+    archiving_charge = state.charge_step_budget(
+        budget_database.dsn,
+        family_id=family_id,
+        job_id=child_id,
+        step_key="archive",
+        attempt_no=1,
+        charge_kind="general",
+        elapsed_seconds=5,
+    )
+    assert archiving_charge.status == "charged"
+
+    # §9.1 / ADR-004: an already RUNNING/ARCHIVING child still settles its
+    # exit charge even after the parent family becomes BLOCKED.
+    budget_database.connection.execute(
+        "UPDATE jobs SET state = 'BLOCKED' WHERE job_id = %s",
+        (family_id,),
+    )
+    blocked_family_charge = state.charge_step_budget(
+        budget_database.dsn,
+        family_id=family_id,
+        job_id=child_id,
+        step_key="archive-after-family-blocked",
+        attempt_no=1,
+        charge_kind="general",
+        elapsed_seconds=3,
+    )
+    assert blocked_family_charge.status == "charged"
+
+    # Returning to READY or entering terminal states still rejects new charges
+    # while allowing idempotent recovery of existing charges.
+    for state_name in ("READY", "BLOCKED", "COMPLETED"):
+        if state_name == "COMPLETED":
+            budget_database.connection.execute(
+                "UPDATE jobs SET state = 'COMPLETED', evidence_status = 'archived', "
+                "evidence_path = '/tmp/round.json', evidence_digest = %s "
+                "WHERE job_id = %s",
+                ("sha256:" + "b" * 64, child_id),
+            )
+        else:
+            budget_database.connection.execute(
+                "UPDATE jobs SET state = %s WHERE job_id = %s",
+                (state_name, child_id),
+            )
+        with pytest.raises(state.StateError, match=state_name):
+            state.charge_step_budget(
+                budget_database.dsn,
+                family_id=family_id,
+                job_id=child_id,
+                step_key=f"new-in-{state_name.lower()}",
+                attempt_no=1,
+                charge_kind="general",
+                elapsed_seconds=5,
+            )
+        recovered = state.charge_step_budget(
+            budget_database.dsn,
+            family_id=family_id,
+            job_id=child_id,
+            step_key="build",
+            attempt_no=1,
+            charge_kind="general",
+            elapsed_seconds=10,
+        )
+        assert recovered.status == "recovered"
+        assert recovered.charge == running_charge.charge
+
+    final_summary = state.family_budget_summary(budget_database.dsn, family_id)
+    assert final_summary["spent_seconds"] == 18
+    assert final_summary["remaining_seconds"] == 82

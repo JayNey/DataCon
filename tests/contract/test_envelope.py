@@ -447,3 +447,25 @@ def test_envelope_rejects_empty_accepted_signature_set():
         )
     with pytest.raises(ValueError, match="accepted_signature_set"):
         _guided_envelope(accepted_signature_set=[])
+
+
+def test_normalize_envelope_accepts_readonly_mapping():
+    from types import MappingProxyType
+
+    raw = _guided_envelope()
+    readonly_top = MappingProxyType(raw)
+    readonly_nested = MappingProxyType(
+        {
+            **raw,
+            "mutation_limits": MappingProxyType(raw["mutation_limits"]),
+            "accepted_signature_set": [
+                MappingProxyType(sig) for sig in raw["accepted_signature_set"]
+            ],
+        }
+    )
+
+    expected = contracts.normalize_envelope(raw)
+    assert contracts.normalize_envelope(readonly_top) == expected
+    assert contracts.normalize_envelope(readonly_nested) == expected
+    assert contracts.envelope_digest(readonly_top) == contracts.envelope_digest(raw)
+    assert contracts.envelope_digest(readonly_nested) == contracts.envelope_digest(raw)

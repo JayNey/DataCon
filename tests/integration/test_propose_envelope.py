@@ -577,3 +577,402 @@ def test_propose_envelope_budget_tightening_races_claim_next_safely(
             assert claimed["job_id"] == child_id
             assert claimed["state"] == "RUNNING"
             assert child_state == "RUNNING"
+
+
+def test_begin_execution_blocks_unsynced_ready_child_while_pending_envelope_exists(
+    isolated_database, tmp_path, monkeypatch
+):
+    monkeypatch.setenv("DATACON_EVIDENCE_ROOT", str(tmp_path / "evidence"))
+    seed = _seed_family(isolated_database, first_approval=False)
+    family_id = seed["family_id"]
+    child_id = seed["child_id"]
+    isolated_database.connection.execute(
+        "UPDATE jobs SET request = %s WHERE job_id = %s",
+        (Jsonb({"schema_version": 2, "limits": {"execute_seconds": 600}}), child_id),
+    )
+
+    first = state.record_review(
+        isolated_database.dsn,
+        family_id,
+        plan_digest=FIRST_PLAN_DIGEST,
+        decision="approve",
+        reviewer_id=REVIEWER_2,
+    )
+    assert first.status == "applied", first.message
+    assert _row(
+        isolated_database,
+        "SELECT state, workflow_synced FROM jobs WHERE job_id = %s",
+        (child_id,),
+    ) == ("READY", False)
+
+    proposed = state.propose_envelope(
+        isolated_database.dsn,
+        family_id,
+        _envelope(max_total_seconds=100, max_fuzz_seconds=50),
+    )
+    assert proposed["status"] == "pending"
+
+    claimed = state.claim_next(
+        isolated_database.dsn, "v2-worker", job_contract_version=2
+    )
+    assert claimed is not None
+    assert claimed["job_id"] == child_id
+    assert claimed["state"] == "READY"
+
+    with pytest.raises(state.StateError, match="pending"):
+        state.begin_execution(
+            isolated_database.dsn, child_id, generation=claimed["generation"]
+        )
+    assert (
+        _row(
+            isolated_database,
+            "SELECT state FROM jobs WHERE job_id = %s",
+            (child_id,),
+        )[0]
+        == "READY"
+    )
+
+    # Simulate workflow.py finalizing workflow sync after skipping begin_execution.
+    isolated_database.connection.execute(
+        "UPDATE jobs SET workflow_synced = true, lease_owner = NULL, "
+        "lease_expires_at = NULL WHERE job_id = %s",
+        (child_id,),
+    )
+
+    approved = state.record_review(
+        isolated_database.dsn,
+        family_id,
+        plan_digest=FIRST_PLAN_DIGEST,
+        decision="approve",
+        reviewer_id=REVIEWER_2,
+        envelope_digest=proposed["envelope_digest"],
+    )
+    assert approved.status == "applied", approved.message
+    ledger = state.load_budget_ledger(isolated_database.dsn, family_id)
+    assert ledger is not None
+    assert ledger["max_total_seconds"] == 100
+    assert ledger["max_fuzz_seconds"] == 50
+
+    reclaimed = state.claim_next(
+        isolated_database.dsn, "v2-worker", job_contract_version=2
+    )
+    assert reclaimed is not None
+    assert reclaimed["job_id"] == child_id
+    assert reclaimed["state"] == "RUNNING"
+
+
+def test_begin_execution_blocks_ready_child_after_family_rejected_into_blocked(
+    isolated_database, tmp_path, monkeypatch
+):
+    monkeypatch.setenv("DATACON_EVIDENCE_ROOT", str(tmp_path / "evidence"))
+    seed = _seed_family(isolated_database, first_approval=False)
+    family_id = seed["family_id"]
+    child_id = seed["child_id"]
+    isolated_database.connection.execute(
+        "UPDATE jobs SET request = %s WHERE job_id = %s",
+        (Jsonb({"schema_version": 2, "limits": {"execute_seconds": 600}}), child_id),
+    )
+
+    first = state.record_review(
+        isolated_database.dsn,
+        family_id,
+        plan_digest=FIRST_PLAN_DIGEST,
+        decision="approve",
+        reviewer_id=REVIEWER_2,
+    )
+    assert first.status == "applied", first.message
+
+    claimed = state.claim_next(
+        isolated_database.dsn, "v2-worker", job_contract_version=2
+    )
+    assert claimed is not None
+    assert claimed["job_id"] == child_id
+    assert claimed["state"] == "READY"
+
+    proposed = state.propose_envelope(
+        isolated_database.dsn,
+        family_id,
+        _envelope(max_total_seconds=600, max_fuzz_seconds=200),
+    )
+    rejected = state.record_review(
+        isolated_database.dsn,
+        family_id,
+        plan_digest=FIRST_PLAN_DIGEST,
+        decision="reject",
+        reviewer_id=REVIEWER_2,
+        envelope_digest=proposed["envelope_digest"],
+    )
+    assert rejected.status == "applied", rejected.message
+    assert _row(
+        isolated_database,
+        "SELECT state, reason_code FROM jobs WHERE job_id = %s",
+        (family_id,),
+    ) == ("BLOCKED", "REVIEW_REJECTED")
+
+    with pytest.raises(state.StateError, match="BLOCKED"):
+        state.begin_execution(
+            isolated_database.dsn, child_id, generation=claimed["generation"]
+        )
+    assert (
+        _row(
+            isolated_database,
+            "SELECT state FROM jobs WHERE job_id = %s",
+            (child_id,),
+        )[0]
+        == "READY"
+    )
+
+
+def test_begin_execution_races_propose_envelope_and_record_review_without_deadlock(
+    isolated_database, tmp_path, monkeypatch
+):
+    monkeypatch.setenv("DATACON_EVIDENCE_ROOT", str(tmp_path / "evidence"))
+    seed = _approved_family(isolated_database)
+    family_id = seed["family_id"]
+    child_id = seed["child_id"]
+    isolated_database.connection.execute(
+        "UPDATE jobs SET request = %s WHERE job_id = %s",
+        (Jsonb({"schema_version": 2, "limits": {"execute_seconds": 600}}), child_id),
+    )
+    state.initialize_budget_ledger(
+        isolated_database.dsn,
+        family_id,
+        max_total_seconds=900,
+        max_fuzz_seconds=300,
+    )
+
+    for i in range(25):
+        isolated_database.connection.execute(
+            "DELETE FROM family_envelopes "
+            "WHERE family_id = %s AND status = 'pending'",
+            (family_id,),
+        )
+        isolated_database.connection.execute(
+            "UPDATE jobs SET state = 'READY', stage = 'ready', "
+            "workflow_synced = false, lease_owner = 'v2-worker', "
+            "lease_expires_at = clock_timestamp() + interval '10 minutes', "
+            "execute_deadline_at = NULL WHERE job_id = %s",
+            (child_id,),
+        )
+        generation = _row(
+            isolated_database,
+            "SELECT generation FROM jobs WHERE job_id = %s",
+            (child_id,),
+        )[0]
+        tightened = _envelope(
+            max_total_seconds=899 - i,
+            max_fuzz_seconds=299 - i,
+        )
+
+        # 1. Race begin_execution against tightening propose_envelope.
+        barrier = threading.Barrier(2)
+        propose_result: dict[str, object] = {}
+        begin_result: dict[str, object] = {}
+        propose_errors: list[BaseException] = []
+        begin_errors: list[BaseException] = []
+
+        def run_propose() -> None:
+            try:
+                barrier.wait(timeout=10)
+                propose_result["value"] = state.propose_envelope(
+                    isolated_database.dsn, family_id, tightened
+                )
+            except BaseException as error:  # noqa: BLE001 - asserted below
+                propose_errors.append(error)
+
+        def run_begin() -> None:
+            try:
+                barrier.wait(timeout=10)
+                begin_result["value"] = state.begin_execution(
+                    isolated_database.dsn, child_id, generation=generation
+                )
+            except BaseException as error:  # noqa: BLE001 - asserted below
+                begin_errors.append(error)
+
+        threads = [
+            threading.Thread(target=run_propose),
+            threading.Thread(target=run_begin),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=30)
+            assert not thread.is_alive(), (
+                f"iteration {i}: propose/begin thread deadlocked"
+            )
+
+        child_state = _row(
+            isolated_database,
+            "SELECT state FROM jobs WHERE job_id = %s",
+            (child_id,),
+        )[0]
+        pending_count = _row(
+            isolated_database,
+            "SELECT count(*) FROM family_envelopes "
+            "WHERE family_id = %s AND status = 'pending'",
+            (family_id,),
+        )[0]
+        assert not (pending_count > 0 and child_state == "RUNNING"), (
+            f"iteration {i}: pending tightening envelope coexisted with RUNNING child"
+        )
+
+        if "value" in propose_result:
+            assert not propose_errors
+            assert len(begin_errors) == 1
+            assert isinstance(begin_errors[0], state.StateError)
+            assert pending_count == 1
+            assert child_state == "READY"
+            pending_digest = propose_result["value"]["envelope_digest"]  # type: ignore[index]
+
+            # 2. Race begin_execution against record_review(approve) for that pending envelope.
+            barrier2 = threading.Barrier(2)
+            review_result: dict[str, object] = {}
+            begin2_result: dict[str, object] = {}
+            review_errors: list[BaseException] = []
+            begin2_errors: list[BaseException] = []
+
+            def run_approve() -> None:
+                try:
+                    barrier2.wait(timeout=10)
+                    review_result["value"] = state.record_review(
+                        isolated_database.dsn,
+                        family_id,
+                        plan_digest=FIRST_PLAN_DIGEST,
+                        decision="approve",
+                        reviewer_id=REVIEWER_2,
+                        envelope_digest=pending_digest,
+                    )
+                except BaseException as error:  # noqa: BLE001 - asserted below
+                    review_errors.append(error)
+
+            def run_begin2() -> None:
+                try:
+                    barrier2.wait(timeout=10)
+                    begin2_result["value"] = state.begin_execution(
+                        isolated_database.dsn, child_id, generation=generation
+                    )
+                except BaseException as error:  # noqa: BLE001 - asserted below
+                    begin2_errors.append(error)
+
+            threads2 = [
+                threading.Thread(target=run_approve),
+                threading.Thread(target=run_begin2),
+            ]
+            for thread in threads2:
+                thread.start()
+            for thread in threads2:
+                thread.join(timeout=30)
+                assert not thread.is_alive(), (
+                    f"iteration {i}: approve/begin thread deadlocked"
+                )
+
+            assert not review_errors, f"iteration {i}: {review_errors!r}"
+            assert review_result["value"].status == "applied"  # type: ignore[attr-defined]
+            if begin2_errors:
+                assert len(begin2_errors) == 1
+                assert isinstance(begin2_errors[0], state.StateError)
+            else:
+                assert begin2_result["value"] is True
+        else:
+            assert len(propose_errors) == 1
+            assert isinstance(propose_errors[0], state.StateError)
+            assert "RUNNING" in str(propose_errors[0])
+            assert not begin_errors
+            assert begin_result["value"] is True
+            assert pending_count == 0
+            assert child_state == "RUNNING"
+
+    # Phase B: With a pending tightening envelope already committed, race
+    # begin_execution against record_review(approve). Zero deadlocks and
+    # record_review(approve) must never fail due to a premature RUNNING child.
+    for i in range(20):
+        isolated_database.connection.execute(
+            "DELETE FROM family_envelopes "
+            "WHERE family_id = %s AND status = 'pending'",
+            (family_id,),
+        )
+        isolated_database.connection.execute(
+            "UPDATE jobs SET state = 'READY', stage = 'ready', "
+            "workflow_synced = false, lease_owner = 'v2-worker', "
+            "lease_expires_at = clock_timestamp() + interval '10 minutes', "
+            "execute_deadline_at = NULL WHERE job_id = %s",
+            (child_id,),
+        )
+        generation = _row(
+            isolated_database,
+            "SELECT generation FROM jobs WHERE job_id = %s",
+            (child_id,),
+        )[0]
+        proposed = state.propose_envelope(
+            isolated_database.dsn,
+            family_id,
+            _envelope(max_total_seconds=850 - i, max_fuzz_seconds=250 - i),
+        )
+        pending_digest = proposed["envelope_digest"]
+
+        barrier = threading.Barrier(2)
+        review_result: dict[str, object] = {}
+        begin_result = {}
+        review_errors: list[BaseException] = []
+        begin_errors = []
+
+        def run_approve_phase_b() -> None:
+            try:
+                barrier.wait(timeout=10)
+                review_result["value"] = state.record_review(
+                    isolated_database.dsn,
+                    family_id,
+                    plan_digest=FIRST_PLAN_DIGEST,
+                    decision="approve",
+                    reviewer_id=REVIEWER_2,
+                    envelope_digest=pending_digest,
+                )
+            except BaseException as error:  # noqa: BLE001 - asserted below
+                review_errors.append(error)
+
+        def run_begin_phase_b() -> None:
+            try:
+                barrier.wait(timeout=10)
+                begin_result["value"] = state.begin_execution(
+                    isolated_database.dsn, child_id, generation=generation
+                )
+            except BaseException as error:  # noqa: BLE001 - asserted below
+                begin_errors.append(error)
+
+        threads = [
+            threading.Thread(target=run_approve_phase_b),
+            threading.Thread(target=run_begin_phase_b),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=30)
+            assert not thread.is_alive(), (
+                f"phase B iteration {i}: approve/begin thread deadlocked"
+            )
+
+        assert not review_errors, (
+            f"phase B iteration {i}: record_review failed: {review_errors!r}"
+        )
+        assert review_result["value"].status == "applied"  # type: ignore[attr-defined]
+        if begin_errors:
+            assert len(begin_errors) == 1
+            assert isinstance(begin_errors[0], state.StateError)
+            assert (
+                _row(
+                    isolated_database,
+                    "SELECT state FROM jobs WHERE job_id = %s",
+                    (child_id,),
+                )[0]
+                == "READY"
+            )
+        else:
+            assert begin_result["value"] is True
+            assert (
+                _row(
+                    isolated_database,
+                    "SELECT state FROM jobs WHERE job_id = %s",
+                    (child_id,),
+                )[0]
+                == "RUNNING"
+            )

@@ -674,6 +674,7 @@ def test_budget_ledger_has_no_cross_remaining_check(isolated_database):
         family_id=family_id,
         parent_job_id=family_id,
         round_no=1,
+        state_name="RUNNING",
     )
     try:
         ledger = state.initialize_budget_ledger(

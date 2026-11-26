@@ -674,3 +674,97 @@ def test_admission_plan_experiment_digest_binding():
                 admission_id=ADMISSION_ID,
                 plan_experiment_digest=bad_digest,
             )
+
+
+def test_admission_budget_snapshot_closed_keyset_and_reconciliation():
+    bad_snapshots = [
+        {"remaining_total_seconds": 100, "unknown_key": 1},
+        {"remaining_total_seconds": 100, "max_total_seconds": 0},
+        {"remaining_total_seconds": 100, "max_total_seconds": -999},
+        {"remaining_total_seconds": 100, "max_total_seconds": True},
+        {"remaining_total_seconds": 100, "max_fuzz_seconds": -1},
+        {"remaining_total_seconds": 100, "max_fuzz_seconds": False},
+        {
+            "remaining_total_seconds": 100,
+            "max_total_seconds": 200,
+            "max_fuzz_seconds": 201,
+        },
+        {"remaining_total_seconds": 100, "spent_seconds": -5},
+        {"remaining_total_seconds": 100, "spent_seconds": True},
+        {"remaining_total_seconds": 100, "spent_fuzz_seconds": -1},
+        {"remaining_total_seconds": 100, "spent_fuzz_seconds": False},
+        {
+            "remaining_total_seconds": 100,
+            "spent_seconds": 10,
+            "spent_fuzz_seconds": 11,
+        },
+        {"remaining_total_seconds": 200, "max_total_seconds": 100},
+        {
+            "remaining_total_seconds": 100,
+            "max_total_seconds": 900,
+            "spent_seconds": 700,
+        },
+        {
+            "remaining_total_seconds": 100,
+            "remaining_fuzz_seconds": 200,
+            "max_fuzz_seconds": 100,
+        },
+        {
+            "remaining_total_seconds": 100,
+            "remaining_fuzz_seconds": 100,
+            "max_fuzz_seconds": 300,
+            "spent_fuzz_seconds": 100,
+        },
+        {"remaining_total_seconds": 100, "family_id": "not-a-uuid"},
+        {"remaining_total_seconds": 100, "family_id": 123},
+        {"remaining_total_seconds": 100, "updated_at": "not-rfc3339"},
+        {"remaining_total_seconds": 100, "updated_at": 123},
+    ]
+    for bad in bad_snapshots:
+        with pytest.raises(state.StateError):
+            state.policy_admit_round(
+                clock=FakeClock(),
+                job_id=JOB_ID,
+                parent_job_id=FAMILY_ID,
+                envelope=_guided_envelope(),
+                parent_approval_digest=APPROVAL_DIGEST,
+                approval_chain_tail_digest=APPROVAL_DIGEST,
+                seed_digest=SEED_CORPUS_DIGEST,
+                round_no=2,
+                budget_snapshot=bad,
+                admission_id=ADMISSION_ID,
+            )
+
+    # Valid ledger-shaped and summary-shaped snapshots still pass cleanly.
+    valid_snapshots = [
+        {
+            "family_id": FAMILY_ID,
+            "max_total_seconds": 900,
+            "max_fuzz_seconds": 300,
+            "remaining_total_seconds": 800,
+            "remaining_fuzz_seconds": 250,
+            "updated_at": "2099-01-01T00:00:00Z",
+        },
+        {
+            "max_total_seconds": 900,
+            "max_fuzz_seconds": 300,
+            "spent_seconds": 100,
+            "spent_fuzz_seconds": 50,
+            "remaining_seconds": 800,
+            "remaining_fuzz_seconds": 250,
+        },
+    ]
+    for good in valid_snapshots:
+        admitted = state.policy_admit_round(
+            clock=FakeClock(),
+            job_id=JOB_ID,
+            parent_job_id=FAMILY_ID,
+            envelope=_guided_envelope(),
+            parent_approval_digest=APPROVAL_DIGEST,
+            approval_chain_tail_digest=APPROVAL_DIGEST,
+            seed_digest=SEED_CORPUS_DIGEST,
+            round_no=2,
+            budget_snapshot=good,
+            admission_id=ADMISSION_ID,
+        )
+        assert admitted.admitted

@@ -3323,6 +3323,10 @@ def test_family_approval_initializes_budget_ledger(
     assert ledger["remaining_total_seconds"] == 900
     assert ledger["remaining_fuzz_seconds"] == 300
 
+    isolated_database.connection.execute(
+        "UPDATE jobs SET state = 'RUNNING', stage = 'execute' WHERE job_id = %s",
+        (seed["child_id"],),
+    )
     charge = state.charge_step_budget(
         isolated_database.dsn,
         family_id=seed["family_id"],
@@ -3364,6 +3368,10 @@ def test_reapproval_tightens_budget_ledger_and_propose_rejects_below_spent(
     first_approval = _review(isolated_database, seed)
     assert first_approval.status == "applied", first_approval.message
 
+    isolated_database.connection.execute(
+        "UPDATE jobs SET state = 'RUNNING', stage = 'execute' WHERE job_id = %s",
+        (seed["child_id"],),
+    )
     charge = state.charge_step_budget(
         isolated_database.dsn,
         family_id=family_id,
@@ -3375,6 +3383,12 @@ def test_reapproval_tightens_budget_ledger_and_propose_rejects_below_spent(
         elapsed_fuzz_seconds=5,
     )
     assert charge.status == "charged", charge.status
+
+    # Move the child out of RUNNING/ARCHIVING before proposing a tightened cap.
+    isolated_database.connection.execute(
+        "UPDATE jobs SET state = 'READY', stage = 'ready' WHERE job_id = %s",
+        (seed["child_id"],),
+    )
 
     tightened = deepcopy(GUIDED_ENVELOPE_BODY)
     tightened["max_total_seconds"] = 600
@@ -3462,7 +3476,7 @@ def test_charge_step_budget_concurrent_with_propose_envelope_and_record_review_n
         isolated_database,
         first_approval=True,
         pending_envelope=None,
-        child_state="READY",
+        child_state="RUNNING",
     )
     family_id = seed["family_id"]
     child_id = seed["child_id"]
@@ -3474,13 +3488,16 @@ def test_charge_step_budget_concurrent_with_propose_envelope_and_record_review_n
     )
 
     for i in range(20):
-        next_total = 899 - i
-        next_fuzz = 299 - i
+        non_tightening = deepcopy(GUIDED_ENVELOPE_BODY)
+        non_tightening["max_total_seconds"] = 900
+        non_tightening["max_fuzz_seconds"] = 300
+        non_tightening["mutation_limits"]["max_input_bytes"] = 4095 - i
         tightened = deepcopy(GUIDED_ENVELOPE_BODY)
-        tightened["max_total_seconds"] = next_total
-        tightened["max_fuzz_seconds"] = next_fuzz
+        tightened["max_total_seconds"] = 899 - i
+        tightened["max_fuzz_seconds"] = 299 - i
 
-        # 1. Concurrent propose_envelope + charge_step_budget on the same family.
+        # 1. Concurrent non-tightening propose_envelope + charge_step_budget
+        #    on a RUNNING child.
         barrier = threading.Barrier(2)
         results: dict[str, object] = {}
         errors: list[BaseException] = []
@@ -3489,7 +3506,7 @@ def test_charge_step_budget_concurrent_with_propose_envelope_and_record_review_n
             try:
                 barrier.wait(timeout=10)
                 results["propose"] = state.propose_envelope(
-                    isolated_database.dsn, family_id, tightened
+                    isolated_database.dsn, family_id, non_tightening
                 )
             except BaseException as error:  # pragma: no cover - surfaced below
                 errors.append(error)
@@ -3517,6 +3534,9 @@ def test_charge_step_budget_concurrent_with_propose_envelope_and_record_review_n
             thread.start()
         for thread in threads:
             thread.join(timeout=30)
+            assert not thread.is_alive(), (
+                f"propose+charge iteration {i} deadlocked"
+            )
 
         assert not errors, f"propose+charge iteration {i} failed: {errors!r}"
         proposed = results["propose"]
@@ -3525,7 +3545,8 @@ def test_charge_step_budget_concurrent_with_propose_envelope_and_record_review_n
         assert results["charge"].status == "charged"  # type: ignore[attr-defined]
         pending_digest = proposed["envelope_digest"]
 
-        # 2. Concurrent record_review(approve) + charge_step_budget on the same family.
+        # 2. Concurrent record_review(approve) + charge_step_budget on the same
+        #    RUNNING child.
         barrier = threading.Barrier(2)
         results = {}
         errors = []
@@ -3567,19 +3588,84 @@ def test_charge_step_budget_concurrent_with_propose_envelope_and_record_review_n
             thread.start()
         for thread in threads:
             thread.join(timeout=30)
+            assert not thread.is_alive(), (
+                f"review+charge iteration {i} deadlocked"
+            )
 
         assert not errors, f"review+charge iteration {i} failed: {errors!r}"
         assert results["review"].status == "applied"  # type: ignore[attr-defined]
         assert results["charge"].status == "charged"  # type: ignore[attr-defined]
-        expected_spent = 2 * (i + 1)
+
+        # 3. Concurrent tightening propose_envelope (must be rejected while
+        #    child is RUNNING) + charge_step_budget: zero deadlock and active
+        #    child non-tightening invariant holds.
+        barrier = threading.Barrier(2)
+        results = {}
+        tighten_errors: list[BaseException] = []
+        charge_errors: list[BaseException] = []
+
+        def run_tighten_propose() -> None:
+            try:
+                barrier.wait(timeout=10)
+                results["tighten"] = state.propose_envelope(
+                    isolated_database.dsn, family_id, tightened
+                )
+            except BaseException as error:  # noqa: BLE001 - asserted below
+                tighten_errors.append(error)
+
+        def run_charge_tighten() -> None:
+            try:
+                barrier.wait(timeout=10)
+                results["charge"] = state.charge_step_budget(
+                    isolated_database.dsn,
+                    family_id=family_id,
+                    job_id=child_id,
+                    step_key=f"tighten-race-{i}",
+                    attempt_no=1,
+                    charge_kind="general",
+                    elapsed_seconds=1,
+                )
+            except BaseException as error:  # pragma: no cover - surfaced below
+                charge_errors.append(error)
+
+        threads = [
+            threading.Thread(target=run_tighten_propose),
+            threading.Thread(target=run_charge_tighten),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=30)
+            assert not thread.is_alive(), (
+                f"tighten+charge iteration {i} deadlocked"
+            )
+
+        assert not charge_errors, (
+            f"tighten+charge iteration {i} charge failed: {charge_errors!r}"
+        )
+        assert results["charge"].status == "charged"  # type: ignore[attr-defined]
+        assert len(tighten_errors) == 1
+        assert isinstance(tighten_errors[0], state.StateError)
+        assert "RUNNING" in str(tighten_errors[0])
+        assert (
+            _row(
+                isolated_database,
+                "SELECT count(*) FROM family_envelopes "
+                "WHERE family_id = %s AND status = 'pending'",
+                (family_id,),
+            )[0]
+            == 0
+        )
+
+        expected_spent = 3 * (i + 1)
         summary = state.family_budget_summary(isolated_database.dsn, family_id)
         assert summary == {
-            "max_total_seconds": next_total,
-            "max_fuzz_seconds": next_fuzz,
+            "max_total_seconds": 900,
+            "max_fuzz_seconds": 300,
             "spent_seconds": expected_spent,
             "spent_fuzz_seconds": 0,
-            "remaining_seconds": next_total - expected_spent,
-            "remaining_fuzz_seconds": next_fuzz,
+            "remaining_seconds": 900 - expected_spent,
+            "remaining_fuzz_seconds": 300,
         }
 
 

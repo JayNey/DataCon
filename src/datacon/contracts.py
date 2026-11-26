@@ -245,8 +245,9 @@ def _envelope_signature_set(value: Any) -> list[dict[str, Any]]:
     normalized: list[dict[str, Any]] = []
     for index, item in enumerate(value):
         label = f"accepted_signature_set[{index}]"
+        raw_item = dict(item) if isinstance(item, Mapping) else item
         signature = _object(
-            item,
+            raw_item,
             required=set(_ENVELOPE_SIGNATURE_FIELDS),
             optional=set(_ENVELOPE_SIGNATURE_OPTIONAL),
         )
@@ -288,6 +289,8 @@ def normalize_envelope(
     image binds ``fuzz_image_digest`` to the fixed toolchain image digest; a
     fixed envelope always uses its degenerate, empty mutation surface.
     """
+    if isinstance(value, Mapping):
+        value = dict(value)
     _object(value, required=set(_ENVELOPE_FIELDS))
 
     mode = value["mode"]
@@ -298,8 +301,11 @@ def normalize_envelope(
         value["allowed_mutation_families"],
         label="envelope.allowed_mutation_families",
     )
+    raw_limits = value["mutation_limits"]
+    if isinstance(raw_limits, Mapping):
+        raw_limits = dict(raw_limits)
     limits = _object(
-        value["mutation_limits"],
+        raw_limits,
         required=set(_ENVELOPE_MUTATION_LIMIT_FIELDS),
     )
     allowed_ops = _envelope_string_list(

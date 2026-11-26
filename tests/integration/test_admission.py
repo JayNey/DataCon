@@ -72,6 +72,8 @@ def _seed_family(
     approval_digest: str = APPROVAL_DIGEST,
     plan_envelope_digest: str | None = None,
     plan_parent_approval_digest: Any = _UNSET,
+    plan_experiment_digest: str | None = None,
+    plan_seed_digest: str = SEED_CORPUS_DIGEST,
     envelope: dict | None = None,
     family_state: str = "AGGREGATING",
 ):
@@ -86,8 +88,16 @@ def _seed_family(
     )
     plan = {
         "schema_version": 2,
+        "family_id": str(family_id),
+        "parent_job_id": str(family_id),
+        "round_no": round_no,
         "envelope_digest": plan_envelope_digest or envelope_digest,
         "parent_approval_digest": resolved_plan_parent,
+        "inputs": {
+            "normal": _digest("1"),
+            "candidate": plan_seed_digest,
+        },
+        "experiment_digest": plan_experiment_digest,
     }
 
     database.connection.execute(
@@ -410,10 +420,19 @@ def test_record_admission_denies_exhausted_ledger_even_with_forged_snapshot(
 ):
     seed = _seed_family(isolated_database)
     family_id, child_id, _envelope_value = seed
+    campaign_id = uuid4()
+    isolated_database.connection.execute(
+        "INSERT INTO jobs (job_id, request, state, stage, submitted_at, "
+        "job_contract_version, family_id, job_kind, parent_job_id, round_no, "
+        "generation) "
+        "VALUES (%s, %s, 'RUNNING', 'execute', clock_timestamp(), 2, %s, "
+        "'campaign', %s, NULL, 1)",
+        (campaign_id, Jsonb({"schema_version": 2}), family_id, family_id),
+    )
     charge = state.charge_step_budget(
         isolated_database.dsn,
         family_id=family_id,
-        job_id=child_id,
+        job_id=campaign_id,
         step_key="drain",
         attempt_no=1,
         charge_kind="general",
@@ -443,10 +462,19 @@ def test_record_admission_denies_exhausted_ledger_even_with_forged_snapshot(
 def test_record_admission_rejects_snapshot_exceeding_ledger(isolated_database):
     seed = _seed_family(isolated_database)
     family_id, child_id, _envelope_value = seed
+    campaign_id = uuid4()
+    isolated_database.connection.execute(
+        "INSERT INTO jobs (job_id, request, state, stage, submitted_at, "
+        "job_contract_version, family_id, job_kind, parent_job_id, round_no, "
+        "generation) "
+        "VALUES (%s, %s, 'RUNNING', 'execute', clock_timestamp(), 2, %s, "
+        "'campaign', %s, NULL, 1)",
+        (campaign_id, Jsonb({"schema_version": 2}), family_id, family_id),
+    )
     charge = state.charge_step_budget(
         isolated_database.dsn,
         family_id=family_id,
-        job_id=child_id,
+        job_id=campaign_id,
         step_key="build",
         attempt_no=1,
         charge_kind="general",
@@ -685,10 +713,13 @@ def test_record_admission_rejects_new_round_while_pending_envelope_exists(
 def test_readmission_rejects_out_of_envelope_or_different_experiment(
     isolated_database,
 ):
-    seed = _seed_family(isolated_database)
-    family_id, child_id, _envelope_value = seed
     exp_a = _valid_experiment("length_boundary")
     exp_b = _valid_experiment("byte_flip")
+    seed = _seed_family(
+        isolated_database,
+        plan_experiment_digest=jsonutil.digest_json(exp_a),
+    )
+    family_id, child_id, _envelope_value = seed
 
     first = _admit(isolated_database, seed, experiment=exp_a)
     assert first.admitted
@@ -1080,3 +1111,121 @@ def test_record_admission_validates_plan_experiment_digest_when_present(
         "round_admitted",
         "round_admission_denied",
     ]
+
+
+def test_record_admission_requires_plan_v2_binding_fields_and_fails_closed_uniformly(
+    isolated_database,
+):
+    def _full_plan(family_id, envelope_digest, approval_digest, *, round_no=2):
+        return {
+            "schema_version": 2,
+            "family_id": str(family_id),
+            "parent_job_id": str(family_id),
+            "round_no": round_no,
+            "envelope_digest": envelope_digest,
+            "parent_approval_digest": approval_digest,
+            "inputs": {
+                "normal": _digest("1"),
+                "candidate": SEED_CORPUS_DIGEST,
+            },
+            "experiment_digest": None,
+        }
+
+    # 1. Missing required binding fields or null inputs fail closed on first admission.
+    missing_cases = [
+        ("missing_family_id", lambda p: p.pop("family_id")),
+        ("missing_parent_job_id", lambda p: p.pop("parent_job_id")),
+        ("missing_round_no", lambda p: p.pop("round_no")),
+        ("missing_inputs", lambda p: p.pop("inputs")),
+        ("null_inputs", lambda p: p.__setitem__("inputs", None)),
+        ("missing_candidate", lambda p: p["inputs"].pop("candidate")),
+        ("missing_experiment_digest", lambda p: p.pop("experiment_digest")),
+        ("missing_envelope_digest", lambda p: p.pop("envelope_digest")),
+        ("missing_parent_approval_digest", lambda p: p.pop("parent_approval_digest")),
+        ("bad_experiment_digest_type", lambda p: p.__setitem__("experiment_digest", 123)),
+        ("bool_round_no", lambda p: p.__setitem__("round_no", True)),
+        ("bad_candidate_digest", lambda p: p["inputs"].__setitem__("candidate", "not-a-digest")),
+        ("bad_envelope_digest_type", lambda p: p.__setitem__("envelope_digest", 123)),
+        ("bad_parent_approval_type", lambda p: p.__setitem__("parent_approval_digest", 123)),
+    ]
+    for idx, (label, mutate) in enumerate(missing_cases):
+        approval = f"sha256:{idx:064x}"
+        seed = _seed_family(isolated_database, approval_digest=approval)
+        family_id, child_id, envelope = seed
+        plan = _full_plan(family_id, contracts.envelope_digest(envelope), approval)
+        mutate(plan)
+        isolated_database.connection.execute(
+            "UPDATE plans SET plan = %s WHERE job_id = %s",
+            (Jsonb(plan), child_id),
+        )
+        with pytest.raises(state.StateError):
+            _admit(isolated_database, seed)
+        assert _admissions(isolated_database, family_id, 2) == [], label
+        assert _events(isolated_database, child_id) == [], label
+
+    # 2. Invalid type (experiment_digest=123) and missing field on readmission
+    #    must ALSO raise StateError with zero dirty round_admission_denied events.
+    seed_readmit = _seed_family(isolated_database, approval_digest=_digest("7"))
+    family_id, child_id, envelope = seed_readmit
+    valid_plan = _full_plan(family_id, contracts.envelope_digest(envelope), _digest("7"))
+    isolated_database.connection.execute(
+        "UPDATE plans SET plan = %s WHERE job_id = %s",
+        (Jsonb(valid_plan), child_id),
+    )
+    first = _admit(isolated_database, seed_readmit)
+    assert first.admitted
+    assert len(_admissions(isolated_database, family_id, 2)) == 1
+    assert [event[0] for event in _events(isolated_database, child_id)] == [
+        "round_admitted"
+    ]
+
+    for bad_plan in (
+        {**valid_plan, "experiment_digest": 123},
+        {k: v for k, v in valid_plan.items() if k != "experiment_digest"},
+        {**valid_plan, "inputs": None},
+    ):
+        isolated_database.connection.execute(
+            "UPDATE plans SET plan = %s WHERE job_id = %s",
+            (Jsonb(bad_plan), child_id),
+        )
+        with pytest.raises(state.StateError):
+            _admit(isolated_database, seed_readmit)
+        assert len(_admissions(isolated_database, family_id, 2)) == 1
+        assert [event[0] for event in _events(isolated_database, child_id)] == [
+            "round_admitted"
+        ]
+
+
+def test_record_admission_rejects_unreconciled_or_unknown_key_budget_snapshot(
+    isolated_database,
+):
+    seed = _seed_family(isolated_database)
+    family_id, child_id, _ = seed
+    bad_snapshots = [
+        {"remaining_total_seconds": 100, "extra_unknown": 1},
+        {
+            "remaining_total_seconds": 100,
+            "max_total_seconds": -999,
+            "spent_seconds": -5,
+        },
+        {"remaining_total_seconds": 100, "max_total_seconds": True},
+        {"remaining_total_seconds": 100, "spent_seconds": False},
+        {
+            "remaining_total_seconds": 800,
+            "max_total_seconds": 900,
+            "spent_seconds": 50,
+        },
+        {
+            "remaining_total_seconds": 800,
+            "remaining_fuzz_seconds": 200,
+            "max_fuzz_seconds": 300,
+            "spent_fuzz_seconds": 50,
+        },
+        {"remaining_total_seconds": 100, "family_id": "not-a-uuid"},
+        {"remaining_total_seconds": 100, "updated_at": "not-a-timestamp"},
+    ]
+    for bad in bad_snapshots:
+        with pytest.raises(state.StateError):
+            _admit(isolated_database, seed, budget_snapshot=bad)
+    assert _admissions(isolated_database, family_id, 2) == []
+    assert _events(isolated_database, child_id) == []
