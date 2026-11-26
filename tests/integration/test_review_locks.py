@@ -3675,6 +3675,105 @@ def test_reapproval_tightens_budget_ledger_and_propose_rejects_below_spent(
     )[0] == 0, "unapprovable envelope left a stuck pending row"
 
 
+def test_reapproval_raises_budget_ledger_after_spend(
+    isolated_database, tmp_path, monkeypatch
+):
+    monkeypatch.setenv("DATACON_EVIDENCE_ROOT", str(tmp_path / "evidence"))
+    seed = _seed_family(isolated_database)
+    family_id = seed["family_id"]
+
+    first_approval = _review(isolated_database, seed)
+    assert first_approval.status == "applied", first_approval.message
+
+    isolated_database.connection.execute(
+        "UPDATE jobs SET state = 'RUNNING', stage = 'execute', "
+        "lease_owner = 'worker-a', "
+        "lease_expires_at = clock_timestamp() + interval '10 minutes' "
+        "WHERE job_id = %s",
+        (seed["child_id"],),
+    )
+    charge = state.charge_step_budget(
+        isolated_database.dsn,
+        generation=2,
+        family_id=family_id,
+        job_id=seed["child_id"],
+        step_key="fuzz",
+        attempt_no=1,
+        charge_kind="fuzz",
+        elapsed_seconds=10,
+        elapsed_fuzz_seconds=5,
+    )
+    assert charge.status == "charged", charge.status
+
+    # Tighten 900/300 -> 600/200 after 10/5 is already spent.
+    isolated_database.connection.execute(
+        "UPDATE jobs SET state = 'READY', stage = 'ready' WHERE job_id = %s",
+        (seed["child_id"],),
+    )
+    tightened = deepcopy(GUIDED_ENVELOPE_BODY)
+    tightened["max_total_seconds"] = 600
+    tightened["max_fuzz_seconds"] = 200
+    tightened_digest = jsonutil.digest_json(tightened)
+    proposed = state.propose_envelope(
+        isolated_database.dsn, family_id, tightened
+    )
+    assert proposed["envelope_digest"] == tightened_digest
+    tightened_review = state.record_review(
+        isolated_database.dsn,
+        family_id,
+        plan_digest=FIRST_PLAN_DIGEST,
+        decision="approve",
+        reviewer_id=REVIEWER_2,
+        envelope_digest=tightened_digest,
+    )
+    assert tightened_review.status == "applied", tightened_review.message
+    assert state.family_budget_summary(
+        isolated_database.dsn, family_id
+    ) == {
+        "max_total_seconds": 600,
+        "max_fuzz_seconds": 200,
+        "spent_seconds": 10,
+        "spent_fuzz_seconds": 5,
+        "remaining_seconds": 590,
+        "remaining_fuzz_seconds": 195,
+    }
+
+    # Raise 600/200 -> 900/300 again; the already-spent 10/5 must survive.
+    raised = deepcopy(GUIDED_ENVELOPE_BODY)
+    raised["max_total_seconds"] = 900
+    raised["max_fuzz_seconds"] = 300
+    raised_digest = jsonutil.digest_json(raised)
+    proposed = state.propose_envelope(
+        isolated_database.dsn, family_id, raised
+    )
+    assert proposed["envelope_digest"] == raised_digest
+    raised_review = state.record_review(
+        isolated_database.dsn,
+        family_id,
+        plan_digest=FIRST_PLAN_DIGEST,
+        decision="approve",
+        reviewer_id=REVIEWER_2,
+        envelope_digest=raised_digest,
+    )
+    assert raised_review.status == "applied", raised_review.message
+
+    assert state.family_budget_summary(
+        isolated_database.dsn, family_id
+    ) == {
+        "max_total_seconds": 900,
+        "max_fuzz_seconds": 300,
+        "spent_seconds": 10,
+        "spent_fuzz_seconds": 5,
+        "remaining_seconds": 890,
+        "remaining_fuzz_seconds": 295,
+    }
+    assert _row(
+        isolated_database,
+        "SELECT count(*) FROM budget_ledger WHERE family_id = %s",
+        (family_id,),
+    )[0] == 1, "raising caps inserted or dropped a budget ledger row"
+
+
 def test_freeze_plan_rejects_unsupported_admission_predicate_version(
     isolated_database,
 ):
