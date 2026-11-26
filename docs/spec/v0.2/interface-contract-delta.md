@@ -1106,6 +1106,8 @@ campaign 的 job `state` 在搜索结束/预算耗尽并归档后固定为 `COMP
 **T15 在线情报抓取与许可原因码归属**：T15 不新增顶层原因码枚举，按既有原因码归属并在审计事件 `detail.sub_reason` 中精确记录细因：
 - 抓取失败（非 HTTPS、超时、超 5 跳重定向、超 8 MiB/32 MiB/100:1、快照缺失）：归属 `MATERIAL_MISSING`（`BLOCKED`），`detail.sub_reason` 记录 `REDIRECT_LIMIT_EXCEEDED` / `FETCH_TIMEOUT` / `SIZE_LIMIT_EXCEEDED` / `DECOMPRESSION_BOMB` 等；
 - 情报来源冲突：归属 `SOURCE_CONFLICT`（`BLOCKED`）；
+- 抓取路径的成帧与状态失败同归 `MATERIAL_MISSING`（`BLOCKED`）：正文截断 `CONTENT_TRUNCATED`、缺少或自相矛盾的 `Content-Length` `RESPONSE_UNFRAMED`、空正文 `EMPTY_CONTENT`、最终状态不在 2xx `HTTP_STATUS_REJECTED`、响应头超过 64 KiB `RESPONSE_HEAD_TOO_LARGE`；
+- 固定快照（离线案例）沿用 v0.1 的归类：内容摘要与登记值不符属材料无法校验，归 `MATERIAL_MISSING`（`detail.sub_reason=DIGEST_MISMATCH`）；读不到、读取出错、登记摘要格式非法分别为 `SNAPSHOT_MISSING` / `SNAPSHOT_UNREADABLE` / `SNAPSHOT_DIGEST_INVALID`，为空或超过线上上限分别为 `EMPTY_CONTENT` / `SIZE_LIMIT_EXCEEDED`。来源登记给了别的案例属 `SOURCE_CONFLICT`（`detail.sub_reason=SOURCE_CASE_MISMATCH`，该快照不被打开）；来源 URL 缺失或无法解析属 `POLICY_DENIED`（`detail.sub_reason=SOURCE_URL_INVALID`）；
 - 域名不在白名单、私网/回环/CGNAT/元数据/IPv4-mapped IPv6 被拒、缺许可或许可用途不符：归属 `POLICY_DENIED`（`BLOCKED`），其中许可拒绝的 `detail.sub_reason` 记录 `LICENSE_REJECTED`。
 
 这些原因码与 v0.1 原因码并集使用。T10 起应把新码加入对应终态的封闭集合（`ENVELOPE_VIOLATION`、`ADMISSION_DENIED`、`REUSE_MISMATCH`、`HARNESS_REJECTED` 按阻断或失败归属，`BUDGET_EXHAUSTED` 与 `BUILD_PROVENANCE_MISSING` 按上表归属）；`REVIEW_ENVELOPE_MISMATCH` 是审核调用的拒绝码，不进入 job 终态，也不新增 `reviews` 行。T09 不修改判定实现。
