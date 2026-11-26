@@ -285,6 +285,47 @@ def _envelope_signature_set(value: Any) -> list[dict[str, Any]]:
     return normalized
 
 
+def normalize_asan_signature(value: Any) -> dict[str, Any]:
+    """Validate and normalize one ASan signature object.
+
+    The plan and the envelope's ``accepted_signature_set`` use the same
+    structure; both sides must run this function before comparing so optional
+    ``operation``/``access_size`` presence is compared, not merely the
+    sanitizer text.
+    """
+    signature = _object(
+        value,
+        required={"error", "function", "source"},
+        optional={"operation", "access_size"},
+    )
+    normalized: dict[str, Any] = {
+        "error": _text(signature["error"], label="asan_signature.error"),
+        "function": _text(
+            signature["function"], label="asan_signature.function"
+        ),
+        "source": _text(signature["source"], label="asan_signature.source"),
+    }
+    if "operation" in signature:
+        operation = _text(
+            signature["operation"], label="asan_signature.operation"
+        )
+        if operation not in _ASAN_OPERATIONS:
+            raise ValueError("asan_signature.operation must be READ or WRITE")
+        normalized["operation"] = operation
+    if "access_size" in signature:
+        access_size = signature["access_size"]
+        if (
+            type(access_size) is not int
+            or not 1 <= access_size <= MAX_ACCESS_SIZE
+        ):
+            raise ValueError(
+                "asan_signature.access_size must be an integer between 1 "
+                f"and {MAX_ACCESS_SIZE}"
+            )
+        normalized["access_size"] = access_size
+    return normalized
+
+
 def normalize_envelope(
     value: Any, *, toolchain_image_digest: str | None = None
 ) -> dict[str, Any]:
@@ -1364,34 +1405,7 @@ def _normalize_plan(plan: Mapping[str, Any]) -> tuple[dict[str, Any], dict[str, 
     if extras is not None:
         _validate_plan_v2_cross_fields(extras, normalized_inputs)
 
-    signature = _object(
-        plan["asan_signature"],
-        required={"error", "function", "source"},
-        optional={"operation", "access_size"},
-    )
-    asan_signature: dict[str, Any] = {
-        "error": _text(signature["error"], label="asan_signature.error"),
-        "function": _text(signature["function"], label="asan_signature.function"),
-        "source": _text(signature["source"], label="asan_signature.source"),
-    }
-    if "operation" in signature:
-        operation = _text(
-            signature["operation"], label="asan_signature.operation"
-        )
-        if operation not in _ASAN_OPERATIONS:
-            raise ValueError("asan_signature.operation must be READ or WRITE")
-        asan_signature["operation"] = operation
-    if "access_size" in signature:
-        access_size = signature["access_size"]
-        if (
-            type(access_size) is not int
-            or not 1 <= access_size <= MAX_ACCESS_SIZE
-        ):
-            raise ValueError(
-                "asan_signature.access_size must be an integer between 1 "
-                f"and {MAX_ACCESS_SIZE}"
-            )
-        asan_signature["access_size"] = access_size
+    asan_signature = normalize_asan_signature(plan["asan_signature"])
 
     platform = _text(plan["platform"], label="platform")
     toolchain = _toolchain_value(plan["toolchain"], "toolchain")

@@ -170,22 +170,54 @@ def _admit(
     campaign_bundle_digest: str | None = None,
     existing_rounds: tuple[int, ...] = (),
 ):
+    resolved_envelope = envelope or _guided_envelope()
+    resolved_experiment = experiment
+    if resolved_experiment is None:
+        if store is None:
+            resolved_experiment = None
+        elif recomputable:
+            resolved_experiment = _experiment()
+        else:
+            resolved_experiment = None
+    envelope_digest = contracts.envelope_digest(resolved_envelope)
+    experiment_digest = (
+        jsonutil.digest_json(resolved_experiment)
+        if resolved_experiment is not None
+        else None
+    )
+    plan_signature = dict(SIGNATURE)
+    if resolved_experiment is not None:
+        plan_signature = deepcopy(
+            resolved_experiment.get("expected_signature", SIGNATURE)
+        )
+    binding_options = {}
+    if store is not None:
+        binding_options = {
+            "approved_envelope_digest": envelope_digest,
+            "plan_parent_approval_digest": APPROVAL_DIGEST,
+            "plan_envelope_digest": envelope_digest,
+            "plan_seed_digest": SEED_CORPUS_DIGEST,
+            "plan_experiment_digest": experiment_digest,
+            "plan_harness_digest": resolved_envelope["harness_digest"],
+            "plan_asan_signature": plan_signature,
+        }
     return state.policy_admit_round(
         store=store,
         clock=clock or FakeClock(),
         job_id=JOB_ID,
         parent_job_id=FAMILY_ID,
-        envelope=envelope or _guided_envelope(),
+        envelope=resolved_envelope,
         parent_approval_digest=parent_approval_digest,
         approval_chain_tail_digest=approval_chain_tail_digest,
         seed_digest=SEED_CORPUS_DIGEST,
         round_no=round_no,
         budget_snapshot=_budget_snapshot(),
-        experiment=experiment,
+        experiment=resolved_experiment,
         recomputable=recomputable,
         campaign_bundle_digest=campaign_bundle_digest,
         admission_id=ADMISSION_ID,
         existing_rounds=existing_rounds,
+        **binding_options,
     )
 
 

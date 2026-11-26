@@ -615,6 +615,22 @@ def freeze_plan(
                         "a non-first v2 plan requires a non-null "
                         "parent_approval_digest"
                     )
+                # A pending re-approval invalidates the old chain tail for the
+                # next round: freezing now would bind a plan to an approval
+                # that the re-approval is about to supersede, leaving an
+                # immutable plan that can never be admitted. The family row is
+                # locked, so a concurrent propose-envelope cannot commit a new
+                # pending row between this check and the plan insert.
+                pending_envelope = connection.execute(
+                    "SELECT 1 FROM family_envelopes "
+                    "WHERE family_id = %s AND status = 'pending' LIMIT 1",
+                    (job["family_id"],),
+                ).fetchone()
+                if pending_envelope is not None:
+                    raise StateError(
+                        "cannot freeze a non-first plan while an envelope "
+                        "re-approval is pending"
+                    )
                 # The family row is already locked FOR UPDATE above, so the
                 # approval chain tail cannot move while this check runs.
                 # first_plan_digest is intentionally not re-checked here: every
@@ -646,6 +662,47 @@ def freeze_plan(
                         "plan envelope_digest does not match the "
                         "family_approvals chain tail"
                     )
+                # The approval digest alone does not bind the plan's harness.
+                # Read the approved envelope body so a later plan cannot name
+                # a harness the operator never approved, and fail before the
+                # immutable plan row is written.
+                tail_envelope_row = connection.execute(
+                    "SELECT envelope_json FROM family_envelopes "
+                    "WHERE family_id = %s AND envelope_digest = %s",
+                    (job["family_id"], tail["envelope_digest"]),
+                ).fetchone()
+                if tail_envelope_row is None:
+                    raise StateError(
+                        "a non-first v2 plan requires the approved envelope body"
+                    )
+                try:
+                    tail_envelope = _validate_envelope(
+                        tail_envelope_row["envelope_json"]
+                    )
+                except ValueError as error:
+                    raise StateError(
+                        f"approved envelope is invalid: {error}"
+                    ) from error
+                if plan.get("harness_digest") != tail_envelope["harness_digest"]:
+                    raise StateError(
+                        "plan harness_digest does not match the approved "
+                        "envelope body"
+                    )
+                try:
+                    tail_plan_signature = contracts.normalize_asan_signature(
+                        plan["asan_signature"]
+                    )
+                except (KeyError, ValueError) as error:
+                    raise StateError(
+                        f"plan asan_signature is invalid: {error}"
+                    ) from error
+                if tail_plan_signature not in tail_envelope[
+                    "accepted_signature_set"
+                ]:
+                    raise StateError(
+                        "plan asan_signature is outside the approved envelope "
+                        "accepted_signature_set"
+                    )
         normalized_envelope: dict[str, Any] | None = None
         if first_v2_plan:
             if envelope is None:
@@ -669,6 +726,30 @@ def freeze_plan(
             ):
                 raise StateError(
                     "envelope body does not match the plan envelope_digest"
+                )
+            # The envelope is the authorization boundary, so the first plan's
+            # harness must be the one the operator reviewed. Comparing only
+            # envelope_digest binds the envelope body but not the plan field
+            # execution reads, which would let a plan name a different harness
+            # under an approved envelope digest.
+            if plan.get("harness_digest") != normalized_envelope["harness_digest"]:
+                raise StateError(
+                    "plan harness_digest does not match the reviewed envelope"
+                )
+            try:
+                plan_asan_signature = contracts.normalize_asan_signature(
+                    plan["asan_signature"]
+                )
+            except (KeyError, ValueError) as error:
+                raise StateError(
+                    f"plan asan_signature is invalid: {error}"
+                ) from error
+            if plan_asan_signature not in normalized_envelope[
+                "accepted_signature_set"
+            ]:
+                raise StateError(
+                    "plan asan_signature is outside the reviewed envelope "
+                    "accepted_signature_set"
                 )
             # The first envelope is an approval boundary just like a
             # propose-envelope body: it may tighten, never widen, the request
@@ -2373,6 +2454,7 @@ def policy_admit_round(
     plan_seed_digest: Any = _ADMISSION_BINDING_UNSET,
     plan_experiment_digest: Any = _ADMISSION_BINDING_UNSET,
     plan_harness_digest: Any = _ADMISSION_BINDING_UNSET,
+    plan_asan_signature: Any = _ADMISSION_BINDING_UNSET,
     ledger_remaining_total_seconds: int | None = None,
 ) -> AdmissionOutcome:
     """Decide one policy round and emit exactly one admission audit event.
@@ -2487,6 +2569,41 @@ def policy_admit_round(
             )
         except ValueError as error:
             raise StateError(str(error)) from error
+    plan_asan_signature_checked = (
+        plan_asan_signature is not _ADMISSION_BINDING_UNSET
+    )
+    if plan_asan_signature_checked:
+        try:
+            plan_asan_signature = contracts.normalize_asan_signature(
+                plan_asan_signature
+            )
+        except ValueError as error:
+            raise StateError(
+                f"plan_asan_signature is invalid: {error}"
+            ) from error
+    if store is not None:
+        # A store-backed decision persists an admission, so it must carry the
+        # full frozen-plan/approval binding. Optional kwargs are only safe for
+        # the pure offline recomputation path; a future caller must not be able
+        # to silently drop the approval-chain or plan checks.
+        missing_bindings = []
+        if approved_envelope_digest is None:
+            missing_bindings.append("approved_envelope_digest")
+        for name, value in (
+            ("plan_parent_approval_digest", plan_parent_approval_digest),
+            ("plan_envelope_digest", plan_envelope_digest),
+            ("plan_seed_digest", plan_seed_digest),
+            ("plan_experiment_digest", plan_experiment_digest),
+            ("plan_harness_digest", plan_harness_digest),
+            ("plan_asan_signature", plan_asan_signature),
+        ):
+            if value is _ADMISSION_BINDING_UNSET:
+                missing_bindings.append(name)
+        if missing_bindings:
+            raise StateError(
+                "store-backed admission requires explicit bindings: "
+                + ", ".join(missing_bindings)
+            )
     if campaign_bundle_digest is not None:
         try:
             campaign_bundle_digest = jsonutil.require_digest(
@@ -2496,6 +2613,8 @@ def policy_admit_round(
             raise StateError(str(error)) from error
 
     experiment_digest: str | None = None
+    experiment_expected_signature: dict[str, Any] | None = None
+    experiment_signature_error: str | None = None
     if experiment is not None:
         if not isinstance(experiment, Mapping):
             raise StateError("experiment must be a JSON object")
@@ -2505,6 +2624,19 @@ def policy_admit_round(
             raise StateError(
                 f"experiment must be canonical JSON: {error}"
             ) from error
+        if "expected_signature" not in experiment:
+            experiment_signature_error = (
+                "ExperimentSpec is missing required field(s): expected_signature"
+            )
+        else:
+            try:
+                experiment_expected_signature = (
+                    contracts.normalize_asan_signature(
+                        experiment["expected_signature"]
+                    )
+                )
+            except ValueError as error:
+                experiment_signature_error = str(error)
 
     if not callable(clock):
         raise StateError("clock must be callable")
@@ -2637,6 +2769,26 @@ def policy_admit_round(
     ):
         reason_code = "HARNESS_REJECTED"
         sub_reason = "PLAN_HARNESS_MISMATCH"
+    elif plan_asan_signature_checked and experiment_signature_error is not None:
+        reason_code = "ENVELOPE_VIOLATION"
+        sub_reason = experiment_signature_error
+    elif (
+        plan_asan_signature_checked
+        and plan_asan_signature
+        not in normalized_envelope["accepted_signature_set"]
+    ):
+        # The plan's asan_signature is what execution/reporting uses. It must
+        # be one of the signatures the operator actually accepted, not merely
+        # match the experiment the planner derived.
+        reason_code = "ENVELOPE_VIOLATION"
+        sub_reason = "PLAN_SIGNATURE_NOT_ACCEPTED"
+    elif (
+        plan_asan_signature_checked
+        and experiment is not None
+        and plan_asan_signature != experiment_expected_signature
+    ):
+        reason_code = "ADMISSION_DENIED"
+        sub_reason = "PLAN_SIGNATURE_MISMATCH"
     elif plan_seed_checked and plan_seed_digest != seed_digest:
         reason_code = "ADMISSION_DENIED"
         sub_reason = "PLAN_SEED_MISMATCH"
@@ -2664,6 +2816,17 @@ def policy_admit_round(
     elif not recomputable and campaign_bundle_digest is None:
         reason_code = "ADMISSION_DENIED"
         sub_reason = "SUPPORTING_BUNDLE_MISSING"
+    elif (
+        plan_asan_signature_checked
+        and experiment is None
+        and (not plan_experiment_checked or plan_experiment_digest is None)
+        and recomputable
+    ):
+        # Without an ExperimentSpec the only admissible explanation is a
+        # non-recomputable decision backed by the campaign bundle (checked
+        # above). A recomputable round cannot omit both bindings.
+        reason_code = "ADMISSION_DENIED"
+        sub_reason = "EXPERIMENT_OR_BUNDLE_REQUIRED"
     else:
         if experiment is not None:
             try:
@@ -2700,6 +2863,17 @@ def policy_admit_round(
     elif sub_reason == "PLAN_HARNESS_MISMATCH":
         detail["expected_harness_digest"] = normalized_envelope["harness_digest"]
         detail["actual_harness_digest"] = plan_harness_digest
+    elif sub_reason == "PLAN_SIGNATURE_NOT_ACCEPTED":
+        detail["accepted_signature_set"] = normalized_envelope[
+            "accepted_signature_set"
+        ]
+        detail["actual_asan_signature"] = plan_asan_signature
+    elif sub_reason == "PLAN_SIGNATURE_MISMATCH":
+        detail["expected_asan_signature"] = experiment_expected_signature
+        detail["actual_asan_signature"] = plan_asan_signature
+    elif sub_reason == "EXPERIMENT_OR_BUNDLE_REQUIRED":
+        detail["recomputable"] = recomputable
+        detail["supporting_bundle_digest"] = campaign_bundle_digest
     elif sub_reason == "PLAN_SEED_MISMATCH":
         detail["expected_seed_digest"] = plan_seed_digest
         detail["actual_seed_digest"] = seed_digest
@@ -3039,6 +3213,35 @@ def record_admission(
                 raise StateError(
                     "admission plan requires harness_digest"
                 ) from error
+            try:
+                plan_asan_signature = contracts.normalize_asan_signature(
+                    plan_body["asan_signature"]
+                )
+            except (KeyError, ValueError) as error:
+                raise StateError(
+                    "admission plan requires a valid asan_signature"
+                ) from error
+            plan_signature_in_envelope = (
+                plan_asan_signature
+                in normalized_envelope["accepted_signature_set"]
+            )
+            plan_signature_matches_experiment = True
+            experiment_signature_valid = True
+            experiment_expected_signature = None
+            if experiment is not None:
+                try:
+                    experiment_expected_signature = (
+                        contracts.normalize_asan_signature(
+                            experiment["expected_signature"]
+                        )
+                    )
+                except (KeyError, ValueError):
+                    plan_signature_matches_experiment = False
+                    experiment_signature_valid = False
+                else:
+                    plan_signature_matches_experiment = (
+                        plan_asan_signature == experiment_expected_signature
+                    )
             existing = connection.execute(
                 "SELECT admission_id, job_id, parent_job_id, round_no, "
                 "approval_kind, envelope_digest, parent_approval_digest, "
@@ -3116,6 +3319,8 @@ def record_admission(
                     and plan_envelope_digest == envelope_digest
                     and plan_harness_digest
                     == normalized_envelope["harness_digest"]
+                    and plan_signature_in_envelope
+                    and plan_signature_matches_experiment
                     and plan_seed_digest == seed_digest
                     and plan_experiment_digest == experiment_digest
                     and plan_approval_belongs_to_family
@@ -3141,15 +3346,17 @@ def record_admission(
                         status="already_admitted",
                         sub_reason="ROUND_ALREADY_ADMITTED",
                     )
-                if family["state"] != "AGGREGATING":
+                if (
+                    family["state"] != "AGGREGATING"
+                    and family["state"] not in _TERMINAL_JOB_STATES
+                ):
                     raise StateError(
                         f"admission family is {family['state']}, not AGGREGATING"
                     )
-                if round_job["state"] in _TERMINAL_JOB_STATES:
-                    raise StateError(
-                        "admission round job is in terminal state "
-                        f"{round_job['state']}"
-                    )
+                # A terminal family/round does not change the §7 three-path
+                # outcome for a conflicting re-admission: it is a recorded
+                # ADMISSION_DENIED/ROUND_ALREADY_ADMITTED, not a raw error that
+                # would leave the conflict unaudited.
                 harness_mismatch = (
                     experiment_violation is None
                     and envelope_is_bound
@@ -3159,6 +3366,16 @@ def record_admission(
                 if harness_mismatch:
                     denied_reason_code = "HARNESS_REJECTED"
                     denied_sub_reason = "PLAN_HARNESS_MISMATCH"
+                elif not plan_signature_in_envelope:
+                    denied_reason_code = "ENVELOPE_VIOLATION"
+                    denied_sub_reason = "PLAN_SIGNATURE_NOT_ACCEPTED"
+                elif (
+                    experiment is not None
+                    and experiment_signature_valid
+                    and not plan_signature_matches_experiment
+                ):
+                    denied_reason_code = "ADMISSION_DENIED"
+                    denied_sub_reason = "PLAN_SIGNATURE_MISMATCH"
                 else:
                     denied_reason_code = (
                         "ENVELOPE_VIOLATION"
@@ -3185,6 +3402,9 @@ def record_admission(
                     "experiment_digest": experiment_digest,
                     "reason_code": denied_reason_code,
                     "sub_reason": denied_sub_reason,
+                    "existing_admission_id": str(existing["admission_id"]),
+                    "family_state": family["state"],
+                    "round_state": round_job["state"],
                 }
                 if harness_mismatch:
                     denied_detail["expected_harness_digest"] = (
@@ -3193,6 +3413,16 @@ def record_admission(
                     denied_detail["actual_harness_digest"] = (
                         plan_harness_digest
                     )
+                elif denied_sub_reason == "PLAN_SIGNATURE_NOT_ACCEPTED":
+                    denied_detail["accepted_signature_set"] = (
+                        normalized_envelope["accepted_signature_set"]
+                    )
+                    denied_detail["actual_asan_signature"] = plan_asan_signature
+                elif denied_sub_reason == "PLAN_SIGNATURE_MISMATCH":
+                    denied_detail["expected_asan_signature"] = (
+                        experiment_expected_signature
+                    )
+                    denied_detail["actual_asan_signature"] = plan_asan_signature
                 _audit(
                     connection,
                     job_id,
@@ -3311,6 +3541,7 @@ def record_admission(
                 plan_seed_digest=plan_seed_digest,
                 plan_experiment_digest=plan_experiment_digest,
                 plan_harness_digest=plan_harness_digest,
+                plan_asan_signature=plan_asan_signature,
                 ledger_remaining_total_seconds=ledger_remaining_total,
             )
 
@@ -3561,6 +3792,24 @@ def charge_budget_local(
             if charge.get("charge_kind") != charge_kind:
                 raise StateError(
                     "existing budget charge has a different charge_kind"
+                )
+            existing_seconds = charge.get("seconds")
+            existing_fuzz_seconds = charge.get("fuzz_seconds", 0)
+            if (
+                type(existing_seconds) is not int
+                or type(existing_fuzz_seconds) is not int
+                or existing_seconds < 0
+                or existing_fuzz_seconds < 0
+            ):
+                raise StateError("existing budget charge has invalid durations")
+            # Recovery is only a no-op when the replay does not claim less time
+            # than was already accounted for. A smaller replay is a different
+            # step that would silently under-report usage; fail closed. A
+            # recorded value below the request is a legitimate cap by the
+            # remaining balance, so it still recovers.
+            if existing_seconds > elapsed or existing_fuzz_seconds > fuzz_elapsed:
+                raise StateError(
+                    "replay claims more elapsed time than the recorded charge"
                 )
             return BudgetChargeOutcome(
                 "recovered", None, dict(charge), dict(ledger)
@@ -4163,6 +4412,12 @@ def charge_step_budget(
                     raise StateError(
                         "existing budget charge has a different charge_kind"
                     )
+                if existing["seconds"] > elapsed or (
+                    existing["fuzz_seconds"] > fuzz_elapsed
+                ):
+                    raise StateError(
+                        "replay claims more elapsed time than the recorded charge"
+                    )
                 return BudgetChargeOutcome(
                     "recovered",
                     None,
@@ -4587,6 +4842,29 @@ def _record_family_review(
         "decided_at": jsonutil.timestamp(decision_at),
     }
     if decision == "approve":
+        # The frozen plan is immutable, so the review must re-read the pending
+        # envelope body and prove the plan harness it will execute is the one
+        # being approved. A digest-only check cannot catch a DB drift between
+        # freeze_plan and record_review.
+        pending_envelope_body = envelope["envelope_json"]
+        if not isinstance(pending_envelope_body, Mapping):
+            raise StateError("approved family envelope must be a JSON object")
+        try:
+            normalized_pending_envelope = _validate_envelope(
+                pending_envelope_body
+            )
+        except ValueError as error:
+            raise StateError(
+                f"approved family envelope is invalid: {error}"
+            ) from error
+        plan_body = plan["plan"] if isinstance(plan["plan"], Mapping) else {}
+        if (
+            plan_body.get("harness_digest")
+            != normalized_pending_envelope["harness_digest"]
+        ):
+            raise StateError(
+                "first plan harness_digest does not match the approved envelope"
+            )
         # reviews is a first-round record only; a changed-envelope re-approval
         # appends to family_approvals and must not rewrite it.
         if first_round:

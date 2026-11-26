@@ -10,16 +10,20 @@ from uuid import uuid4
 import pytest
 from psycopg.types.json import Jsonb
 
-from datacon import jsonutil, state
+from datacon import contracts, jsonutil, state
 
 from test_review_locks import (
+    APPROVAL_1,
+    ENVELOPE_1,
     ENVELOPE_2,
     FIRST_PLAN_DIGEST,
     REVIEWER_2,
     _family_request,
     _insert_job,
+    _insert_plain_job,
     _row,
     _seed_family,
+    _v2_plan,
 )
 
 pytestmark = pytest.mark.postgres
@@ -119,6 +123,54 @@ def test_propose_envelope_rejects_second_pending(isolated_database):
     seed = _approved_family(isolated_database, pending=ENVELOPE_2)
     with pytest.raises(state.StateError, match="pending"):
         state.propose_envelope(isolated_database.dsn, seed["family_id"], _envelope())
+
+
+def test_freeze_plan_rejects_pending_envelope(isolated_database):
+    seed = _approved_family(isolated_database)
+    family_id = seed["family_id"]
+    child_id = uuid4()
+    _insert_plain_job(
+        isolated_database,
+        child_id,
+        request=_family_request("guided"),
+        state_name="PREPARING",
+        family_id=family_id,
+        job_kind="round",
+        parent_job_id=family_id,
+        round_no=2,
+        lease=True,
+    )
+    proposed = state.propose_envelope(
+        isolated_database.dsn, family_id, _envelope(max_rounds=7)
+    )
+    assert proposed["status"] == "pending"
+
+    plan = _v2_plan(
+        family_id,
+        round_no=2,
+        envelope_digest=ENVELOPE_1,
+        parent_approval_digest=APPROVAL_1,
+    )
+    with pytest.raises(state.StateError, match="pending"):
+        state.freeze_plan(
+            isolated_database.dsn,
+            child_id,
+            generation=1,
+            plan=plan,
+            plan_digest=contracts.plan_digest(plan),
+            summary={},
+        )
+
+    assert _row(
+        isolated_database,
+        "SELECT count(*) FROM plans WHERE job_id = %s",
+        (child_id,),
+    )[0] == 0
+    assert _row(
+        isolated_database,
+        "SELECT state FROM jobs WHERE job_id = %s",
+        (child_id,),
+    )[0] == "PREPARING"
 
 
 def test_fixed_family_cannot_propose_guided(isolated_database):

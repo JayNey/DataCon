@@ -115,34 +115,66 @@ def _admit(
     recomputable: bool = True,
     campaign_bundle_digest: str | None = None,
     existing_rounds: tuple[int, ...] = (),
-    approved_envelope_digest: str | None = None,
-    plan_envelope_digest: str | None = None,
+    experiment: Any = _UNSET,
+    approved_envelope_digest: Any = _UNSET,
+    plan_parent_approval_digest: Any = _UNSET,
+    plan_envelope_digest: Any = _UNSET,
+    plan_seed_digest: Any = _UNSET,
+    plan_experiment_digest: Any = _UNSET,
     plan_harness_digest: Any = _UNSET,
+    plan_asan_signature: Any = _UNSET,
 ):
-    binding_options = {}
-    if approved_envelope_digest is not None:
-        binding_options["approved_envelope_digest"] = approved_envelope_digest
-    if plan_envelope_digest is not None:
-        binding_options["plan_envelope_digest"] = plan_envelope_digest
-    if plan_harness_digest is not _UNSET:
-        binding_options["plan_harness_digest"] = plan_harness_digest
+    envelope = _guided_envelope()
+    envelope_digest = contracts.envelope_digest(envelope)
+    if experiment is _UNSET:
+        # The store-backed predicate now requires an ExperimentSpec or a
+        # campaign-backed non-recomputable decision; offline recomputation
+        # keeps the historical experiment-free shape.
+        experiment = _valid_experiment() if store is not None else None
+    experiment_digest = (
+        jsonutil.digest_json(experiment) if experiment is not None else None
+    )
+    binding_options = {
+        "approved_envelope_digest": approved_envelope_digest,
+        "plan_parent_approval_digest": plan_parent_approval_digest,
+        "plan_envelope_digest": plan_envelope_digest,
+        "plan_seed_digest": plan_seed_digest,
+        "plan_experiment_digest": plan_experiment_digest,
+        "plan_harness_digest": plan_harness_digest,
+        "plan_asan_signature": plan_asan_signature,
+    }
+    defaults = {
+        "approved_envelope_digest": envelope_digest,
+        "plan_parent_approval_digest": APPROVAL_DIGEST,
+        "plan_envelope_digest": envelope_digest,
+        "plan_seed_digest": SEED_CORPUS_DIGEST,
+        "plan_experiment_digest": experiment_digest,
+        "plan_harness_digest": HARNESS_DIGEST,
+        "plan_asan_signature": dict(SIGNATURE),
+    }
+    resolved_options = {}
+    for name, value in binding_options.items():
+        if value is not _UNSET:
+            resolved_options[name] = value
+        elif store is not None:
+            resolved_options[name] = defaults[name]
     return state.policy_admit_round(
         store=store,
         clock=clock or FakeClock(),
         job_id=JOB_ID,
         parent_job_id=FAMILY_ID,
-        envelope=_guided_envelope(),
+        envelope=envelope,
         parent_approval_digest=APPROVAL_DIGEST,
         approval_chain_tail_digest=APPROVAL_DIGEST,
         seed_digest=SEED_CORPUS_DIGEST,
         round_no=round_no,
         budget_snapshot=_budget_snapshot(),
-        experiment=None,
+        experiment=experiment,
         recomputable=recomputable,
         campaign_bundle_digest=campaign_bundle_digest,
         admission_id=ADMISSION_ID,
         existing_rounds=existing_rounds,
-        **binding_options,
+        **resolved_options,
     )
 
 
@@ -385,7 +417,9 @@ def test_admission_validates_budget_snapshot_and_denies_exhausted():
             seed_digest=SEED_CORPUS_DIGEST,
             round_no=2,
             budget_snapshot=exhausted_snapshot,
+            experiment=_valid_experiment(),
             admission_id=ADMISSION_ID,
+            **_bindings(),
         )
         assert not denied.admitted
         assert denied.reason_code == "BUDGET_EXHAUSTED"
@@ -410,8 +444,9 @@ def test_admission_denies_null_plan_parent_approval_digest():
         seed_digest=SEED_CORPUS_DIGEST,
         round_no=2,
         budget_snapshot=_budget_snapshot(),
+        experiment=_valid_experiment(),
         admission_id=ADMISSION_ID,
-        plan_parent_approval_digest=None,
+        **_bindings(plan_parent_approval_digest=None),
     )
 
     assert not outcome.admitted
@@ -445,7 +480,9 @@ def test_admission_denies_fixed_envelope():
             "remaining_total_seconds": 900,
             "remaining_fuzz_seconds": 0,
         },
+        experiment=_valid_experiment(),
         admission_id=ADMISSION_ID,
+        **_bindings(),
     )
 
     assert not outcome.admitted
@@ -482,7 +519,12 @@ def test_admission_denies_unsupported_predicate_version():
         seed_digest=SEED_CORPUS_DIGEST,
         round_no=2,
         budget_snapshot=_budget_snapshot(),
+        experiment=_valid_experiment(),
         admission_id=ADMISSION_ID,
+        **_bindings(
+            approved_envelope_digest=contracts.envelope_digest(envelope),
+            plan_envelope_digest=contracts.envelope_digest(envelope),
+        ),
     )
 
     assert not outcome.admitted
@@ -539,8 +581,9 @@ def test_admission_plan_seed_mismatch_is_denied():
         seed_digest=SEED_CORPUS_DIGEST,
         round_no=2,
         budget_snapshot=_budget_snapshot(),
+        experiment=_valid_experiment(),
         admission_id=ADMISSION_ID,
-        plan_seed_digest=_digest("9"),
+        **_bindings(plan_seed_digest=_digest("9")),
     )
 
     assert not outcome.admitted
@@ -595,6 +638,23 @@ def _valid_experiment(input_family: str = "length_boundary") -> dict:
     }
 
 
+def _bindings(**overrides: Any) -> dict[str, Any]:
+    """Complete, internally consistent plan/approval bindings for a store."""
+    envelope = _guided_envelope()
+    experiment = _valid_experiment()
+    values: dict[str, Any] = {
+        "approved_envelope_digest": contracts.envelope_digest(envelope),
+        "plan_parent_approval_digest": APPROVAL_DIGEST,
+        "plan_envelope_digest": contracts.envelope_digest(envelope),
+        "plan_seed_digest": SEED_CORPUS_DIGEST,
+        "plan_experiment_digest": jsonutil.digest_json(experiment),
+        "plan_harness_digest": HARNESS_DIGEST,
+        "plan_asan_signature": dict(SIGNATURE),
+    }
+    values.update(overrides)
+    return values
+
+
 def test_admission_plan_experiment_digest_binding():
     exp_a = _valid_experiment("length_boundary")
     exp_b = _valid_experiment("byte_flip")
@@ -617,7 +677,7 @@ def test_admission_plan_experiment_digest_binding():
         budget_snapshot=_budget_snapshot(),
         experiment=None,
         admission_id=ADMISSION_ID,
-        plan_experiment_digest=exp_a_digest,
+        **_bindings(plan_experiment_digest=exp_a_digest),
     )
     assert not missing.admitted
     assert missing.reason_code == "ADMISSION_DENIED"
@@ -644,7 +704,7 @@ def test_admission_plan_experiment_digest_binding():
         budget_snapshot=_budget_snapshot(),
         experiment=exp_b,
         admission_id=ADMISSION_ID,
-        plan_experiment_digest=exp_a_digest,
+        **_bindings(plan_experiment_digest=exp_a_digest),
     )
     assert not different.admitted
     assert different.reason_code == "ADMISSION_DENIED"
@@ -671,7 +731,7 @@ def test_admission_plan_experiment_digest_binding():
         budget_snapshot=_budget_snapshot(),
         experiment=exp_a,
         admission_id=ADMISSION_ID,
-        plan_experiment_digest=None,
+        **_bindings(plan_experiment_digest=None),
     )
     assert not unexpected.admitted
     assert unexpected.reason_code == "ADMISSION_DENIED"
@@ -698,7 +758,7 @@ def test_admission_plan_experiment_digest_binding():
         budget_snapshot=_budget_snapshot(),
         experiment=exp_a,
         admission_id=ADMISSION_ID,
-        plan_experiment_digest=exp_a_digest,
+        **_bindings(plan_experiment_digest=exp_a_digest),
     )
     assert admitted.admitted
     assert admitted.reason_code is None
@@ -741,6 +801,87 @@ def test_admission_plan_experiment_digest_binding():
                 admission_id=ADMISSION_ID,
                 plan_experiment_digest=bad_digest,
             )
+
+
+def test_store_backed_predicate_requires_plan_bindings():
+    envelope = _guided_envelope()
+    envelope_digest = contracts.envelope_digest(envelope)
+    experiment = _valid_experiment()
+    experiment_digest = jsonutil.digest_json(experiment)
+    bindings = {
+        "approved_envelope_digest": envelope_digest,
+        "plan_parent_approval_digest": APPROVAL_DIGEST,
+        "plan_envelope_digest": envelope_digest,
+        "plan_seed_digest": SEED_CORPUS_DIGEST,
+        "plan_experiment_digest": experiment_digest,
+        "plan_harness_digest": HARNESS_DIGEST,
+        "plan_asan_signature": dict(SIGNATURE),
+    }
+
+    for missing in bindings:
+        store = RecordingAdmissionStore()
+        kwargs = dict(bindings)
+        kwargs.pop(missing)
+        with pytest.raises(state.StateError, match="binding|required"):
+            state.policy_admit_round(
+                store=store,
+                clock=FakeClock(),
+                job_id=JOB_ID,
+                parent_job_id=FAMILY_ID,
+                envelope=envelope,
+                parent_approval_digest=APPROVAL_DIGEST,
+                approval_chain_tail_digest=APPROVAL_DIGEST,
+                seed_digest=SEED_CORPUS_DIGEST,
+                round_no=2,
+                budget_snapshot=_budget_snapshot(),
+                experiment=experiment,
+                admission_id=ADMISSION_ID,
+                **kwargs,
+            )
+        assert not store.admissions, missing
+        assert not store.events, missing
+
+    # approved_envelope_digest has no meaningful "not supplied" default: None
+    # must fail just like the sentinel-backed plan bindings.
+    store = RecordingAdmissionStore()
+    with pytest.raises(state.StateError, match="approved_envelope_digest|binding"):
+        state.policy_admit_round(
+            store=store,
+            clock=FakeClock(),
+            job_id=JOB_ID,
+            parent_job_id=FAMILY_ID,
+            envelope=envelope,
+            parent_approval_digest=APPROVAL_DIGEST,
+            approval_chain_tail_digest=APPROVAL_DIGEST,
+            seed_digest=SEED_CORPUS_DIGEST,
+            round_no=2,
+            budget_snapshot=_budget_snapshot(),
+            experiment=experiment,
+            admission_id=ADMISSION_ID,
+            approved_envelope_digest=None,
+            **{k: v for k, v in bindings.items() if k != "approved_envelope_digest"},
+        )
+    assert not store.admissions
+
+    store = RecordingAdmissionStore()
+    admitted = state.policy_admit_round(
+        store=store,
+        clock=FakeClock(),
+        job_id=JOB_ID,
+        parent_job_id=FAMILY_ID,
+        envelope=envelope,
+        parent_approval_digest=APPROVAL_DIGEST,
+        approval_chain_tail_digest=APPROVAL_DIGEST,
+        seed_digest=SEED_CORPUS_DIGEST,
+        round_no=2,
+        budget_snapshot=_budget_snapshot(),
+        experiment=experiment,
+        admission_id=ADMISSION_ID,
+        **bindings,
+    )
+    assert admitted.admitted
+    assert len(store.admissions) == 1
+    assert [event["event_type"] for event in store.events] == ["round_admitted"]
 
 
 def test_admission_budget_snapshot_closed_keyset_and_reconciliation():
@@ -987,8 +1128,9 @@ def test_admission_reconciles_spent_against_envelope_caps_when_max_omitted():
                 seed_digest=SEED_CORPUS_DIGEST,
                 round_no=2,
                 budget_snapshot=bad,
+                experiment=_valid_experiment(),
                 admission_id=ADMISSION_ID,
-                approved_envelope_digest=contracts.envelope_digest(envelope),
+                **_bindings(),
             )
         assert store.admissions == [], bad
         assert store.events == [], bad
@@ -1065,8 +1207,9 @@ def test_unapproved_envelope_cap_change_with_real_snapshot_is_denied(
             seed_digest=SEED_CORPUS_DIGEST,
             round_no=2,
             budget_snapshot=snapshot,
+            experiment=_valid_experiment(),
             admission_id=ADMISSION_ID,
-            **binding,
+            **_bindings(**binding),
         )
         assert outcome.status == "denied"
         assert not outcome.admitted
@@ -1091,8 +1234,12 @@ def test_unapproved_envelope_cap_change_with_real_snapshot_is_denied(
         seed_digest=SEED_CORPUS_DIGEST,
         round_no=2,
         budget_snapshot=snapshot,
+        experiment=_valid_experiment(),
         admission_id=ADMISSION_ID,
-        plan_envelope_digest=approved_digest,
+        **_bindings(
+            approved_envelope_digest=contracts.envelope_digest(unapproved),
+            plan_envelope_digest=approved_digest,
+        ),
     )
     assert outcome.reason_code == "ADMISSION_DENIED"
     assert outcome.sub_reason == "PLAN_ENVELOPE_MISMATCH"

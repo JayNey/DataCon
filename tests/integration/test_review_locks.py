@@ -28,6 +28,9 @@ pytestmark = pytest.mark.postgres
 ENVELOPE_1 = "sha256:" + "1" * 64
 ENVELOPE_2 = "sha256:" + "2" * 64
 UNKNOWN_ENVELOPE = "sha256:" + "9" * 64
+# The seeded first plan and every stored envelope body share this harness so a
+# review can prove the frozen plan's harness is the approved one.
+ENVELOPE_HARNESS = "sha256:" + "c" * 64
 FIRST_PLAN_DIGEST = "sha256:" + "a" * 64
 OTHER_PLAN_DIGEST = "sha256:" + "b" * 64
 APPROVAL_1 = "sha256:" + "c" * 64
@@ -115,9 +118,27 @@ def _insert_envelope(
             Jsonb(
                 {
                     "mode": "guided",
-                    "envelope_digest": envelope_digest,
+                    "allowed_mutation_families": ["byte_flip"],
+                    "mutation_limits": {
+                        "allowed_ops": ["append"],
+                        "max_input_bytes": 64,
+                    },
+                    "seed_corpus_digest": "sha256:" + "a" * 64,
+                    "fuzz_image_digest": "sha256:" + "b" * 64,
+                    "harness_digest": ENVELOPE_HARNESS,
+                    "max_rounds": 2,
                     "max_total_seconds": max_total_seconds,
                     "max_fuzz_seconds": max_fuzz_seconds,
+                    "accepted_signature_set": [
+                        {
+                            "error": "heap-buffer-overflow",
+                            "function": "parse_token",
+                            "source": "parser.c",
+                            "operation": "WRITE",
+                            "access_size": 1,
+                        }
+                    ],
+                    "admission_predicate_version": "admission-v1",
                 }
             ),
             status_name,
@@ -219,6 +240,7 @@ def _seed_family(
                     "round_no": round_no,
                     "parent_approval_digest": APPROVAL_1 if first_approval else None,
                     "envelope_digest": ENVELOPE_1,
+                    "harness_digest": ENVELOPE_HARNESS,
                     "build_ref": None,
                     "build_spec": BUILD_SPEC,
                     "compile_flags": ["-g"],
@@ -1420,6 +1442,7 @@ def _insert_plan(database, child_id, plan_digest, envelope_digest, round_no):
         "round_no": round_no,
         "parent_approval_digest": None,
         "envelope_digest": envelope_digest,
+        "harness_digest": ENVELOPE_HARNESS,
         "build_ref": None,
         "build_spec": BUILD_SPEC,
         "compile_flags": ["-g"],
@@ -1466,6 +1489,7 @@ def test_first_plan_freeze_inserts_pending_envelope_end_to_end(
     body = dict(GUIDED_ENVELOPE_BODY)
     digest = jsonutil.digest_json(body)
     plan = _v2_plan(family_id, round_no=None, envelope_digest=digest)
+    assert plan["harness_digest"] == body["harness_digest"]
     plan_digest = contracts.plan_digest(plan)
 
     with pytest.raises(state.StateError):
@@ -1560,6 +1584,186 @@ def test_first_plan_freeze_inserts_pending_envelope_end_to_end(
         isolated_database,
         "SELECT count(*) FROM family_envelopes WHERE family_id = %s",
         (family_2,),
+    )[0] == 0
+
+
+def test_first_plan_freeze_rejects_harness_mismatch(isolated_database):
+    family_id, child_id = _freeze_seed(
+        isolated_database, _family_request("guided"), job_kind="campaign"
+    )
+    body = deepcopy(GUIDED_ENVELOPE_BODY)
+    digest = jsonutil.digest_json(body)
+    plan = _v2_plan(family_id, round_no=None, envelope_digest=digest)
+    plan["harness_digest"] = "sha256:" + "2" * 64
+    assert plan["harness_digest"] != body["harness_digest"]
+
+    with pytest.raises(state.StateError, match="harness_digest"):
+        state.freeze_plan(
+            isolated_database.dsn,
+            child_id,
+            generation=1,
+            plan=plan,
+            plan_digest=contracts.plan_digest(plan),
+            summary={},
+            envelope=body,
+        )
+    _assert_no_freeze_rows(isolated_database, family_id, child_id)
+
+
+def test_first_plan_freeze_rejects_plan_signature_outside_envelope(
+    isolated_database,
+):
+    family_id, child_id = _freeze_seed(
+        isolated_database, _family_request("guided"), job_kind="campaign"
+    )
+    body = deepcopy(GUIDED_ENVELOPE_BODY)
+    digest = jsonutil.digest_json(body)
+    plan = _v2_plan(family_id, round_no=None, envelope_digest=digest)
+    plan["asan_signature"] = {
+        **PLAN_BASE["asan_signature"],
+        "function": "some_other_function",
+        "operation": "READ",
+        "access_size": 8,
+    }
+
+    with pytest.raises(state.StateError, match="asan_signature"):
+        state.freeze_plan(
+            isolated_database.dsn,
+            child_id,
+            generation=1,
+            plan=plan,
+            plan_digest=contracts.plan_digest(plan),
+            summary={},
+            envelope=body,
+        )
+    _assert_no_freeze_rows(isolated_database, family_id, child_id)
+
+
+def test_later_plan_freeze_rejects_plan_signature_outside_envelope(
+    isolated_database,
+):
+    seed = _seed_family(
+        isolated_database, first_approval=True, pending_envelope=None
+    )
+    family_id = seed["family_id"]
+    child_id = uuid4()
+    _insert_plain_job(
+        isolated_database,
+        child_id,
+        request=_family_request("guided"),
+        state_name="PREPARING",
+        family_id=family_id,
+        job_kind="round",
+        parent_job_id=family_id,
+        round_no=1,
+        lease=True,
+    )
+    plan = _v2_plan(
+        family_id,
+        round_no=1,
+        envelope_digest=ENVELOPE_1,
+        parent_approval_digest=APPROVAL_1,
+    )
+    plan["asan_signature"] = {
+        **PLAN_BASE["asan_signature"],
+        "function": "some_other_function",
+        "operation": "READ",
+        "access_size": 8,
+    }
+
+    with pytest.raises(state.StateError, match="asan_signature"):
+        state.freeze_plan(
+            isolated_database.dsn,
+            child_id,
+            generation=1,
+            plan=plan,
+            plan_digest=contracts.plan_digest(plan),
+            summary={},
+        )
+    assert _row(
+        isolated_database,
+        "SELECT count(*) FROM plans WHERE job_id = %s",
+        (child_id,),
+    )[0] == 0
+
+
+def test_first_plan_review_rejects_harness_mismatch(
+    isolated_database, tmp_path, monkeypatch
+):
+    monkeypatch.setenv("DATACON_EVIDENCE_ROOT", str(tmp_path / "evidence"))
+    seed = _seed_family(isolated_database)
+    family_id = seed["family_id"]
+    child_id = seed["child_id"]
+    tampered_digest = "sha256:" + "2" * 64
+    isolated_database.connection.execute(
+        "UPDATE plans SET plan = jsonb_set(plan, '{harness_digest}', "
+        "to_jsonb(%s::text)) WHERE job_id = %s",
+        (tampered_digest, child_id),
+    )
+
+    with pytest.raises(state.StateError, match="harness_digest"):
+        _review(isolated_database, seed, decision="approve")
+
+    assert _row(
+        isolated_database,
+        "SELECT state FROM jobs WHERE job_id = %s",
+        (family_id,),
+    )[0] == "AGGREGATING"
+    assert _row(
+        isolated_database,
+        "SELECT state FROM jobs WHERE job_id = %s",
+        (child_id,),
+    )[0] == "AWAITING_REVIEW"
+    assert _row(
+        isolated_database,
+        "SELECT count(*) FROM reviews WHERE job_id = %s",
+        (family_id,),
+    )[0] == 0
+    assert _row(
+        isolated_database,
+        "SELECT count(*) FROM family_approvals WHERE family_id = %s",
+        (family_id,),
+    )[0] == 0
+
+
+def test_freeze_later_plan_rejects_harness_mismatch(isolated_database):
+    seed = _seed_family(
+        isolated_database, first_approval=True, pending_envelope=None
+    )
+    family_id = seed["family_id"]
+    child_id = uuid4()
+    _insert_plain_job(
+        isolated_database,
+        child_id,
+        request=_family_request("guided"),
+        state_name="PREPARING",
+        family_id=family_id,
+        job_kind="round",
+        parent_job_id=family_id,
+        round_no=1,
+        lease=True,
+    )
+    plan = _v2_plan(
+        family_id,
+        round_no=1,
+        envelope_digest=ENVELOPE_1,
+        parent_approval_digest=APPROVAL_1,
+    )
+    plan["harness_digest"] = "sha256:" + "2" * 64
+
+    with pytest.raises(state.StateError, match="harness_digest"):
+        state.freeze_plan(
+            isolated_database.dsn,
+            child_id,
+            generation=1,
+            plan=plan,
+            plan_digest=contracts.plan_digest(plan),
+            summary={},
+        )
+    assert _row(
+        isolated_database,
+        "SELECT count(*) FROM plans WHERE job_id = %s",
+        (child_id,),
     )[0] == 0
 
 
@@ -2066,6 +2270,7 @@ def _v2_plan(
             "round_no": round_no,
             "parent_approval_digest": parent_approval_digest,
             "envelope_digest": envelope_digest,
+            "harness_digest": ENVELOPE_HARNESS,
             "build_ref": None,
             "build_spec": deepcopy(BUILD_SPEC),
             "compile_flags": ["-g"],
@@ -2128,7 +2333,8 @@ def _assert_no_freeze_rows(database, family_id, child_id, state_name="PREPARING"
     )[0] == 0
     assert _row(
         database,
-        "SELECT count(*) FROM family_envelopes WHERE family_id = %s",
+        "SELECT count(*) FROM family_envelopes WHERE family_id = %s "
+        "AND status = 'pending'",
         (family_id,),
     )[0] == 0
     assert _row(
@@ -2163,6 +2369,23 @@ def _insert_approval(
             supersedes,
         ),
     )
+    # A later plan's freeze reads the approved envelope body to bind the plan
+    # harness, so a hand-seeded approval must also seed the body it approved.
+    if _row(
+        database,
+        "SELECT envelope_id FROM family_envelopes WHERE family_id = %s "
+        "AND envelope_digest = %s",
+        (family_id, envelope_digest),
+    ) is None:
+        _insert_envelope(
+            database,
+            family_id,
+            envelope_digest,
+            status_name="approved",
+            review_deadline_at=_now() + timedelta(hours=24),
+            reviewer_id=reviewer_id,
+            decided_at=_now(),
+        )
     return approval_id
 
 
@@ -2206,7 +2429,8 @@ def test_freeze_guided_round_one_does_not_enter_review(isolated_database):
     )
     assert _row(
         isolated_database,
-        "SELECT count(*) FROM family_envelopes WHERE family_id = %s",
+        "SELECT count(*) FROM family_envelopes WHERE family_id = %s "
+        "AND status = 'pending'",
         (family_id,),
     )[0] == 0
     assert _row(

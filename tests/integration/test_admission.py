@@ -9,6 +9,7 @@ decision for the same ``(parent_job_id, round_no)`` is a real denial.
 
 from __future__ import annotations
 
+from copy import deepcopy
 from typing import Any
 from uuid import uuid4
 
@@ -16,6 +17,8 @@ import pytest
 from psycopg.types.json import Jsonb
 
 from datacon import contracts, jsonutil, state
+
+from test_review_locks import BUILD_SPEC, PLAN_BASE, PLAN_BUILD_RECIPE_DIGEST
 
 pytestmark = pytest.mark.postgres
 _UNSET = object()
@@ -40,13 +43,27 @@ SIGNATURE = {
     "access_size": 1,
 }
 
+DEFAULT_EXPERIMENT = {
+    "input_family": "length_boundary",
+    "mutation_constraints": {
+        "allowed_ops": ["append", "truncate"],
+        "max_input_bytes": 2048,
+    },
+    "expected_signature": dict(SIGNATURE),
+}
+DEFAULT_EXPERIMENT_DIGEST = jsonutil.digest_json(DEFAULT_EXPERIMENT)
+
 BUDGET_SNAPSHOT = {
     "remaining_total_seconds": 900,
     "remaining_fuzz_seconds": 300,
 }
 
 
-def _envelope(*, max_rounds: int = 8) -> dict:
+def _envelope(
+    *,
+    max_rounds: int = 8,
+    accepted_signature_set: list[dict] | None = None,
+) -> dict:
     return contracts.guided_envelope(
         allowed_mutation_families=["byte_flip", "length_boundary"],
         mutation_limits={
@@ -59,9 +76,48 @@ def _envelope(*, max_rounds: int = 8) -> dict:
         max_rounds=max_rounds,
         max_total_seconds=900,
         max_fuzz_seconds=300,
-        accepted_signature_set=[dict(SIGNATURE)],
+        accepted_signature_set=accepted_signature_set or [dict(SIGNATURE)],
         admission_predicate_version="admission-v1",
     )
+
+
+def _plan_body(
+    *,
+    family_id,
+    round_no,
+    envelope_digest,
+    parent_approval_digest,
+    harness_digest,
+    seed_digest,
+    experiment_digest,
+    asan_signature=None,
+) -> dict:
+    """Build a complete Plan v2 rather than a partial admission-only stub."""
+    plan = deepcopy(PLAN_BASE)
+    plan.update(
+        {
+            "schema_version": 2,
+            "family_id": str(family_id),
+            "parent_job_id": str(family_id),
+            "round_no": round_no,
+            "envelope_digest": envelope_digest,
+            "parent_approval_digest": parent_approval_digest,
+            "harness_digest": harness_digest,
+            "build_ref": None,
+            "build_spec": deepcopy(BUILD_SPEC),
+            "compile_flags": ["-g"],
+            "experiment_digest": experiment_digest,
+            "build_provenance_rules_version": "build-provenance-v1",
+            "build_recipe_digest": PLAN_BUILD_RECIPE_DIGEST,
+            "inputs": {
+                "normal": _digest("1"),
+                "candidate": seed_digest,
+            },
+        }
+    )
+    if asan_signature is not None:
+        plan["asan_signature"] = deepcopy(asan_signature)
+    return plan
 
 
 def _seed_family(
@@ -72,9 +128,10 @@ def _seed_family(
     approval_digest: str = APPROVAL_DIGEST,
     plan_envelope_digest: str | None = None,
     plan_parent_approval_digest: Any = _UNSET,
-    plan_experiment_digest: str | None = None,
+    plan_experiment_digest: Any = _UNSET,
     plan_seed_digest: str = SEED_CORPUS_DIGEST,
     plan_harness_digest: Any = _UNSET,
+    plan_asan_signature: Any = _UNSET,
     envelope: dict | None = None,
     family_state: str = "AGGREGATING",
 ):
@@ -92,20 +149,26 @@ def _seed_family(
         if plan_harness_digest is _UNSET
         else plan_harness_digest
     )
-    plan = {
-        "schema_version": 2,
-        "family_id": str(family_id),
-        "parent_job_id": str(family_id),
-        "round_no": round_no,
-        "envelope_digest": plan_envelope_digest or envelope_digest,
-        "parent_approval_digest": resolved_plan_parent,
-        "harness_digest": resolved_plan_harness,
-        "inputs": {
-            "normal": _digest("1"),
-            "candidate": plan_seed_digest,
-        },
-        "experiment_digest": plan_experiment_digest,
-    }
+    resolved_plan_experiment = (
+        DEFAULT_EXPERIMENT_DIGEST
+        if plan_experiment_digest is _UNSET
+        else plan_experiment_digest
+    )
+    resolved_plan_signature = (
+        SIGNATURE
+        if plan_asan_signature is _UNSET
+        else plan_asan_signature
+    )
+    plan = _plan_body(
+        family_id=family_id,
+        round_no=round_no,
+        envelope_digest=plan_envelope_digest or envelope_digest,
+        parent_approval_digest=resolved_plan_parent,
+        harness_digest=resolved_plan_harness,
+        seed_digest=plan_seed_digest,
+        experiment_digest=resolved_plan_experiment,
+        asan_signature=resolved_plan_signature,
+    )
 
     database.connection.execute(
         "INSERT INTO jobs (job_id, request, state, stage, submitted_at, "
@@ -148,13 +211,20 @@ def _seed_family(
             REVIEWER_ID,
         ),
     )
+    try:
+        plan_digest = contracts.plan_digest(plan)
+    except ValueError:
+        # Some negative tests seed a deliberately contract-invalid plan (for
+        # example a later round with a null parent approval) to prove
+        # record_admission fails closed before any write.
+        plan_digest = jsonutil.digest_json(plan)
     database.connection.execute(
         "INSERT INTO plans (plan_id, job_id, plan_digest, plan, summary) "
         "VALUES (%s, %s, %s, %s, %s)",
         (
             uuid4(),
             child_id,
-            jsonutil.digest_json(plan),
+            plan_digest,
             Jsonb(plan),
             Jsonb({}),
         ),
@@ -175,26 +245,32 @@ def _full_plan(
     *,
     round_no=2,
     harness_digest=_UNSET,
+    experiment_digest=_UNSET,
+    asan_signature=_UNSET,
 ):
     resolved_harness_digest = (
         envelope["harness_digest"]
         if harness_digest is _UNSET
         else harness_digest
     )
-    return {
-        "schema_version": 2,
-        "family_id": str(family_id),
-        "parent_job_id": str(family_id),
-        "round_no": round_no,
-        "envelope_digest": contracts.envelope_digest(envelope),
-        "parent_approval_digest": approval_digest,
-        "harness_digest": resolved_harness_digest,
-        "inputs": {
-            "normal": _digest("1"),
-            "candidate": SEED_CORPUS_DIGEST,
-        },
-        "experiment_digest": None,
-    }
+    resolved_experiment_digest = (
+        DEFAULT_EXPERIMENT_DIGEST
+        if experiment_digest is _UNSET
+        else experiment_digest
+    )
+    resolved_signature = (
+        SIGNATURE if asan_signature is _UNSET else asan_signature
+    )
+    return _plan_body(
+        family_id=family_id,
+        round_no=round_no,
+        envelope_digest=contracts.envelope_digest(envelope),
+        parent_approval_digest=approval_digest,
+        harness_digest=resolved_harness_digest,
+        seed_digest=SEED_CORPUS_DIGEST,
+        experiment_digest=resolved_experiment_digest,
+        asan_signature=resolved_signature,
+    )
 
 
 def _admit(
@@ -204,12 +280,14 @@ def _admit(
     round_no: int = 2,
     envelope: dict | None = None,
     seed_digest: str = SEED_CORPUS_DIGEST,
-    experiment: dict | None = None,
+    experiment: Any = _UNSET,
     recomputable: bool = True,
     campaign_bundle_digest: str | None = None,
     budget_snapshot: dict | None = None,
 ):
     family_id, child_id, approved_envelope = seed
+    if experiment is _UNSET:
+        experiment = deepcopy(DEFAULT_EXPERIMENT)
     return state.record_admission(
         database.dsn,
         family_id=family_id,
@@ -716,14 +794,9 @@ def test_idempotent_readmission_survives_envelope_reapproval(isolated_database):
 
 
 def _valid_experiment(input_family: str = "length_boundary") -> dict:
-    return {
-        "input_family": input_family,
-        "mutation_constraints": {
-            "allowed_ops": ["append", "truncate"],
-            "max_input_bytes": 2048,
-        },
-        "expected_signature": dict(SIGNATURE),
-    }
+    experiment = deepcopy(DEFAULT_EXPERIMENT)
+    experiment["input_family"] = input_family
+    return experiment
 
 
 def test_record_admission_rejects_new_round_while_pending_envelope_exists(
@@ -788,9 +861,20 @@ def test_readmission_rejects_out_of_envelope_or_different_experiment(
     with pytest.raises(state.StateError):
         _admit(isolated_database, seed, experiment={"bad": float("nan")})
 
-    # Round originally admitted with experiment=None must also reject bad/new experiments.
-    seed_none = _seed_family(isolated_database, approval_digest=_digest("8"))
-    assert _admit(isolated_database, seed_none, experiment=None).admitted
+    # An experiment-free round is only admissible as a non-recomputable
+    # admission backed by the campaign bundle.
+    seed_none = _seed_family(
+        isolated_database,
+        approval_digest=_digest("8"),
+        plan_experiment_digest=None,
+    )
+    assert _admit(
+        isolated_database,
+        seed_none,
+        experiment=None,
+        recomputable=False,
+        campaign_bundle_digest=_digest("f"),
+    ).admitted
     for bad_exp in ({"input_family": "FORBIDDEN"}, {}, exp_a):
         denied = _admit(isolated_database, seed_none, experiment=bad_exp)
         assert not denied.admitted
@@ -888,6 +972,127 @@ def test_record_admission_denies_plan_harness_mismatch(isolated_database):
     assert approvals_after == approvals_before
 
 
+def test_plan_signature_must_match_experiment_and_envelope(isolated_database):
+    other_signature = {
+        **SIGNATURE,
+        "function": "some_other_function",
+        "operation": "READ",
+        "access_size": 8,
+    }
+
+    # The plan's asan_signature is what execution uses, so it must be a member
+    # of the approved accepted_signature_set even when the experiment matches
+    # the frozen experiment_digest.
+    seed = _seed_family(
+        isolated_database,
+        approval_digest=_digest("1"),
+        plan_asan_signature=other_signature,
+    )
+    family_id, child_id, _ = seed
+    outside = _admit(isolated_database, seed)
+    assert not outside.admitted
+    assert outside.status == "denied"
+    assert outside.reason_code == "ENVELOPE_VIOLATION"
+    assert outside.sub_reason == "PLAN_SIGNATURE_NOT_ACCEPTED"
+    assert _admissions(isolated_database, family_id, 2) == []
+    events = _events(isolated_database, child_id)
+    assert [event[0] for event in events] == ["round_admission_denied"]
+    assert events[0][2]["actual_asan_signature"] == other_signature
+
+    # An accepted signature still has to be the exact signature the
+    # ExperimentSpec declared: optional-field presence participates.
+    envelope = _envelope(
+        accepted_signature_set=[dict(SIGNATURE), dict(other_signature)]
+    )
+    seed_mismatch = _seed_family(
+        isolated_database,
+        approval_digest=_digest("2"),
+        envelope=envelope,
+        plan_asan_signature=other_signature,
+    )
+    family_id, child_id, _ = seed_mismatch
+    mismatch = _admit(isolated_database, seed_mismatch)
+    assert not mismatch.admitted
+    assert mismatch.status == "denied"
+    assert mismatch.reason_code == "ADMISSION_DENIED"
+    assert mismatch.sub_reason == "PLAN_SIGNATURE_MISMATCH"
+    assert _admissions(isolated_database, family_id, 2) == []
+    assert [event[0] for event in _events(isolated_database, child_id)] == [
+        "round_admission_denied"
+    ]
+
+    # A post-admission plan drift must not be masked as already_admitted.
+    seed_drift = _seed_family(isolated_database, approval_digest=_digest("3"))
+    family_id, child_id, _ = seed_drift
+    assert _admit(isolated_database, seed_drift).admitted
+    isolated_database.connection.execute(
+        "UPDATE plans SET plan = jsonb_set(plan, '{asan_signature}', %s) "
+        "WHERE job_id = %s",
+        (Jsonb(other_signature), child_id),
+    )
+    drift = _admit(isolated_database, seed_drift)
+    assert not drift.admitted
+    assert drift.status == "denied"
+    assert drift.status != "already_admitted"
+    assert drift.reason_code == "ENVELOPE_VIOLATION"
+    assert drift.sub_reason == "PLAN_SIGNATURE_NOT_ACCEPTED"
+    assert len(_admissions(isolated_database, family_id, 2)) == 1
+    assert [event[0] for event in _events(isolated_database, child_id)] == [
+        "round_admitted",
+        "round_admission_denied",
+    ]
+
+
+def test_admission_requires_experiment_or_campaign_bundle(isolated_database):
+    seed = _seed_family(
+        isolated_database,
+        approval_digest=_digest("4"),
+        plan_experiment_digest=None,
+    )
+    family_id, child_id, _ = seed
+
+    denied = _admit(isolated_database, seed, experiment=None)
+    assert not denied.admitted
+    assert denied.status == "denied"
+    assert denied.reason_code == "ADMISSION_DENIED"
+    assert denied.sub_reason == "EXPERIMENT_OR_BUNDLE_REQUIRED"
+    assert _admissions(isolated_database, family_id, 2) == []
+    assert [event[0] for event in _events(isolated_database, child_id)] == [
+        "round_admission_denied"
+    ]
+
+    # A non-recomputable admission without a campaign bundle is still denied.
+    no_bundle = _admit(
+        isolated_database, seed, experiment=None, recomputable=False
+    )
+    assert not no_bundle.admitted
+    assert no_bundle.reason_code == "ADMISSION_DENIED"
+
+    # Only a non-recomputable admission backed by the campaign bundle may
+    # stand in for an absent ExperimentSpec.
+    admitted = _admit(
+        isolated_database,
+        seed,
+        experiment=None,
+        recomputable=False,
+        campaign_bundle_digest=_digest("f"),
+    )
+    assert admitted.admitted
+    assert admitted.admission["recomputable"] is False
+    assert admitted.admission["supporting_bundle_digest"] == _digest("f")
+    assert len(_admissions(isolated_database, family_id, 2)) == 1
+
+    same = _admit(
+        isolated_database,
+        seed,
+        experiment=None,
+        recomputable=False,
+        campaign_bundle_digest=_digest("f"),
+    )
+    assert same.status == "already_admitted"
+    assert len(_admissions(isolated_database, family_id, 2)) == 1
+
+
 def test_readmission_after_plan_harness_tamper_is_denied_not_already_admitted(
     isolated_database,
 ):
@@ -928,14 +1133,19 @@ def test_readmission_after_plan_harness_tamper_is_denied_not_already_admitted(
     )
     assert events[1][2]["actual_harness_digest"] == tampered_digest
 
-    # Terminal protection still wins: no dirty denial audit is appended.
+    # The family becoming terminal does not turn a conflicting readmission
+    # into a raw StateError: it is still a recorded ADMISSION_DENIED conflict.
     isolated_database.connection.execute(
         "UPDATE jobs SET state = 'BLOCKED' WHERE job_id = %s",
         (family_id,),
     )
-    with pytest.raises(state.StateError, match="AGGREGATING"):
-        _admit(isolated_database, seed)
-    assert len(_events(isolated_database, child_id)) == 2
+    blocked = _admit(isolated_database, seed)
+    assert blocked.status == "denied"
+    assert blocked.reason_code == "HARNESS_REJECTED"
+    events = _events(isolated_database, child_id)
+    assert len(events) == 3
+    assert events[-1][0] == "round_admission_denied"
+    assert events[-1][2]["family_state"] == "BLOCKED"
     assert len(_admissions(isolated_database, family_id, 2)) == 1
 
 
@@ -969,10 +1179,61 @@ def test_readmission_on_terminal_family_blocks_dirty_audit(
     assert same.status == "already_admitted"
     assert len(_events(isolated_database, child_id)) == 1
 
-    # Conflicting readmission must fail closed without appending dirty audit events.
-    with pytest.raises(state.StateError, match="AGGREGATING"):
-        _admit(isolated_database, seed, seed_digest=_digest("9"))
-    assert len(_events(isolated_database, child_id)) == 1
+    # A different parameter set is the third §7 path even when the family is
+    # terminal: denied plus exactly one denied event, no admission row.
+    denied = _admit(isolated_database, seed, seed_digest=_digest("9"))
+    assert denied.status == "denied"
+    assert denied.reason_code == "ADMISSION_DENIED"
+    assert denied.sub_reason == "ROUND_ALREADY_ADMITTED"
+    events = _events(isolated_database, child_id)
+    assert [event[0] for event in events] == [
+        "round_admitted",
+        "round_admission_denied",
+    ]
+    detail = events[-1][2]
+    assert detail["sub_reason"] == "ROUND_ALREADY_ADMITTED"
+    assert detail["existing_admission_id"] == first.admission["admission_id"]
+    assert detail["family_state"] == terminal_state
+    assert detail["round_state"] == "QUEUED"
+    assert len(_admissions(isolated_database, family_id, 2)) == 1
+
+
+@pytest.mark.parametrize("round_state", ["BLOCKED", "COMPLETED"])
+def test_readmission_on_terminal_round_returns_denied(
+    isolated_database, round_state
+):
+    seed = _seed_family(isolated_database)
+    family_id, child_id, _envelope_value = seed
+
+    first = _admit(isolated_database, seed)
+    assert first.admitted
+    if round_state == "COMPLETED":
+        isolated_database.connection.execute(
+            "UPDATE jobs SET state = 'COMPLETED', evidence_status = 'archived', "
+            "evidence_path = '/tmp/round.json', evidence_digest = %s "
+            "WHERE job_id = %s",
+            (_digest("8"), child_id),
+        )
+    else:
+        isolated_database.connection.execute(
+            "UPDATE jobs SET state = 'BLOCKED' WHERE job_id = %s",
+            (child_id,),
+        )
+
+    denied = _admit(isolated_database, seed, seed_digest=_digest("9"))
+    assert denied.status == "denied"
+    assert denied.reason_code == "ADMISSION_DENIED"
+    assert denied.sub_reason == "ROUND_ALREADY_ADMITTED"
+    events = _events(isolated_database, child_id)
+    assert [event[0] for event in events] == [
+        "round_admitted",
+        "round_admission_denied",
+    ]
+    detail = events[-1][2]
+    assert detail["existing_admission_id"] == first.admission["admission_id"]
+    assert detail["family_state"] == "AGGREGATING"
+    assert detail["round_state"] == round_state
+    assert len(_admissions(isolated_database, family_id, 2)) == 1
 
 
 @pytest.mark.parametrize("round_state", ["BLOCKED", "COMPLETED"])
@@ -1339,6 +1600,9 @@ def test_record_admission_requires_plan_v2_binding_fields_and_fails_closed_unifo
         ("missing_family_id", lambda p: p.pop("family_id")),
         ("missing_parent_job_id", lambda p: p.pop("parent_job_id")),
         ("missing_round_no", lambda p: p.pop("round_no")),
+        ("missing_harness_digest", lambda p: p.pop("harness_digest")),
+        ("missing_asan_signature", lambda p: p.pop("asan_signature")),
+        ("bad_asan_signature", lambda p: p.__setitem__("asan_signature", {"error": 1})),
         ("missing_inputs", lambda p: p.pop("inputs")),
         ("null_inputs", lambda p: p.__setitem__("inputs", None)),
         ("missing_candidate", lambda p: p["inputs"].pop("candidate")),

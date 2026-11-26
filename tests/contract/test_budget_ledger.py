@@ -153,6 +153,93 @@ def test_recovery_does_not_charge_twice():
     assert second.charge["charge_id"] == first.charge["charge_id"]
 
 
+def test_replay_with_smaller_elapsed_fails_closed():
+    ledger = _ledger()
+    charges: list[dict] = []
+
+    first = _charge(ledger, charges, elapsed_seconds=10)
+    assert first.status == "charged"
+    assert first.charge["seconds"] == 10
+
+    # A replay that claims less elapsed time than was already accounted for
+    # must not silently return the old record as if no time were missing.
+    with pytest.raises(state.StateError, match="recorded charge"):
+        _charge(ledger, charges, elapsed_seconds=9)
+
+    assert len(charges) == 1
+    assert ledger["remaining_total_seconds"] == 90
+
+
+def test_replay_with_different_fuzz_seconds_fails_closed():
+    ledger = _ledger()
+    charges: list[dict] = []
+
+    first = _charge(
+        ledger,
+        charges,
+        step_key="fuzz",
+        charge_kind="fuzz",
+        elapsed_seconds=10,
+        elapsed_fuzz_seconds=5,
+    )
+    assert first.status == "charged"
+    assert first.charge["fuzz_seconds"] == 5
+
+    with pytest.raises(state.StateError, match="recorded charge"):
+        _charge(
+            ledger,
+            charges,
+            step_key="fuzz",
+            charge_kind="fuzz",
+            elapsed_seconds=10,
+            elapsed_fuzz_seconds=3,
+        )
+
+    assert len(charges) == 1
+
+
+def test_replay_with_capped_elapsed_still_recovers():
+    # The first charge is capped by the remaining balance, so the recorded
+    # seconds are legitimately smaller than the requested elapsed time. A
+    # same-or-larger replay must still be an idempotent recovery.
+    ledger = _ledger(remaining_total_seconds=5, remaining_fuzz_seconds=5)
+    charges: list[dict] = []
+
+    first = _charge(ledger, charges, elapsed_seconds=10)
+    assert first.status == "budget_exhausted", first.status
+    assert first.charge["seconds"] == 5
+
+    replay = _charge(ledger, charges, elapsed_seconds=10)
+    assert replay.status == "recovered", replay.status
+    assert replay.charge["charge_id"] == first.charge["charge_id"]
+    assert len(charges) == 1
+
+    fuzz_ledger = _ledger(remaining_total_seconds=5, remaining_fuzz_seconds=5)
+    fuzz_charges: list[dict] = []
+    fuzz_first = _charge(
+        fuzz_ledger,
+        fuzz_charges,
+        step_key="fuzz",
+        charge_kind="fuzz",
+        elapsed_seconds=10,
+        elapsed_fuzz_seconds=10,
+    )
+    assert fuzz_first.status == "budget_exhausted", fuzz_first.status
+    assert fuzz_first.charge["seconds"] == 5
+    assert fuzz_first.charge["fuzz_seconds"] == 5
+
+    fuzz_replay = _charge(
+        fuzz_ledger,
+        fuzz_charges,
+        step_key="fuzz",
+        charge_kind="fuzz",
+        elapsed_seconds=10,
+        elapsed_fuzz_seconds=10,
+    )
+    assert fuzz_replay.status == "recovered", fuzz_replay.status
+    assert len(fuzz_charges) == 1
+
+
 def test_retry_with_new_attempt_charges_again():
     ledger = _ledger()
     charges: list[dict] = []
@@ -1864,3 +1951,55 @@ def test_budget_summary_validates_charge_family_id_and_charge_kind():
         "remaining_seconds": 90,
         "remaining_fuzz_seconds": 55,
     }
+
+
+@pytest.mark.postgres
+def test_step_replay_with_smaller_elapsed_fails_closed(budget_database):
+    family_id = uuid.uuid4()
+    child_id = uuid.uuid4()
+    budget_database.connection.execute(
+        "INSERT INTO jobs (job_id, request, state, stage, submitted_at, "
+        "job_contract_version, family_id, job_kind, parent_job_id, round_no, "
+        "generation, workflow_synced) "
+        "VALUES (%s, %s, 'AGGREGATING', 'family', clock_timestamp(), 2, %s, "
+        "'family', NULL, NULL, 1, true)",
+        (family_id, Jsonb({"schema_version": 2}), family_id),
+    )
+    budget_database.connection.execute(
+        "INSERT INTO jobs (job_id, request, state, stage, submitted_at, "
+        "job_contract_version, family_id, job_kind, parent_job_id, round_no, "
+        "generation) "
+        "VALUES (%s, %s, 'RUNNING', 'build', clock_timestamp(), 2, %s, "
+        "'round', %s, 2, 1)",
+        (child_id, Jsonb({"schema_version": 2}), family_id, family_id),
+    )
+    state.initialize_budget_ledger(
+        budget_database.dsn,
+        family_id,
+        max_total_seconds=100,
+        max_fuzz_seconds=60,
+    )
+    _activate_lease(budget_database, child_id, 1)
+
+    def charge(elapsed_seconds):
+        return state.charge_step_budget(
+            budget_database.dsn,
+            family_id=family_id,
+            job_id=child_id,
+            generation=1,
+            step_key="build",
+            attempt_no=1,
+            charge_kind="general",
+            elapsed_seconds=elapsed_seconds,
+        )
+
+    first = charge(10)
+    assert first.status == "charged"
+    assert first.charge["seconds"] == 10
+
+    with pytest.raises(state.StateError, match="recorded charge"):
+        charge(9)
+
+    replay = charge(10)
+    assert replay.status == "recovered"
+    assert replay.charge["charge_id"] == first.charge["charge_id"]
