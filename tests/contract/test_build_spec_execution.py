@@ -22,6 +22,7 @@ from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
+import os
 from pathlib import Path
 import stat
 import subprocess
@@ -49,6 +50,7 @@ from datacon.tools.sandbox import (
     SandboxPolicyError,
     build_runner_command,
     prepare_build_spec_execution,
+    render_build_runner_script,
     render_cc_shim_script,
 )
 
@@ -544,6 +546,7 @@ class _FakeSandbox:
         faces: dict[str, bytes | None],
         face_name: str,
         build_error: SandboxError | None = None,
+        build_error_by_version: dict[str, SandboxError] | None = None,
         build_logs: dict[str, bytes] | None = None,
     ) -> None:
         self.image_digest = image_digest
@@ -551,14 +554,17 @@ class _FakeSandbox:
         self.faces = faces
         self.face_name = face_name
         self.build_error = build_error
+        self.build_error_by_version = dict(build_error_by_version or {})
         self.build_logs = build_logs or {
             "vulnerable": b"building vulnerable...\n",
             "fixed": b"building fixed...\n",
         }
+        self.probe_calls: int = 0
         self.build_calls: list[dict[str, Any]] = []
         self.replay_calls: list[dict[str, Any]] = []
 
     def probe(self, *, deadline_seconds: float = 120.0) -> ProbeReport:
+        self.probe_calls += 1
         return ProbeReport(
             ok=True,
             checks={
@@ -602,6 +608,8 @@ class _FakeSandbox:
                 "staged_files": staged_files,
             }
         )
+        if version in self.build_error_by_version:
+            raise self.build_error_by_version[version]
         if self.build_error is not None:
             raise self.build_error
         artifact = f"ELF-{version}".encode("utf-8")
@@ -773,13 +781,17 @@ def test_cmake_runner_preserves_shell_metacharacters_without_shell_splicing(tmp_
     """Execute the real fixed runner template via subprocess.run and verify verbatim argv."""
     pwn_marker = tmp_path / "pwned-by-shell"
     dump_file = tmp_path / "argv-dump.json"
-    dumper = tmp_path / "dump_argv.py"
-    dumper.write_text(
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_cmake = fake_bin / "cmake"
+    fake_cmake.write_text(
+        f"#!{sys.executable}\n"
         "import json, sys\n"
         f"with open({str(dump_file)!r}, 'a', encoding='utf-8') as f:\n"
         "    f.write(json.dumps(sys.argv[1:]) + '\\n')\n",
         encoding="utf-8",
     )
+    fake_cmake.chmod(0o755)
 
     tricky_args = [
         f"-DPWN=$(touch {pwn_marker})",
@@ -790,9 +802,9 @@ def test_cmake_runner_preserves_shell_metacharacters_without_shell_splicing(tmp_
         "-DGLOB=*",
     ]
     spec = _cmake_spec(
-        configure=[sys.executable, str(dumper), "-S", ".", "-B", "build", *tricky_args],
-        build=[sys.executable, str(dumper), "build-step", "; echo pwn", "$(id)"],
-        install=[sys.executable, str(dumper), "install-step", "a b 'c' \"d\""],
+        configure=["cmake", "-S", ".", "-B", "build", *tricky_args],
+        build=["cmake", "--build", "build", "--target", "; echo pwn", "$(id)"],
+        install=["cmake", "--install", "build", "--prefix", "a b 'c' \"d\""],
     )
     plan = prepare_build_spec_execution(spec)
     cmd = build_runner_command(
@@ -802,9 +814,11 @@ def test_cmake_runner_preserves_shell_metacharacters_without_shell_splicing(tmp_
         wait_for_release=False,
     )
 
+    env = {**os.environ, "PATH": f"{fake_bin}:{os.environ.get('PATH', '')}"}
     proc = subprocess.run(
         cmd,
         cwd=tmp_path,
+        env=env,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         check=False,
@@ -830,10 +844,10 @@ def test_cmake_runner_preserves_shell_metacharacters_without_shell_splicing(tmp_
         *tricky_args,
         "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON",
     ], f"configure argv was altered or shell-expanded: {lines[0]!r}"
-    assert lines[1] == ["build-step", "; echo pwn", "$(id)"], (
+    assert lines[1] == ["--build", "build", "--target", "; echo pwn", "$(id)"], (
         f"build argv was altered or shell-expanded: {lines[1]!r}"
     )
-    assert lines[2] == ["install-step", "a b 'c' \"d\""], (
+    assert lines[2] == ["--install", "build", "--prefix", "a b 'c' \"d\""], (
         f"install argv was altered or shell-expanded: {lines[2]!r}"
     )
 
@@ -1511,7 +1525,18 @@ def test_v2_provenance_failure_fails_closed_without_replay_or_inconclusive_downg
         "comparable",
     }
     assert report["build_provenance"]["comparable"] is False
-    assert isinstance(report["error"], str) and "BUILD_PROVENANCE_MISSING:" in report["error"]
+    expected_error_substrings = {
+        "missing_fixed_face": "missing or empty provenance face",
+        "include_order_difference": "effective flag order difference",
+        "declared_flag_missing_from_effective": "missing declared flag",
+        "drifted_shell_face": "fixed:",
+        "pre_container_sandbox_error": "build_spec rejected before container creation",
+    }
+    assert isinstance(report["error"], str)
+    assert report["error"].startswith("BUILD_PROVENANCE_MISSING:")
+    assert expected_error_substrings[scenario] in report["error"], (
+        f"{scenario}: expected diagnostic {expected_error_substrings[scenario]!r} in {report['error']!r}"
+    )
     assert report["replays"] == []
 
     files_by_path = {entry["path"]: entry for entry in manifest["files"]}
@@ -1583,7 +1608,7 @@ def test_build_with_spec_make_mounts_cc_and_cxx_shims_readonly_and_cleans_up_tem
         cc_text = cc_src.read_text(encoding="utf-8")
         cxx_text = cxx_src.read_text(encoding="utf-8")
         assert "_datacon_real_compiler=clang\n" in cc_text
-        assert "_datacon_real_compiler='clang++'\n" in cxx_text or "_datacon_real_compiler=clang++\n" in cxx_text
+        assert "_datacon_real_compiler=clang++\n" in cxx_text
         assert "/work/.datacon-cc-shim.log" in cc_text
         assert "/work/.datacon-cc-shim.log" in cxx_text
         assert cc_src.parent == cxx_src.parent
@@ -2335,3 +2360,973 @@ def test_v2_archive_only_recovery_never_downgrades_provenance_failure(
     assert report["verdict"] == "FAILED"
     assert report["reason_code"] == build_provenance.BUILD_PROVENANCE_MISSING
     assert report["build_provenance"]["comparable"] is False
+
+
+# ---------------------------------------------------------------------------
+# 9. Regression tests for B1-B5 and non-blocking #1-#6
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "sandbox_reason,expected_reason",
+    [
+        ("TIMEOUT", "TIMEOUT"),
+        ("SANDBOX_ERROR", "RUN_INCOMPLETE"),
+    ],
+)
+def test_b1_v2_partial_inconclusive_build_timeout_and_sandbox_error_preserve_evidence(
+    tmp_path, monkeypatch, sandbox_reason, expected_reason
+):
+    """B1: v2 partial INCONCLUSIVE (0 replays) preserves verdict, reason, and partial logs."""
+    run_root, _ = _configure_isolated_roots(tmp_path, monkeypatch)
+    spec = _cmake_spec()
+    vuln_face = _cmake_compile_commands_bytes(flags=DECLARED_FLAGS)
+
+    job, plan, plan_digest, review = _setup_fixture_plan_and_job(
+        version=2, build_spec=spec
+    )
+    mem_state = _InMemoryState(job, plan, plan_digest, review)
+    mem_state.install(monkeypatch)
+
+    fake_sandbox = _FakeSandbox(
+        image_digest=plan["image_digest"],
+        build_recipe_digest=plan["build_recipe_digest"],
+        faces={"vulnerable": vuln_face, "fixed": None},
+        face_name="compile_commands.json",
+        build_error_by_version={
+            "fixed": SandboxError(
+                f"simulated fixed build {sandbox_reason}",
+                reason_code=sandbox_reason,
+            )
+        },
+    )
+
+    result = execution.run_execution(
+        "dsn",
+        job["job_id"],
+        1,
+        case_root=str(FIXTURE_CASES),
+        run_root=run_root,
+        sandbox=fake_sandbox,
+    )
+
+    assert result.state == "INCONCLUSIVE", (
+        f"v2 partial {sandbox_reason} must stay INCONCLUSIVE (not FAILED / EVIDENCE_WRITE_FAILED), got {result}"
+    )
+    assert result.verdict == "INCONCLUSIVE"
+    assert result.verdict_reason == expected_reason
+    assert result.reason_code == expected_reason
+    assert result.evidence_path is not None
+    assert len(fake_sandbox.replay_calls) == 0
+
+    bundle_root = Path(result.evidence_path)
+    manifest = json.loads((bundle_root / "manifest.json").read_text(encoding="utf-8"))
+    report = json.loads((bundle_root / "report.json").read_text(encoding="utf-8"))
+
+    assert manifest["schema_version"] == 2
+    assert manifest["verdict"] == "INCONCLUSIVE"
+    assert manifest["reason_code"] == expected_reason
+    assert report["verdict"] == "INCONCLUSIVE"
+    assert report["reason_code"] == expected_reason
+    assert report["rule"] is None
+    assert report["replays"] == []
+
+    files_by_path = {entry["path"]: entry for entry in manifest["files"]}
+    assert "build/vulnerable/build.log" in files_by_path
+    assert (bundle_root / "build/vulnerable/build.log").read_bytes() == fake_sandbox.build_logs[
+        "vulnerable"
+    ]
+    assert "build/vulnerable/build_provenance/compile_commands.json" in files_by_path
+    assert (
+        bundle_root / "build/vulnerable/build_provenance/compile_commands.json"
+    ).read_bytes() == vuln_face
+
+
+@pytest.mark.parametrize(
+    "label,bad_spec,face_name",
+    [
+        (
+            "bad_shell_missing_digest_and_review",
+            _shell_spec(face_digest=None, review=None),
+            "shell-face.log",
+        ),
+        (
+            "bad_make_non_shim_cc",
+            _make_spec(cc="/usr/bin/clang"),
+            "cc-shim.log",
+        ),
+        (
+            "bad_make_missing_cc_env",
+            _make_spec(cc=None),
+            "cc-shim.log",
+        ),
+        (
+            "bad_cmake_export_off",
+            _cmake_spec(
+                configure=[
+                    "cmake",
+                    "-S",
+                    ".",
+                    "-B",
+                    "build",
+                    "-DCMAKE_EXPORT_COMPILE_COMMANDS=OFF",
+                ]
+            ),
+            "compile_commands.json",
+        ),
+    ],
+)
+def test_b2_invalid_build_spec_fails_closed_before_probe_and_in_defense_in_depth(
+    tmp_path, monkeypatch, label, bad_spec, face_name
+):
+    """B2: invalid BuildSpec fails closed before sandbox.probe AND on reuse/custom-sandbox paths."""
+    run_root, _ = _configure_isolated_roots(tmp_path, monkeypatch)
+    job, plan, plan_digest, review = _setup_fixture_plan_and_job(
+        version=2, build_spec=bad_spec
+    )
+    mem_state = _InMemoryState(job, plan, plan_digest, review)
+    mem_state.install(monkeypatch)
+
+    fake_sandbox = _FakeSandbox(
+        image_digest=plan["image_digest"],
+        build_recipe_digest=plan["build_recipe_digest"],
+        faces={},
+        face_name=face_name,
+    )
+
+    result = execution.run_execution(
+        "dsn",
+        job["job_id"],
+        1,
+        case_root=str(FIXTURE_CASES),
+        run_root=run_root,
+        sandbox=fake_sandbox,
+    )
+
+    assert result.state == "FAILED", f"{label}: expected FAILED, got {result}"
+    assert result.reason_code == build_provenance.BUILD_PROVENANCE_MISSING
+    assert result.verdict is None
+    assert fake_sandbox.probe_calls == 0, f"{label}: sandbox.probe must never be called"
+    assert len(fake_sandbox.build_calls) == 0, f"{label}: sandbox.build must never be called"
+    assert len(fake_sandbox.replay_calls) == 0, f"{label}: sandbox.replay must never be called"
+
+    # Defense-in-depth: even if builds were reused or produced by a custom sandbox
+    # with syntactically valid provenance faces on disk, _verify_v2_build_provenance
+    # must still reject the invalid BuildSpec.
+    mem_state.job["state"] = "RUNNING"
+    ctx = execution._load_context(
+        "dsn",
+        job["job_id"],
+        1,
+        case_root=str(FIXTURE_CASES),
+        run_root=run_root,
+    )
+    work_root = execution._work_root(ctx)
+    gen_root = work_root / "generation-1"
+    raw_face = (
+        _cmake_compile_commands_bytes(flags=DECLARED_FLAGS)
+        if bad_spec["kind"] == "cmake"
+        else (
+            _make_cc_shim_log_bytes(flags=DECLARED_FLAGS)
+            if bad_spec["kind"] == "make"
+            else b"2099-01-01T00:00:00Z /work clang -fsanitize=address -g src/parser.c\n"
+        )
+    )
+    reused_builds: dict[str, dict[str, Any]] = {}
+    for version in ("vulnerable", "fixed"):
+        fdir = gen_root / "build" / version / "build_provenance"
+        fdir.mkdir(parents=True, exist_ok=True)
+        ffile = fdir / face_name
+        ffile.write_bytes(raw_face)
+        reused_builds[version] = {
+            "files": {"provenance_face": str(ffile.relative_to(work_root))},
+            "file_digests": {"provenance_face": _sha256_prefixed(raw_face)},
+            "provenance_face_name": face_name,
+        }
+
+    outcome = execution._verify_v2_build_provenance(ctx, work_root, reused_builds)
+    assert outcome.comparable is False, (
+        f"{label}: defense-in-depth _verify_v2_build_provenance must fail closed"
+    )
+    assert outcome.error_detail
+
+
+@pytest.mark.parametrize(
+    "label,bad_spec",
+    [
+        ("shell-sh-c", {**_shell_spec(face_digest="sha256:" + "a" * 64, review={"reviewer_id": "r", "reviewed_at": "2099-01-01T00:00:00Z", "face_kind": "build_log"}), "build": ["sh", "-c", "echo pwn"]}),
+        ("shell-eval", {**_shell_spec(face_digest="sha256:" + "a" * 64, review={"reviewer_id": "r", "reviewed_at": "2099-01-01T00:00:00Z", "face_kind": "build_log"}), "build": ["eval", "echo pwn"]}),
+        ("shell-python3-c", {**_shell_spec(face_digest="sha256:" + "a" * 64, review={"reviewer_id": "r", "reviewed_at": "2099-01-01T00:00:00Z", "face_kind": "build_log"}), "build": ["python3", "-c", "import os"]}),
+        ("cmake-sh-c", _cmake_spec(configure=["sh", "-c", "cmake ."])),
+        ("cmake-python3-c", _cmake_spec(build=["python3", "-c", "print(1)"])),
+        ("cmake-script-mode", _cmake_spec(configure=["cmake", "-P", "evil.cmake"])),
+        ("make-eval", {**_make_spec(), "build": ["eval", "make"]}),
+        ("make-sh-c", {**_make_spec(), "build": ["sh", "-c", "make"]}),
+        ("make-cli-cc-override", {**_make_spec(), "build": ["make", "CC=clang", "parser"]}),
+        ("make-cli-cxx-override", {**_make_spec(), "build": ["make", "CXX=clang++", "parser"]}),
+        ("make-cli-eval-flag", {**_make_spec(), "build": ["make", "--eval=all:;echo pwn"]}),
+        ("make-cli-env-override-flag", {**_make_spec(), "build": ["make", "-e", "parser"]}),
+        ("make-cli-cc-after-double-dash", {**_make_spec(), "build": ["make", "--", "CC=clang"]}),
+    ],
+)
+def test_b3_template_closedness_rejects_arbitrary_commands_and_overrides(label, bad_spec):
+    """B3: both freeze validation and prepare_build_spec_execution enforce closed templates."""
+    decision = build_provenance.validate_build_spec_for_freeze(bad_spec)
+    assert decision.ok is False, f"{label}: freeze validation must reject"
+    assert decision.reason_code == build_provenance.BUILD_PROVENANCE_MISSING
+
+    with pytest.raises(SandboxError) as exc_info:
+        prepare_build_spec_execution(bad_spec)
+    assert exc_info.value.reason_code == build_provenance.BUILD_PROVENANCE_MISSING
+
+
+def test_b3_runner_subshell_isolation_blocks_eval_mutating_runner_state(tmp_path):
+    """B3: runner executes each step in an isolated subshell via exec so eval cannot overwrite _datacon_out."""
+    target_out = tmp_path / "never_created_parser"
+    script = render_build_runner_script(
+        stage_fixture=False,
+        emit_result_marker=True,
+        wait_for_release=False,
+    )
+    cmd = [
+        "/bin/sh",
+        "-c",
+        script,
+        "datacon-build-runner",
+        str(target_out),
+        "0",  # _n_clean
+        "0",  # _n_cfg
+        "2",  # _n_bld
+        "eval",
+        "_datacon_out=/etc/passwd",
+        "0",  # _n_inst
+    ]
+    proc = subprocess.run(
+        cmd,
+        cwd=tmp_path,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    stderr_text = proc.stderr.decode("utf-8", "replace")
+    assert proc.returncode != 0, "exec eval inside subshell must fail instead of executing builtin"
+    assert "DATACON_BUILD_RESULT code=" in stderr_text
+    assert "size=-1 digest=missing" in stderr_text, (
+        f"_datacon_out was mutated to an existing file! stderr={stderr_text!r}"
+    )
+
+
+def test_b4_runner_prebuild_cleanup_and_symlink_rejection_and_copy_work_path(
+    tmp_path, monkeypatch
+):
+    """B4: runner cleans pre-existing faces/outputs and rejects symlinks in marker and _copy_work_path."""
+    # 1. Pre-build cleanup removes stale outputs and provenance face before build runs.
+    stale_out = tmp_path / "stale_parser"
+    stale_face = tmp_path / "stale_compile_commands.json"
+    stale_out.write_bytes(b"STALE-BINARY")
+    stale_face.write_bytes(b'[{"stale": true}]')
+
+    script = render_build_runner_script(
+        stage_fixture=False,
+        emit_result_marker=True,
+        wait_for_release=False,
+    )
+    cmd_clean = [
+        "/bin/sh",
+        "-c",
+        script,
+        "datacon-build-runner",
+        str(stale_out),
+        "2",
+        str(stale_out),
+        str(stale_face),
+        "0",
+        "1",
+        "/bin/true",
+        "0",
+    ]
+    proc_clean = subprocess.run(
+        cmd_clean, cwd=tmp_path, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False
+    )
+    assert proc_clean.returncode == 0
+    assert not stale_out.exists(), "pre-existing output must be cleaned before build"
+    assert not stale_face.exists(), "pre-existing provenance face must be cleaned before build"
+    assert "size=-1 digest=missing" in proc_clean.stderr.decode("utf-8", "replace")
+
+    # 2. Runner marker refuses symlinked output produced during build.
+    secret = tmp_path / "secret.txt"
+    secret.write_bytes(b"TOP-SECRET-CONTENT")
+    symlink_out = tmp_path / "symlink_parser"
+    cmd_symlink = [
+        "/bin/sh",
+        "-c",
+        script,
+        "datacon-build-runner",
+        str(symlink_out),
+        "1",
+        str(symlink_out),
+        "0",
+        "4",
+        "/bin/ln",
+        "-s",
+        str(secret),
+        str(symlink_out),
+        "0",
+    ]
+    proc_sym = subprocess.run(
+        cmd_symlink, cwd=tmp_path, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False
+    )
+    assert proc_sym.returncode == 0
+    assert symlink_out.is_symlink()
+    assert "size=-1 digest=missing" in proc_sym.stderr.decode("utf-8", "replace"), (
+        "runner result marker must reject symlinked outputs"
+    )
+
+    # 3. _copy_work_path rejects symlinked outputs, symlinked provenance faces, and symlinked dirs.
+    fake_work = tmp_path / "fake_work"
+    (fake_work / "build").mkdir(parents=True)
+    regular_file = fake_work / "build" / "parser"
+    regular_file.write_bytes(b"REGULAR-ELF")
+    leaf_symlink_out = fake_work / "build" / "symlink_out"
+    leaf_symlink_out.symlink_to(secret)
+    leaf_symlink_face = fake_work / "build" / "compile_commands.json"
+    leaf_symlink_face.symlink_to(secret)
+    outside_dir = tmp_path / "outside_dir"
+    outside_dir.mkdir()
+    (outside_dir / "compile_commands.json").write_bytes(b"[]")
+    (fake_work / "symlink_dir").symlink_to(outside_dir)
+
+    sandbox = _make_sandbox(tmp_path)
+
+    def local_docker(args, *, timeout=30):
+        # Execute the exact POSIX sh -c check emitted by _copy_work_path against fake_work.
+        assert args[:4] == ["exec", "fake-cid", "sh", "-c"]
+        shell_snippet = args[4].replace("/work", str(fake_work))
+        shell_args = [arg.replace("/work", str(fake_work)) for arg in args[5:]]
+        return subprocess.run(
+            ["/bin/sh", "-c", shell_snippet, *shell_args],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+
+    monkeypatch.setattr(sandbox, "_docker", local_docker)
+
+    data_ok, size_ok, trunc_ok = sandbox._copy_work_path(
+        "fake-cid", "/work/build/parser", MAX_ARTIFACT_BYTES
+    )
+    assert (data_ok, size_ok, trunc_ok) == (b"REGULAR-ELF", len(b"REGULAR-ELF"), False)
+
+    for symlink_target in (
+        "/work/build/symlink_out",
+        "/work/build/compile_commands.json",
+        "/work/symlink_dir/compile_commands.json",
+    ):
+        assert sandbox._copy_work_path(
+            "fake-cid", symlink_target, MAX_PROVENANCE_FACE_BYTES
+        ) == (b"", 0, False), f"_copy_work_path must refuse symlink path {symlink_target}"
+
+
+@pytest.mark.parametrize("lock_mode", ["flock", "mkdir_fallback"])
+def test_b5_cc_shim_concurrent_large_flags_produces_valid_jsonl(tmp_path, lock_mode):
+    """B5: parallel cc-shim invocations with >16 KiB flags emit 100% valid non-interleaved JSONL."""
+    stub_cc = tmp_path / "stub-clang"
+    stub_cc.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    stub_cc.chmod(0o755)
+
+    log_path = tmp_path / f"cc-shim-{lock_mode}.log"
+    shim_script = render_cc_shim_script(
+        real_compiler=str(stub_cc),
+        log_path=str(log_path),
+    )
+    if lock_mode == "mkdir_fallback":
+        assert "if command -v flock >/dev/null 2>&1; then" in shim_script
+        shim_script = shim_script.replace(
+            "if command -v flock >/dev/null 2>&1; then",
+            "if false; then",
+        )
+    shim_path = tmp_path / f"cc-shim-{lock_mode}"
+    shim_path.write_text(shim_script, encoding="utf-8")
+    shim_path.chmod(0o755)
+
+    workers = 12
+    # >16 KiB per invocation (well above 4 KiB PIPE_BUF).
+    big_chunk = "X" * 100
+    procs: list[subprocess.Popen[bytes]] = []
+    for idx in range(workers):
+        large_flags = [f"-DW{idx}_K{k}={big_chunk}" for k in range(170)]
+        assert sum(len(f) for f in large_flags) > 16 * 1024
+        procs.append(
+            subprocess.Popen(
+                [str(shim_path), *large_flags, "-c", f"src/unit_{idx}.c", "-o", f"u_{idx}.o"],
+                cwd=tmp_path,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+        )
+
+    for idx, proc in enumerate(procs):
+        _out, err = proc.communicate(timeout=30)
+        assert proc.returncode == 0, (
+            f"worker {idx} failed rc={proc.returncode} stderr={err.decode('utf-8', 'replace')}"
+        )
+
+    raw_lines = [
+        line for line in log_path.read_text(encoding="utf-8").splitlines() if line.strip()
+    ]
+    assert len(raw_lines) == workers, (
+        f"{lock_mode}: expected {workers} JSONL lines, got {len(raw_lines)}"
+    )
+    seen_units: set[str] = set()
+    for line_no, line in enumerate(raw_lines, start=1):
+        rec = jsonutil.loads_strict(line)
+        assert isinstance(rec, dict) and set(rec.keys()) == {"cwd", "compiler", "argv"}
+        assert len(rec["argv"]) == 1 + 170 + 4, f"line {line_no} truncated/interleaved"
+        seen_units.add(rec["argv"][-3])
+    assert seen_units == {f"src/unit_{idx}.c" for idx in range(workers)}
+
+
+@pytest.mark.parametrize(
+    "forbidden_key",
+    ["PATH", "LD_PRELOAD", "LD_LIBRARY_PATH", "TMPDIR", "HOME", "ASAN_OPTIONS", "DATACON_SECRET"],
+)
+def test_nonblocking_1_forbidden_env_keys_rejected_in_freeze_and_prepare(forbidden_key):
+    """#1: dangerous env keys (PATH, LD_PRELOAD, etc.) are rejected in BuildSpec.env."""
+    for spec in (_cmake_spec(), _make_spec()):
+        spec["env"][forbidden_key] = "/tmp/evil"
+        decision = build_provenance.validate_build_spec_for_freeze(spec)
+        assert decision.ok is False, f"freeze must reject env.{forbidden_key}"
+        assert decision.reason_code == build_provenance.BUILD_PROVENANCE_MISSING
+        with pytest.raises(SandboxError) as exc_info:
+            prepare_build_spec_execution(spec)
+        assert exc_info.value.reason_code == build_provenance.BUILD_PROVENANCE_MISSING
+
+
+@pytest.mark.parametrize(
+    "label,bad_spec",
+    [
+        ("cmake-abs-B", _cmake_spec(configure=["cmake", "-S", ".", "-B", "/etc"])),
+        ("cmake-traversal-B", _cmake_spec(configure=["cmake", "-S", ".", "-B", "../escape"])),
+        ("make-work-cc-shim", _make_spec(cc="/work/cc-shim")),
+        ("make-tmp-cc-shim", _make_spec(cc="/tmp/cc-shim")),
+        ("outputs-semicolon", _cmake_spec(outputs=["build/parser;id"])),
+        ("outputs-whitespace", _cmake_spec(outputs=["build/par ser"])),
+        ("outputs-subshell", _cmake_spec(outputs=["build/$(id)"])),
+        ("env-key-with-equals", _cmake_spec(env={"CC": "clang", "FOO=BAR": "1"})),
+        ("env-key-starts-with-digit", _cmake_spec(env={"CC": "clang", "1BAD": "1"})),
+    ],
+)
+def test_nonblocking_2_freeze_and_prepare_parity(label, bad_spec):
+    """#2: validate_build_spec_for_freeze and prepare_build_spec_execution reject identically."""
+    decision = build_provenance.validate_build_spec_for_freeze(bad_spec)
+    assert decision.ok is False, f"{label}: freeze validation must reject"
+    assert decision.reason_code == build_provenance.BUILD_PROVENANCE_MISSING
+
+    with pytest.raises(SandboxError) as exc_info:
+        prepare_build_spec_execution(bad_spec)
+    assert exc_info.value.reason_code == build_provenance.BUILD_PROVENANCE_MISSING
+
+
+@pytest.mark.parametrize("bad_cxx", ["clang++", "/usr/bin/g++", "/work/cxx-shim"])
+def test_nonblocking_3_make_explicit_non_shim_cxx_rejected(bad_cxx):
+    """#3: make BuildSpec with explicit non-shim env.CXX fails closed."""
+    spec = _make_spec()
+    spec["env"]["CXX"] = bad_cxx
+    decision = build_provenance.validate_build_spec_for_freeze(spec)
+    assert decision.ok is False
+    assert decision.reason_code == build_provenance.BUILD_PROVENANCE_MISSING
+
+    with pytest.raises(SandboxError) as exc_info:
+        prepare_build_spec_execution(spec)
+    assert exc_info.value.reason_code == build_provenance.BUILD_PROVENANCE_MISSING
+
+
+def test_nonblocking_4_provenance_parser_and_normalizer_edge_cases():
+    """#4: out-of-repo conftest filtering, -M/-MM skip, empty token lookahead, -include-pth."""
+    # 1. CMake face with /tmp/conftest.c and -MM dependency gen entry alongside real CU.
+    cmake_payload = json.dumps(
+        [
+            {
+                "directory": "/work/build",
+                "file": "/tmp/conftest.c",
+                "arguments": ["clang", "-O0", "-c", "/tmp/conftest.c", "-o", "/tmp/conftest.o"],
+            },
+            {
+                "directory": "/work/build",
+                "file": "/work/src/parser.c",
+                "arguments": ["clang", "-MM", "-I../include", "/work/src/parser.c"],
+            },
+            {
+                "directory": "/work/build",
+                "file": "/work/src/parser.c",
+                "arguments": [
+                    "clang",
+                    "-fsanitize=address",
+                    "-g",
+                    "-c",
+                    "/work/src/parser.c",
+                    "-o",
+                    "parser.o",
+                ],
+            },
+        ]
+    ).encode("utf-8")
+    parsed_cmake = build_provenance.parse_provenance_face(
+        kind="cmake", raw_face=cmake_payload, repo_root="/work"
+    )
+    assert list(parsed_cmake.units.keys()) == ["src/parser.c"]
+    assert parsed_cmake.units["src/parser.c"] == ["-fsanitize=address", "-g"]
+
+    # 2. Make cc-shim face with /tmp/conftest.c and -M/-MM dependency gen entries.
+    make_lines = "\n".join(
+        json.dumps(rec)
+        for rec in [
+            {
+                "cwd": "/work",
+                "compiler": "clang",
+                "argv": ["clang", "-O0", "-c", "/tmp/conftest.c", "-o", "/tmp/conftest.o"],
+            },
+            {
+                "cwd": "/work",
+                "compiler": "clang",
+                "argv": ["clang", "-M", "src/parser.c"],
+            },
+            {
+                "cwd": "/work",
+                "compiler": "clang",
+                "argv": ["clang", "-MM", "src/parser.c"],
+            },
+            {
+                "cwd": "/work",
+                "compiler": "clang",
+                "argv": ["clang", "-fsanitize=address", "-g", "-c", "src/parser.c", "-o", "p.o"],
+            },
+        ]
+    ).encode("utf-8")
+    parsed_make = build_provenance.parse_provenance_face(
+        kind="make", raw_face=make_lines, repo_root="/work"
+    )
+    assert list(parsed_make.units.keys()) == ["src/parser.c"]
+    assert parsed_make.units["src/parser.c"] == ["-fsanitize=address", "-g"]
+
+    # 3. Empty token between -I and its directory argument.
+    assert build_provenance.normalize_compile_flags(
+        ["-I", "", "include", "-g"], repo_root="/work"
+    ) == ["-Iinclude", "-g"]
+
+    # 4. -include-pth / -include-pch / -isystem-after are NOT split as -include / -isystem.
+    assert build_provenance.normalize_compile_flags(
+        ["-include-pth", "a.pth", "-include-pch", "b.pch", "-isystem-after", "/usr/include"],
+        repo_root="/work",
+    ) == ["-include-pth", "a.pth", "-include-pch", "b.pch", "-isystem-after", "/usr/include"]
+
+
+def _seed_archive_only_v2_job(
+    *,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    spec: dict[str, Any],
+    face_name: str,
+    faces_by_version: dict[str, bytes | None],
+    with_replays: bool,
+    reproduced_crash: bool = False,
+) -> tuple[dict[str, Any], Path]:
+    run_root, _ = _configure_isolated_roots(tmp_path, monkeypatch)
+    job, plan, plan_digest, review = _setup_fixture_plan_and_job(
+        version=2, build_spec=spec
+    )
+    job["state"] = "ARCHIVING"
+    job["generation"] = 2
+    mem_state = _InMemoryState(job, plan, plan_digest, review)
+    mem_state.install(monkeypatch)
+
+    ctx = execution._load_context(
+        "dsn",
+        job["job_id"],
+        2,
+        case_root=str(FIXTURE_CASES),
+        run_root=run_root,
+    )
+    work_root = execution._work_root(ctx)
+    gen1_root = work_root / "generation-1"
+
+    probe_payload = {
+        "tool_id": "sandbox.probe",
+        "job_id": ctx.job_id_text,
+        "generation": 1,
+        "plan_digest": plan_digest,
+        "status": "completed",
+        "ok": True,
+        "checks": {"uid": "65534", "errors": []},
+        "compiler_version": "clang 19.1.7",
+        "image_digest": plan["image_digest"],
+    }
+    mem_state.record_attempt(
+        "dsn",
+        job["job_id"],
+        stage="execute",
+        step_key="sandbox.probe",
+        attempt_no=1,
+        generation=1,
+        input_digest=plan_digest,
+        status="completed",
+        result=probe_payload,
+    )
+
+    for version, raw_face in faces_by_version.items():
+        bdir = gen1_root / "build" / version
+        bdir.mkdir(parents=True, exist_ok=True)
+        log_bytes = f"build {version}\n".encode("utf-8")
+        art_bytes = f"ELF-{version}".encode("utf-8")
+        log_file = bdir / "build.log"
+        art_file = bdir / "parser"
+        log_file.write_bytes(log_bytes)
+        art_file.write_bytes(art_bytes)
+        files_map: dict[str, Any] = {
+            "log": str(log_file.relative_to(work_root)),
+            "artifact": str(art_file.relative_to(work_root)),
+        }
+        digests_map: dict[str, Any] = {
+            "log": _sha256_prefixed(log_bytes),
+            "artifact": _sha256_prefixed(art_bytes),
+        }
+        if raw_face is not None:
+            fdir = bdir / "build_provenance"
+            fdir.mkdir(parents=True, exist_ok=True)
+            ffile = fdir / face_name
+            ffile.write_bytes(raw_face)
+            files_map["provenance_face"] = str(ffile.relative_to(work_root))
+            digests_map["provenance_face"] = _sha256_prefixed(raw_face)
+        build_payload = {
+            "tool_id": "sandbox.build",
+            "job_id": ctx.job_id_text,
+            "generation": 1,
+            "plan_digest": plan_digest,
+            "input_digest": plan["analysis_digest"],
+            "status": "completed",
+            "version": version,
+            "container_id": f"gen1-build-{version}",
+            "artifact_digest": _sha256_prefixed(art_bytes),
+            "attempt_no": 1,
+            "files": files_map,
+            "file_digests": digests_map,
+            "build_spec_kind": spec["kind"],
+            "provenance_face_name": face_name,
+        }
+        mem_state.record_attempt(
+            "dsn",
+            job["job_id"],
+            stage="execute",
+            step_key=f"build:{version}",
+            attempt_no=1,
+            generation=1,
+            input_digest=plan["analysis_digest"],
+            status="completed",
+            result=build_payload,
+        )
+
+    if with_replays:
+        for version in ("vulnerable", "fixed"):
+            for phase in ("normal", "candidate_1", "candidate_2"):
+                rdir = gen1_root / "replay" / version / phase
+                rdir.mkdir(parents=True, exist_ok=True)
+                is_vuln_crash = (
+                    reproduced_crash and version == "vulnerable" and phase != "normal"
+                )
+                out_bytes = b"OK\n" if phase == "normal" else (b"" if is_vuln_crash else b"ABCD\n")
+                err_bytes = (
+                    (
+                        "ERROR: AddressSanitizer: heap-buffer-overflow on address 0x1\n"
+                        "WRITE of size 1 at 0x1 thread T0\n"
+                        "    #0 0x123 in parse_token parser.c:12\n"
+                    ).encode("utf-8")
+                    if is_vuln_crash
+                    else b""
+                )
+                sig = (
+                    {
+                        "error": "heap-buffer-overflow",
+                        "operation": "WRITE",
+                        "access_size": 1,
+                        "function": "parse_token",
+                        "source": "parser.c",
+                    }
+                    if is_vuln_crash
+                    else None
+                )
+                out_file = rdir / "stdout.log"
+                err_file = rdir / "stderr.log"
+                out_file.write_bytes(out_bytes)
+                err_file.write_bytes(err_bytes)
+                in_digest = (
+                    plan["inputs"]["normal"]
+                    if phase == "normal"
+                    else plan["inputs"]["candidate"]
+                )
+                replay_payload = {
+                    "tool_id": "sandbox.replay",
+                    "job_id": ctx.job_id_text,
+                    "generation": 1,
+                    "plan_digest": plan_digest,
+                    "input_digest": in_digest,
+                    "artifact_digest": _sha256_prefixed(f"ELF-{version}".encode("utf-8")),
+                    "status": "completed",
+                    "version": version,
+                    "phase": phase,
+                    "exit_code": 86 if is_vuln_crash else 0,
+                    "duration_seconds": 0.05,
+                    "container_id": f"gen1-replay-{version}-{phase}",
+                    "signature": sig,
+                    "timed_out": False,
+                    "quota_hit": False,
+                    "log_truncated": False,
+                    "capture_error": None,
+                    "truncated_roles": [],
+                    "attempt_no": 1,
+                    "files": {
+                        "stdout": str(out_file.relative_to(work_root)),
+                        "stderr": str(err_file.relative_to(work_root)),
+                    },
+                    "file_digests": {
+                        "stdout": _sha256_prefixed(out_bytes),
+                        "stderr": _sha256_prefixed(err_bytes),
+                    },
+                }
+                mem_state.record_attempt(
+                    "dsn",
+                    job["job_id"],
+                    stage="execute",
+                    step_key=f"replay:{version}:{phase}",
+                    attempt_no=1,
+                    generation=1,
+                    input_digest=in_digest,
+                    status="completed",
+                    result=replay_payload,
+                )
+
+    return job, run_root
+
+
+def test_nonblocking_5_archive_only_v2_normal_recovery_and_single_build_provenance(
+    tmp_path, monkeypatch
+):
+    """#5: normal v2 _archive_only recovers REPRODUCED; single-build corrupt face -> BUILD_PROVENANCE_MISSING."""
+    # A. Normal v2 recovery with 2 comparable builds + 6 replays -> REPRODUCED + verify_bundle.
+    face = _cmake_compile_commands_bytes(
+        flags=["-fsanitize=address", "-g", "-O1", "-I../include", "-D_GNU_SOURCE"]
+    )
+    job_ok, run_root_ok = _seed_archive_only_v2_job(
+        tmp_path=tmp_path / "ok",
+        monkeypatch=monkeypatch,
+        spec=_cmake_spec(),
+        face_name="compile_commands.json",
+        faces_by_version={"vulnerable": face, "fixed": face},
+        with_replays=True,
+        reproduced_crash=True,
+    )
+    res_ok = execution.run_execution(
+        "dsn",
+        job_ok["job_id"],
+        2,
+        case_root=str(FIXTURE_CASES),
+        run_root=run_root_ok,
+    )
+    assert res_ok.state == "REPRODUCED", f"expected normal v2 archive recovery REPRODUCED, got {res_ok}"
+    assert res_ok.evidence_path is not None
+    verified = evidence.verify_bundle(res_ok.evidence_path)
+    assert verified.manifest["verdict"] == "REPRODUCED"
+    paths = {entry["path"] for entry in verified.manifest["files"]}
+    assert "build/vulnerable/build_provenance/compile_commands.json" in paths
+    assert "build/fixed/build_provenance/compile_commands.json" in paths
+
+    # B. Single completed build with corrupt JSON face -> FAILED / BUILD_PROVENANCE_MISSING.
+    job_corrupt, run_root_corrupt = _seed_archive_only_v2_job(
+        tmp_path=tmp_path / "single_corrupt",
+        monkeypatch=monkeypatch,
+        spec=_cmake_spec(),
+        face_name="compile_commands.json",
+        faces_by_version={"vulnerable": b"{not valid json"},
+        with_replays=False,
+    )
+    res_corrupt = execution.run_execution(
+        "dsn",
+        job_corrupt["job_id"],
+        2,
+        case_root=str(FIXTURE_CASES),
+        run_root=run_root_corrupt,
+    )
+    assert res_corrupt.state == "FAILED", (
+        f"single-build corrupt face must fail closed as FAILED, got {res_corrupt}"
+    )
+    assert res_corrupt.reason_code == build_provenance.BUILD_PROVENANCE_MISSING
+
+    # C. Single completed build with valid face missing declared flag -> FAILED / BUILD_PROVENANCE_MISSING.
+    incomplete_flags_face = _cmake_compile_commands_bytes(flags=["-fsanitize=address"])
+    job_missing_flag, run_root_missing_flag = _seed_archive_only_v2_job(
+        tmp_path=tmp_path / "single_missing_flag",
+        monkeypatch=monkeypatch,
+        spec=_cmake_spec(),
+        face_name="compile_commands.json",
+        faces_by_version={"vulnerable": incomplete_flags_face},
+        with_replays=False,
+    )
+    res_missing_flag = execution.run_execution(
+        "dsn",
+        job_missing_flag["job_id"],
+        2,
+        case_root=str(FIXTURE_CASES),
+        run_root=run_root_missing_flag,
+    )
+    assert res_missing_flag.state == "FAILED"
+    assert res_missing_flag.reason_code == build_provenance.BUILD_PROVENANCE_MISSING
+
+    # D. Single completed build with valid conforming face -> INCONCLUSIVE / EVIDENCE_INCOMPLETE.
+    job_valid_single, run_root_valid_single = _seed_archive_only_v2_job(
+        tmp_path=tmp_path / "single_valid",
+        monkeypatch=monkeypatch,
+        spec=_cmake_spec(),
+        face_name="compile_commands.json",
+        faces_by_version={"vulnerable": face},
+        with_replays=False,
+    )
+    res_valid_single = execution.run_execution(
+        "dsn",
+        job_valid_single["job_id"],
+        2,
+        case_root=str(FIXTURE_CASES),
+        run_root=run_root_valid_single,
+    )
+    assert res_valid_single.state == "INCONCLUSIVE"
+    assert res_valid_single.reason_code == "EVIDENCE_INCOMPLETE"
+
+
+def test_nonblocking_6_persist_build_oversize_face_and_campaign_inputs_none_and_multi_outputs(
+    tmp_path, monkeypatch
+):
+    """#6: _persist_build oversize pre-check, campaign inputs=None guard, and multi-outputs."""
+    # A. _persist_build rejects >MAX_PROVENANCE_FACE_BYTES BEFORE writing face to disk.
+    run_root, _ = _configure_isolated_roots(tmp_path / "oversize", monkeypatch)
+    job, plan, plan_digest, review = _setup_fixture_plan_and_job(
+        version=2, build_spec=_cmake_spec()
+    )
+    mem_state = _InMemoryState(job, plan, plan_digest, review)
+    mem_state.install(monkeypatch)
+    ctx = execution._load_context(
+        "dsn", job["job_id"], 1, case_root=str(FIXTURE_CASES), run_root=run_root
+    )
+    gen_root = execution._generation_root(ctx)
+    gen_root.mkdir(parents=True, exist_ok=True)
+    artifact = b"ELF-bin"
+    oversize_face = b"x" * (MAX_PROVENANCE_FACE_BYTES + 1)
+    build_result = BuildResult(
+        version="vulnerable",
+        status="completed",
+        exit_code=0,
+        duration_seconds=0.1,
+        container_id="cid-1",
+        image_digest=plan["image_digest"],
+        compile_args=tuple(DECLARED_FLAGS),
+        artifact_digest=_sha256_prefixed(artifact),
+        log=b"ok\n",
+        log_truncated=False,
+        artifact=artifact,
+        metadata={},
+        provenance_face=oversize_face,
+        provenance_face_name="compile_commands.json",
+    )
+    with pytest.raises(execution.ExecutionFailed) as exc_info:
+        execution._persist_build("dsn", ctx, build_result, attempt_no=1, token="tok-1")
+    assert exc_info.value.reason_code == build_provenance.BUILD_PROVENANCE_MISSING
+    face_dir = gen_root / "build" / "vulnerable" / "build_provenance"
+    assert not face_dir.exists(), (
+        "oversize provenance face must be rejected before creating or writing to run_root"
+    )
+
+    # B. Campaign plan (inputs=None) in run_execution blocks cleanly without TypeError.
+    camp_run_root, _ = _configure_isolated_roots(tmp_path / "campaign", monkeypatch)
+    camp_job, camp_plan, camp_digest, camp_review = _setup_fixture_plan_and_job(
+        version=2, build_spec=_cmake_spec(), round_no=None, job_kind="campaign"
+    )
+    assert camp_plan["inputs"] is None
+    camp_state = _InMemoryState(camp_job, camp_plan, camp_digest, camp_review)
+    camp_state.install(monkeypatch)
+    camp_sandbox = _FakeSandbox(
+        image_digest=camp_plan["image_digest"],
+        build_recipe_digest=camp_plan["build_recipe_digest"],
+        faces={},
+        face_name="compile_commands.json",
+    )
+    camp_result = execution.run_execution(
+        "dsn",
+        camp_job["job_id"],
+        1,
+        case_root=str(FIXTURE_CASES),
+        run_root=camp_run_root,
+        sandbox=camp_sandbox,
+    )
+    assert camp_result.state == "BLOCKED"
+    assert camp_result.reason_code == "MATERIAL_MISSING"
+    assert camp_sandbox.probe_calls == 0
+    assert len(camp_sandbox.build_calls) == 0
+    assert len(camp_sandbox.replay_calls) == 0
+    assert camp_result.evidence_path is not None
+    evidence.verify_bundle(camp_result.evidence_path)
+
+    # C. Multi-outputs BuildSpec cleans and copies all outputs and picks parser as primary.
+    multi_spec = _cmake_spec(outputs=["build/libhelper.so", "build/parser"])
+    multi_plan = prepare_build_spec_execution(multi_spec)
+    assert multi_plan.primary_output == "build/parser"
+    assert multi_plan.output_container_paths == (
+        ("build/libhelper.so", "/work/build/libhelper.so"),
+        ("build/parser", "/work/build/parser"),
+    )
+    runner_cmd = build_runner_command(multi_plan)
+    assert "/work/build/libhelper.so" in runner_cmd
+    assert "/work/build/parser" in runner_cmd
+    assert "/work/build/compile_commands.json" in runner_cmd
+
+    sandbox = _make_sandbox(tmp_path / "multi")
+    materials = tmp_path / "multi-materials"
+    materials.mkdir()
+    helper_bytes = b"ELF-libhelper"
+    parser_bytes = b"ELF-parser"
+    face_bytes = _cmake_compile_commands_bytes(flags=DECLARED_FLAGS)
+    captured_extra: list[tuple[str, int]] = []
+
+    monkeypatch.setattr(sandbox, "_create", lambda **kwargs: ("fake-multi-cid", {}))
+
+    def fake_start_multi(name, *, deadline_seconds, artifact=False, extra_copy_paths=()):
+        captured_extra.extend(extra_copy_paths)
+        return (
+            b"multi ok\n",
+            _build_result_marker(parser_bytes, code=0),
+            {
+                "/work/build/libhelper.so": helper_bytes,
+                "/work/build/parser": parser_bytes,
+                "/work/build/compile_commands.json": face_bytes,
+            },
+            set(),
+            {"Running": False, "Status": "exited", "ExitCode": 0},
+            False,
+            0,
+            None,
+        )
+
+    monkeypatch.setattr(sandbox, "_start_and_wait", fake_start_multi)
+    multi_res = sandbox.build("vulnerable", materials_dir=materials, build_spec=multi_spec)
+    assert multi_res.status == "completed"
+    assert multi_res.artifact == parser_bytes
+    assert multi_res.artifact_digest == _sha256_prefixed(parser_bytes)
+    assert multi_res.metadata["outputs"] == {
+        "build/libhelper.so": {
+            "size_bytes": len(helper_bytes),
+            "sha256": _sha256_prefixed(helper_bytes),
+        },
+        "build/parser": {
+            "size_bytes": len(parser_bytes),
+            "sha256": _sha256_prefixed(parser_bytes),
+        },
+    }
+    assert ("/work/build/libhelper.so", MAX_ARTIFACT_BYTES) in captured_extra
+    assert ("/work/build/parser", MAX_ARTIFACT_BYTES) in captured_extra
+    assert ("/work/build/compile_commands.json", MAX_PROVENANCE_FACE_BYTES) in captured_extra

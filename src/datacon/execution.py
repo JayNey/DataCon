@@ -154,10 +154,7 @@ class ExecutionResult:
 class _ProvenanceCheckOutcome:
     comparable: bool
     report_summary: dict[str, Any]
-    rules_version: str
-    reason_code: str | None = None
     error_detail: str = ""
-    faces: dict[str, bytes] = field(default_factory=dict)
 
 
 def _is_v2_context(context: Any) -> bool:
@@ -220,6 +217,53 @@ def _is_input_material_path(relative: str, input_paths: set[str]) -> bool:
     return normalized in input_paths or normalized.startswith("inputs/")
 
 
+def _expected_build_recipe_digest_from_parts(
+    *,
+    is_v2: bool,
+    plan: Mapping[str, Any],
+    manifest: Mapping[str, Any],
+    materials: Mapping[str, Any],
+) -> Any:
+    """Select the expected case build-recipe file digest for v1 or v2 plans."""
+    if is_v2 and isinstance(plan.get("build_spec"), Mapping):
+        return materials.get(manifest["build_recipe"])
+    return plan["build_recipe_digest"]
+
+
+def _expected_build_recipe_digest(context: ExecutionContext) -> Any:
+    """Return the expected digest for ``context.case.manifest['build_recipe']``."""
+    return _expected_build_recipe_digest_from_parts(
+        is_v2=_is_v2_context(context),
+        plan=context.plan,
+        manifest=context.case.manifest,
+        materials=context.materials,
+    )
+
+
+def _make_provenance_summary(
+    *,
+    face_name: str,
+    declared: Sequence[str],
+    vulnerable_effective: Sequence[str] = (),
+    fixed_effective: Sequence[str] = (),
+    comparable: bool = False,
+) -> dict[str, Any]:
+    """Build a strictly closed §8 3-key ``report.build_provenance`` payload."""
+    return {
+        "vulnerable": {
+            "face": face_name,
+            "declared": list(declared),
+            "effective": list(vulnerable_effective),
+        },
+        "fixed": {
+            "face": face_name,
+            "declared": list(declared),
+            "effective": list(fixed_effective),
+        },
+        "comparable": comparable,
+    }
+
+
 def _normalize_build_provenance_summary(
     summary: Mapping[str, Any],
 ) -> dict[str, Any]:
@@ -273,19 +317,11 @@ def _empty_build_provenance_summary(
             )
         except ValueError:
             declared_list = list(raw_declared)
-    return {
-        "vulnerable": {
-            "face": face_name,
-            "declared": list(declared_list),
-            "effective": [],
-        },
-        "fixed": {
-            "face": face_name,
-            "declared": list(declared_list),
-            "effective": [],
-        },
-        "comparable": comparable,
-    }
+    return _make_provenance_summary(
+        face_name=face_name,
+        declared=declared_list,
+        comparable=comparable,
+    )
 
 
 def _verified_provenance_face(
@@ -378,20 +414,186 @@ def _check_declared_compile_flags_consistency(
     return True, norm_plan, ""
 
 
+def _validate_v2_spec_and_flags(
+    context: ExecutionContext,
+    build_spec: Mapping[str, Any],
+) -> tuple[bool, list[str], str]:
+    """Validate v2 ``build_spec`` freeze rules and declared compile flag consistency."""
+    freeze_decision = build_provenance.validate_build_spec_for_freeze(build_spec)
+    if not freeze_decision.ok:
+        return (
+            False,
+            [],
+            freeze_decision.error_detail
+            or "v2 build_spec failed provenance freeze validation",
+        )
+    return _check_declared_compile_flags_consistency(context)
+
+
+def _verify_v2_single_build_provenance(
+    context: ExecutionContext,
+    build_root: Path,
+    builds: Mapping[str, Mapping[str, Any]],
+) -> _ProvenanceCheckOutcome:
+    """Validate provenance for a single completed v2 build during archive recovery.
+
+    When only one version completed before archiving, a missing, corrupt,
+    unparseable, or non-conforming provenance face must still fail closed as
+    ``FAILED / BUILD_PROVENANCE_MISSING`` rather than masking as
+    ``INCONCLUSIVE / EVIDENCE_INCOMPLETE``.
+    """
+    build_spec = _build_spec_from_context(context)
+    if build_spec is None:
+        return _ProvenanceCheckOutcome(
+            comparable=False,
+            report_summary=_empty_build_provenance_summary(context, comparable=False),
+            error_detail="v2 plan is missing build_spec for build provenance verification",
+        )
+
+    kind = build_spec.get("kind")
+    face_name = (
+        build_provenance.FACE_FILENAMES.get(kind, str(kind))
+        if isinstance(kind, str)
+        else ""
+    )
+    spec_ok, normalized_declared, spec_error = _validate_v2_spec_and_flags(
+        context, build_spec
+    )
+    if not spec_ok:
+        summary = (
+            _make_provenance_summary(
+                face_name=face_name,
+                declared=normalized_declared,
+                comparable=False,
+            )
+            if normalized_declared
+            else _empty_build_provenance_summary(context, comparable=False)
+        )
+        return _ProvenanceCheckOutcome(
+            comparable=False,
+            report_summary=summary,
+            error_detail=spec_error,
+        )
+
+    present_versions = [
+        version for version in ("vulnerable", "fixed") if version in builds
+    ]
+    if not present_versions:
+        return _ProvenanceCheckOutcome(
+            comparable=True,
+            report_summary=_make_provenance_summary(
+                face_name=face_name,
+                declared=normalized_declared,
+                comparable=False,
+            ),
+        )
+    version = present_versions[0]
+    build = builds[version]
+    raw_face = (
+        _verified_provenance_face(build_root, build, expected_face_name=face_name)
+        if isinstance(build, Mapping) and face_name
+        else None
+    )
+    if raw_face is None:
+        return _ProvenanceCheckOutcome(
+            comparable=False,
+            report_summary=_make_provenance_summary(
+                face_name=face_name,
+                declared=normalized_declared,
+                comparable=False,
+            ),
+            error_detail=(
+                f"missing or empty provenance face ({kind}/{face_name}) for {version}"
+            ),
+        )
+
+    repo_root = _build_provenance_repo_root(context)
+    raw_declared = context.plan.get("compile_flags")
+    if not isinstance(raw_declared, list):
+        raw_declared = build_spec.get("declared_compile_flags", [])
+
+    if kind in ("cmake", "make"):
+        try:
+            parsed = build_provenance.parse_provenance_face(
+                kind=kind, raw_face=raw_face, repo_root=repo_root
+            )
+        except build_provenance.ProvenanceParseError as exc:
+            return _ProvenanceCheckOutcome(
+                comparable=False,
+                report_summary=_make_provenance_summary(
+                    face_name=face_name,
+                    declared=normalized_declared,
+                    comparable=False,
+                ),
+                error_detail=f"{version} ({kind}/{face_name}): {exc}",
+            )
+        prov_result = build_provenance.verify_build_provenance(
+            kind=kind,
+            declared_compile_flags=raw_declared,
+            vulnerable_face=raw_face,
+            fixed_face=raw_face,
+            repo_root=repo_root,
+        )
+        eff = list(parsed.effective_flags)
+        summary = _make_provenance_summary(
+            face_name=face_name,
+            declared=normalized_declared,
+            vulnerable_effective=eff if version == "vulnerable" else (),
+            fixed_effective=eff if version == "fixed" else (),
+            comparable=False,
+        )
+        if not prov_result.comparable:
+            return _ProvenanceCheckOutcome(
+                comparable=False,
+                report_summary=summary,
+                error_detail=prov_result.error_detail
+                or f"{version} ({kind}/{face_name}) provenance verification failed",
+            )
+        return _ProvenanceCheckOutcome(comparable=True, report_summary=summary)
+
+    if kind == "shell":
+        res = build_provenance.verify_shell_face(
+            build_spec=build_spec,
+            actual_log=raw_face,
+            repo_root=repo_root,
+        )
+        summary = _make_provenance_summary(
+            face_name=build_provenance.FACE_FILENAMES["shell"],
+            declared=normalized_declared,
+            vulnerable_effective=(
+                normalized_declared if (version == "vulnerable" and res.comparable) else ()
+            ),
+            fixed_effective=(
+                normalized_declared if (version == "fixed" and res.comparable) else ()
+            ),
+            comparable=False,
+        )
+        if not res.comparable:
+            return _ProvenanceCheckOutcome(
+                comparable=False,
+                report_summary=summary,
+                error_detail=f"{version}: {res.error_detail}",
+            )
+        return _ProvenanceCheckOutcome(comparable=True, report_summary=summary)
+
+    return _ProvenanceCheckOutcome(
+        comparable=False,
+        report_summary=_empty_build_provenance_summary(context, comparable=False),
+        error_detail=f"unsupported build_spec.kind {kind!r} for build provenance verification",
+    )
+
+
 def _verify_v2_build_provenance(
     context: ExecutionContext,
     build_root: Path,
     builds: Mapping[str, Mapping[str, Any]],
 ) -> _ProvenanceCheckOutcome:
     """Verify two-version v2 build provenance before entering the replay phase."""
-    rules_version = _provenance_rules_version(context)
     build_spec = _build_spec_from_context(context)
     if build_spec is None:
         return _ProvenanceCheckOutcome(
             comparable=False,
             report_summary=_empty_build_provenance_summary(context, comparable=False),
-            rules_version=rules_version,
-            reason_code=build_provenance.BUILD_PROVENANCE_MISSING,
             error_detail="v2 plan is missing build_spec for build provenance verification",
         )
 
@@ -402,49 +604,38 @@ def _verify_v2_build_provenance(
         else ""
     )
     repo_root = _build_provenance_repo_root(context)
-    flags_ok, normalized_declared, flags_error = (
-        _check_declared_compile_flags_consistency(context)
+    spec_ok, normalized_declared, spec_error = _validate_v2_spec_and_flags(
+        context, build_spec
     )
+    if not spec_ok:
+        summary = (
+            _make_provenance_summary(
+                face_name=face_name,
+                declared=normalized_declared,
+                comparable=False,
+            )
+            if normalized_declared
+            else _empty_build_provenance_summary(context, comparable=False)
+        )
+        return _ProvenanceCheckOutcome(
+            comparable=False,
+            report_summary=summary,
+            error_detail=spec_error,
+        )
+
     raw_declared = context.plan.get("compile_flags")
     if not isinstance(raw_declared, list):
         raw_declared = build_spec.get("declared_compile_flags", [])
 
-    archived_faces: dict[str, bytes] = {}
     version_faces: dict[str, bytes | None] = {}
     for version in ("vulnerable", "fixed"):
         build = builds.get(version)
-        face = (
+        version_faces[version] = (
             _verified_provenance_face(
                 build_root, build, expected_face_name=face_name
             )
             if isinstance(build, Mapping) and face_name
             else None
-        )
-        version_faces[version] = face
-        if face:
-            archived_faces[version] = face
-
-    if not flags_ok:
-        summary = {
-            "vulnerable": {
-                "face": face_name,
-                "declared": list(normalized_declared),
-                "effective": [],
-            },
-            "fixed": {
-                "face": face_name,
-                "declared": list(normalized_declared),
-                "effective": [],
-            },
-            "comparable": False,
-        }
-        return _ProvenanceCheckOutcome(
-            comparable=False,
-            report_summary=summary,
-            rules_version=rules_version,
-            reason_code=build_provenance.BUILD_PROVENANCE_MISSING,
-            error_detail=flags_error,
-            faces=archived_faces,
         )
 
     vuln_face = version_faces["vulnerable"]
@@ -472,29 +663,20 @@ def _verify_v2_build_provenance(
                     effective_by_version[version] = list(parsed.effective_flags)
                 except build_provenance.ProvenanceParseError:
                     effective_by_version[version] = []
-            summary = {
-                "vulnerable": {
-                    "face": face_name,
-                    "declared": list(normalized_declared),
-                    "effective": effective_by_version["vulnerable"],
-                },
-                "fixed": {
-                    "face": face_name,
-                    "declared": list(normalized_declared),
-                    "effective": effective_by_version["fixed"],
-                },
-                "comparable": False,
-            }
+            summary = _make_provenance_summary(
+                face_name=face_name,
+                declared=normalized_declared,
+                vulnerable_effective=effective_by_version["vulnerable"],
+                fixed_effective=effective_by_version["fixed"],
+                comparable=False,
+            )
             return _ProvenanceCheckOutcome(
                 comparable=False,
                 report_summary=summary,
-                rules_version=rules_version,
-                reason_code=build_provenance.BUILD_PROVENANCE_MISSING,
                 error_detail=(
                     f"missing or empty provenance face ({kind}/{face_name}) for "
                     + ", ".join(missing_versions)
                 ),
-                faces=archived_faces,
             )
 
         assert vuln_face is not None and fixed_face is not None
@@ -510,10 +692,7 @@ def _verify_v2_build_provenance(
             report_summary=_normalize_build_provenance_summary(
                 prov_result.report_summary
             ),
-            rules_version=rules_version,
-            reason_code=prov_result.reason_code,
             error_detail=prov_result.error_detail,
-            faces=archived_faces,
         )
 
     if kind == "shell":
@@ -530,41 +709,27 @@ def _verify_v2_build_provenance(
             if not res.comparable:
                 issues.append(f"{version}: {res.error_detail}")
         comparable = all(res.comparable for res in shell_results.values())
-        summary = {
-            "vulnerable": {
-                "face": build_provenance.FACE_FILENAMES["shell"],
-                "declared": list(normalized_declared),
-                "effective": list(normalized_declared)
-                if shell_results["vulnerable"].comparable
-                else [],
-            },
-            "fixed": {
-                "face": build_provenance.FACE_FILENAMES["shell"],
-                "declared": list(normalized_declared),
-                "effective": list(normalized_declared)
-                if shell_results["fixed"].comparable
-                else [],
-            },
-            "comparable": comparable,
-        }
+        summary = _make_provenance_summary(
+            face_name=build_provenance.FACE_FILENAMES["shell"],
+            declared=normalized_declared,
+            vulnerable_effective=(
+                normalized_declared if shell_results["vulnerable"].comparable else ()
+            ),
+            fixed_effective=(
+                normalized_declared if shell_results["fixed"].comparable else ()
+            ),
+            comparable=comparable,
+        )
         return _ProvenanceCheckOutcome(
             comparable=comparable,
             report_summary=summary,
-            rules_version=rules_version,
-            reason_code=None
-            if comparable
-            else build_provenance.BUILD_PROVENANCE_MISSING,
             error_detail="" if comparable else "; ".join(issues),
-            faces=archived_faces,
         )
 
     return _ProvenanceCheckOutcome(
         comparable=False,
         report_summary=_empty_build_provenance_summary(context, comparable=False),
-        rules_version=rules_version,
-        reason_code=build_provenance.BUILD_PROVENANCE_MISSING,
         error_detail=f"unsupported build_spec.kind {kind!r} for build provenance verification",
-        faces=archived_faces,
     )
 
 
@@ -1025,9 +1190,9 @@ def _load_context(
         "harness": (manifest["harness"], plan["harness_digest"]),
         "build_recipe": (
             manifest["build_recipe"],
-            materials.get(manifest["build_recipe"])
-            if has_v2_build_spec
-            else plan["build_recipe_digest"],
+            _expected_build_recipe_digest_from_parts(
+                is_v2=is_v2, plan=plan, manifest=manifest, materials=materials
+            ),
         ),
         "dependencies": (manifest["dependencies"], plan["dependencies_digest"]),
         "patch": (case.repository["patch"], plan["repository"]["patch_digest"]),
@@ -1281,18 +1446,10 @@ def _assert_context_unchanged(
         raise ExecutionBlocked("POLICY_DENIED", error.message) from error
     if current_isolation != context.isolation:
         raise ExecutionBlocked("POLICY_DENIED", "isolation policy drifted")
-    is_v2_ctx = _is_v2_context(context)
-    has_v2_build_spec = is_v2_ctx and isinstance(
-        context.plan.get("build_spec"), Mapping
-    )
     plan_inputs = context.plan.get("inputs")
     expected_digests: dict[str, Any] = {
         "harness": context.plan["harness_digest"],
-        "build_recipe": (
-            context.materials.get(context.case.manifest["build_recipe"])
-            if has_v2_build_spec
-            else context.plan["build_recipe_digest"]
-        ),
+        "build_recipe": _expected_build_recipe_digest(context),
         "dependencies": context.plan["dependencies_digest"],
         "source_vulnerable": context.materials.get(
             context.case.manifest["versions"]["vulnerable"]
@@ -1616,17 +1773,12 @@ def _materialize_into_generation(
     context: ExecutionContext, generation_root: Path, generation_fd: int
 ) -> tuple[Path, dict[str, Path], dict[str, str]]:
     is_v2 = _is_v2_context(context)
-    has_v2_build_spec = is_v2 and isinstance(
-        context.plan.get("build_spec"), Mapping
-    )
     target = generation_root / "materials"
     expected_build: dict[str, tuple[str, str | None]] = {
         "harness": (context.case.manifest["harness"], context.plan["harness_digest"]),
         "build_recipe": (
             context.case.manifest["build_recipe"],
-            context.materials.get(context.case.manifest["build_recipe"])
-            if has_v2_build_spec
-            else context.plan["build_recipe_digest"],
+            _expected_build_recipe_digest(context),
         ),
         "dependencies": (
             context.case.manifest["dependencies"],
@@ -1659,32 +1811,24 @@ def _materialize_into_generation(
         raise ExecutionBlocked("MATERIAL_MISSING", "plan has no inputs mapping")
 
     build_payloads: dict[str, bytes] = {}
-    for label, (relative, digest) in expected_build.items():
-        try:
-            data, actual = context.case.read_material(relative, digest)
-        except CaseConfigurationError as error:
-            raise ExecutionBlocked(error.reason_code, error.message) from error
-        if digest is None:
-            digest = context.materials.get(relative)
-        if digest is not None and actual != digest:
-            raise ExecutionBlocked(
-                "MATERIAL_MISSING", f"material {label} digest drifted while materializing"
-            )
-        build_payloads[relative] = data
-
     input_payloads: dict[str, bytes] = {}
-    for label, (relative, digest) in expected_inputs.items():
-        try:
-            data, actual = context.case.read_material(relative, digest)
-        except CaseConfigurationError as error:
-            raise ExecutionBlocked(error.reason_code, error.message) from error
-        if digest is None:
-            digest = context.materials.get(relative)
-        if digest is not None and actual != digest:
-            raise ExecutionBlocked(
-                "MATERIAL_MISSING", f"material {label} digest drifted while materializing"
-            )
-        input_payloads[relative] = data
+    for expected_group, target_payloads in (
+        (expected_build, build_payloads),
+        (expected_inputs, input_payloads),
+    ):
+        for label, (relative, digest) in expected_group.items():
+            try:
+                data, actual = context.case.read_material(relative, digest)
+            except CaseConfigurationError as error:
+                raise ExecutionBlocked(error.reason_code, error.message) from error
+            if digest is None:
+                digest = context.materials.get(relative)
+            if digest is not None and actual != digest:
+                raise ExecutionBlocked(
+                    "MATERIAL_MISSING",
+                    f"material {label} digest drifted while materializing",
+                )
+            target_payloads[relative] = data
 
     payloads: dict[str, bytes] = (
         dict(build_payloads) if is_v2 else {**build_payloads, **input_payloads}
@@ -2859,6 +3003,15 @@ def _persist_build(
     provenance_face_digest: str | None = None
     if (
         result.provenance_face is not None
+        and len(result.provenance_face) > MAX_PROVENANCE_FACE_BYTES
+    ):
+        raise ExecutionFailed(
+            build_provenance.BUILD_PROVENANCE_MISSING,
+            f"provenance face exceeds {MAX_PROVENANCE_FACE_BYTES} bytes "
+            f"({len(result.provenance_face)} bytes)",
+        )
+    if (
+        result.provenance_face is not None
         and result.provenance_face
         and isinstance(result.provenance_face_name, str)
         and result.provenance_face_name in build_provenance.FACE_FILENAMES.values()
@@ -3410,19 +3563,13 @@ def _verified_run_file(
 def _case_materials(
     context: ExecutionContext,
 ) -> dict[str, tuple[str, bytes]]:
-    is_v2 = _is_v2_context(context)
-    has_v2_build_spec = is_v2 and isinstance(
-        context.plan.get("build_spec"), Mapping
-    )
     manifest = context.case.manifest
     entries: list[tuple[str, str, Any]] = [
         (manifest["harness"], "material_harness", context.plan["harness_digest"]),
         (
             manifest["build_recipe"],
             "material_build_recipe",
-            context.materials.get(manifest["build_recipe"])
-            if has_v2_build_spec
-            else context.plan["build_recipe_digest"],
+            _expected_build_recipe_digest(context),
         ),
         (
             manifest["dependencies"],
@@ -4096,13 +4243,20 @@ def _write_v2_bundle_dir(
         evidence._apply_bundle_modes(target, dir_mode=dir_mode, file_mode=file_mode)
 
         # Complete execution, campaign, and blocked bundles must pass the full
-        # offline v2 verifier. Pre-replay FAILED execution bundles (such as
-        # BUILD_PROVENANCE_MISSING with 0 replays) preserve logs and faces
+        # offline v2 verifier. Pre-replay FAILED and partial INCONCLUSIVE
+        # execution bundles (such as BUILD_PROVENANCE_MISSING, build TIMEOUT,
+        # or SANDBOX_ERROR / RUN_INCOMPLETE with <6 replays, where
+        # report["rule"] is None) preserve partial logs, faces, and metadata
         # without fabricating replay files, so their manifest header, entries,
         # roles, D39 provenance paths, and markdown bindings are verified above.
+        is_complete_inconclusive = (
+            effective_verdict == "INCONCLUSIVE"
+            and report.get("rule") is not None
+        )
         if (
             bundle_kind in ("blocked", "campaign")
-            or effective_verdict in ("REPRODUCED", "NOT_REPRODUCED", "INCONCLUSIVE")
+            or effective_verdict in ("REPRODUCED", "NOT_REPRODUCED")
+            or is_complete_inconclusive
         ):
             verify_bundle(target)
         return evidence.BundleInfo(
@@ -4309,67 +4463,13 @@ def _archive_only(dsn: str, context: ExecutionContext) -> ExecutionResult:
 
     # On v2 with BuildSpec, evaluate provenance BEFORE the generic completeness
     # check so a missing/corrupted/non-comparable provenance face or a
-    # plan.compile_flags mismatch ALWAYS fails closed as FAILED /
-    # BUILD_PROVENANCE_MISSING and NEVER downgrades to INCONCLUSIVE or
+    # plan.compile_flags / freeze-rule violation ALWAYS fails closed as
+    # FAILED / BUILD_PROVENANCE_MISSING and NEVER downgrades to INCONCLUSIVE or
     # NOT_REPRODUCED during ARCHIVING recovery.
     provenance_outcome: _ProvenanceCheckOutcome | None = None
     if is_v2_spec:
         assert v2_build_spec is not None
-        freeze_decision = build_provenance.validate_build_spec_for_freeze(
-            v2_build_spec
-        )
-        if not freeze_decision.ok:
-            return _finish_failed(
-                dsn,
-                context.job_id,
-                context.generation,
-                ExecutionFailed(
-                    build_provenance.BUILD_PROVENANCE_MISSING,
-                    freeze_decision.error_detail
-                    or "v2 build_spec failed provenance freeze validation",
-                ),
-                context=context,
-                probe=probe,
-                builds=builds,
-                runs=runs,
-                build_provenance_summary=_empty_build_provenance_summary(
-                    context, comparable=False
-                ),
-            )
-        flags_ok, _norm_flags, flags_error = (
-            _check_declared_compile_flags_consistency(context)
-        )
-        if not flags_ok:
-            return _finish_failed(
-                dsn,
-                context.job_id,
-                context.generation,
-                ExecutionFailed(
-                    build_provenance.BUILD_PROVENANCE_MISSING,
-                    flags_error,
-                ),
-                context=context,
-                probe=probe,
-                builds=builds,
-                runs=runs,
-                build_provenance_summary=_empty_build_provenance_summary(
-                    context, comparable=False
-                ),
-            )
-        kind = v2_build_spec.get("kind")
-        expected_face_name = (
-            build_provenance.FACE_FILENAMES.get(kind)
-            if isinstance(kind, str)
-            else None
-        )
-        any_present_build_missing_face = bool(builds) and any(
-            _verified_provenance_face(
-                build_root, build_row, expected_face_name=expected_face_name
-            )
-            is None
-            for build_row in builds.values()
-        )
-        if len(builds) == 2 or any_present_build_missing_face:
+        if len(builds) == 2:
             provenance_outcome = _verify_v2_build_provenance(
                 context, build_root, builds
             )
@@ -4388,6 +4488,47 @@ def _archive_only(dsn: str, context: ExecutionContext) -> ExecutionResult:
                     builds=builds,
                     runs=runs,
                     build_provenance_summary=provenance_outcome.report_summary,
+                )
+        elif len(builds) == 1:
+            single_outcome = _verify_v2_single_build_provenance(
+                context, build_root, builds
+            )
+            if not single_outcome.comparable:
+                return _finish_failed(
+                    dsn,
+                    context.job_id,
+                    context.generation,
+                    ExecutionFailed(
+                        build_provenance.BUILD_PROVENANCE_MISSING,
+                        single_outcome.error_detail
+                        or "v2 single-build provenance verification failed",
+                    ),
+                    context=context,
+                    probe=probe,
+                    builds=builds,
+                    runs=runs,
+                    build_provenance_summary=single_outcome.report_summary,
+                )
+        else:
+            spec_ok, _norm_flags, spec_error = _validate_v2_spec_and_flags(
+                context, v2_build_spec
+            )
+            if not spec_ok:
+                return _finish_failed(
+                    dsn,
+                    context.job_id,
+                    context.generation,
+                    ExecutionFailed(
+                        build_provenance.BUILD_PROVENANCE_MISSING,
+                        spec_error,
+                    ),
+                    context=context,
+                    probe=probe,
+                    builds=builds,
+                    runs=runs,
+                    build_provenance_summary=_empty_build_provenance_summary(
+                        context, comparable=False
+                    ),
                 )
 
     complete = (
@@ -4726,23 +4867,34 @@ def run_execution(
     missing: list[str] = []
     provenance_outcome: _ProvenanceCheckOutcome | None = None
     try:
-        if _is_v2_context(context) and _build_spec_from_context(context) is not None:
-            flags_ok, _norm_flags, flags_error = (
-                _check_declared_compile_flags_consistency(context)
+        plan_inputs = context.plan.get("inputs")
+        if (
+            not isinstance(plan_inputs, Mapping)
+            or not isinstance(plan_inputs.get("normal"), str)
+            or not isinstance(plan_inputs.get("candidate"), str)
+        ):
+            raise ExecutionBlocked(
+                "MATERIAL_MISSING",
+                "execution plan has no replay inputs mapping",
             )
-            if not flags_ok:
+        v2_build_spec = (
+            _build_spec_from_context(context) if _is_v2_context(context) else None
+        )
+        if v2_build_spec is not None:
+            spec_ok, _norm_flags, spec_error = _validate_v2_spec_and_flags(
+                context, v2_build_spec
+            )
+            if not spec_ok:
                 provenance_outcome = _ProvenanceCheckOutcome(
                     comparable=False,
                     report_summary=_empty_build_provenance_summary(
                         context, comparable=False
                     ),
-                    rules_version=_provenance_rules_version(context),
-                    reason_code=build_provenance.BUILD_PROVENANCE_MISSING,
-                    error_detail=flags_error,
+                    error_detail=spec_error,
                 )
                 raise ExecutionFailed(
                     build_provenance.BUILD_PROVENANCE_MISSING,
-                    flags_error,
+                    spec_error,
                 )
         probe_result, _ = _run_step(
             dsn,
@@ -4814,7 +4966,7 @@ def run_execution(
                     dsn,
                     context,
                     step_key=step_key,
-                    input_digest=context.plan["inputs"][
+                    input_digest=plan_inputs[
                         "normal" if phase == "normal" else "candidate"
                     ],
                     action=lambda attempt_no, token, version=version, phase=phase, input_path=input_path, replay_timeout=replay_timeout: _do_replay(
@@ -4835,9 +4987,9 @@ def run_execution(
         input_mismatch = False
         for run in runs:
             expected = (
-                context.plan["inputs"]["normal"]
+                plan_inputs["normal"]
                 if run.get("phase") == "normal"
-                else context.plan["inputs"]["candidate"]
+                else plan_inputs["candidate"]
             )
             if run.get("input_digest") != expected:
                 input_mismatch = True
@@ -5200,19 +5352,13 @@ def _expected_build_materials(context: ExecutionContext) -> dict[str, str]:
     manifest = context.case.manifest
     source_vulnerable = manifest["versions"]["vulnerable"]
     source_fixed = manifest["versions"]["fixed"]
-    has_v2_build_spec = _is_v2_context(context) and isinstance(
-        context.plan.get("build_spec"), Mapping
-    )
     expected: dict[str, str] = {
         manifest["harness"]: context.plan["harness_digest"],
         manifest["dependencies"]: context.plan["dependencies_digest"],
     }
-    if has_v2_build_spec:
-        recipe_digest = context.materials.get(manifest["build_recipe"])
-        if isinstance(recipe_digest, str):
-            expected[manifest["build_recipe"]] = recipe_digest
-    else:
-        expected[manifest["build_recipe"]] = context.plan["build_recipe_digest"]
+    recipe_digest = _expected_build_recipe_digest(context)
+    if isinstance(recipe_digest, str):
+        expected[manifest["build_recipe"]] = recipe_digest
     for relative in (source_vulnerable, source_fixed):
         digest = context.materials.get(relative)
         if isinstance(digest, str):
@@ -5325,7 +5471,12 @@ def _do_replay(
         raise ExecutionBlocked(
             "PLAN_MISMATCH", "the built parser changed before replay"
         )
-    expected_input = context.plan["inputs"][
+    plan_inputs = context.plan.get("inputs")
+    if not isinstance(plan_inputs, Mapping):
+        raise ExecutionBlocked(
+            "MATERIAL_MISSING", "execution plan has no replay inputs mapping"
+        )
+    expected_input = plan_inputs[
         "normal" if phase == "normal" else "candidate"
     ]
     staging: Path | None = None

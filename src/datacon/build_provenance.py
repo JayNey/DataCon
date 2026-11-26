@@ -51,6 +51,7 @@ _SHELL_REVIEW_FIELDS: Final[frozenset[str]] = frozenset(
 _WS_RE: Final[re.Pattern[str]] = re.compile(r"\s+")
 _SHELL_META_RE: Final[re.Pattern[str]] = re.compile(r"[\s;&|`$<>\"'\\()]")
 _CONTROL_RE: Final[re.Pattern[str]] = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+_ENV_KEY_RE: Final[re.Pattern[str]] = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _CMAKE_EXPORT_RE: Final[re.Pattern[str]] = re.compile(
     r"^CMAKE_EXPORT_COMPILE_COMMANDS(?::[A-Za-z0-9_]+)?=(.*)$",
     re.IGNORECASE,
@@ -62,6 +63,94 @@ _TIMESTAMP_RE: Final[re.Pattern[str]] = re.compile(
     r"\b[0-9]{4}-[0-9]{2}-[0-9]{2}[Tt ][0-9]{2}:[0-9]{2}:[0-9]{2}"
     r"(?:\.[0-9]{1,9})?(?:[Zz]|[+-][0-9]{2}:?[0-9]{2})?"
 )
+
+CC_SHIM_BASENAMES: Final[frozenset[str]] = frozenset({"cc-shim"})
+CXX_SHIM_BASENAMES: Final[frozenset[str]] = frozenset(
+    {"cxx-shim", "cc-shim++", "c++-shim"}
+)
+FORBIDDEN_SHIM_MOUNT_PREFIXES: Final[tuple[str, ...]] = (
+    "/fixture",
+    "/work",
+    "/tmp",
+    "/proc",
+    "/sys",
+    "/dev",
+)
+FORBIDDEN_BUILD_ENV_KEYS: Final[frozenset[str]] = frozenset(
+    {
+        "PATH",
+        "LD_PRELOAD",
+        "LD_LIBRARY_PATH",
+        "TMPDIR",
+        "HOME",
+        "ASAN_OPTIONS",
+    }
+)
+_CREDENTIAL_ENV_PREFIXES: Final[tuple[str, ...]] = (
+    "DATACON_",
+    "GITHUB_",
+    "AWS_",
+    "TOKEN",
+    "SECRET",
+)
+_ALLOWED_TOOL_DIRS: Final[frozenset[str]] = frozenset(
+    {"/usr/bin", "/usr/local/bin", "/bin"}
+)
+_CMAKE_TOOL_NAMES: Final[frozenset[str]] = frozenset({"cmake", "cmake3"})
+_MAKE_TOOL_NAMES: Final[frozenset[str]] = frozenset({"make", "gmake"})
+_SHELL_TOOL_PATHS: Final[frozenset[str]] = frozenset({"sh", "/bin/sh", "/usr/bin/sh"})
+_FORBIDDEN_CMAKE_CONFIGURE_FLAGS: Final[frozenset[str]] = frozenset(
+    {"-P", "-E", "--build", "--install", "--open"}
+)
+_FORBIDDEN_MAKE_CLI_VARS: Final[frozenset[str]] = frozenset(
+    {
+        "CC",
+        "CXX",
+        "CPP",
+        "LD",
+        "AS",
+        "AR",
+        "HOSTCC",
+        "HOSTCXX",
+        "BUILD_CC",
+        "BUILD_CXX",
+        "SHELL",
+        "MAKESHELL",
+        "MAKE",
+        "PATH",
+        "LD_PRELOAD",
+        "LD_LIBRARY_PATH",
+        "TMPDIR",
+        "HOME",
+        "ASAN_OPTIONS",
+    }
+)
+_MAKE_LONG_ARG_OPTS: Final[frozenset[str]] = frozenset(
+    {
+        "--directory",
+        "--file",
+        "--makefile",
+        "--include-dir",
+        "--old-file",
+        "--assume-old",
+        "--what-if",
+        "--new-file",
+        "--assume-new",
+    }
+)
+_MAKE_VAR_ASSIGN_RE: Final[re.Pattern[str]] = re.compile(
+    r"^\s*(?:(?:export|override)\s+)*([A-Za-z_][A-Za-z0-9_]*)\s*(?::::=|::=|:=|\?=|\+=|!=|=)"
+)
+
+
+def has_control_chars(value: str) -> bool:
+    """Return True if ``value`` contains ASCII control characters (including NUL)."""
+    return _CONTROL_RE.search(value) is not None
+
+
+def has_shell_metachars(value: str) -> bool:
+    """Return True if ``value`` contains shell metacharacters or whitespace."""
+    return _SHELL_META_RE.search(value) is not None
 
 
 class ProvenanceParseError(ValueError):
@@ -254,21 +343,28 @@ def normalize_compile_flags(
         else:
             norm_cwd = raw_cwd
 
-    tokens = [_clean_token(item) for item in flags]
+    tokens = [cleaned for item in flags if (cleaned := _clean_token(item))]
     result: list[str] = []
     seen_includes: set[str] = set()
+
+    def _append_short_opt(opt: str, arg: str) -> None:
+        if opt in _PATH_OPTS:
+            arg = _normalize_path_arg(arg, repo_root=norm_root, cwd=norm_cwd)
+        canonical = f"{opt}{arg}"
+        if opt == "-I":
+            if canonical in seen_includes:
+                return
+            seen_includes.add(canonical)
+        result.append(canonical)
 
     i = 0
     total = len(tokens)
     while i < total:
         tok = tokens[i]
-        if not tok:
-            i += 1
-            continue
 
         # Long options in the closed 7-item set: split form ["-isystem", "<dir>"].
         if tok in _LONG_OPTS:
-            if i + 1 < total and tokens[i + 1]:
+            if i + 1 < total:
                 arg = _normalize_path_arg(
                     tokens[i + 1], repo_root=norm_root, cwd=norm_cwd
                 )
@@ -282,9 +378,9 @@ def normalize_compile_flags(
         matched_long = False
         for opt in ("-isystem", "-include"):
             if tok.startswith(opt) and len(tok) > len(opt):
-                if opt == "-include" and tok.startswith("-include-pch"):
-                    break
-                if opt == "-isystem" and tok.startswith("-isystem-after"):
+                # Never split distinct hyphenated flags like -include-pch,
+                # -include-pth, or -isystem-after into ["-include", "-pth"].
+                if tok.startswith(f"{opt}-"):
                     break
                 arg = tok[len(opt) :].strip()
                 if arg:
@@ -300,17 +396,9 @@ def normalize_compile_flags(
 
         # Short options in the closed 7-item set: single connected token.
         if tok in _SHORT_OPTS:
-            if i + 1 < total and tokens[i + 1]:
-                arg = tokens[i + 1]
-                if tok in _PATH_OPTS:
-                    arg = _normalize_path_arg(arg, repo_root=norm_root, cwd=norm_cwd)
-                canonical = f"{tok}{arg}"
+            if i + 1 < total:
+                _append_short_opt(tok, tokens[i + 1])
                 i += 2
-                if tok == "-I":
-                    if canonical in seen_includes:
-                        continue
-                    seen_includes.add(canonical)
-                result.append(canonical)
             else:
                 result.append(tok)
                 i += 1
@@ -320,15 +408,8 @@ def normalize_compile_flags(
             opt = tok[:2]
             arg = tok[2:].strip()
             if arg:
-                if opt in _PATH_OPTS:
-                    arg = _normalize_path_arg(arg, repo_root=norm_root, cwd=norm_cwd)
-                canonical = f"{opt}{arg}"
+                _append_short_opt(opt, arg)
                 i += 1
-                if opt == "-I":
-                    if canonical in seen_includes:
-                        continue
-                    seen_includes.add(canonical)
-                result.append(canonical)
                 continue
 
         # Outside the closed 7-item set: preserve adjacent tokens as separate items.
@@ -363,6 +444,17 @@ def _is_source_path(path: str) -> bool:
     return PurePosixPath(path).suffix in _SOURCE_SUFFIXES
 
 
+def _is_in_repo_source_path(source_path: str) -> bool:
+    """Return True iff ``source_path`` is a C/C++ source file inside ``repo_root``."""
+    if not source_path or source_path == ".":
+        return False
+    if posixpath.isabs(source_path):
+        return False
+    if source_path == ".." or source_path.startswith("../"):
+        return False
+    return _is_source_path(source_path)
+
+
 def _strip_compile_argv(
     argv: Sequence[str],
     *,
@@ -372,14 +464,15 @@ def _strip_compile_argv(
 ) -> tuple[bool, bool, list[str], list[str]]:
     """Extract (is_compile, is_preprocess_only, source_paths, raw_compile_flags).
 
-    Strips compiler argv[0], ``-c``, ``-E``, ``-o <obj>`` / ``-o<obj>``, and
-    source file path(s) while leaving all compile flags (and arguments of
-    options in the closed 7-item set) intact.
+    Strips compiler argv[0], ``-c``, ``-E``/``-M``/``-MM``, ``-o <obj>`` /
+    ``-o<obj>``, and source file path(s) while leaving all compile flags (and
+    arguments of options in the closed 7-item set) intact.
     """
     if not argv:
         return False, False, [], []
     first_cleaned = _clean_token(argv[0])
-    args = list(argv[1:]) if not first_cleaned.startswith("-") else list(argv)
+    raw_args = list(argv[1:]) if not first_cleaned.startswith("-") else list(argv)
+    args = [tok for tok in raw_args if _clean_token(tok)]
 
     has_compile_flag = False
     is_preprocess_only = False
@@ -395,7 +488,7 @@ def _strip_compile_argv(
             has_compile_flag = True
             j += 1
             continue
-        if cleaned == "-E":
+        if cleaned in ("-E", "-M", "-MM"):
             is_preprocess_only = True
             j += 1
             continue
@@ -562,7 +655,11 @@ def _parse_cmake_face(
             cwd=norm_dir,
             explicit_source=source_path,
         )
-        if not is_compile or is_preprocess_only or not _is_source_path(source_path):
+        if (
+            not is_compile
+            or is_preprocess_only
+            or not _is_in_repo_source_path(source_path)
+        ):
             continue
 
         normalized = normalize_compile_flags(
@@ -637,13 +734,14 @@ def _parse_make_face(
             repo_root=repo_root,
             cwd=norm_cwd,
         )
-        if is_preprocess_only or not source_paths:
+        repo_sources = [p for p in source_paths if _is_in_repo_source_path(p)]
+        if is_preprocess_only or not repo_sources:
             continue
 
         normalized = normalize_compile_flags(
             raw_flags, repo_root=repo_root, cwd=norm_cwd
         )
-        for source_path in source_paths:
+        for source_path in repo_sources:
             _record_unit(units, source_path, list(normalized))
 
     if not units:
@@ -924,7 +1022,11 @@ def _is_cmake_false_value(value: str) -> bool:
     return lowered in _CMAKE_FALSE_VALUES or lowered.endswith("-notfound")
 
 
-def _cmake_disables_compile_commands(configure: Sequence[str]) -> bool:
+def iter_cmake_export_compile_commands_values(
+    configure: Sequence[str],
+) -> list[str]:
+    """Return all ``CMAKE_EXPORT_COMPILE_COMMANDS`` values in ``configure`` (quote-aware)."""
+    values: list[str] = []
     i = 0
     total = len(configure)
     while i < total:
@@ -934,29 +1036,362 @@ def _cmake_disables_compile_commands(configure: Sequence[str]) -> bool:
             define_expr = _clean_token(configure[i + 1])
             i += 2
         elif tok.startswith("-D") and len(tok) > 2:
-            define_expr = tok[2:].strip()
+            define_expr = _clean_token(tok[2:])
             i += 1
         else:
             i += 1
             continue
 
         match = _CMAKE_EXPORT_RE.fullmatch(define_expr)
-        if match is not None and _is_cmake_false_value(match.group(1)):
-            return True
-    return False
+        if match is not None:
+            values.append(match.group(1))
+    return values
 
 
-def _is_controlled_cc_shim(cc_value: Any) -> bool:
-    if not isinstance(cc_value, str) or not cc_value.strip():
+def cmake_has_export_compile_commands(configure: Sequence[str]) -> bool:
+    """Return True if ``configure`` explicitly defines ``CMAKE_EXPORT_COMPILE_COMMANDS``."""
+    return bool(iter_cmake_export_compile_commands_values(configure))
+
+
+def cmake_disables_compile_commands(configure: Sequence[str]) -> bool:
+    """Return True if any ``CMAKE_EXPORT_COMPILE_COMMANDS`` define in ``configure`` is falsey."""
+    return any(
+        _is_cmake_false_value(val)
+        for val in iter_cmake_export_compile_commands_values(configure)
+    )
+
+
+def extract_cmake_build_dir(configure: Sequence[str]) -> tuple[str, str]:
+    """Extract and validate CMake ``-B`` build directory inside ``/work``.
+
+    Returns ``(relative_build_dir, compile_commands_container_path)`` or raises
+    ``ValueError`` if ``-B`` is missing its argument or escapes ``/work``.
+    """
+    raw_dir = "."
+    i = 0
+    total = len(configure)
+    while i < total:
+        tok = configure[i]
+        if tok == "-B":
+            if i + 1 >= total or configure[i + 1].startswith("-"):
+                raise ValueError("cmake -B requires a build directory argument")
+            raw_dir = configure[i + 1]
+            i += 2
+            continue
+        if tok.startswith("-B") and len(tok) > 2:
+            raw_dir = tok[2:]
+            i += 1
+            continue
+        i += 1
+
+    if (
+        not raw_dir
+        or not raw_dir.strip()
+        or "\\" in raw_dir
+        or has_control_chars(raw_dir)
+        or has_shell_metachars(raw_dir)
+    ):
+        raise ValueError(f"unsafe cmake build directory: {raw_dir!r}")
+
+    if raw_dir.startswith("/"):
+        if raw_dir.startswith("//") or ".." in PurePosixPath(raw_dir).parts:
+            raise ValueError(
+                f"cmake build directory must not traverse parents: {raw_dir!r}"
+            )
+        norm = posixpath.normpath(raw_dir)
+        if norm == "/work":
+            return ".", "/work/compile_commands.json"
+        if norm.startswith("/work/"):
+            rel_dir = norm[len("/work/") :]
+            return rel_dir, f"{norm}/compile_commands.json"
+        raise ValueError(f"cmake build directory escapes /work: {raw_dir!r}")
+
+    norm = posixpath.normpath(raw_dir)
+    if norm == ".":
+        return ".", "/work/compile_commands.json"
+    if (
+        norm.startswith("/")
+        or norm == ".."
+        or norm.startswith("../")
+        or ".." in PurePosixPath(norm).parts
+    ):
+        raise ValueError(f"cmake build directory escapes /work: {raw_dir!r}")
+    return norm, f"/work/{norm}/compile_commands.json"
+
+
+def validate_build_spec_output_path(raw_output: str, index: int) -> tuple[str, str]:
+    """Validate one ``build_spec.outputs[index]`` path and return ``(rel, /work/rel)``."""
+    rel = jsonutil.safe_relative_path(raw_output, f"build_spec.outputs[{index}]")
+    if has_control_chars(raw_output) or has_shell_metachars(raw_output):
+        raise ValueError(
+            f"build_spec.outputs[{index}] must not contain shell metacharacters: {raw_output!r}"
+        )
+    norm_rel = posixpath.normpath(rel)
+    if (
+        norm_rel in ("", ".")
+        or norm_rel.startswith("/")
+        or norm_rel == ".."
+        or norm_rel.startswith("../")
+        or ".." in PurePosixPath(norm_rel).parts
+        or has_control_chars(norm_rel)
+        or has_shell_metachars(norm_rel)
+    ):
+        raise ValueError(f"unsafe build_spec.outputs[{index}]: {raw_output!r}")
+    return norm_rel, f"/work/{norm_rel}"
+
+
+def is_controlled_shim_path(
+    value: Any,
+    *,
+    allowed_basenames: Iterable[str] = CC_SHIM_BASENAMES,
+) -> bool:
+    """Return True iff ``value`` is a safe read-only rootfs path for a controlled shim."""
+    if not isinstance(value, str) or not value.strip():
         return False
-    if _CONTROL_RE.search(cc_value) or _SHELL_META_RE.search(cc_value):
+    if has_control_chars(value) or has_shell_metachars(value):
         return False
-    if not cc_value.startswith("/"):
+    if not value.startswith("/") or value.startswith("//") or value.endswith("/"):
         return False
-    parts = PurePosixPath(cc_value).parts
+    parts = PurePosixPath(value).parts
     if ".." in parts:
         return False
-    return posixpath.basename(cc_value) == "cc-shim"
+    norm = posixpath.normpath(value)
+    if (
+        not norm.startswith("/")
+        or norm.startswith("//")
+        or norm == "/"
+        or posixpath.dirname(norm) == "/"
+        or any(
+            norm == prefix or norm.startswith(prefix + "/")
+            for prefix in FORBIDDEN_SHIM_MOUNT_PREFIXES
+        )
+    ):
+        return False
+    return posixpath.basename(norm) in frozenset(allowed_basenames)
+
+
+def validate_build_spec_env(env: Any) -> str | None:
+    """Validate ``build_spec.env`` keys/values, rejecting sensitive & credential-like vars."""
+    if not isinstance(env, Mapping):
+        return "build_spec.env must be a JSON object"
+    for key, val in env.items():
+        if not isinstance(key, str) or not _ENV_KEY_RE.fullmatch(key):
+            return (
+                "build_spec.env keys must be valid POSIX identifiers "
+                f"(got {key!r})"
+            )
+        upper_key = key.upper()
+        if upper_key in FORBIDDEN_BUILD_ENV_KEYS:
+            return (
+                f"build_spec.env must not override sensitive environment variable {key!r}"
+            )
+        if upper_key.startswith(_CREDENTIAL_ENV_PREFIXES):
+            return (
+                f"build_spec.env must not set credential-like environment variable {key!r}"
+            )
+        if not isinstance(val, str) or has_control_chars(val):
+            return f"build_spec.env[{key!r}] must be a string without control characters"
+    return None
+
+
+def _is_allowed_system_tool(token: str, *, allowed_names: frozenset[str]) -> bool:
+    if not isinstance(token, str) or not token:
+        return False
+    if has_control_chars(token) or has_shell_metachars(token):
+        return False
+    if "/" not in token:
+        return token in allowed_names
+    if not token.startswith("/") or token.startswith("//") or token.endswith("/"):
+        return False
+    if ".." in PurePosixPath(token).parts:
+        return False
+    norm = posixpath.normpath(token)
+    if norm != token:
+        return False
+    return (
+        posixpath.dirname(norm) in _ALLOWED_TOOL_DIRS
+        and posixpath.basename(norm) in allowed_names
+    )
+
+
+def _validate_make_cli_args(args: Sequence[str], *, label: str) -> str | None:
+    skip_next = False
+    after_double_dash = False
+    for index, tok in enumerate(args):
+        if skip_next:
+            skip_next = False
+            continue
+        if not after_double_dash:
+            if tok == "--":
+                after_double_dash = True
+                continue
+            if tok.startswith("--"):
+                if (
+                    tok == "--eval"
+                    or tok.startswith("--eval=")
+                    or tok == "--environment-overrides"
+                    or tok.startswith("--environment-overrides=")
+                    or tok.startswith("--env")
+                ):
+                    return (
+                        f"{label} must not pass eval or environment-override flag {tok!r}"
+                    )
+                if tok in _MAKE_LONG_ARG_OPTS:
+                    skip_next = True
+                continue
+            if tok.startswith("-") and len(tok) > 1:
+                for pos, ch in enumerate(tok[1:]):
+                    if ch in ("E", "e"):
+                        return (
+                            f"{label} must not pass eval (-E) or environment-override "
+                            f"(-e) flag in {tok!r}"
+                        )
+                    if ch in ("C", "f", "I", "o", "W"):
+                        if pos == len(tok) - 2:
+                            skip_next = True
+                        break
+                    if ch in ("j", "l", "O"):
+                        break
+                continue
+
+        match = _MAKE_VAR_ASSIGN_RE.match(tok)
+        if match is not None:
+            var_name = match.group(1)
+            if (
+                var_name in _FORBIDDEN_MAKE_CLI_VARS
+                or var_name.upper() in FORBIDDEN_BUILD_ENV_KEYS
+            ):
+                return (
+                    f"{label}[{index}] must not override {var_name!r} on the command line"
+                )
+    return None
+
+
+def _validate_shell_command(argv: Sequence[str], *, label: str) -> str | None:
+    for index, tok in enumerate(argv):
+        if has_control_chars(tok) or has_shell_metachars(tok):
+            return (
+                f"{label}[{index}] must not contain control or shell metacharacters: {tok!r}"
+            )
+    first = argv[0]
+    if first in _SHELL_TOOL_PATHS:
+        if len(argv) < 2:
+            return f"{label} using {first!r} requires a relative script path"
+        script = argv[1]
+        if script.startswith("-"):
+            return f"{label} must not pass shell flags such as {script!r} (no sh -c)"
+        try:
+            jsonutil.safe_relative_path(script, f"{label}[1]")
+        except ValueError as exc:
+            return str(exc)
+        return None
+
+    if "/" in first and not first.startswith("/") and not first.startswith("-"):
+        try:
+            jsonutil.safe_relative_path(first, f"{label}[0]")
+        except ValueError as exc:
+            return str(exc)
+        return None
+
+    return (
+        f"{label}[0] must invoke sh/bin/sh with a relative script or an audited "
+        f"relative script path (got {first!r})"
+    )
+
+
+def validate_build_spec_commands(
+    kind: str,
+    *,
+    configure: Sequence[str] | None = None,
+    build: Sequence[str],
+    install: Sequence[str] = (),
+) -> str | None:
+    """Enforce closed per-``kind`` command allowlists on ``configure``/``build``/``install``."""
+    if kind == "cmake":
+        if not configure or not _is_allowed_system_tool(
+            configure[0], allowed_names=_CMAKE_TOOL_NAMES
+        ):
+            got = configure[0] if configure else None
+            return (
+                "build_spec.configure (cmake) must invoke a controlled cmake binary "
+                f"(got {got!r})"
+            )
+        for tok in configure[1:]:
+            if tok in _FORBIDDEN_CMAKE_CONFIGURE_FLAGS:
+                return (
+                    f"build_spec.configure (cmake) must not use execution mode flag {tok!r}"
+                )
+        if not build or not _is_allowed_system_tool(
+            build[0], allowed_names=_CMAKE_TOOL_NAMES
+        ):
+            got = build[0] if build else None
+            return (
+                "build_spec.build (cmake) must invoke a controlled cmake binary "
+                f"(got {got!r})"
+            )
+        if len(build) < 3 or build[1] != "--build" or build[2].startswith("-"):
+            return (
+                "build_spec.build (cmake) must use 'cmake --build <dir> ...'"
+            )
+        if "--" in build[3:]:
+            dash_idx = build.index("--", 3)
+            native_err = _validate_make_cli_args(
+                build[dash_idx + 1 :], label="build_spec.build"
+            )
+            if native_err is not None:
+                return native_err
+        if install:
+            if not _is_allowed_system_tool(
+                install[0], allowed_names=_CMAKE_TOOL_NAMES
+            ):
+                return (
+                    "build_spec.install (cmake) must invoke a controlled cmake binary "
+                    f"(got {install[0]!r})"
+                )
+            if len(install) < 3 or install[1] != "--install" or install[2].startswith("-"):
+                return (
+                    "build_spec.install (cmake) must use 'cmake --install <dir> ...'"
+                )
+        return None
+
+    if kind == "make":
+        if not build or not _is_allowed_system_tool(
+            build[0], allowed_names=_MAKE_TOOL_NAMES
+        ):
+            got = build[0] if build else None
+            return (
+                "build_spec.build (make) must invoke make or gmake "
+                f"(got {got!r})"
+            )
+        build_err = _validate_make_cli_args(build[1:], label="build_spec.build")
+        if build_err is not None:
+            return build_err
+        if install:
+            if not _is_allowed_system_tool(
+                install[0], allowed_names=_MAKE_TOOL_NAMES
+            ):
+                return (
+                    "build_spec.install (make) must invoke make or gmake "
+                    f"(got {install[0]!r})"
+                )
+            install_err = _validate_make_cli_args(
+                install[1:], label="build_spec.install"
+            )
+            if install_err is not None:
+                return install_err
+        return None
+
+    if kind == "shell":
+        build_err = _validate_shell_command(build, label="build_spec.build")
+        if build_err is not None:
+            return build_err
+        if install:
+            install_err = _validate_shell_command(install, label="build_spec.install")
+            if install_err is not None:
+                return install_err
+        return None
+
+    return f"unsupported build_spec.kind {kind!r}"
 
 
 def validate_build_spec_for_freeze(
@@ -1005,12 +1440,14 @@ def validate_build_spec_for_freeze(
     if build_err is not None:
         return _freeze_fail(build_err)
 
+    install_argv: list[str] = []
     if "install" in build_spec:
         install_err = _validate_str_list(
             build_spec["install"], label="build_spec.install", allow_empty=True
         )
         if install_err is not None:
             return _freeze_fail(install_err)
+        install_argv = list(build_spec["install"])
 
     outputs = build_spec["outputs"]
     outputs_err = _validate_str_list(
@@ -1020,7 +1457,7 @@ def validate_build_spec_for_freeze(
         return _freeze_fail(outputs_err)
     for index, out_path in enumerate(outputs):
         try:
-            jsonutil.safe_relative_path(out_path, f"build_spec.outputs[{index}]")
+            validate_build_spec_output_path(out_path, index)
         except ValueError as exc:
             return _freeze_fail(str(exc))
 
@@ -1033,28 +1470,44 @@ def validate_build_spec_for_freeze(
         return _freeze_fail(flags_err)
 
     env = build_spec["env"]
-    if not isinstance(env, Mapping):
-        return _freeze_fail("build_spec.env must be a JSON object")
-    for key, val in env.items():
-        if not isinstance(key, str) or not key.strip() or _CONTROL_RE.search(key):
-            return _freeze_fail("build_spec.env keys must be non-empty strings")
-        if not isinstance(val, str) or _CONTROL_RE.search(val):
-            return _freeze_fail(f"build_spec.env[{key!r}] must be a string")
+    env_err = validate_build_spec_env(env)
+    if env_err is not None:
+        return _freeze_fail(env_err)
 
-    # Kind-specific provenance face validation.
-    if kind == "cmake":
+    if kind != "shell":
         for shell_field in sorted(_SHELL_ONLY_SPEC_FIELDS):
             if build_spec.get(shell_field) is not None:
                 return _freeze_fail(
-                    f"build_spec (cmake) must not set shell-only field {shell_field!r}"
+                    f"build_spec ({kind}) must not set shell-only field {shell_field!r}"
                 )
+
+    configure_argv: list[str] | None = None
+    if kind == "cmake":
         configure = build_spec["configure"]
         configure_err = _validate_str_list(
             configure, label="build_spec.configure", allow_empty=False
         )
         if configure_err is not None:
             return _freeze_fail(configure_err)
-        if _cmake_disables_compile_commands(configure):
+        configure_argv = list(configure)
+
+    cmd_err = validate_build_spec_commands(
+        kind,
+        configure=configure_argv,
+        build=build_spec["build"],
+        install=install_argv,
+    )
+    if cmd_err is not None:
+        return _freeze_fail(cmd_err)
+
+    # Kind-specific provenance face validation.
+    if kind == "cmake":
+        assert configure_argv is not None
+        try:
+            extract_cmake_build_dir(configure_argv)
+        except ValueError as exc:
+            return _freeze_fail(str(exc))
+        if cmake_disables_compile_commands(configure_argv):
             return _freeze_fail(
                 "build_spec (cmake) explicitly disables CMAKE_EXPORT_COMPILE_COMMANDS"
             )
@@ -1066,17 +1519,23 @@ def validate_build_spec_for_freeze(
             )
 
     elif kind == "make":
-        for shell_field in sorted(_SHELL_ONLY_SPEC_FIELDS):
-            if build_spec.get(shell_field) is not None:
-                return _freeze_fail(
-                    f"build_spec (make) must not set shell-only field {shell_field!r}"
-                )
         cc_value = env.get("CC")
-        if not _is_controlled_cc_shim(cc_value):
+        if not is_controlled_shim_path(
+            cc_value, allowed_basenames=CC_SHIM_BASENAMES
+        ):
             return _freeze_fail(
                 "build_spec (make) requires env.CC pointing to a controlled cc-shim "
                 f"(got {cc_value!r})"
             )
+        if "CXX" in env:
+            cxx_value = env["CXX"]
+            if not is_controlled_shim_path(
+                cxx_value, allowed_basenames=CXX_SHIM_BASENAMES
+            ):
+                return _freeze_fail(
+                    "build_spec (make) requires env.CXX (when set) pointing to a "
+                    f"controlled cxx-shim (got {cxx_value!r})"
+                )
 
     elif kind == "shell":
         recipe_digest = build_spec.get("shell_recipe_digest")
