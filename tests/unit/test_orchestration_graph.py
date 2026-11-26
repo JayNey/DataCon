@@ -1352,6 +1352,77 @@ def test_family_level_transitions_create_next_round_child():
             )
 
 
+def test_verify_iteration_requires_round_and_budget_capacity():
+    """T12/TC-12: edge #26 only spawns when rounds and budget both remain.
+
+    The gate is deliberately checked after a real (fake-clock) round archives:
+    an exhausted round cap or a drained family balance must stop at the
+    current child and never derive another round child.
+    """
+    runner_cls = getattr(workflow, "OrchestrationRunner", None)
+    assert runner_cls is not None, (
+        "datacon.workflow.OrchestrationRunner is missing (T11): cannot verify "
+        "the T12 iteration capacity gate"
+    )
+
+    def _run(*, max_rounds, max_total_seconds=None):
+        clock = FakeClock()
+        runner = runner_cls(
+            sandbox=FakeSandbox(clock=clock, replay_faults=("timeout",)),
+            clock=clock,
+            review_gate=FakeReviewGate(clock=clock, decision="approve"),
+            envelope_policy=FakeEnvelopePolicy(clock=clock, default_admit=True),
+        )
+        return runner.run_family_guided(
+            family_id=str(uuid4()),
+            candidate_seeds=[b"seed-round-1", b"seed-round-2"],
+            max_rounds=max_rounds,
+            max_total_seconds=max_total_seconds,
+        )
+
+    # Round capacity: max_rounds=1 permits the first validation round but the
+    # INCONCLUSIVE verdict may not re-enter hypothesis_aggregator for round 2.
+    round_limited = _run(max_rounds=1)
+    assert [child.round_no for child in round_limited.round_children] == [1], (
+        "a family must not derive a round beyond max_rounds: "
+        f"rounds={[child.round_no for child in round_limited.round_children]}"
+    )
+    assert round_limited.stop_reason_code == "BUDGET_EXHAUSTED"
+    assert [
+        transition["edge_no"]
+        for transition in round_limited.family_transitions
+        if transition["target"] == "hypothesis_aggregator"
+    ] == [23], (
+        "edge #26 must not fire after max_rounds is exhausted: "
+        f"transitions={round_limited.family_transitions}"
+    )
+    assert len(round_limited.child_execution_windows) == 2, (
+        "only the campaign and the single round child may execute: "
+        f"windows={round_limited.child_execution_windows}"
+    )
+    assert round_limited.max_concurrent_children == 1
+
+    # Budget boundary: a drained family balance stops after round 1 even when
+    # max_rounds still allows another round.
+    budget_limited = _run(max_rounds=2, max_total_seconds=5.0)
+    assert len(budget_limited.round_children) == 1, (
+        "a family must not derive a round after its budget is exhausted: "
+        f"rounds={[child.round_no for child in budget_limited.round_children]}"
+    )
+    assert budget_limited.stop_reason_code == "BUDGET_EXHAUSTED"
+    assert [
+        transition["edge_no"]
+        for transition in budget_limited.family_transitions
+        if transition["target"] == "hypothesis_aggregator"
+    ] == [23], (
+        "edge #26 must not fire after the family budget is exhausted: "
+        f"transitions={budget_limited.family_transitions}"
+    )
+    assert len(budget_limited.child_execution_windows) == 2
+    assert budget_limited.state == "COMPLETED"
+    assert budget_limited.reason_code is None
+
+
 def test_family_children_execute_serially():
     clock = FakeClock()
     # Deterministic round-1 INCONCLUSIVE ensures campaign + round 1 + round 2 execute

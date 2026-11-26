@@ -3617,6 +3617,78 @@ def _v2_required_role_paths(
         )
 
 
+# D4: v2 build records describe build materials only. The two reviewed input
+# aliases stay in the frozen v1 branch; a v2 build record that stages them is
+# rejected rather than silently accepting an input digest in build provenance.
+_V2_BUILD_INPUT_ALIASES = frozenset(
+    {"inputs/normal.txt", "inputs/candidate.txt"}
+)
+
+
+def _verify_v2_build_records(data: Mapping[str, bytes]) -> None:
+    """Reject v1-only input aliases in a v2 report's build records.
+
+    Full report/build semantic replay belongs to the later evidence-v2 tasks,
+    but a report that already carries ``builds`` must not smuggle input
+    digests into v2 build provenance. The check is deliberately conditional so
+    skeleton bundles without a report build list keep verifying.
+    """
+    report = _parse_json_file(data, "report.json")
+    builds = report.get("builds")
+    if builds is None:
+        return
+    if not isinstance(builds, list):
+        raise BundleError("INVALID_MANIFEST", "v2 report builds must be a list")
+    for build in builds:
+        if not isinstance(build, Mapping):
+            raise BundleError(
+                "INVALID_MANIFEST", "v2 report build must be an object"
+            )
+        staged = build.get("staged_materials")
+        if not isinstance(staged, Mapping):
+            raise BundleError(
+                "INVALID_MANIFEST",
+                "a v2 build record requires a staged_materials object",
+            )
+        aliases = sorted(set(staged) & _V2_BUILD_INPUT_ALIASES)
+        if aliases:
+            raise BundleError(
+                "INVALID_MANIFEST",
+                "a v2 build record must not stage v1 input aliases: "
+                + ", ".join(aliases),
+            )
+
+
+def _verify_v2_reuse_plan(
+    manifest: Mapping[str, Any], data: Mapping[str, bytes]
+) -> None:
+    """Bind a reusable validation bundle to the plan's authoritative build_ref.
+
+    The plan's ``build_ref`` is the single authority (§8). The manifest copies
+    it for offline inventory and ``reuse_origin`` points at the campaign; a
+    disagreement between any of the three is a reuse mismatch, not a silent
+    fallback.
+    """
+    plan = _parse_json_file(data, "plan.json")
+    plan_build_ref = plan.get("build_ref")
+    if not isinstance(plan_build_ref, Mapping):
+        raise BundleError(
+            "INVALID_MANIFEST", "a reuse execution plan requires build_ref"
+        )
+    normalized_plan_ref = _v2_build_ref(plan_build_ref, "plan.build_ref")
+    normalized_manifest_ref = _v2_build_ref(
+        manifest.get("build_ref"), "build_ref"
+    )
+    if normalized_plan_ref != normalized_manifest_ref:
+        raise BundleError(
+            "REUSE_MISMATCH",
+            "manifest build_ref must equal plan.build_ref",
+        )
+    _v2_reuse_origin(
+        manifest.get("reuse_origin"), "reuse_origin", normalized_plan_ref
+    )
+
+
 def _verify_v2_build_layout(
     listed: Mapping[str, Mapping[str, Any]], *, partial_execution: bool = False
 ) -> None:
@@ -3994,6 +4066,10 @@ def _verify_bundle_v2(
     )
     if data is None:
         data = _read_listed_files(root_path, listed)
+    if bundle_kind in ("execution", "campaign"):
+        _verify_v2_build_records(data)
+    if bundle_kind == "execution" and manifest.get("reuse_origin") is not None:
+        _verify_v2_reuse_plan(manifest, data)
     if bundle_kind == "blocked":
         _verify_v2_blocked_semantics(
             job_id=job_id,

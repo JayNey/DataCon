@@ -12,7 +12,7 @@ from pathlib import Path
 from uuid import uuid4
 
 import pytest
-from test_evidence import make_bundle
+from test_evidence import MATERIAL_DIGESTS, _update_build, make_bundle
 
 from datacon import contracts, evidence
 from datacon.evidence import BundleError, export_bundle, verify_bundle
@@ -227,6 +227,64 @@ def test_v2_execution_bundle_verifies_with_fixed_paths(tmp_path):
     )
     verified = verify_bundle(root)
     assert verified.manifest["bundle_kind"] == "execution"
+
+
+def test_manifest_uses_fixed_evidence_paths(tmp_path):
+    """T12/TC-16 (D39): every v2 role lives at its canonical fixed path."""
+    files = _base_files(execution=True, campaign=False)
+    root = _write_v2_bundle(tmp_path, _manifest("execution"), files)
+    verified = verify_bundle(root)
+    listed = {
+        entry["path"]: entry["role"] for entry in verified.manifest["files"]
+    }
+
+    expected = {
+        "metadata/execution.json": "execution_metadata",
+        "metadata/probe.json": "probe",
+        "metadata/case.json": "case_config",
+        "plan.json": "plan",
+        "review.json": "review",
+        "envelope.json": "envelope",
+        "budget/snapshot.json": "budget_snapshot",
+    }
+    for version in VERSIONS:
+        prefix = f"build/{version}/"
+        expected[prefix + "metadata.json"] = "build_metadata"
+        expected[prefix + "build.log"] = "build_log"
+        expected[prefix + "parser"] = "build_artifact"
+        expected[prefix + "build_provenance/compile_commands.json"] = (
+            "build_provenance"
+        )
+        for phase in PHASES:
+            replay = f"replay/{version}/{phase}/"
+            expected[replay + "stdout.log"] = (
+                "normal_output" if phase == "normal" else "replay_stdout"
+            )
+            expected[replay + "stderr.log"] = (
+                "normal_error" if phase == "normal" else "asan_log"
+            )
+            expected[replay + "metadata.json"] = "replay_metadata"
+    for path, role in expected.items():
+        assert listed.get(path) == role, (
+            f"manifest must list fixed evidence path {path} with role {role}, "
+            f"got {listed.get(path)!r}"
+        )
+    assert len([path for path in listed if path.startswith("replay/")]) == 18, (
+        "the fixed replay layout is two versions x three phases x three files"
+    )
+
+    # A v2 role may not escape its fixed path: an alias for execution metadata
+    # must fail closed instead of being accepted as an ad-hoc location.
+    ad_hoc = _base_files(execution=True, campaign=False)
+    ad_hoc["metadata/execution-notes.json"] = ("execution_metadata", b"{}\n")
+    alias_root = _write_v2_bundle(
+        tmp_path,
+        _manifest("execution"),
+        ad_hoc,
+        name="ad-hoc-execution-metadata",
+    )
+    with pytest.raises(BundleError, match="must live at metadata/execution.json"):
+        verify_bundle(alias_root)
 
 
 @pytest.mark.parametrize("relative", ["envelope.json", "budget/snapshot.json"])
@@ -821,6 +879,100 @@ def test_v2_non_reuse_execution_still_rejects_build_ref_without_reuse_origin(tmp
     with pytest.raises(BundleError, match="build_ref") as raised:
         verify_bundle(root)
     assert raised.value.reason_code == "INVALID_MANIFEST"
+
+
+def test_fixed_execution_has_envelope_but_no_reuse_origin(tmp_path):
+    """T12/TC-12: a fixed round has a non-empty envelope but no reuse pointer."""
+    manifest = _manifest("execution")
+    assert manifest["envelope_digest"] is not None
+    root = _write_v2_bundle(
+        tmp_path,
+        manifest,
+        _base_files(execution=True, campaign=False),
+        name="fixed-execution",
+    )
+    verified = verify_bundle(root)
+    assert verified.manifest["envelope_digest"] == OTHER_DIGEST
+    assert verified.manifest["build_ref"] is None
+    assert verified.manifest["reuse_origin"] is None
+
+
+@pytest.mark.parametrize("missing", ["build_ref", "reuse_origin"])
+def test_reuse_validation_requires_build_ref_and_reuse_origin(tmp_path, missing):
+    """T12/TC-16: a reused validation round needs both provenance halves."""
+    manifest = _manifest("execution")
+    build_ref = _build_ref()
+    manifest["experiment_digest"] = DIGEST
+    manifest["build_ref"] = build_ref
+    manifest["reuse_origin"] = {
+        "source_job_id": build_ref["source_job_id"],
+        "generation": build_ref["generation"],
+        "campaign_bundle_digest": OTHER_DIGEST,
+        "artifacts": _build_artifacts(),
+    }
+    if missing == "build_ref":
+        manifest["build_ref"] = None
+        expected = "requires build_ref"
+    else:
+        manifest["reuse_origin"] = None
+        expected = "must not carry build_ref"
+    root = _write_v2_bundle(
+        tmp_path,
+        manifest,
+        _base_files(execution=True, campaign=False),
+        name="reuse-missing-" + missing,
+    )
+    with pytest.raises(BundleError, match=expected) as raised:
+        verify_bundle(root)
+    assert raised.value.reason_code == "INVALID_MANIFEST"
+
+
+def test_v2_build_record_rejects_input_aliases(tmp_path):
+    """T12 (D4): v2 build records only stage build materials, never inputs."""
+    files = _base_files(execution=True, campaign=False)
+    report = {
+        "schema_version": 2,
+        "builds": [
+            {
+                "version": version,
+                "staged_materials": {
+                    "harness.c": DIGEST,
+                    "inputs/normal.txt": DIGEST,
+                    "inputs/candidate.txt": OTHER_DIGEST,
+                },
+            }
+            for version in VERSIONS
+        ],
+    }
+    files["report.json"] = (
+        "report_json",
+        json.dumps(report).encode() + b"\n",
+    )
+    root = _write_v2_bundle(
+        tmp_path,
+        _manifest("execution"),
+        files,
+        name="v2-build-input-aliases",
+    )
+    with pytest.raises(BundleError, match="input alias"):
+        verify_bundle(root)
+
+
+def test_v1_build_record_still_requires_input_aliases(tmp_path):
+    """T12 (D4): the frozen v1 branch keeps its two staged input aliases."""
+    info = make_bundle(tmp_path, name="v1-input-aliases")
+    assert verify_bundle(info.root).manifest["schema_version"] == 1
+
+    for version in VERSIONS:
+        staged = dict(MATERIAL_DIGESTS)
+        staged.pop("inputs/normal.txt")
+        staged.pop("inputs/candidate.txt")
+        _update_build(info.root, version, staged_materials=staged)
+
+    with pytest.raises(BundleError) as raised:
+        verify_bundle(info.root)
+    assert raised.value.reason_code in ("DIGEST_MISMATCH", "INVALID_MANIFEST")
+    assert "missing=" in raised.value.message
 
 
 @pytest.mark.parametrize("bundle_kind", ["execution", "campaign", "blocked"])
