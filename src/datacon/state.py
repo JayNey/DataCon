@@ -5,6 +5,7 @@ from __future__ import annotations
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 import hashlib
+import math
 from pathlib import Path, PurePosixPath
 import re
 import threading
@@ -66,6 +67,59 @@ class ReviewOutcome:
             "envelope_mismatch": "REVIEW_ENVELOPE_MISMATCH",
             "job_not_found": "JOB_NOT_FOUND",
         }.get(self.status, "REVIEW_ERROR")
+
+
+@dataclass(frozen=True)
+class AdmissionOutcome:
+    """The result of one deterministic policy-admission predicate run.
+
+    ``admission`` carries exactly the row shape of the ``admissions`` table
+    when the round is admitted; a denied round has no admission row and only
+    the ``round_admission_denied`` audit event. ``event_detail`` is the same
+    audit detail so callers can persist it through ``_audit`` without
+    recomputing any decision input.
+    """
+
+    admitted: bool
+    reason_code: str | None
+    admission: dict[str, Any] | None
+    event_type: str | None
+    event_detail: dict[str, Any]
+    # Persistence-aware callers distinguish an admitted round, a real denial
+    # and an idempotent re-entry. The predicate-only path sets admitted/denied;
+    # record_admission adds already_admitted without writing a row or event.
+    status: str | None = None
+    sub_reason: str | None = None
+
+
+BUDGET_EXHAUSTED = "BUDGET_EXHAUSTED"
+
+
+@dataclass(frozen=True)
+class BudgetDecision:
+    """Deterministic answer to "may the next step/round start?"."""
+
+    allowed: bool
+    reason_code: str | None
+    hard_timeout_seconds: int
+    next_round_no: int | None = None
+    sub_reason: str | None = None
+
+
+@dataclass(frozen=True)
+class BudgetChargeOutcome:
+    """One idempotent charge attempt against the family ledger.
+
+    ``recovered`` returns the existing charge without touching the ledger;
+    ``budget_exhausted`` means the start gate refused or the conditional
+    update found no affordable balance. ``charge`` is None only when the
+    refusal happened before a charge could be written.
+    """
+
+    status: str
+    reason_code: str | None
+    charge: dict[str, Any] | None
+    ledger: dict[str, Any]
 
 
 def _connect(dsn: str):
@@ -230,12 +284,46 @@ def claim_next(
                   OR (job_kind IN ('campaign', 'round')
                       AND (
                           state = 'BLOCKED'
-                          OR EXISTS (
-                              SELECT 1 FROM jobs parent_job
-                              WHERE parent_job.job_id = jobs.parent_job_id
-                                AND parent_job.job_contract_version = 2
-                                AND parent_job.job_kind = 'family'
-                                AND parent_job.state = 'AGGREGATING'
+                          OR (
+                              EXISTS (
+                                  SELECT 1 FROM jobs parent_job
+                                  WHERE parent_job.job_id = jobs.parent_job_id
+                                    AND parent_job.job_contract_version = 2
+                                    AND parent_job.job_kind = 'family'
+                                    AND parent_job.state = 'AGGREGATING'
+                              )
+                              AND NOT (
+                                  state = 'READY'
+                                  AND workflow_synced = true
+                                  AND EXISTS (
+                                      SELECT 1 FROM family_envelopes pending_env
+                                      WHERE pending_env.family_id = jobs.parent_job_id
+                                        AND pending_env.status = 'pending'
+                                  )
+                              )
+                              AND NOT (
+                                  state = 'READY'
+                                  AND workflow_synced = true
+                                  AND job_kind = 'round'
+                                  AND (
+                                      round_no > 1
+                                      OR EXISTS (
+                                          SELECT 1 FROM jobs mode_parent
+                                          WHERE mode_parent.job_id = jobs.parent_job_id
+                                            AND COALESCE(
+                                                mode_parent.request->'exploration'->>'mode',
+                                                'fixed'
+                                            ) = 'guided'
+                                      )
+                                  )
+                                  AND NOT EXISTS (
+                                      SELECT 1 FROM admissions a
+                                      WHERE a.parent_job_id = jobs.parent_job_id
+                                        AND a.round_no = jobs.round_no
+                                        AND a.job_id = jobs.job_id
+                                        AND a.approval_kind = 'policy'
+                                  )
+                              )
                           )
                       ))
               )"""
@@ -527,6 +615,22 @@ def freeze_plan(
                         "a non-first v2 plan requires a non-null "
                         "parent_approval_digest"
                     )
+                # A pending re-approval invalidates the old chain tail for the
+                # next round: freezing now would bind a plan to an approval
+                # that the re-approval is about to supersede, leaving an
+                # immutable plan that can never be admitted. The family row is
+                # locked, so a concurrent propose-envelope cannot commit a new
+                # pending row between this check and the plan insert.
+                pending_envelope = connection.execute(
+                    "SELECT 1 FROM family_envelopes "
+                    "WHERE family_id = %s AND status = 'pending' LIMIT 1",
+                    (job["family_id"],),
+                ).fetchone()
+                if pending_envelope is not None:
+                    raise StateError(
+                        "cannot freeze a non-first plan while an envelope "
+                        "re-approval is pending"
+                    )
                 # The family row is already locked FOR UPDATE above, so the
                 # approval chain tail cannot move while this check runs.
                 # first_plan_digest is intentionally not re-checked here: every
@@ -558,6 +662,47 @@ def freeze_plan(
                         "plan envelope_digest does not match the "
                         "family_approvals chain tail"
                     )
+                # The approval digest alone does not bind the plan's harness.
+                # Read the approved envelope body so a later plan cannot name
+                # a harness the operator never approved, and fail before the
+                # immutable plan row is written.
+                tail_envelope_row = connection.execute(
+                    "SELECT envelope_json FROM family_envelopes "
+                    "WHERE family_id = %s AND envelope_digest = %s",
+                    (job["family_id"], tail["envelope_digest"]),
+                ).fetchone()
+                if tail_envelope_row is None:
+                    raise StateError(
+                        "a non-first v2 plan requires the approved envelope body"
+                    )
+                try:
+                    tail_envelope = _validate_envelope(
+                        tail_envelope_row["envelope_json"]
+                    )
+                except ValueError as error:
+                    raise StateError(
+                        f"approved envelope is invalid: {error}"
+                    ) from error
+                if plan.get("harness_digest") != tail_envelope["harness_digest"]:
+                    raise StateError(
+                        "plan harness_digest does not match the approved "
+                        "envelope body"
+                    )
+                try:
+                    tail_plan_signature = contracts.normalize_asan_signature(
+                        plan["asan_signature"]
+                    )
+                except (KeyError, ValueError) as error:
+                    raise StateError(
+                        f"plan asan_signature is invalid: {error}"
+                    ) from error
+                if tail_plan_signature not in tail_envelope[
+                    "accepted_signature_set"
+                ]:
+                    raise StateError(
+                        "plan asan_signature is outside the approved envelope "
+                        "accepted_signature_set"
+                    )
         normalized_envelope: dict[str, Any] | None = None
         if first_v2_plan:
             if envelope is None:
@@ -565,14 +710,46 @@ def freeze_plan(
                     "a v2 first plan requires the reviewed envelope body"
                 )
             try:
-                normalized_envelope = _validate_envelope(dict(envelope))
+                normalized_envelope = _validate_envelope(envelope)
             except ValueError as error:
                 raise StateError(f"envelope is invalid: {error}") from error
+            if (
+                normalized_envelope["admission_predicate_version"]
+                not in SUPPORTED_ADMISSION_PREDICATE_VERSIONS
+            ):
+                raise StateError(
+                    "unsupported admission_predicate_version: "
+                    f"{normalized_envelope['admission_predicate_version']}"
+                )
             if jsonutil.digest_json(normalized_envelope) != plan.get(
                 "envelope_digest"
             ):
                 raise StateError(
                     "envelope body does not match the plan envelope_digest"
+                )
+            # The envelope is the authorization boundary, so the first plan's
+            # harness must be the one the operator reviewed. Comparing only
+            # envelope_digest binds the envelope body but not the plan field
+            # execution reads, which would let a plan name a different harness
+            # under an approved envelope digest.
+            if plan.get("harness_digest") != normalized_envelope["harness_digest"]:
+                raise StateError(
+                    "plan harness_digest does not match the reviewed envelope"
+                )
+            try:
+                plan_asan_signature = contracts.normalize_asan_signature(
+                    plan["asan_signature"]
+                )
+            except (KeyError, ValueError) as error:
+                raise StateError(
+                    f"plan asan_signature is invalid: {error}"
+                ) from error
+            if plan_asan_signature not in normalized_envelope[
+                "accepted_signature_set"
+            ]:
+                raise StateError(
+                    "plan asan_signature is outside the reviewed envelope "
+                    "accepted_signature_set"
                 )
             # The first envelope is an approval boundary just like a
             # propose-envelope body: it may tighten, never widen, the request
@@ -981,13 +1158,99 @@ def analysis_progress(
 
 
 def begin_execution(dsn: str, job_id: UUID, *, generation: int) -> bool:
-    """Move a READY job to RUNNING under the current claim's generation."""
+    """Move a READY job to RUNNING under the current claim's generation.
+
+    A job that is already RUNNING is an idempotent re-entry and returns True
+    even if its family has been rejected into BLOCKED in the meantime, matching
+    ``finish_execution``/``charge_step_budget`` so the active generation can
+    still settle. The family AGGREGATING and pending-envelope gates only apply
+    to the READY -> RUNNING transition.
+    """
     with _connect(dsn) as connection:
+        identity = connection.execute(
+            "SELECT job_contract_version, job_kind, family_id, round_no "
+            "FROM jobs WHERE job_id = %s",
+            (job_id,),
+        ).fetchone()
+        if identity is None:
+            raise StateError("job does not exist")
+        is_v2_child = (
+            identity["job_contract_version"] == 2
+            and identity["job_kind"] in ("campaign", "round")
+        )
+        family_id: UUID | None = None
+        if is_v2_child:
+            family_id = identity["family_id"]
+            if family_id is None:
+                raise StateError("a v2 child requires a family")
+            # Follow the global lock order jobs(family) -> jobs(child).
+            # FOR KEY SHARE conflicts with FOR UPDATE held by propose_envelope
+            # and record_review, serializing child promotion against pending
+            # envelopes and family rejection while allowing concurrent v2
+            # children and budget charges to proceed without deadlocks.
+            family = connection.execute(
+                "SELECT job_id, job_kind, job_contract_version, state, "
+                "COALESCE(request->'exploration'->>'mode', 'fixed') "
+                "AS exploration_mode "
+                "FROM jobs WHERE job_id = %s FOR KEY SHARE",
+                (family_id,),
+            ).fetchone()
+            if family is None:
+                raise StateError("the child family does not exist")
+            if (
+                family["job_contract_version"] != 2
+                or family["job_kind"] != "family"
+            ):
+                raise StateError("the child parent is not a v2 family")
         job = _locked_job(connection, job_id, generation=generation)
         if job["state"] == "RUNNING":
+            # A child that is already RUNNING keeps its idempotent re-entry even
+            # when the family was rejected in the meantime, matching
+            # finish_execution and charge_step_budget: the running generation
+            # must still be able to settle. The family-state gate below only
+            # governs the READY -> RUNNING transition.
             return True
+        if is_v2_child:
+            if family["state"] != "AGGREGATING":
+                raise StateError(
+                    "cannot start execution while the family is "
+                    f"{family['state']}"
+                )
+            pending_envelope = connection.execute(
+                "SELECT 1 FROM family_envelopes "
+                "WHERE family_id = %s AND status = 'pending' LIMIT 1",
+                (family_id,),
+            ).fetchone()
+            if pending_envelope is not None:
+                raise StateError(
+                    "cannot start execution while a family envelope "
+                    "re-approval is pending"
+                )
         if job["state"] != "READY":
             raise StateError(f"cannot start execution while the job is {job['state']}")
+        if (
+            is_v2_child
+            and job["job_kind"] == "round"
+            and (
+                family["exploration_mode"] == "guided"
+                or (job["round_no"] or 0) > 1
+            )
+        ):
+            # A non-first round (guided rounds, or fixed rounds after the
+            # first) is policy-admitted, never human-approved: it may only
+            # run once its admissions row is persisted. Lock order stays
+            # jobs(family) -> jobs(child) -> admissions; this is a plain read.
+            admitted = connection.execute(
+                "SELECT 1 FROM admissions "
+                "WHERE parent_job_id = %s AND round_no = %s "
+                "AND job_id = %s AND approval_kind = 'policy'",
+                (family_id, job["round_no"], job_id),
+            ).fetchone()
+            if admitted is None:
+                raise StateError(
+                    "cannot start execution of a round that has not been "
+                    "policy-admitted (no admissions row)"
+                )
         updated = connection.execute(
             "UPDATE jobs SET state = 'RUNNING', stage = 'execute', "
             "execute_deadline_at = COALESCE("
@@ -1482,206 +1745,17 @@ def finalize_workflow(dsn: str, job_id: UUID, generation: int) -> bool:
 # into guided and its mutation surface is empty. The envelope body is closed:
 # every field documented in interface-contract-delta §2 is required and any
 # other field is rejected, because envelope_digest commits to these exact bytes.
-_ENVELOPE_FIELDS = frozenset(
-    {
-        "mode",
-        "allowed_mutation_families",
-        "mutation_limits",
-        "seed_corpus_digest",
-        "fuzz_image_digest",
-        "harness_digest",
-        "max_rounds",
-        "max_total_seconds",
-        "max_fuzz_seconds",
-        "accepted_signature_set",
-        "admission_predicate_version",
-    }
-)
-_MUTATION_LIMIT_FIELDS = frozenset({"allowed_ops", "max_input_bytes"})
-_ENVELOPE_SIGNATURE_FIELDS = frozenset({"error", "function", "source"})
-_ENVELOPE_SIGNATURE_OPTIONAL = frozenset({"operation", "access_size"})
-_ENVELOPE_MODES = frozenset({"fixed", "guided"})
-_ENVELOPE_MAX_ACCESS_SIZE = 2**31 - 1
-
-
-def _envelope_text(value: Any, label: str) -> str:
-    """Require a non-empty string envelope identifier without whitespace."""
-    text = jsonutil.require_text(value, label)
-    if any(character.isspace() for character in text):
-        raise ValueError(f"{label} must not contain whitespace")
-    return text
-
-
-def _envelope_string_list(value: Any, label: str) -> list[str]:
-    if not isinstance(value, list):
-        raise ValueError(f"{label} must be a JSON array")
-    result: list[str] = []
-    seen: set[str] = set()
-    for index, item in enumerate(value):
-        text = _envelope_text(item, f"{label}[{index}]")
-        if text in seen:
-            raise ValueError(f"{label} must not contain duplicates")
-        seen.add(text)
-        result.append(text)
-    return result
-
-
-def _envelope_digest_or_null(value: Any, label: str) -> str | None:
-    if value is None:
-        return None
-    return jsonutil.require_digest(value, label)
-
-
 def _envelope_signature_set(value: Any) -> list[dict[str, Any]]:
-    if not isinstance(value, list):
-        raise ValueError("envelope.accepted_signature_set must be a JSON array")
-    normalized: list[dict[str, Any]] = []
-    for index, item in enumerate(value):
-        label = f"accepted_signature_set[{index}]"
-        signature = jsonutil.require_object(
-            item,
-            required=set(_ENVELOPE_SIGNATURE_FIELDS),
-            optional=_ENVELOPE_SIGNATURE_OPTIONAL,
-            label=label,
-        )
-        entry: dict[str, Any] = {
-            field: jsonutil.require_text(signature[field], f"{label}.{field}")
-            for field in sorted(_ENVELOPE_SIGNATURE_FIELDS)
-        }
-        if "operation" in signature:
-            operation = jsonutil.require_text(
-                signature["operation"], f"{label}.operation"
-            )
-            if operation not in ("READ", "WRITE"):
-                raise ValueError(f"{label}.operation must be READ or WRITE")
-            entry["operation"] = operation
-        if "access_size" in signature:
-            access_size = signature["access_size"]
-            if (
-                type(access_size) is not int
-                or not 1 <= access_size <= _ENVELOPE_MAX_ACCESS_SIZE
-            ):
-                raise ValueError(
-                    f"{label}.access_size must be an integer between 1 and "
-                    f"{_ENVELOPE_MAX_ACCESS_SIZE}"
-                )
-            entry["access_size"] = access_size
-        normalized.append(entry)
-    return normalized
+    return contracts._envelope_signature_set(value)
 
 
 def _validate_envelope(envelope: Any) -> dict[str, Any]:
     """Validate and normalize one proposed exploration envelope.
 
-    The body is closed and every documented field is required. Fixed mode is
-    kept at its degenerate values so a fixed envelope can never carry a
-    mutation surface; guided mode requires the seed/fuzz digests that make the
-    admitted rounds reproducible. Values are otherwise preserved byte-for-byte
-    (apart from the deterministic ordering of accepted_signature_set fields) so
-    the persisted body and envelope_digest describe the approval.
+    Delegates directly to ``contracts.normalize_envelope`` so plan freezing,
+    envelope proposals and policy admission share one validation boundary.
     """
-    jsonutil.require_object(
-        envelope,
-        required=set(_ENVELOPE_FIELDS),
-        label="envelope",
-    )
-    mode = envelope["mode"]
-    if not isinstance(mode, str) or mode not in _ENVELOPE_MODES:
-        raise ValueError("envelope.mode must be fixed or guided")
-
-    families = _envelope_string_list(
-        envelope["allowed_mutation_families"],
-        "envelope.allowed_mutation_families",
-    )
-    limits = jsonutil.require_object(
-        envelope["mutation_limits"],
-        required=set(_MUTATION_LIMIT_FIELDS),
-        label="envelope.mutation_limits",
-    )
-    allowed_ops = _envelope_string_list(
-        limits["allowed_ops"], "envelope.mutation_limits.allowed_ops"
-    )
-    max_input_bytes = limits["max_input_bytes"]
-    if type(max_input_bytes) is not int or max_input_bytes < 0:
-        raise ValueError(
-            "envelope.mutation_limits.max_input_bytes must be a non-negative integer"
-        )
-
-    seed_corpus_digest = _envelope_digest_or_null(
-        envelope["seed_corpus_digest"], "envelope.seed_corpus_digest"
-    )
-    fuzz_image_digest = _envelope_digest_or_null(
-        envelope["fuzz_image_digest"], "envelope.fuzz_image_digest"
-    )
-    harness_digest = jsonutil.require_digest(
-        envelope["harness_digest"], "envelope.harness_digest"
-    )
-    max_rounds = envelope["max_rounds"]
-    if type(max_rounds) is not int or max_rounds < 1:
-        raise ValueError("envelope.max_rounds must be a positive integer")
-    max_total_seconds = envelope["max_total_seconds"]
-    if type(max_total_seconds) is not int or max_total_seconds < 1:
-        raise ValueError("envelope.max_total_seconds must be a positive integer")
-    max_fuzz_seconds = envelope["max_fuzz_seconds"]
-    if (
-        type(max_fuzz_seconds) is not int
-        or not 0 <= max_fuzz_seconds <= max_total_seconds
-    ):
-        raise ValueError(
-            "envelope.max_fuzz_seconds must be an integer between 0 and "
-            "max_total_seconds"
-        )
-    accepted_signature_set = _envelope_signature_set(
-        envelope["accepted_signature_set"]
-    )
-    admission_predicate_version = jsonutil.require_text(
-        envelope["admission_predicate_version"],
-        "envelope.admission_predicate_version",
-    )
-
-    if mode == "fixed":
-        if families:
-            raise ValueError("fixed envelope requires allowed_mutation_families=[]")
-        if allowed_ops:
-            raise ValueError("fixed envelope requires mutation_limits.allowed_ops=[]")
-        if max_input_bytes != 0:
-            raise ValueError(
-                "fixed envelope requires mutation_limits.max_input_bytes=0"
-            )
-        if seed_corpus_digest is not None:
-            raise ValueError("fixed envelope requires seed_corpus_digest=null")
-        if fuzz_image_digest is not None:
-            raise ValueError("fixed envelope requires fuzz_image_digest=null")
-        if max_rounds != 1:
-            raise ValueError("fixed envelope requires max_rounds=1")
-        if max_fuzz_seconds != 0:
-            raise ValueError("fixed envelope requires max_fuzz_seconds=0")
-    else:
-        if not families:
-            raise ValueError(
-                "guided envelope requires a non-empty allowed_mutation_families"
-            )
-        if seed_corpus_digest is None:
-            raise ValueError("guided envelope requires seed_corpus_digest")
-        if fuzz_image_digest is None:
-            raise ValueError("guided envelope requires fuzz_image_digest")
-
-    return {
-        "mode": mode,
-        "allowed_mutation_families": families,
-        "mutation_limits": {
-            "allowed_ops": allowed_ops,
-            "max_input_bytes": max_input_bytes,
-        },
-        "seed_corpus_digest": seed_corpus_digest,
-        "fuzz_image_digest": fuzz_image_digest,
-        "harness_digest": harness_digest,
-        "max_rounds": max_rounds,
-        "max_total_seconds": max_total_seconds,
-        "max_fuzz_seconds": max_fuzz_seconds,
-        "accepted_signature_set": accepted_signature_set,
-        "admission_predicate_version": admission_predicate_version,
-    }
+    return contracts.normalize_envelope(envelope)
 
 
 def _request_exploration(request: Any) -> dict[str, Any] | None:
@@ -1929,6 +2003,20 @@ def _assert_envelope_not_expanded(
         )
 
 
+_ADMISSION_BINDING_UNSET = object()
+SUPPORTED_ADMISSION_PREDICATE_VERSIONS = frozenset({"admission-v1"})
+_TERMINAL_JOB_STATES = frozenset(
+    {
+        "COMPLETED",
+        "FAILED",
+        "BLOCKED",
+        "REPRODUCED",
+        "NOT_REPRODUCED",
+        "INCONCLUSIVE",
+    }
+)
+
+
 def propose_envelope(
     dsn: str,
     family_id: UUID,
@@ -1948,6 +2036,14 @@ def propose_envelope(
         normalized = _validate_envelope(envelope)
     except ValueError as error:
         raise StateError(str(error)) from error
+    if (
+        normalized["admission_predicate_version"]
+        not in SUPPORTED_ADMISSION_PREDICATE_VERSIONS
+    ):
+        raise StateError(
+            "unsupported admission_predicate_version: "
+            f"{normalized['admission_predicate_version']}"
+        )
 
     if operator_id is not None:
         try:
@@ -1992,6 +2088,74 @@ def propose_envelope(
         _assert_envelope_not_expanded(normalized, job["request"])
         _assert_envelope_within_case_registry(normalized, job["request"])
 
+        # Follow the global lock order jobs(family) -> jobs(child) ->
+        # budget_ledger(family). Share-locking READY/RUNNING/ARCHIVING
+        # children before locking budget_ledger closes the TOCTOU window with
+        # claim_next (which uses FOR UPDATE SKIP LOCKED): if claim_next locked
+        # a READY child first we wait and observe its committed RUNNING state;
+        # if we lock it first claim_next skips it until our pending envelope
+        # commits.
+        locked_children = connection.execute(
+            "SELECT job_id, state "
+            "FROM jobs "
+            "WHERE parent_job_id = %s "
+            "AND state IN ('READY', 'RUNNING', 'ARCHIVING') "
+            "ORDER BY job_id "
+            "FOR SHARE",
+            (family_id,),
+        ).fetchall()
+
+        ledger = connection.execute(
+            "SELECT max_total_seconds, max_fuzz_seconds, "
+            "remaining_total_seconds, remaining_fuzz_seconds "
+            "FROM budget_ledger WHERE family_id = %s FOR UPDATE",
+            (family_id,),
+        ).fetchone()
+        if ledger is not None:
+            totals = connection.execute(
+                "SELECT COALESCE(SUM(seconds), 0) AS spent_total, "
+                "COALESCE(SUM(fuzz_seconds), 0) AS spent_fuzz "
+                "FROM budget_charges WHERE family_id = %s",
+                (family_id,),
+            ).fetchone()
+            spent_total = int(totals["spent_total"])
+            spent_fuzz = int(totals["spent_fuzz"])
+            if (
+                int(ledger["max_total_seconds"])
+                - int(ledger["remaining_total_seconds"])
+                != spent_total
+                or int(ledger["max_fuzz_seconds"])
+                - int(ledger["remaining_fuzz_seconds"])
+                != spent_fuzz
+            ):
+                raise StateError(
+                    "budget ledger does not reconcile with budget_charges"
+                )
+            if normalized["max_total_seconds"] < spent_total:
+                raise StateError(
+                    "envelope.max_total_seconds is below already spent "
+                    f"family budget ({spent_total}s)"
+                )
+            if normalized["max_fuzz_seconds"] < spent_fuzz:
+                raise StateError(
+                    "envelope.max_fuzz_seconds is below already spent "
+                    f"family fuzz budget ({spent_fuzz}s)"
+                )
+            if (
+                normalized["max_total_seconds"]
+                < int(ledger["max_total_seconds"])
+                or normalized["max_fuzz_seconds"]
+                < int(ledger["max_fuzz_seconds"])
+            ):
+                if any(
+                    child["state"] in ("RUNNING", "ARCHIVING")
+                    for child in locked_children
+                ):
+                    raise StateError(
+                        "cannot tighten family budget while a child job is "
+                        "RUNNING or ARCHIVING"
+                    )
+
         try:
             inserted = connection.execute(
                 "INSERT INTO family_envelopes "
@@ -2032,6 +2196,2375 @@ def propose_envelope(
         "status": "pending",
         "review_deadline_at": review_deadline_at,
     }
+
+
+_BUDGET_SNAPSHOT_ALLOWED_KEYS = frozenset(
+    {
+        "remaining_total_seconds",
+        "remaining_seconds",
+        "remaining_fuzz_seconds",
+        "max_total_seconds",
+        "max_fuzz_seconds",
+        "spent_seconds",
+        "spent_fuzz_seconds",
+        "family_id",
+        "updated_at",
+    }
+)
+
+
+def _validate_budget_snapshot(
+    budget_snapshot: Mapping[str, Any],
+    *,
+    expected_family_id: UUID | str | None = None,
+    expected_max_total_seconds: int | None = None,
+    expected_max_fuzz_seconds: int | None = None,
+) -> tuple[int, int | None]:
+    """Validate admission budget_snapshot structure and return balances.
+
+    Enforces a closed key set covering standard budget ledger/summary fields,
+    strict integer/type/range checks, and cross-field reconciliation. Fails
+    closed on unknown keys, missing balances, conflicting total fields,
+    out-of-range values, or unreconciled spent + remaining != max equations.
+    """
+    unknown = set(budget_snapshot) - _BUDGET_SNAPSHOT_ALLOWED_KEYS
+    if unknown:
+        raise StateError(
+            "budget_snapshot has unknown field(s): "
+            + ", ".join(sorted(str(key) for key in unknown))
+        )
+    has_total = "remaining_total_seconds" in budget_snapshot
+    has_remaining = "remaining_seconds" in budget_snapshot
+    if not has_total and not has_remaining:
+        raise StateError(
+            "budget_snapshot must include remaining_total_seconds or "
+            "remaining_seconds"
+        )
+    total_value: int | None = None
+    remaining_value: int | None = None
+    if has_total:
+        raw_total = budget_snapshot["remaining_total_seconds"]
+        if type(raw_total) is not int or raw_total < 0:
+            raise StateError(
+                "budget_snapshot.remaining_total_seconds must be a "
+                "non-negative integer"
+            )
+        total_value = raw_total
+    if has_remaining:
+        raw_remaining = budget_snapshot["remaining_seconds"]
+        if type(raw_remaining) is not int or raw_remaining < 0:
+            raise StateError(
+                "budget_snapshot.remaining_seconds must be a non-negative "
+                "integer"
+            )
+        remaining_value = raw_remaining
+    if (
+        total_value is not None
+        and remaining_value is not None
+        and total_value != remaining_value
+    ):
+        raise StateError(
+            "budget_snapshot remaining_total_seconds and remaining_seconds "
+            "must be equal"
+        )
+    available_total = (
+        total_value if total_value is not None else remaining_value
+    )
+    assert available_total is not None
+
+    remaining_fuzz: int | None = None
+    if "remaining_fuzz_seconds" in budget_snapshot:
+        raw_fuzz = budget_snapshot["remaining_fuzz_seconds"]
+        if type(raw_fuzz) is not int or raw_fuzz < 0:
+            raise StateError(
+                "budget_snapshot.remaining_fuzz_seconds must be a "
+                "non-negative integer"
+            )
+        remaining_fuzz = raw_fuzz
+
+    max_total: int | None = None
+    if "max_total_seconds" in budget_snapshot:
+        raw_max_total = budget_snapshot["max_total_seconds"]
+        if type(raw_max_total) is not int or raw_max_total < 1:
+            raise StateError(
+                "budget_snapshot.max_total_seconds must be a positive integer"
+            )
+        max_total = raw_max_total
+
+    max_fuzz: int | None = None
+    if "max_fuzz_seconds" in budget_snapshot:
+        raw_max_fuzz = budget_snapshot["max_fuzz_seconds"]
+        if type(raw_max_fuzz) is not int or raw_max_fuzz < 0:
+            raise StateError(
+                "budget_snapshot.max_fuzz_seconds must be a non-negative "
+                "integer"
+            )
+        max_fuzz = raw_max_fuzz
+
+    if max_total is not None and max_fuzz is not None and max_fuzz > max_total:
+        raise StateError(
+            "budget_snapshot.max_fuzz_seconds must not exceed "
+            "max_total_seconds"
+        )
+    if (
+        max_total is not None
+        and expected_max_total_seconds is not None
+        and max_total != expected_max_total_seconds
+    ):
+        raise StateError(
+            "budget_snapshot.max_total_seconds must match envelope "
+            "max_total_seconds"
+        )
+    if (
+        max_fuzz is not None
+        and expected_max_fuzz_seconds is not None
+        and max_fuzz != expected_max_fuzz_seconds
+    ):
+        raise StateError(
+            "budget_snapshot.max_fuzz_seconds must match envelope "
+            "max_fuzz_seconds"
+        )
+
+    spent_total: int | None = None
+    if "spent_seconds" in budget_snapshot:
+        raw_spent_total = budget_snapshot["spent_seconds"]
+        if type(raw_spent_total) is not int or raw_spent_total < 0:
+            raise StateError(
+                "budget_snapshot.spent_seconds must be a non-negative integer"
+            )
+        spent_total = raw_spent_total
+
+    spent_fuzz: int | None = None
+    if "spent_fuzz_seconds" in budget_snapshot:
+        raw_spent_fuzz = budget_snapshot["spent_fuzz_seconds"]
+        if type(raw_spent_fuzz) is not int or raw_spent_fuzz < 0:
+            raise StateError(
+                "budget_snapshot.spent_fuzz_seconds must be a non-negative "
+                "integer"
+            )
+        spent_fuzz = raw_spent_fuzz
+
+    if (
+        spent_total is not None
+        and spent_fuzz is not None
+        and spent_fuzz > spent_total
+    ):
+        raise StateError(
+            "budget_snapshot.spent_fuzz_seconds must not exceed spent_seconds"
+        )
+
+    # Reconcile spent/remaining against the snapshot's own caps, or against
+    # the authoritative caps supplied by the caller when the snapshot omits
+    # max_* fields; omitting a cap must not bypass the spent + remaining check.
+    effective_max_total = (
+        max_total if max_total is not None else expected_max_total_seconds
+    )
+    effective_max_fuzz = (
+        max_fuzz if max_fuzz is not None else expected_max_fuzz_seconds
+    )
+
+    if effective_max_total is not None:
+        if available_total > effective_max_total:
+            raise StateError(
+                "budget_snapshot remaining total must not exceed "
+                "max_total_seconds"
+            )
+        if (
+            spent_total is not None
+            and spent_total + available_total != effective_max_total
+        ):
+            raise StateError(
+                "budget_snapshot spent_seconds + remaining total must equal "
+                "max_total_seconds"
+            )
+
+    if effective_max_fuzz is not None:
+        if remaining_fuzz is not None:
+            if remaining_fuzz > effective_max_fuzz:
+                raise StateError(
+                    "budget_snapshot.remaining_fuzz_seconds must not exceed "
+                    "max_fuzz_seconds"
+                )
+            if (
+                spent_fuzz is not None
+                and spent_fuzz + remaining_fuzz != effective_max_fuzz
+            ):
+                raise StateError(
+                    "budget_snapshot spent_fuzz_seconds + "
+                    "remaining_fuzz_seconds must equal max_fuzz_seconds"
+                )
+        elif spent_fuzz is not None and spent_fuzz > effective_max_fuzz:
+            raise StateError(
+                "budget_snapshot.spent_fuzz_seconds must not exceed "
+                "max_fuzz_seconds"
+            )
+
+    if "family_id" in budget_snapshot:
+        raw_family_id = budget_snapshot["family_id"]
+        if not isinstance(raw_family_id, str):
+            raise StateError("budget_snapshot.family_id must be a UUID string")
+        try:
+            parsed_family_id = uuid.UUID(raw_family_id)
+        except ValueError as error:
+            raise StateError(
+                "budget_snapshot.family_id must be a valid UUID string"
+            ) from error
+        if expected_family_id is not None:
+            expected_uuid = (
+                expected_family_id
+                if isinstance(expected_family_id, UUID)
+                else uuid.UUID(str(expected_family_id))
+            )
+            if parsed_family_id != expected_uuid:
+                raise StateError(
+                    "budget_snapshot.family_id does not match the target family"
+                )
+
+    if "updated_at" in budget_snapshot:
+        try:
+            jsonutil.require_rfc3339(
+                budget_snapshot["updated_at"], "budget_snapshot.updated_at"
+            )
+        except ValueError as error:
+            raise StateError(str(error)) from error
+
+    return available_total, remaining_fuzz
+
+
+def policy_admit_round(
+    *,
+    store: Any = None,
+    clock: Any,
+    job_id: UUID | str,
+    parent_job_id: UUID | str,
+    envelope: Mapping[str, Any],
+    parent_approval_digest: str | None,
+    approval_chain_tail_digest: str | None,
+    seed_digest: str,
+    round_no: int,
+    budget_snapshot: Mapping[str, Any],
+    experiment: Mapping[str, Any] | None = None,
+    recomputable: bool = True,
+    campaign_bundle_digest: str | None = None,
+    admission_id: UUID | str | None = None,
+    existing_rounds: Any = (),
+    approved_envelope_digest: str | None = None,
+    plan_parent_approval_digest: Any = _ADMISSION_BINDING_UNSET,
+    plan_envelope_digest: Any = _ADMISSION_BINDING_UNSET,
+    plan_seed_digest: Any = _ADMISSION_BINDING_UNSET,
+    plan_experiment_digest: Any = _ADMISSION_BINDING_UNSET,
+    plan_harness_digest: Any = _ADMISSION_BINDING_UNSET,
+    plan_asan_signature: Any = _ADMISSION_BINDING_UNSET,
+    ledger_remaining_total_seconds: int | None = None,
+) -> AdmissionOutcome:
+    """Decide one policy round and emit exactly one admission audit event.
+
+    The predicate is pure and deterministic: the envelope, parent approval,
+    seed, round, budget snapshot and injected clock are its only inputs. It
+    never reads or writes ``reviews`` / ``family_approvals``. When ``store`` is
+    supplied, an admitted round writes one ``admissions`` row
+    (``approval_kind='policy'``) and appends ``round_admitted``; a denied
+    round writes no admission row and appends ``round_admission_denied``.
+    Round capacity is checked here rather than delegated to the
+    ``UNIQUE(parent_job_id, round_no)`` backstop. Optional binding inputs let
+    callers pass the persisted approval/plan envelope digests; when supplied,
+    the predicate denies an envelope that is not the approved one or not the
+    frozen plan's one. A supplied ``plan_harness_digest`` must equal the
+    envelope's frozen harness digest; a mismatch is rejected as
+    ``HARNESS_REJECTED`` only after the approval/envelope binding checks.
+    Omitting the binding inputs keeps the historical predicate behavior.
+    """
+    if not isinstance(envelope, Mapping):
+        raise StateError("envelope must be a JSON object")
+    try:
+        normalized_envelope = contracts.normalize_envelope(envelope)
+    except ValueError as error:
+        raise StateError(f"envelope is invalid: {error}") from error
+    try:
+        envelope_digest = contracts.envelope_digest(normalized_envelope)
+    except ValueError as error:
+        raise StateError(f"envelope is invalid: {error}") from error
+
+    try:
+        job_id = str(uuid.UUID(str(job_id)))
+        parent_job_id = str(uuid.UUID(str(parent_job_id)))
+    except (TypeError, ValueError) as error:
+        raise StateError("admission job ids must be UUIDs") from error
+    if admission_id is None:
+        admission_id = uuid.uuid4()
+    else:
+        try:
+            admission_id = uuid.UUID(str(admission_id))
+        except (TypeError, ValueError) as error:
+            raise StateError("admission_id must be a UUID") from error
+
+    try:
+        seed_digest = jsonutil.require_digest(seed_digest, "seed_digest")
+    except ValueError as error:
+        raise StateError(str(error)) from error
+    if parent_approval_digest is not None:
+        try:
+            parent_approval_digest = jsonutil.require_digest(
+                parent_approval_digest, "parent_approval_digest"
+            )
+        except ValueError as error:
+            raise StateError(str(error)) from error
+    if approval_chain_tail_digest is not None:
+        try:
+            approval_chain_tail_digest = jsonutil.require_digest(
+                approval_chain_tail_digest, "approval_chain_tail_digest"
+            )
+        except ValueError as error:
+            raise StateError(str(error)) from error
+    if approved_envelope_digest is not None:
+        try:
+            approved_envelope_digest = jsonutil.require_digest(
+                approved_envelope_digest, "approved_envelope_digest"
+            )
+        except ValueError as error:
+            raise StateError(str(error)) from error
+    plan_parent_approval_checked = (
+        plan_parent_approval_digest is not _ADMISSION_BINDING_UNSET
+    )
+    if plan_parent_approval_checked and plan_parent_approval_digest is not None:
+        try:
+            plan_parent_approval_digest = jsonutil.require_digest(
+                plan_parent_approval_digest, "plan_parent_approval_digest"
+            )
+        except ValueError as error:
+            raise StateError(str(error)) from error
+    plan_envelope_checked = plan_envelope_digest is not _ADMISSION_BINDING_UNSET
+    if plan_envelope_checked and plan_envelope_digest is not None:
+        try:
+            plan_envelope_digest = jsonutil.require_digest(
+                plan_envelope_digest, "plan_envelope_digest"
+            )
+        except ValueError as error:
+            raise StateError(str(error)) from error
+    plan_seed_checked = plan_seed_digest is not _ADMISSION_BINDING_UNSET
+    if plan_seed_checked and plan_seed_digest is not None:
+        try:
+            plan_seed_digest = jsonutil.require_digest(
+                plan_seed_digest, "plan_seed_digest"
+            )
+        except ValueError as error:
+            raise StateError(str(error)) from error
+    plan_experiment_checked = (
+        plan_experiment_digest is not _ADMISSION_BINDING_UNSET
+    )
+    if plan_experiment_checked and plan_experiment_digest is not None:
+        try:
+            plan_experiment_digest = jsonutil.require_digest(
+                plan_experiment_digest, "plan_experiment_digest"
+            )
+        except ValueError as error:
+            raise StateError(str(error)) from error
+    plan_harness_checked = (
+        plan_harness_digest is not _ADMISSION_BINDING_UNSET
+    )
+    if plan_harness_checked:
+        try:
+            plan_harness_digest = jsonutil.require_digest(
+                plan_harness_digest, "plan_harness_digest"
+            )
+        except ValueError as error:
+            raise StateError(str(error)) from error
+    plan_asan_signature_checked = (
+        plan_asan_signature is not _ADMISSION_BINDING_UNSET
+    )
+    if plan_asan_signature_checked:
+        try:
+            plan_asan_signature = contracts.normalize_asan_signature(
+                plan_asan_signature
+            )
+        except ValueError as error:
+            raise StateError(
+                f"plan_asan_signature is invalid: {error}"
+            ) from error
+    if store is not None:
+        # A store-backed decision persists an admission, so it must carry the
+        # full frozen-plan/approval binding. Optional kwargs are only safe for
+        # the pure offline recomputation path; a future caller must not be able
+        # to silently drop the approval-chain or plan checks.
+        missing_bindings = []
+        if approved_envelope_digest is None:
+            missing_bindings.append("approved_envelope_digest")
+        for name, value in (
+            ("plan_parent_approval_digest", plan_parent_approval_digest),
+            ("plan_envelope_digest", plan_envelope_digest),
+            ("plan_seed_digest", plan_seed_digest),
+            ("plan_experiment_digest", plan_experiment_digest),
+            ("plan_harness_digest", plan_harness_digest),
+            ("plan_asan_signature", plan_asan_signature),
+        ):
+            if value is _ADMISSION_BINDING_UNSET:
+                missing_bindings.append(name)
+        if missing_bindings:
+            raise StateError(
+                "store-backed admission requires explicit bindings: "
+                + ", ".join(missing_bindings)
+            )
+    if campaign_bundle_digest is not None:
+        try:
+            campaign_bundle_digest = jsonutil.require_digest(
+                campaign_bundle_digest, "campaign_bundle_digest"
+            )
+        except ValueError as error:
+            raise StateError(str(error)) from error
+
+    experiment_digest: str | None = None
+    experiment_expected_signature: dict[str, Any] | None = None
+    experiment_signature_error: str | None = None
+    if experiment is not None:
+        if not isinstance(experiment, Mapping):
+            raise StateError("experiment must be a JSON object")
+        try:
+            experiment_digest = jsonutil.digest_json(dict(experiment))
+        except (TypeError, ValueError) as error:
+            raise StateError(
+                f"experiment must be canonical JSON: {error}"
+            ) from error
+        if "expected_signature" not in experiment:
+            experiment_signature_error = (
+                "ExperimentSpec is missing required field(s): expected_signature"
+            )
+        else:
+            try:
+                experiment_expected_signature = (
+                    contracts.normalize_asan_signature(
+                        experiment["expected_signature"]
+                    )
+                )
+            except ValueError as error:
+                experiment_signature_error = str(error)
+
+    if not callable(clock):
+        raise StateError("clock must be callable")
+    try:
+        decided_at_text = jsonutil.timestamp(clock())
+    except ValueError as error:
+        raise StateError(str(error)) from error
+
+    if not isinstance(budget_snapshot, Mapping):
+        raise StateError("budget_snapshot must be a JSON object")
+    try:
+        budget_snapshot = dict(budget_snapshot)
+        budget_snapshot_digest = jsonutil.digest_json(budget_snapshot)
+    except (TypeError, ValueError) as error:
+        raise StateError(
+            f"budget_snapshot must be canonical JSON: {error}"
+        ) from error
+    if not budget_snapshot:
+        raise StateError("budget_snapshot must not be empty")
+    # Structural/self-consistency/family binding first. The caller's envelope
+    # caps are not yet trusted: an unapproved envelope that changed max_* must
+    # surface as a recorded ADMISSION_DENIED, not as a StateError that drops
+    # the round_admission_denied audit event.
+    snapshot_remaining_total, snapshot_remaining_fuzz = (
+        _validate_budget_snapshot(
+            budget_snapshot,
+            expected_family_id=parent_job_id,
+        )
+    )
+    envelope_is_bound = (
+        approved_envelope_digest is None
+        or approved_envelope_digest == envelope_digest
+    ) and (
+        not plan_envelope_checked or plan_envelope_digest == envelope_digest
+    )
+    if envelope_is_bound:
+        if snapshot_remaining_total > normalized_envelope["max_total_seconds"]:
+            raise StateError(
+                "budget_snapshot remaining total exceeds envelope "
+                "max_total_seconds"
+            )
+        if (
+            snapshot_remaining_fuzz is not None
+            and snapshot_remaining_fuzz
+            > normalized_envelope["max_fuzz_seconds"]
+        ):
+            raise StateError(
+                "budget_snapshot remaining fuzz exceeds envelope "
+                "max_fuzz_seconds"
+            )
+        _validate_budget_snapshot(
+            budget_snapshot,
+            expected_family_id=parent_job_id,
+            expected_max_total_seconds=normalized_envelope["max_total_seconds"],
+            expected_max_fuzz_seconds=normalized_envelope["max_fuzz_seconds"],
+        )
+    if ledger_remaining_total_seconds is not None:
+        if (
+            type(ledger_remaining_total_seconds) is not int
+            or ledger_remaining_total_seconds < 0
+        ):
+            raise StateError(
+                "ledger_remaining_total_seconds must be a non-negative integer"
+            )
+        available_total = min(
+            snapshot_remaining_total, ledger_remaining_total_seconds
+        )
+    else:
+        available_total = snapshot_remaining_total
+
+    if type(recomputable) is not bool:
+        raise StateError("recomputable must be a boolean")
+    if isinstance(existing_rounds, (str, bytes, Mapping)):
+        raise StateError(
+            "existing_rounds must be a collection of positive integers"
+        )
+    try:
+        existing_rounds_tuple = tuple(existing_rounds)
+    except TypeError as error:
+        raise StateError(
+            "existing_rounds must be a collection of positive integers"
+        ) from error
+    for item in existing_rounds_tuple:
+        if type(item) is not int or item < 1:
+            raise StateError(
+                "existing_rounds items must be positive integers"
+            )
+    admitted_rounds = set(existing_rounds_tuple)
+
+    predicate_version = normalized_envelope["admission_predicate_version"]
+    reason_code: str | None = None
+    sub_reason: str | None = None
+    supporting_bundle_digest: str | None = None
+
+    if normalized_envelope["mode"] == "fixed":
+        reason_code = "ENVELOPE_VIOLATION"
+        sub_reason = "FIXED_ENVELOPE_HAS_NO_POLICY_ADMISSION"
+    elif parent_approval_digest is None:
+        reason_code = "ADMISSION_DENIED"
+        sub_reason = "PARENT_APPROVAL_MISSING"
+    elif (
+        approval_chain_tail_digest is None
+        or parent_approval_digest != approval_chain_tail_digest
+    ):
+        reason_code = "ADMISSION_DENIED"
+        sub_reason = "PARENT_APPROVAL_NOT_CHAIN_TAIL"
+    elif plan_parent_approval_checked and plan_parent_approval_digest is None:
+        reason_code = "ADMISSION_DENIED"
+        sub_reason = "PLAN_PARENT_APPROVAL_MISSING"
+    elif (
+        plan_parent_approval_checked
+        and plan_parent_approval_digest != approval_chain_tail_digest
+    ):
+        reason_code = "ADMISSION_DENIED"
+        sub_reason = "PARENT_APPROVAL_NOT_CHAIN_TAIL"
+    elif (
+        approved_envelope_digest is not None
+        and approved_envelope_digest != envelope_digest
+    ):
+        reason_code = "ADMISSION_DENIED"
+        sub_reason = "PARENT_APPROVAL_ENVELOPE_MISMATCH"
+    elif (
+        plan_envelope_checked and plan_envelope_digest != envelope_digest
+    ):
+        reason_code = "ADMISSION_DENIED"
+        sub_reason = "PLAN_ENVELOPE_MISMATCH"
+    elif (
+        plan_harness_checked
+        and plan_harness_digest != normalized_envelope["harness_digest"]
+    ):
+        reason_code = "HARNESS_REJECTED"
+        sub_reason = "PLAN_HARNESS_MISMATCH"
+    elif plan_asan_signature_checked and experiment_signature_error is not None:
+        reason_code = "ENVELOPE_VIOLATION"
+        sub_reason = experiment_signature_error
+    elif (
+        plan_asan_signature_checked
+        and plan_asan_signature
+        not in normalized_envelope["accepted_signature_set"]
+    ):
+        # The plan's asan_signature is what execution/reporting uses. It must
+        # be one of the signatures the operator actually accepted, not merely
+        # match the experiment the planner derived.
+        reason_code = "ENVELOPE_VIOLATION"
+        sub_reason = "PLAN_SIGNATURE_NOT_ACCEPTED"
+    elif (
+        plan_asan_signature_checked
+        and experiment is not None
+        and plan_asan_signature != experiment_expected_signature
+    ):
+        reason_code = "ADMISSION_DENIED"
+        sub_reason = "PLAN_SIGNATURE_MISMATCH"
+    elif plan_seed_checked and plan_seed_digest != seed_digest:
+        reason_code = "ADMISSION_DENIED"
+        sub_reason = "PLAN_SEED_MISMATCH"
+    elif (
+        plan_experiment_checked
+        and plan_experiment_digest != experiment_digest
+    ):
+        reason_code = "ADMISSION_DENIED"
+        sub_reason = "PLAN_EXPERIMENT_MISMATCH"
+    elif predicate_version not in SUPPORTED_ADMISSION_PREDICATE_VERSIONS:
+        reason_code = "ADMISSION_DENIED"
+        sub_reason = "UNSUPPORTED_PREDICATE_VERSION"
+    elif type(round_no) is not int or round_no < 1:
+        reason_code = "ADMISSION_DENIED"
+        sub_reason = "INVALID_ROUND_NO"
+    elif round_no > normalized_envelope["max_rounds"]:
+        reason_code = BUDGET_EXHAUSTED
+        sub_reason = "ROUND_BEYOND_MAX_ROUNDS"
+    elif round_no in admitted_rounds:
+        reason_code = "ADMISSION_DENIED"
+        sub_reason = "ROUND_ALREADY_ADMITTED"
+    elif available_total < 1:
+        reason_code = BUDGET_EXHAUSTED
+        sub_reason = BUDGET_EXHAUSTED
+    elif not recomputable and campaign_bundle_digest is None:
+        reason_code = "ADMISSION_DENIED"
+        sub_reason = "SUPPORTING_BUNDLE_MISSING"
+    elif (
+        plan_asan_signature_checked
+        and experiment is None
+        and (not plan_experiment_checked or plan_experiment_digest is None)
+        and recomputable
+    ):
+        # Without an ExperimentSpec the only admissible explanation is a
+        # non-recomputable decision backed by the campaign bundle (checked
+        # above). A recomputable round cannot omit both bindings.
+        reason_code = "ADMISSION_DENIED"
+        sub_reason = "EXPERIMENT_OR_BUNDLE_REQUIRED"
+    else:
+        if experiment is not None:
+            try:
+                contracts.check_experiment_against_envelope(
+                    experiment, normalized_envelope
+                )
+            except contracts.EnvelopeViolation as error:
+                reason_code = "ENVELOPE_VIOLATION"
+                sub_reason = str(error)
+
+    if reason_code is None and not recomputable:
+        supporting_bundle_digest = campaign_bundle_digest
+
+    detail: dict[str, Any] = {
+        "job_id": job_id,
+        "parent_job_id": parent_job_id,
+        "round_no": round_no,
+        "approval_kind": "policy",
+        "envelope_digest": envelope_digest,
+        "parent_approval_digest": parent_approval_digest,
+        "seed_digest": seed_digest,
+        "predicate_version": predicate_version,
+        "recomputable": recomputable,
+        "supporting_bundle_digest": supporting_bundle_digest,
+        "budget_snapshot_digest": budget_snapshot_digest,
+        "experiment_digest": experiment_digest,
+    }
+    if sub_reason == "PARENT_APPROVAL_ENVELOPE_MISMATCH":
+        detail["expected_envelope_digest"] = approved_envelope_digest
+        detail["actual_envelope_digest"] = envelope_digest
+    elif sub_reason == "PLAN_ENVELOPE_MISMATCH":
+        detail["expected_envelope_digest"] = plan_envelope_digest
+        detail["actual_envelope_digest"] = envelope_digest
+    elif sub_reason == "PLAN_HARNESS_MISMATCH":
+        detail["expected_harness_digest"] = normalized_envelope["harness_digest"]
+        detail["actual_harness_digest"] = plan_harness_digest
+    elif sub_reason == "PLAN_SIGNATURE_NOT_ACCEPTED":
+        detail["accepted_signature_set"] = normalized_envelope[
+            "accepted_signature_set"
+        ]
+        detail["actual_asan_signature"] = plan_asan_signature
+    elif sub_reason == "PLAN_SIGNATURE_MISMATCH":
+        detail["expected_asan_signature"] = experiment_expected_signature
+        detail["actual_asan_signature"] = plan_asan_signature
+    elif sub_reason == "EXPERIMENT_OR_BUNDLE_REQUIRED":
+        detail["recomputable"] = recomputable
+        detail["supporting_bundle_digest"] = campaign_bundle_digest
+    elif sub_reason == "PLAN_SEED_MISMATCH":
+        detail["expected_seed_digest"] = plan_seed_digest
+        detail["actual_seed_digest"] = seed_digest
+    elif sub_reason == "PLAN_EXPERIMENT_MISMATCH":
+        detail["expected_experiment_digest"] = plan_experiment_digest
+        detail["actual_experiment_digest"] = experiment_digest
+    elif (
+        sub_reason == "PARENT_APPROVAL_NOT_CHAIN_TAIL"
+        and plan_parent_approval_checked
+        and plan_parent_approval_digest is not None
+    ):
+        detail["expected_parent_approval_digest"] = approval_chain_tail_digest
+        detail["actual_parent_approval_digest"] = plan_parent_approval_digest
+
+    admission: dict[str, Any] | None
+    if reason_code is None:
+        admission = {
+            "admission_id": str(admission_id),
+            "job_id": job_id,
+            "parent_job_id": parent_job_id,
+            "round_no": round_no,
+            "approval_kind": "policy",
+            "envelope_digest": envelope_digest,
+            "parent_approval_digest": parent_approval_digest,
+            "seed_digest": seed_digest,
+            "predicate_version": predicate_version,
+            "recomputable": recomputable,
+            "supporting_bundle_digest": supporting_bundle_digest,
+            "decided_at": decided_at_text,
+        }
+        event_type = "round_admitted"
+    else:
+        admission = None
+        event_type = "round_admission_denied"
+        detail["reason_code"] = reason_code
+        detail["sub_reason"] = sub_reason
+
+    event = {
+        "event_type": event_type,
+        "job_id": job_id,
+        "stage": "admission",
+        "reason_code": reason_code,
+        "detail": detail,
+    }
+
+    if store is not None:
+        if admission is not None:
+            store.record_admission(admission)
+        store.append_event(event)
+
+    return AdmissionOutcome(
+        admitted=admission is not None,
+        reason_code=reason_code,
+        admission=admission,
+        event_type=event_type,
+        event_detail=detail,
+        status="admitted" if admission is not None else "denied",
+        sub_reason=sub_reason,
+    )
+
+
+def _family_approval_chain_tail(
+    connection, family_id: UUID
+) -> tuple[str, str] | None:
+    """Return the unique chain-tail approval digest and its envelope digest."""
+    rows = connection.execute(
+        "SELECT prior.approval_digest, prior.envelope_digest "
+        "FROM family_approvals AS prior "
+        "WHERE prior.family_id = %s AND NOT EXISTS ("
+        "SELECT 1 FROM family_approvals AS later "
+        "WHERE later.supersedes = prior.approval_id)",
+        (family_id,),
+    ).fetchall()
+    if not rows:
+        return None
+    if len(rows) > 1:
+        raise StateError("family has multiple family_approvals chain tails")
+    return rows[0]["approval_digest"], rows[0]["envelope_digest"]
+
+
+def _admission_record(row: Mapping[str, Any]) -> dict[str, Any]:
+    """Render an ``admissions`` row exactly like the predicate's admission."""
+    return {
+        "admission_id": str(row["admission_id"]),
+        "job_id": str(row["job_id"]),
+        "parent_job_id": str(row["parent_job_id"]),
+        "round_no": row["round_no"],
+        "approval_kind": row["approval_kind"],
+        "envelope_digest": row["envelope_digest"],
+        "parent_approval_digest": row["parent_approval_digest"],
+        "seed_digest": row["seed_digest"],
+        "predicate_version": row["predicate_version"],
+        "recomputable": row["recomputable"],
+        "supporting_bundle_digest": row["supporting_bundle_digest"],
+        "decided_at": jsonutil.timestamp(row["decided_at"]),
+    }
+
+
+def _admitted_audit_detail(
+    connection, job_id: UUID | str, round_no: int
+) -> dict[str, Any] | None:
+    """Read the round_admitted detail that carries the budget snapshot digest.
+
+    ``admissions`` has no budget_snapshot_digest column and step 1.5 must not
+    add one. The round_admitted event is written in the same transaction as the
+    admission row, so it is the persisted half of the idempotency comparison.
+    """
+    row = connection.execute(
+        "SELECT detail FROM audit_events WHERE job_id = %s "
+        "AND event_type = 'round_admitted' "
+        "AND detail->>'round_no' = %s ORDER BY event_id DESC LIMIT 1",
+        (job_id, str(round_no)),
+    ).fetchone()
+    return dict(row["detail"]) if row is not None and row["detail"] else None
+
+
+def record_admission(
+    dsn: str,
+    *,
+    family_id: UUID | str,
+    job_id: UUID | str,
+    round_no: int,
+    envelope: Mapping[str, Any],
+    seed_digest: str,
+    budget_snapshot: Mapping[str, Any],
+    experiment: Mapping[str, Any] | None = None,
+    recomputable: bool = True,
+    campaign_bundle_digest: str | None = None,
+) -> AdmissionOutcome:
+    """Persist one policy-admission decision with a three-path outcome.
+
+    ``admitted`` writes one ``admissions`` row and one ``round_admitted`` event;
+    a predicate denial writes only ``round_admission_denied``; re-entering the
+    same decision inputs for the same ``(parent_job_id, round_no)`` is an
+    ``already_admitted`` no-op that returns the persisted admission. A different
+    decision for that round is a real ``ADMISSION_DENIED`` whose audit detail
+    carries ``sub_reason=ROUND_ALREADY_ADMITTED``. The comparison includes the
+    budget snapshot digest read from the existing round_admitted detail. The
+    frozen plan's ``harness_digest`` is mandatory and must match the approved
+    envelope; a tampered value is a ``HARNESS_REJECTED`` denial, never an
+    ``already_admitted`` no-op.
+    """
+    if not isinstance(envelope, Mapping):
+        raise StateError("envelope must be a JSON object")
+    try:
+        normalized_envelope = contracts.normalize_envelope(envelope)
+        envelope_digest = contracts.envelope_digest(normalized_envelope)
+        family_id = uuid.UUID(str(family_id))
+        job_id = uuid.UUID(str(job_id))
+        seed_digest = jsonutil.require_digest(seed_digest, "seed_digest")
+    except (TypeError, ValueError) as error:
+        raise StateError(str(error)) from error
+    if type(round_no) is not int or round_no < 1:
+        raise StateError("round_no must be a positive integer")
+    if type(recomputable) is not bool:
+        raise StateError("recomputable must be a boolean")
+    if campaign_bundle_digest is not None:
+        try:
+            campaign_bundle_digest = jsonutil.require_digest(
+                campaign_bundle_digest, "campaign_bundle_digest"
+            )
+        except ValueError as error:
+            raise StateError(str(error)) from error
+    experiment_digest: str | None = None
+    if experiment is not None:
+        if not isinstance(experiment, Mapping):
+            raise StateError("experiment must be a JSON object")
+        try:
+            experiment_digest = jsonutil.digest_json(dict(experiment))
+        except (TypeError, ValueError) as error:
+            raise StateError(
+                f"experiment must be canonical JSON: {error}"
+            ) from error
+    if not isinstance(budget_snapshot, Mapping):
+        raise StateError("budget_snapshot must be a JSON object")
+    try:
+        budget_snapshot = dict(budget_snapshot)
+        budget_snapshot_digest = jsonutil.digest_json(budget_snapshot)
+    except (TypeError, ValueError) as error:
+        raise StateError(
+            f"budget_snapshot must be canonical JSON: {error}"
+        ) from error
+    if not budget_snapshot:
+        raise StateError("budget_snapshot must not be empty")
+    # Outside the transaction only validate structure, self-consistency and the
+    # family binding: the caller's envelope caps are unverified until the
+    # approval chain is read, so they must not reject a genuine ledger snapshot
+    # before an unapproved envelope can be denied and audited.
+    snapshot_remaining_total, snapshot_remaining_fuzz = (
+        _validate_budget_snapshot(
+            budget_snapshot,
+            expected_family_id=family_id,
+        )
+    )
+
+    supporting_bundle_digest = (
+        None if recomputable else campaign_bundle_digest
+    )
+    predicate_version = normalized_envelope["admission_predicate_version"]
+
+    with _connect(dsn) as connection:
+        with connection.transaction():
+            family = connection.execute(
+                "SELECT job_id, job_kind, job_contract_version, state "
+                "FROM jobs WHERE job_id = %s FOR UPDATE",
+                (family_id,),
+            ).fetchone()
+            if family is None:
+                raise StateError("admission family does not exist")
+            if (
+                family["job_contract_version"] != 2
+                or family["job_kind"] != "family"
+            ):
+                raise StateError("admission target is not a v2 family")
+            round_job = connection.execute(
+                "SELECT job_id, job_kind, job_contract_version, family_id, "
+                "parent_job_id, round_no, state FROM jobs WHERE job_id = %s "
+                "FOR UPDATE",
+                (job_id,),
+            ).fetchone()
+            if round_job is None:
+                raise StateError("admission round job does not exist")
+            if (
+                round_job["job_contract_version"] != 2
+                or round_job["job_kind"] != "round"
+            ):
+                raise StateError(
+                    "admission job_id must reference a v2 round child"
+                )
+            if (
+                round_job["family_id"] != family_id
+                or round_job["parent_job_id"] != family_id
+            ):
+                raise StateError(
+                    "admission job_id does not belong to family_id"
+                )
+            if round_job["round_no"] != round_no:
+                raise StateError(
+                    "admission round_no does not match the round job"
+                )
+            approval_tail_row = _family_approval_chain_tail(
+                connection, family_id
+            )
+            if approval_tail_row is None:
+                approval_tail = None
+                approved_envelope_digest = None
+            else:
+                approval_tail, approved_envelope_digest = approval_tail_row
+            plan_row = connection.execute(
+                "SELECT plan FROM plans WHERE job_id = %s "
+                "ORDER BY created_at DESC, plan_id DESC LIMIT 1",
+                (job_id,),
+            ).fetchone()
+            if plan_row is None:
+                raise StateError(
+                    "admission requires a frozen plan for the round job"
+                )
+            plan_body = plan_row["plan"]
+            if not isinstance(plan_body, Mapping):
+                raise StateError("admission plan must be a JSON object")
+            if (
+                "family_id" not in plan_body
+                or not isinstance(plan_body["family_id"], str)
+                or plan_body["family_id"] != str(family_id)
+            ):
+                raise StateError(
+                    "admission plan family_id must match family_id"
+                )
+            if (
+                "parent_job_id" not in plan_body
+                or not isinstance(plan_body["parent_job_id"], str)
+                or plan_body["parent_job_id"] != str(family_id)
+            ):
+                raise StateError(
+                    "admission plan parent_job_id must match family_id"
+                )
+            if (
+                "round_no" not in plan_body
+                or type(plan_body["round_no"]) is not int
+                or plan_body["round_no"] != round_no
+            ):
+                raise StateError(
+                    "admission plan round_no must match round_no"
+                )
+            if "envelope_digest" not in plan_body:
+                raise StateError("admission plan requires envelope_digest")
+            try:
+                plan_envelope_digest = jsonutil.require_digest(
+                    plan_body["envelope_digest"], "plan.envelope_digest"
+                )
+            except ValueError as error:
+                raise StateError(str(error)) from error
+            if "parent_approval_digest" not in plan_body:
+                raise StateError(
+                    "admission plan requires parent_approval_digest"
+                )
+            raw_plan_parent_approval = plan_body["parent_approval_digest"]
+            if raw_plan_parent_approval is None:
+                plan_parent_approval_digest: str | None = None
+            else:
+                try:
+                    plan_parent_approval_digest = jsonutil.require_digest(
+                        raw_plan_parent_approval,
+                        "plan.parent_approval_digest",
+                    )
+                except ValueError as error:
+                    raise StateError(str(error)) from error
+            plan_inputs = plan_body.get("inputs")
+            if (
+                not isinstance(plan_inputs, Mapping)
+                or "candidate" not in plan_inputs
+            ):
+                raise StateError("admission plan requires inputs.candidate")
+            try:
+                plan_seed_digest = jsonutil.require_digest(
+                    plan_inputs["candidate"], "plan.inputs.candidate"
+                )
+            except ValueError as error:
+                raise StateError(str(error)) from error
+            if "experiment_digest" not in plan_body:
+                raise StateError("admission plan requires experiment_digest")
+            raw_plan_experiment = plan_body["experiment_digest"]
+            if raw_plan_experiment is None:
+                plan_experiment_digest: str | None = None
+            else:
+                try:
+                    plan_experiment_digest = jsonutil.require_digest(
+                        raw_plan_experiment, "plan.experiment_digest"
+                    )
+                except ValueError as error:
+                    raise StateError(str(error)) from error
+            try:
+                plan_harness_digest = jsonutil.require_digest(
+                    plan_body["harness_digest"], "plan.harness_digest"
+                )
+            except (KeyError, ValueError) as error:
+                raise StateError(
+                    "admission plan requires harness_digest"
+                ) from error
+            try:
+                plan_asan_signature = contracts.normalize_asan_signature(
+                    plan_body["asan_signature"]
+                )
+            except (KeyError, ValueError) as error:
+                raise StateError(
+                    "admission plan requires a valid asan_signature"
+                ) from error
+            plan_signature_in_envelope = (
+                plan_asan_signature
+                in normalized_envelope["accepted_signature_set"]
+            )
+            plan_signature_matches_experiment = True
+            experiment_signature_valid = True
+            experiment_expected_signature = None
+            if experiment is not None:
+                try:
+                    experiment_expected_signature = (
+                        contracts.normalize_asan_signature(
+                            experiment["expected_signature"]
+                        )
+                    )
+                except (KeyError, ValueError):
+                    plan_signature_matches_experiment = False
+                    experiment_signature_valid = False
+                else:
+                    plan_signature_matches_experiment = (
+                        plan_asan_signature == experiment_expected_signature
+                    )
+            existing = connection.execute(
+                "SELECT admission_id, job_id, parent_job_id, round_no, "
+                "approval_kind, envelope_digest, parent_approval_digest, "
+                "seed_digest, predicate_version, recomputable, "
+                "supporting_bundle_digest, decided_at FROM admissions "
+                "WHERE parent_job_id = %s AND round_no = %s FOR UPDATE",
+                (family_id, round_no),
+            ).fetchone()
+
+            if existing is not None:
+                existing_detail = _admitted_audit_detail(
+                    connection, existing["job_id"], round_no
+                ) or {}
+                # Only apply the caller's envelope caps when the envelope
+                # matches both the persisted admission and frozen plan; an
+                # unbound conflicting envelope with modified max_* caps must
+                # fall through to a persisted ADMISSION_DENIED rather than
+                # raising StateError against a genuine ledger snapshot.
+                # A changed-envelope re-approval re-bases budget_ledger to the
+                # new caps, so the recorded snapshot digest is the only safe
+                # signal that the old envelope may validate this snapshot's
+                # max_* fields. On a digest mismatch the old envelope caps must
+                # not turn that genuine different-inputs conflict into a
+                # StateError; it is audited as
+                # ADMISSION_DENIED/ROUND_ALREADY_ADMITTED instead.
+                envelope_is_bound = (
+                    existing["envelope_digest"] == envelope_digest
+                    and plan_envelope_digest == envelope_digest
+                )
+                snapshot_matches_admission = (
+                    existing_detail.get("budget_snapshot_digest")
+                    == budget_snapshot_digest
+                )
+                if envelope_is_bound:
+                    if (
+                        snapshot_remaining_total
+                        > normalized_envelope["max_total_seconds"]
+                    ):
+                        raise StateError(
+                            "budget_snapshot remaining total exceeds envelope "
+                            "max_total_seconds"
+                        )
+                    if (
+                        snapshot_remaining_fuzz is not None
+                        and snapshot_remaining_fuzz
+                        > normalized_envelope["max_fuzz_seconds"]
+                    ):
+                        raise StateError(
+                            "budget_snapshot remaining fuzz exceeds envelope "
+                            "max_fuzz_seconds"
+                        )
+                    if snapshot_matches_admission:
+                        _validate_budget_snapshot(
+                            budget_snapshot,
+                            expected_family_id=family_id,
+                            expected_max_total_seconds=normalized_envelope[
+                                "max_total_seconds"
+                            ],
+                            expected_max_fuzz_seconds=normalized_envelope[
+                                "max_fuzz_seconds"
+                            ],
+                        )
+                experiment_violation: str | None = None
+                if experiment is not None:
+                    try:
+                        contracts.check_experiment_against_envelope(
+                            experiment, normalized_envelope
+                        )
+                    except contracts.EnvelopeViolation as error:
+                        experiment_violation = str(error)
+                plan_approval_belongs_to_family = False
+                if isinstance(plan_parent_approval_digest, str):
+                    plan_approval_row = connection.execute(
+                        "SELECT envelope_digest FROM family_approvals "
+                        "WHERE family_id = %s AND approval_digest = %s",
+                        (family_id, plan_parent_approval_digest),
+                    ).fetchone()
+                    plan_approval_belongs_to_family = (
+                        plan_approval_row is not None
+                        and plan_approval_row["envelope_digest"]
+                        == envelope_digest
+                    )
+                same_inputs = (
+                    experiment_violation is None
+                    and str(existing["job_id"]) == str(job_id)
+                    and existing["envelope_digest"] == envelope_digest
+                    and plan_envelope_digest == envelope_digest
+                    and plan_harness_digest
+                    == normalized_envelope["harness_digest"]
+                    and plan_signature_in_envelope
+                    and plan_signature_matches_experiment
+                    and plan_seed_digest == seed_digest
+                    and plan_experiment_digest == experiment_digest
+                    and plan_approval_belongs_to_family
+                    and existing["parent_approval_digest"]
+                    == plan_parent_approval_digest
+                    and existing["seed_digest"] == seed_digest
+                    and existing["predicate_version"] == predicate_version
+                    and existing["recomputable"] is recomputable
+                    and existing["supporting_bundle_digest"]
+                    == supporting_bundle_digest
+                    and existing_detail.get("budget_snapshot_digest")
+                    == budget_snapshot_digest
+                    and existing_detail.get("experiment_digest")
+                    == experiment_digest
+                )
+                if same_inputs:
+                    return AdmissionOutcome(
+                        admitted=False,
+                        reason_code=None,
+                        admission=_admission_record(existing),
+                        event_type=None,
+                        event_detail=existing_detail,
+                        status="already_admitted",
+                        sub_reason="ROUND_ALREADY_ADMITTED",
+                    )
+                if (
+                    family["state"] != "AGGREGATING"
+                    and family["state"] not in _TERMINAL_JOB_STATES
+                ):
+                    raise StateError(
+                        f"admission family is {family['state']}, not AGGREGATING"
+                    )
+                # A terminal family/round does not change the §7 three-path
+                # outcome for a conflicting re-admission: it is a recorded
+                # ADMISSION_DENIED/ROUND_ALREADY_ADMITTED, not a raw error that
+                # would leave the conflict unaudited.
+                harness_mismatch = (
+                    experiment_violation is None
+                    and envelope_is_bound
+                    and plan_harness_digest
+                    != normalized_envelope["harness_digest"]
+                )
+                if harness_mismatch:
+                    denied_reason_code = "HARNESS_REJECTED"
+                    denied_sub_reason = "PLAN_HARNESS_MISMATCH"
+                elif not plan_signature_in_envelope:
+                    denied_reason_code = "ENVELOPE_VIOLATION"
+                    denied_sub_reason = "PLAN_SIGNATURE_NOT_ACCEPTED"
+                elif (
+                    experiment is not None
+                    and experiment_signature_valid
+                    and not plan_signature_matches_experiment
+                ):
+                    denied_reason_code = "ADMISSION_DENIED"
+                    denied_sub_reason = "PLAN_SIGNATURE_MISMATCH"
+                else:
+                    denied_reason_code = (
+                        "ENVELOPE_VIOLATION"
+                        if experiment_violation is not None
+                        else "ADMISSION_DENIED"
+                    )
+                    denied_sub_reason = (
+                        experiment_violation
+                        if experiment_violation is not None
+                        else "ROUND_ALREADY_ADMITTED"
+                    )
+                denied_detail = {
+                    "job_id": str(job_id),
+                    "parent_job_id": str(family_id),
+                    "round_no": round_no,
+                    "approval_kind": "policy",
+                    "envelope_digest": envelope_digest,
+                    "parent_approval_digest": approval_tail,
+                    "seed_digest": seed_digest,
+                    "predicate_version": predicate_version,
+                    "recomputable": recomputable,
+                    "supporting_bundle_digest": supporting_bundle_digest,
+                    "budget_snapshot_digest": budget_snapshot_digest,
+                    "experiment_digest": experiment_digest,
+                    "reason_code": denied_reason_code,
+                    "sub_reason": denied_sub_reason,
+                    "existing_admission_id": str(existing["admission_id"]),
+                    "family_state": family["state"],
+                    "round_state": round_job["state"],
+                }
+                if harness_mismatch:
+                    denied_detail["expected_harness_digest"] = (
+                        normalized_envelope["harness_digest"]
+                    )
+                    denied_detail["actual_harness_digest"] = (
+                        plan_harness_digest
+                    )
+                elif denied_sub_reason == "PLAN_SIGNATURE_NOT_ACCEPTED":
+                    denied_detail["accepted_signature_set"] = (
+                        normalized_envelope["accepted_signature_set"]
+                    )
+                    denied_detail["actual_asan_signature"] = plan_asan_signature
+                elif denied_sub_reason == "PLAN_SIGNATURE_MISMATCH":
+                    denied_detail["expected_asan_signature"] = (
+                        experiment_expected_signature
+                    )
+                    denied_detail["actual_asan_signature"] = plan_asan_signature
+                _audit(
+                    connection,
+                    job_id,
+                    "round_admission_denied",
+                    stage="admission",
+                    reason_code=denied_reason_code,
+                    detail=denied_detail,
+                )
+                return AdmissionOutcome(
+                    admitted=False,
+                    reason_code=denied_reason_code,
+                    admission=None,
+                    event_type="round_admission_denied",
+                    event_detail=denied_detail,
+                    status="denied",
+                    sub_reason=denied_sub_reason,
+                )
+
+            if family["state"] != "AGGREGATING":
+                raise StateError(
+                    f"admission family is {family['state']}, not AGGREGATING"
+                )
+            if round_job["state"] not in ("QUEUED", "PREPARING", "READY"):
+                # Admission happens strictly before execution. A RUNNING,
+                # ARCHIVING or AWAITING_REVIEW round is already executing (or
+                # has executed), and a terminal one is gone; none may create an
+                # admissions row or a round_admission_denied event. The same
+                # inputs of an existing admission still take the idempotent
+                # early return above, whatever the round state.
+                raise StateError(
+                    "admission round job is not in an admission-eligible "
+                    f"state {round_job['state']}"
+                )
+            pending_envelope = connection.execute(
+                "SELECT 1 FROM family_envelopes "
+                "WHERE family_id = %s AND status = 'pending' LIMIT 1",
+                (family_id,),
+            ).fetchone()
+            if pending_envelope is not None:
+                raise StateError(
+                    "cannot admit a new round while an envelope re-approval "
+                    "is pending"
+                )
+            ledger = connection.execute(
+                "SELECT max_total_seconds, max_fuzz_seconds, "
+                "remaining_total_seconds, remaining_fuzz_seconds "
+                "FROM budget_ledger WHERE family_id = %s FOR UPDATE",
+                (family_id,),
+            ).fetchone()
+            if ledger is None:
+                raise StateError("admission family has no budget ledger")
+            ledger_max_total = int(ledger["max_total_seconds"])
+            ledger_max_fuzz = int(ledger["max_fuzz_seconds"])
+            ledger_remaining_total = int(ledger["remaining_total_seconds"])
+            ledger_remaining_fuzz = int(ledger["remaining_fuzz_seconds"])
+            if (
+                "max_total_seconds" in budget_snapshot
+                and budget_snapshot["max_total_seconds"] != ledger_max_total
+            ):
+                raise StateError(
+                    "budget_snapshot.max_total_seconds does not match family "
+                    "budget_ledger"
+                )
+            if (
+                "max_fuzz_seconds" in budget_snapshot
+                and budget_snapshot["max_fuzz_seconds"] != ledger_max_fuzz
+            ):
+                raise StateError(
+                    "budget_snapshot.max_fuzz_seconds does not match family "
+                    "budget_ledger"
+                )
+            # The persisted ledger caps are the authority for the snapshot:
+            # reconcile spent/remaining against them even when the snapshot
+            # omits max_* fields. The caller's envelope caps are only applied
+            # by the predicate once the envelope is proven approved.
+            _validate_budget_snapshot(
+                budget_snapshot,
+                expected_family_id=family_id,
+                expected_max_total_seconds=ledger_max_total,
+                expected_max_fuzz_seconds=ledger_max_fuzz,
+            )
+            if ledger_remaining_total >= 1:
+                if snapshot_remaining_total > ledger_remaining_total:
+                    raise StateError(
+                        "budget_snapshot remaining total exceeds family "
+                        "budget_ledger"
+                    )
+                if (
+                    snapshot_remaining_fuzz is not None
+                    and snapshot_remaining_fuzz > ledger_remaining_fuzz
+                ):
+                    raise StateError(
+                        "budget_snapshot remaining fuzz exceeds family "
+                        "budget_ledger"
+                    )
+
+            decided_at = connection.execute(
+                "SELECT clock_timestamp() AS now"
+            ).fetchone()["now"]
+            outcome = policy_admit_round(
+                clock=lambda: decided_at,
+                job_id=job_id,
+                parent_job_id=family_id,
+                envelope=normalized_envelope,
+                parent_approval_digest=approval_tail,
+                approval_chain_tail_digest=approval_tail,
+                seed_digest=seed_digest,
+                round_no=round_no,
+                budget_snapshot=budget_snapshot,
+                experiment=experiment,
+                recomputable=recomputable,
+                campaign_bundle_digest=campaign_bundle_digest,
+                approved_envelope_digest=approved_envelope_digest,
+                plan_parent_approval_digest=plan_parent_approval_digest,
+                plan_envelope_digest=plan_envelope_digest,
+                plan_seed_digest=plan_seed_digest,
+                plan_experiment_digest=plan_experiment_digest,
+                plan_harness_digest=plan_harness_digest,
+                plan_asan_signature=plan_asan_signature,
+                ledger_remaining_total_seconds=ledger_remaining_total,
+            )
+
+            if outcome.admission is not None:
+                inserted = connection.execute(
+                    "INSERT INTO admissions "
+                    "(admission_id, job_id, parent_job_id, round_no, "
+                    "approval_kind, envelope_digest, parent_approval_digest, "
+                    "seed_digest, predicate_version, recomputable, "
+                    "supporting_bundle_digest, decided_at) "
+                    "VALUES (%s, %s, %s, %s, 'policy', %s, %s, %s, %s, %s, "
+                    "%s, %s) "
+                    "ON CONFLICT (parent_job_id, round_no) DO NOTHING "
+                    "RETURNING admission_id",
+                    (
+                        uuid.UUID(outcome.admission["admission_id"]),
+                        job_id,
+                        family_id,
+                        round_no,
+                        envelope_digest,
+                        approval_tail,
+                        seed_digest,
+                        predicate_version,
+                        recomputable,
+                        supporting_bundle_digest,
+                        outcome.admission["decided_at"],
+                    ),
+                ).fetchone()
+                if inserted is None:
+                    # The unique constraint is only a backstop: the family row
+                    # lock serializes this path, but fail closed if it fires.
+                    raise StateError(
+                        "admission was recorded concurrently for this round"
+                    )
+
+            event_type = outcome.event_type
+            if event_type is None:
+                # A fresh decision always carries an event; only the
+                # already_admitted no-op path returns no event type.
+                raise StateError("admission decision has no audit event type")
+            _audit(
+                connection,
+                job_id,
+                event_type,
+                stage="admission",
+                reason_code=outcome.reason_code,
+                detail=outcome.event_detail,
+            )
+            return outcome
+
+
+def _ceil_seconds(value: Any, label: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise StateError(f"{label} must be a number")
+    if not math.isfinite(value):
+        raise StateError(f"{label} must be finite")
+    if value < 0:
+        raise StateError(f"{label} must not be negative")
+    return int(math.ceil(value))
+
+
+def _validate_charge_input(
+    *,
+    step_key: str,
+    attempt_no: int,
+    charge_kind: str,
+    elapsed_seconds: Any,
+    elapsed_fuzz_seconds: Any,
+) -> tuple[str, int, int, int]:
+    try:
+        jsonutil.require_text(step_key, "step_key")
+    except ValueError as error:
+        raise StateError(str(error)) from error
+    if type(attempt_no) is not int or attempt_no < 1:
+        raise StateError("attempt_no must be a positive integer")
+    if charge_kind not in ("general", "fuzz"):
+        raise StateError("charge_kind must be general or fuzz")
+    elapsed = _ceil_seconds(elapsed_seconds, "elapsed_seconds")
+    fuzz_elapsed = _ceil_seconds(elapsed_fuzz_seconds, "elapsed_fuzz_seconds")
+    if charge_kind == "general" and fuzz_elapsed > 0:
+        raise StateError(
+            "general budget charge must not specify positive "
+            "elapsed_fuzz_seconds"
+        )
+    if charge_kind == "fuzz" and elapsed_fuzz_seconds > elapsed_seconds:
+        # Compare the validated raw values so 1.1 > 1.0 is rejected too; the
+        # fuzz sub-span can never be longer than the step it belongs to.
+        raise StateError(
+            "fuzz elapsed_fuzz_seconds must not exceed elapsed_seconds"
+        )
+    return charge_kind, attempt_no, elapsed, fuzz_elapsed
+
+
+def budget_gate(ledger: Mapping[str, Any], *, fuzz: bool = False) -> BudgetDecision:
+    """Return whether a step may start and the hard-timeout ceiling.
+
+    ``general`` needs one second of total budget. ``fuzz`` additionally needs
+    one second of fuzz sub-budget, so its ceiling is the smaller of the two.
+    """
+    if not isinstance(ledger, Mapping):
+        raise StateError("budget ledger must be a mapping")
+    remaining_total = _require_budget_int(
+        ledger, "remaining_total_seconds", "remaining_total_seconds"
+    )
+    if remaining_total < 0:
+        raise StateError("remaining_total_seconds must be non-negative")
+    available = remaining_total
+    if fuzz:
+        remaining_fuzz = _require_budget_int(
+            ledger, "remaining_fuzz_seconds", "remaining_fuzz_seconds"
+        )
+        if remaining_fuzz < 0:
+            raise StateError("remaining_fuzz_seconds must be non-negative")
+        available = min(remaining_total, remaining_fuzz)
+    if available < 1:
+        return BudgetDecision(False, BUDGET_EXHAUSTED, 0)
+    return BudgetDecision(True, None, available)
+
+
+def decide_next_round(
+    ledger: Mapping[str, Any], *, round_no: int, max_rounds: int
+) -> BudgetDecision:
+    """Decide whether a further round may be derived.
+
+    Budget or round exhaustion returns ``BUDGET_EXHAUSTED`` and no
+    ``next_round_no``; ``sub_reason`` distinguishes hitting ``max_rounds``
+    from draining the time budget. The orchestration layer must not create a
+    round from a denied decision.
+    """
+    if type(round_no) is not int or round_no < 0:
+        raise StateError("round_no must be a non-negative integer")
+    if type(max_rounds) is not int or max_rounds < 1:
+        raise StateError("max_rounds must be a positive integer")
+    if round_no >= max_rounds:
+        return BudgetDecision(
+            False,
+            BUDGET_EXHAUSTED,
+            0,
+            sub_reason="ROUND_BEYOND_MAX_ROUNDS",
+        )
+    gate = budget_gate(ledger)
+    if not gate.allowed:
+        return BudgetDecision(
+            False,
+            BUDGET_EXHAUSTED,
+            0,
+            sub_reason=BUDGET_EXHAUSTED,
+        )
+    return BudgetDecision(
+        True, None, gate.hard_timeout_seconds, next_round_no=round_no + 1
+    )
+
+
+def compute_budget_charge(
+    ledger: Mapping[str, Any],
+    *,
+    charge_kind: str,
+    elapsed_seconds: Any,
+    elapsed_fuzz_seconds: Any = 0,
+) -> tuple[int, int]:
+    """Apply the normative charge formula without touching storage.
+
+    ``general`` charges ``min(ceil(elapsed), remaining_total_seconds)``.
+    A ``fuzz`` step requires ``elapsed_fuzz <= elapsed`` and charges
+    ``charged = min(max(1, ceil(elapsed)), remaining_total)`` and
+    ``charged_fuzz = min(max(1, ceil(fuzz_elapsed)), remaining_fuzz, charged)``
+    so ``0 < fuzz_seconds <= seconds`` without overdrawing either balance even
+    when ``elapsed == 0``.
+    """
+    if not isinstance(ledger, Mapping):
+        raise StateError("budget ledger must be a mapping")
+    if charge_kind not in ("general", "fuzz"):
+        raise StateError("charge_kind must be general or fuzz")
+    elapsed = _ceil_seconds(elapsed_seconds, "elapsed_seconds")
+    fuzz_elapsed = _ceil_seconds(elapsed_fuzz_seconds, "elapsed_fuzz_seconds")
+    if charge_kind == "general" and fuzz_elapsed > 0:
+        raise StateError(
+            "general budget charge must not specify positive "
+            "elapsed_fuzz_seconds"
+        )
+    if charge_kind == "fuzz" and elapsed_fuzz_seconds > elapsed_seconds:
+        # Compare the validated raw values so 1.1 > 1.0 is rejected too; the
+        # fuzz sub-span can never be longer than the step it belongs to.
+        raise StateError(
+            "fuzz elapsed_fuzz_seconds must not exceed elapsed_seconds"
+        )
+    remaining_total = _require_budget_int(
+        ledger, "remaining_total_seconds", "remaining_total_seconds"
+    )
+    if remaining_total < 0:
+        raise StateError("remaining_total_seconds must be non-negative")
+    if charge_kind == "general":
+        return min(elapsed, remaining_total), 0
+    remaining_fuzz = _require_budget_int(
+        ledger, "remaining_fuzz_seconds", "remaining_fuzz_seconds"
+    )
+    if remaining_fuzz < 0:
+        raise StateError("remaining_fuzz_seconds must be non-negative")
+    # elapsed_fuzz <= elapsed is enforced above; a zero-length fuzz step still
+    # rounds up to one second so 0 < charged_fuzz <= charged <= remaining_total.
+    effective_elapsed = max(1, elapsed)
+    charged = min(effective_elapsed, remaining_total)
+    charged_fuzz = min(max(1, fuzz_elapsed), remaining_fuzz, charged)
+    return charged, charged_fuzz
+
+
+def charge_budget_local(
+    ledger: dict[str, Any],
+    charges: list[dict[str, Any]],
+    *,
+    family_id: UUID | str,
+    job_id: UUID | str,
+    step_key: str,
+    attempt_no: int,
+    charge_kind: str,
+    elapsed_seconds: Any,
+    elapsed_fuzz_seconds: Any = 0,
+) -> BudgetChargeOutcome:
+    """Idempotent in-memory charge used as the contract-test reference.
+
+    It shares the formula with the PostgreSQL adapter and mirrors the atomic
+    ``UPDATE ... WHERE remaining >= charged`` decision so recovery, retry and
+    exhaustion semantics stay identical without a database.
+    """
+    if not isinstance(ledger, Mapping):
+        raise StateError("budget ledger must be a mapping")
+    charge_kind, attempt_no, elapsed, fuzz_elapsed = _validate_charge_input(
+        step_key=step_key,
+        attempt_no=attempt_no,
+        charge_kind=charge_kind,
+        elapsed_seconds=elapsed_seconds,
+        elapsed_fuzz_seconds=elapsed_fuzz_seconds,
+    )
+    family_text = str(family_id)
+    if "family_id" in ledger and str(ledger["family_id"]) != family_text:
+        raise StateError("budget ledger belongs to a different family")
+    job_text = str(job_id)
+    for charge in charges:
+        if (
+            str(charge["job_id"]) == job_text
+            and charge["step_key"] == step_key
+            and charge["attempt_no"] == attempt_no
+        ):
+            if str(charge.get("family_id")) != family_text:
+                raise StateError(
+                    "existing budget charge belongs to a different family"
+                )
+            if charge.get("charge_kind") != charge_kind:
+                raise StateError(
+                    "existing budget charge has a different charge_kind"
+                )
+            existing_seconds = charge.get("seconds")
+            existing_fuzz_seconds = charge.get("fuzz_seconds", 0)
+            if (
+                type(existing_seconds) is not int
+                or type(existing_fuzz_seconds) is not int
+                or existing_seconds < 0
+                or existing_fuzz_seconds < 0
+            ):
+                raise StateError("existing budget charge has invalid durations")
+            # Recovery is only a no-op when the replay does not claim less time
+            # than was already accounted for. A smaller replay is a different
+            # step that would silently under-report usage; fail closed. A
+            # recorded value below the request is a legitimate cap by the
+            # remaining balance, so it still recovers.
+            if existing_seconds > elapsed or existing_fuzz_seconds > fuzz_elapsed:
+                raise StateError(
+                    "replay claims more elapsed time than the recorded charge"
+                )
+            return BudgetChargeOutcome(
+                "recovered", None, dict(charge), dict(ledger)
+            )
+
+    gate = budget_gate(ledger, fuzz=charge_kind == "fuzz")
+    if not gate.allowed:
+        return BudgetChargeOutcome(
+            "budget_exhausted", BUDGET_EXHAUSTED, None, dict(ledger)
+        )
+
+    charged, charged_fuzz = compute_budget_charge(
+        ledger,
+        charge_kind=charge_kind,
+        elapsed_seconds=elapsed,
+        elapsed_fuzz_seconds=fuzz_elapsed,
+    )
+    if charge_kind == "fuzz" and charged_fuzz < 1:
+        return BudgetChargeOutcome(
+            "budget_exhausted", BUDGET_EXHAUSTED, None, dict(ledger)
+        )
+    remaining_total = _require_budget_int(
+        ledger, "remaining_total_seconds", "remaining_total_seconds"
+    )
+    if remaining_total < 0:
+        raise StateError("remaining_total_seconds must be non-negative")
+    remaining_fuzz = _require_budget_int(
+        ledger, "remaining_fuzz_seconds", "remaining_fuzz_seconds"
+    )
+    if remaining_fuzz < 0:
+        raise StateError("remaining_fuzz_seconds must be non-negative")
+    if remaining_total < charged or remaining_fuzz < charged_fuzz:
+        return BudgetChargeOutcome(
+            "budget_exhausted", BUDGET_EXHAUSTED, None, dict(ledger)
+        )
+
+    ledger["remaining_total_seconds"] -= charged
+    ledger["remaining_fuzz_seconds"] -= charged_fuzz
+    charge = {
+        "charge_id": str(uuid.uuid4()),
+        "family_id": family_text,
+        "job_id": job_text,
+        "step_key": step_key,
+        "attempt_no": attempt_no,
+        "charge_kind": charge_kind,
+        "seconds": charged,
+        "fuzz_seconds": charged_fuzz,
+    }
+    charges.append(charge)
+    exhausted = ledger["remaining_total_seconds"] == 0 or (
+        charge_kind == "fuzz" and ledger["remaining_fuzz_seconds"] == 0
+    )
+    return BudgetChargeOutcome(
+        "budget_exhausted" if exhausted else "charged",
+        BUDGET_EXHAUSTED if exhausted else None,
+        charge,
+        dict(ledger),
+    )
+
+
+def _require_budget_int(
+    mapping: Mapping[str, Any], key: str, label: str
+) -> int:
+    if key not in mapping:
+        raise StateError(f"{label} is missing")
+    value = mapping[key]
+    if type(value) is not int:
+        raise StateError(f"{label} must be an integer")
+    return value
+
+
+def budget_summary(
+    ledger: Mapping[str, Any], charges: list[Mapping[str, Any]]
+) -> dict[str, int]:
+    """Build the six-field report/status/family.json budget object.
+
+    ``budget_ledger.remaining_total_seconds`` is exposed as
+    ``remaining_seconds``; the other five fields keep their DB names. Spending
+    is always rebuilt from ``budget_charges`` and reconciled against the
+    ledger row (``spent + remaining == max``); any discrepancy fails closed.
+    """
+    if not isinstance(ledger, Mapping):
+        raise StateError("budget ledger must be a mapping")
+    max_total_seconds = _require_budget_int(
+        ledger, "max_total_seconds", "ledger.max_total_seconds"
+    )
+    if max_total_seconds < 1:
+        raise StateError("ledger.max_total_seconds must be a positive integer")
+    max_fuzz_seconds = _require_budget_int(
+        ledger, "max_fuzz_seconds", "ledger.max_fuzz_seconds"
+    )
+    if max_fuzz_seconds < 0 or max_fuzz_seconds > max_total_seconds:
+        raise StateError(
+            "ledger.max_fuzz_seconds must be between 0 and max_total_seconds"
+        )
+    remaining_seconds = _require_budget_int(
+        ledger, "remaining_total_seconds", "ledger.remaining_total_seconds"
+    )
+    if remaining_seconds < 0 or remaining_seconds > max_total_seconds:
+        raise StateError(
+            "ledger.remaining_total_seconds must be between 0 and "
+            "max_total_seconds"
+        )
+    remaining_fuzz_seconds = _require_budget_int(
+        ledger, "remaining_fuzz_seconds", "ledger.remaining_fuzz_seconds"
+    )
+    if remaining_fuzz_seconds < 0 or remaining_fuzz_seconds > max_fuzz_seconds:
+        raise StateError(
+            "ledger.remaining_fuzz_seconds must be between 0 and "
+            "max_fuzz_seconds"
+        )
+
+    ledger_family_id = (
+        str(ledger["family_id"])
+        if "family_id" in ledger and ledger["family_id"] is not None
+        else None
+    )
+    spent_seconds = 0
+    spent_fuzz_seconds = 0
+    for index, charge in enumerate(charges):
+        if not isinstance(charge, Mapping):
+            raise StateError(f"charges[{index}] must be a mapping")
+        if (
+            ledger_family_id is not None
+            and "family_id" in charge
+            and charge["family_id"] is not None
+            and str(charge["family_id"]) != ledger_family_id
+        ):
+            raise StateError(
+                f"charges[{index}].family_id does not match ledger.family_id"
+            )
+        seconds = _require_budget_int(
+            charge, "seconds", f"charges[{index}].seconds"
+        )
+        fuzz_seconds = _require_budget_int(
+            charge, "fuzz_seconds", f"charges[{index}].fuzz_seconds"
+        )
+        if seconds < 0:
+            raise StateError(f"charges[{index}].seconds must not be negative")
+        if fuzz_seconds < 0 or fuzz_seconds > seconds:
+            raise StateError(
+                f"charges[{index}].fuzz_seconds must be between 0 and seconds"
+            )
+        if "charge_kind" in charge:
+            kind = charge["charge_kind"]
+            if kind == "general":
+                if fuzz_seconds != 0:
+                    raise StateError(
+                        f"charges[{index}] general charge must have "
+                        "fuzz_seconds == 0"
+                    )
+            elif kind == "fuzz":
+                if fuzz_seconds <= 0:
+                    raise StateError(
+                        f"charges[{index}] fuzz charge must have "
+                        "fuzz_seconds > 0"
+                    )
+            else:
+                raise StateError(
+                    f"charges[{index}].charge_kind must be general or fuzz"
+                )
+        spent_seconds += seconds
+        spent_fuzz_seconds += fuzz_seconds
+
+    if (
+        spent_seconds + remaining_seconds != max_total_seconds
+        or spent_fuzz_seconds + remaining_fuzz_seconds != max_fuzz_seconds
+    ):
+        raise StateError(
+            "budget ledger does not reconcile with budget_charges"
+        )
+    return {
+        "max_total_seconds": max_total_seconds,
+        "max_fuzz_seconds": max_fuzz_seconds,
+        "spent_seconds": spent_seconds,
+        "spent_fuzz_seconds": spent_fuzz_seconds,
+        "remaining_seconds": remaining_seconds,
+        "remaining_fuzz_seconds": remaining_fuzz_seconds,
+    }
+
+
+_BUDGET_LEDGER_COLUMNS = (
+    "family_id, max_total_seconds, max_fuzz_seconds, "
+    "remaining_total_seconds, remaining_fuzz_seconds, updated_at"
+)
+_BUDGET_CHARGE_COLUMNS = (
+    "charge_id, family_id, job_id, step_key, attempt_no, charge_kind, "
+    "seconds, fuzz_seconds, created_at"
+)
+
+
+def _budget_ledger_record(row: Mapping[str, Any]) -> dict[str, Any]:
+    """Render a ``budget_ledger`` row with canonical JSON-serializable types."""
+    record: dict[str, Any] = {
+        "family_id": str(row["family_id"]),
+        "max_total_seconds": int(row["max_total_seconds"]),
+        "max_fuzz_seconds": int(row["max_fuzz_seconds"]),
+        "remaining_total_seconds": int(row["remaining_total_seconds"]),
+        "remaining_fuzz_seconds": int(row["remaining_fuzz_seconds"]),
+    }
+    if "updated_at" in row and row["updated_at"] is not None:
+        updated_at = row["updated_at"]
+        record["updated_at"] = (
+            updated_at
+            if isinstance(updated_at, str)
+            else jsonutil.timestamp(updated_at)
+        )
+    return record
+
+
+def _budget_charge_record(row: Mapping[str, Any]) -> dict[str, Any]:
+    """Render a ``budget_charges`` row with canonical JSON-serializable types."""
+    record: dict[str, Any] = {
+        "charge_id": str(row["charge_id"]),
+        "family_id": str(row["family_id"]),
+        "job_id": str(row["job_id"]),
+        "step_key": row["step_key"],
+        "attempt_no": int(row["attempt_no"]),
+        "charge_kind": row["charge_kind"],
+        "seconds": int(row["seconds"]),
+        "fuzz_seconds": int(row["fuzz_seconds"]),
+    }
+    if "created_at" in row and row["created_at"] is not None:
+        created_at = row["created_at"]
+        record["created_at"] = (
+            created_at
+            if isinstance(created_at, str)
+            else jsonutil.timestamp(created_at)
+        )
+    return record
+
+
+def _approved_envelope_budget(
+    envelope_body: Mapping[str, Any],
+) -> tuple[int, int]:
+    """Return the approved envelope's family budget ceilings.
+
+    The ledger is initialized from the envelope body that was just approved,
+    never from the request or a caller-supplied snapshot. Missing or malformed
+    caps fail closed so no family can run without a budget authority.
+    """
+    max_total = envelope_body.get("max_total_seconds")
+    if type(max_total) is not int or max_total < 1:
+        raise StateError(
+            "approved envelope max_total_seconds must be a positive integer"
+        )
+    max_fuzz = envelope_body.get("max_fuzz_seconds")
+    if (
+        type(max_fuzz) is not int
+        or max_fuzz < 0
+        or max_fuzz > max_total
+    ):
+        raise StateError(
+            "approved envelope max_fuzz_seconds must be between 0 and "
+            "max_total_seconds"
+        )
+    return int(max_total), int(max_fuzz)
+
+
+def _initialize_budget_ledger_in_tx(
+    connection,
+    family_id: UUID | str,
+    *,
+    max_total_seconds: int,
+    max_fuzz_seconds: int,
+) -> dict[str, Any]:
+    """Create the ledger inside the caller's transaction, or return it unchanged.
+
+    This is the one implementation shared by the standalone initializer and the
+    human-approval path: approving a family envelope and creating its ledger
+    must be one transaction. An existing row is locked and its approved caps
+    are compared with the current envelope; a different envelope never silently
+    reuses the old budget.
+    """
+    if type(max_total_seconds) is not int or max_total_seconds < 1:
+        raise StateError("max_total_seconds must be a positive integer")
+    if (
+        type(max_fuzz_seconds) is not int
+        or max_fuzz_seconds < 0
+        or max_fuzz_seconds > max_total_seconds
+    ):
+        raise StateError(
+            "max_fuzz_seconds must be between 0 and max_total_seconds"
+        )
+    try:
+        family_id = uuid.UUID(str(family_id))
+    except (TypeError, ValueError) as error:
+        raise StateError("family_id must be a UUID") from error
+
+    # Global lock order: jobs(family) before budget_ledger(family). Only a v2
+    # family job may own a budget ledger.
+    target = connection.execute(
+        "SELECT job_contract_version, job_kind "
+        "FROM jobs WHERE job_id = %s FOR KEY SHARE",
+        (family_id,),
+    ).fetchone()
+    if target is None:
+        raise StateError("budget ledger family does not exist")
+    if target["job_contract_version"] != 2 or target["job_kind"] != "family":
+        raise StateError("budget ledger target must be a v2 family job")
+
+    row = connection.execute(
+        "INSERT INTO budget_ledger "
+        "(family_id, max_total_seconds, max_fuzz_seconds, "
+        "remaining_total_seconds, remaining_fuzz_seconds) "
+        "VALUES (%s, %s, %s, %s, %s) "
+        "ON CONFLICT (family_id) DO NOTHING "
+        f"RETURNING {_BUDGET_LEDGER_COLUMNS}",
+        (
+            family_id,
+            max_total_seconds,
+            max_fuzz_seconds,
+            max_total_seconds,
+            max_fuzz_seconds,
+        ),
+    ).fetchone()
+    if row is None:
+        row = connection.execute(
+            "SELECT " + _BUDGET_LEDGER_COLUMNS +
+            " FROM budget_ledger WHERE family_id = %s FOR UPDATE",
+            (family_id,),
+        ).fetchone()
+        if row is None:
+            raise StateError("budget ledger could not be initialized")
+        if (
+            row["max_total_seconds"] != max_total_seconds
+            or row["max_fuzz_seconds"] != max_fuzz_seconds
+        ):
+            raise StateError(
+                "budget ledger already exists with different caps: "
+                f"approved max_total_seconds={max_total_seconds}, "
+                f"max_fuzz_seconds={max_fuzz_seconds}; existing "
+                f"max_total_seconds={row['max_total_seconds']}, "
+                f"max_fuzz_seconds={row['max_fuzz_seconds']}"
+            )
+    return _budget_ledger_record(row)
+
+
+def _sync_budget_ledger_on_approval_in_tx(
+    connection,
+    family_id: UUID | str,
+    *,
+    max_total_seconds: int,
+    max_fuzz_seconds: int,
+) -> dict[str, Any]:
+    """Create or re-approve a family's budget ledger inside the review tx.
+
+    First approval inserts the initial ledger with ``remaining = max``. A
+    changed-envelope re-approval locks the existing row, reconciles it against
+    ``budget_charges`` (``old_max - old_rem == spent``), and atomically
+    adjusts the ceilings while preserving all spent budget
+    (``new_remaining = new_max - spent``). Any cap below already-spent budget
+    or unreconciled ledger fails closed and rolls back the approval.
+    """
+    if type(max_total_seconds) is not int or max_total_seconds < 1:
+        raise StateError("max_total_seconds must be a positive integer")
+    if (
+        type(max_fuzz_seconds) is not int
+        or max_fuzz_seconds < 0
+        or max_fuzz_seconds > max_total_seconds
+    ):
+        raise StateError(
+            "max_fuzz_seconds must be between 0 and max_total_seconds"
+        )
+    try:
+        family_id = uuid.UUID(str(family_id))
+    except (TypeError, ValueError) as error:
+        raise StateError("family_id must be a UUID") from error
+
+    row = connection.execute(
+        "INSERT INTO budget_ledger "
+        "(family_id, max_total_seconds, max_fuzz_seconds, "
+        "remaining_total_seconds, remaining_fuzz_seconds) "
+        "VALUES (%s, %s, %s, %s, %s) "
+        "ON CONFLICT (family_id) DO NOTHING "
+        f"RETURNING {_BUDGET_LEDGER_COLUMNS}",
+        (
+            family_id,
+            max_total_seconds,
+            max_fuzz_seconds,
+            max_total_seconds,
+            max_fuzz_seconds,
+        ),
+    ).fetchone()
+    if row is not None:
+        return _budget_ledger_record(row)
+
+    existing = connection.execute(
+        "SELECT " + _BUDGET_LEDGER_COLUMNS +
+        " FROM budget_ledger WHERE family_id = %s FOR UPDATE",
+        (family_id,),
+    ).fetchone()
+    if existing is None:
+        raise StateError("budget ledger could not be initialized")
+
+    totals = connection.execute(
+        "SELECT COALESCE(SUM(seconds), 0) AS spent_total, "
+        "COALESCE(SUM(fuzz_seconds), 0) AS spent_fuzz "
+        "FROM budget_charges WHERE family_id = %s",
+        (family_id,),
+    ).fetchone()
+    spent_total = int(totals["spent_total"])
+    spent_fuzz = int(totals["spent_fuzz"])
+
+    old_max_total = int(existing["max_total_seconds"])
+    old_rem_total = int(existing["remaining_total_seconds"])
+    old_max_fuzz = int(existing["max_fuzz_seconds"])
+    old_rem_fuzz = int(existing["remaining_fuzz_seconds"])
+    if (
+        old_max_total - old_rem_total != spent_total
+        or old_max_fuzz - old_rem_fuzz != spent_fuzz
+    ):
+        raise StateError(
+            "budget ledger does not reconcile with budget_charges"
+        )
+
+    if (
+        old_max_total == max_total_seconds
+        and old_max_fuzz == max_fuzz_seconds
+    ):
+        return _budget_ledger_record(existing)
+
+    if max_total_seconds < spent_total:
+        raise StateError(
+            "approved max_total_seconds is below already spent family budget"
+        )
+    if max_fuzz_seconds < spent_fuzz:
+        raise StateError(
+            "approved max_fuzz_seconds is below already spent family fuzz "
+            "budget"
+        )
+    if (
+        max_total_seconds < old_max_total
+        or max_fuzz_seconds < old_max_fuzz
+    ):
+        # §9.1: changed-envelope re-approval only locks the family row, so this
+        # recheck intentionally takes no row locks on child jobs.
+        active_child = connection.execute(
+            "SELECT 1 FROM jobs WHERE parent_job_id = %s "
+            "AND state IN ('RUNNING', 'ARCHIVING') LIMIT 1",
+            (family_id,),
+        ).fetchone()
+        if active_child is not None:
+            raise StateError(
+                "cannot tighten family budget while a child job is "
+                "RUNNING or ARCHIVING"
+            )
+
+    new_rem_total = max_total_seconds - spent_total
+    new_rem_fuzz = max_fuzz_seconds - spent_fuzz
+    updated = connection.execute(
+        "UPDATE budget_ledger SET "
+        "max_total_seconds = %s, "
+        "max_fuzz_seconds = %s, "
+        "remaining_total_seconds = %s, "
+        "remaining_fuzz_seconds = %s, "
+        "updated_at = clock_timestamp() "
+        "WHERE family_id = %s "
+        f"RETURNING {_BUDGET_LEDGER_COLUMNS}",
+        (
+            max_total_seconds,
+            max_fuzz_seconds,
+            new_rem_total,
+            new_rem_fuzz,
+            family_id,
+        ),
+    ).fetchone()
+    if updated is None:
+        raise StateError("budget ledger could not be updated on re-approval")
+    return _budget_ledger_record(updated)
+
+
+def initialize_budget_ledger(
+    dsn: str,
+    family_id: UUID | str,
+    *,
+    max_total_seconds: int,
+    max_fuzz_seconds: int,
+) -> dict[str, Any]:
+    """Create the family ledger once, or return the existing row unchanged."""
+    with _connect(dsn) as connection:
+        with connection.transaction():
+            return _initialize_budget_ledger_in_tx(
+                connection,
+                family_id,
+                max_total_seconds=max_total_seconds,
+                max_fuzz_seconds=max_fuzz_seconds,
+            )
+
+
+def load_budget_ledger(
+    dsn: str, family_id: UUID | str
+) -> dict[str, Any] | None:
+    try:
+        family_id = uuid.UUID(str(family_id))
+    except (TypeError, ValueError) as error:
+        raise StateError("family_id must be a UUID") from error
+    with _connect(dsn) as connection:
+        row = connection.execute(
+            "SELECT " + _BUDGET_LEDGER_COLUMNS +
+            " FROM budget_ledger WHERE family_id = %s",
+            (family_id,),
+        ).fetchone()
+    return _budget_ledger_record(row) if row is not None else None
+
+
+def charge_step_budget(
+    dsn: str,
+    *,
+    family_id: UUID | str,
+    job_id: UUID | str,
+    step_key: str,
+    attempt_no: int,
+    charge_kind: str,
+    elapsed_seconds: Any,
+    elapsed_fuzz_seconds: Any = 0,
+    generation: int,
+) -> BudgetChargeOutcome:
+    """Charge one step in an independent short transaction.
+
+    The container runs outside this transaction. The ledger row is locked, the
+    idempotency key is checked before any write, and the conditional
+    ``UPDATE ... WHERE remaining >= charged`` is the only mutation, so a
+    concurrent or timed-out charge can never overdraw the family budget.
+
+    ``generation`` is required: a new charge is fenced by the worker's
+    generation and its still-active lease under the job row lock, matching the
+    other same-generation APIs. Omitting it is a ``TypeError``, not a way to
+    skip the fence. An already-recorded charge is still recovered by its
+    idempotency key before that fence, so a lease change or a terminal state
+    cannot erase an accounted step.
+    """
+    if type(generation) is not int or generation < 1:
+        raise StateError("generation must be a positive integer")
+    charge_kind, attempt_no, elapsed, fuzz_elapsed = _validate_charge_input(
+        step_key=step_key,
+        attempt_no=attempt_no,
+        charge_kind=charge_kind,
+        elapsed_seconds=elapsed_seconds,
+        elapsed_fuzz_seconds=elapsed_fuzz_seconds,
+    )
+    try:
+        family_id = uuid.UUID(str(family_id))
+        job_id = uuid.UUID(str(job_id))
+    except (TypeError, ValueError) as error:
+        raise StateError("budget charge ids must be UUIDs") from error
+
+    with _connect(dsn) as connection:
+        with connection.transaction():
+            # Follow the global lock order jobs(family) -> jobs(child) ->
+            # budget_ledger(family). INSERT INTO budget_charges implicitly
+            # takes FOR KEY SHARE on both jobs(family_id) and jobs(job_id) via
+            # its foreign keys, so acquiring FOR KEY SHARE before locking
+            # budget_ledger FOR UPDATE prevents AB-BA deadlocks with
+            # propose_envelope / record_review / record_admission.
+            connection.execute(
+                "SELECT 1 FROM jobs WHERE job_id = %s FOR KEY SHARE",
+                (family_id,),
+            ).fetchone()
+            job_row = connection.execute(
+                "SELECT job_id, job_contract_version, family_id, job_kind, "
+                "state, generation, lease_expires_at "
+                "FROM jobs WHERE job_id = %s FOR KEY SHARE",
+                (job_id,),
+            ).fetchone()
+            if job_row is None:
+                raise StateError("budget charge job does not exist")
+            if job_row["job_contract_version"] != 2:
+                raise StateError(
+                    "budget charge job must be on the v2 job contract"
+                )
+            if job_row["family_id"] != family_id:
+                raise StateError(
+                    "budget charge job does not belong to family_id"
+                )
+            if job_row["job_kind"] not in ("campaign", "round"):
+                raise StateError(
+                    "budget charge job_id must be a campaign or round child"
+                )
+
+            ledger = connection.execute(
+                "SELECT " + _BUDGET_LEDGER_COLUMNS +
+                " FROM budget_ledger WHERE family_id = %s FOR UPDATE",
+                (family_id,),
+            ).fetchone()
+            if ledger is None:
+                raise StateError("budget ledger does not exist")
+            existing = connection.execute(
+                "SELECT " + _BUDGET_CHARGE_COLUMNS +
+                " FROM budget_charges WHERE job_id = %s AND step_key = %s "
+                "AND attempt_no = %s",
+                (job_id, step_key, attempt_no),
+            ).fetchone()
+            if existing is not None:
+                if existing["family_id"] != family_id:
+                    raise StateError(
+                        "existing budget charge belongs to a different family"
+                    )
+                if existing["charge_kind"] != charge_kind:
+                    raise StateError(
+                        "existing budget charge has a different charge_kind"
+                    )
+                if existing["seconds"] > elapsed or (
+                    existing["fuzz_seconds"] > fuzz_elapsed
+                ):
+                    raise StateError(
+                        "replay claims more elapsed time than the recorded charge"
+                    )
+                return BudgetChargeOutcome(
+                    "recovered",
+                    None,
+                    _budget_charge_record(existing),
+                    _budget_ledger_record(ledger),
+                )
+            if job_row["state"] not in ("RUNNING", "ARCHIVING"):
+                raise StateError(
+                    "cannot charge budget while job is in state "
+                    f"{job_row['state']}"
+                )
+            # Evaluate the database clock only after both row locks are held.
+            # A transaction-start now() could predate the lock wait and would
+            # let a worker whose lease expired during the wait still pass the
+            # fence. The fence is unconditional for every new charge: omitting
+            # generation is no longer a way to bypass the lease.
+            db_now = connection.execute(
+                "SELECT clock_timestamp() AS db_now"
+            ).fetchone()["db_now"]
+            if job_row["generation"] != generation:
+                raise StaleGeneration(
+                    "execution generation is no longer current"
+                )
+            if (
+                job_row["lease_expires_at"] is None
+                or job_row["lease_expires_at"] <= db_now
+            ):
+                raise StaleGeneration(
+                    "the worker lease is no longer active"
+                )
+
+            gate = budget_gate(ledger, fuzz=charge_kind == "fuzz")
+            if not gate.allowed:
+                return BudgetChargeOutcome(
+                    "budget_exhausted",
+                    BUDGET_EXHAUSTED,
+                    None,
+                    _budget_ledger_record(ledger),
+                )
+            charged, charged_fuzz = compute_budget_charge(
+                ledger,
+                charge_kind=charge_kind,
+                elapsed_seconds=elapsed,
+                elapsed_fuzz_seconds=fuzz_elapsed,
+            )
+            if charge_kind == "fuzz" and charged_fuzz < 1:
+                return BudgetChargeOutcome(
+                    "budget_exhausted",
+                    BUDGET_EXHAUSTED,
+                    None,
+                    _budget_ledger_record(ledger),
+                )
+
+            updated = connection.execute(
+                "UPDATE budget_ledger SET "
+                "remaining_total_seconds = remaining_total_seconds - %s, "
+                "remaining_fuzz_seconds = remaining_fuzz_seconds - %s, "
+                "updated_at = clock_timestamp() "
+                "WHERE family_id = %s "
+                "AND remaining_total_seconds >= %s "
+                "AND remaining_fuzz_seconds >= %s "
+                "RETURNING " + _BUDGET_LEDGER_COLUMNS,
+                (
+                    charged,
+                    charged_fuzz,
+                    family_id,
+                    charged,
+                    charged_fuzz,
+                ),
+            ).fetchone()
+            if updated is None:
+                return BudgetChargeOutcome(
+                    "budget_exhausted",
+                    BUDGET_EXHAUSTED,
+                    None,
+                    _budget_ledger_record(ledger),
+                )
+
+            charge_id = uuid.uuid4()
+            inserted = connection.execute(
+                "INSERT INTO budget_charges "
+                "(charge_id, family_id, job_id, step_key, attempt_no, "
+                "charge_kind, seconds, fuzz_seconds) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s) "
+                "RETURNING " + _BUDGET_CHARGE_COLUMNS,
+                (
+                    charge_id,
+                    family_id,
+                    job_id,
+                    step_key,
+                    attempt_no,
+                    charge_kind,
+                    charged,
+                    charged_fuzz,
+                ),
+            ).fetchone()
+            if inserted is None:
+                raise StateError("budget charge could not be recorded")
+            charge = _budget_charge_record(inserted)
+            exhausted = updated["remaining_total_seconds"] == 0 or (
+                charge_kind == "fuzz"
+                and updated["remaining_fuzz_seconds"] == 0
+            )
+            return BudgetChargeOutcome(
+                "budget_exhausted" if exhausted else "charged",
+                BUDGET_EXHAUSTED if exhausted else None,
+                charge,
+                _budget_ledger_record(updated),
+            )
+
+
+def family_budget_summary(dsn: str, family_id: UUID | str) -> dict[str, int]:
+    """Return the six report fields from the ledger and family charges."""
+    try:
+        family_id = uuid.UUID(str(family_id))
+    except (TypeError, ValueError) as error:
+        raise StateError("family_id must be a UUID") from error
+    with _connect(dsn) as connection:
+        with connection.transaction():
+            connection.execute(
+                "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"
+            )
+            ledger = connection.execute(
+                "SELECT " + _BUDGET_LEDGER_COLUMNS +
+                " FROM budget_ledger WHERE family_id = %s",
+                (family_id,),
+            ).fetchone()
+            if ledger is None:
+                raise StateError("budget ledger does not exist")
+            charges = connection.execute(
+                "SELECT seconds, fuzz_seconds FROM budget_charges "
+                "WHERE family_id = %s",
+                (family_id,),
+            ).fetchall()
+    return budget_summary(ledger, charges)
 
 
 # A decided family envelope maps back to the review decision it recorded. The
@@ -2201,7 +4734,8 @@ def _record_family_review(
     # decision; it never appends a new row. The expiry check comes from the
     # envelope's own deadline, not the family's.
     envelope = connection.execute(
-        "SELECT envelope_id, status, review_deadline_at, reviewer_id, decided_at "
+        "SELECT envelope_id, status, review_deadline_at, reviewer_id, "
+        "decided_at, envelope_json "
         "FROM family_envelopes WHERE family_id = %s AND envelope_digest = %s",
         (job_id, resolved_envelope),
     ).fetchone()
@@ -2320,6 +4854,29 @@ def _record_family_review(
         "decided_at": jsonutil.timestamp(decision_at),
     }
     if decision == "approve":
+        # The frozen plan is immutable, so the review must re-read the pending
+        # envelope body and prove the plan harness it will execute is the one
+        # being approved. A digest-only check cannot catch a DB drift between
+        # freeze_plan and record_review.
+        pending_envelope_body = envelope["envelope_json"]
+        if not isinstance(pending_envelope_body, Mapping):
+            raise StateError("approved family envelope must be a JSON object")
+        try:
+            normalized_pending_envelope = _validate_envelope(
+                pending_envelope_body
+            )
+        except ValueError as error:
+            raise StateError(
+                f"approved family envelope is invalid: {error}"
+            ) from error
+        plan_body = plan["plan"] if isinstance(plan["plan"], Mapping) else {}
+        if (
+            plan_body.get("harness_digest")
+            != normalized_pending_envelope["harness_digest"]
+        ):
+            raise StateError(
+                "first plan harness_digest does not match the approved envelope"
+            )
         # reviews is a first-round record only; a changed-envelope re-approval
         # appends to family_approvals and must not rewrite it.
         if first_round:
@@ -2382,6 +4939,23 @@ def _record_family_review(
         ).fetchone()
         if decided_envelope is None:
             raise StateError("family envelope changed while recording the review")
+        # The approved envelope is the budget authority for the whole family.
+        # Syncing the ledger here makes approval and budget initialization or
+        # cap adjustment one transaction, preserving spent budget across
+        # changed-envelope re-approvals while failing closed if a cap drops
+        # below already-spent budget.
+        envelope_body = envelope["envelope_json"]
+        if not isinstance(envelope_body, Mapping):
+            raise StateError("approved family envelope must be a JSON object")
+        max_total_seconds, max_fuzz_seconds = _approved_envelope_budget(
+            envelope_body
+        )
+        _sync_budget_ledger_on_approval_in_tx(
+            connection,
+            job_id,
+            max_total_seconds=max_total_seconds,
+            max_fuzz_seconds=max_fuzz_seconds,
+        )
         if first_round:
             updated_child = connection.execute(
                 "UPDATE jobs SET state = 'READY', stage = 'ready', "

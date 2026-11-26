@@ -90,6 +90,8 @@ T11 只验证图结构与节点幂等；policy 准入、轮次与预算容量的
 
 审核状态机与锁序的四条 D36 坐标及 D42 的四条信封坐标见 T10 的 `tests/integration/test_review_locks.py`；T12 复用它们验证重批后的 approval 链尾与 policy 边界，不重复创建测试。T12 另登记 D43 的 family 归档索引坐标与 `budget_ledger` 交叉 CHECK 坐标。
 
+改7 准入持久化三路径：`admitted` 写一行 `admissions` 与一条 `round_admitted`；`denied`（谓词拒绝或同 `(parent_job_id, round_no)` 异参冲突）不写 `admissions`、写一条 `round_admission_denied`；`already_admitted`（同参幂等重入）不写行、不写事件并返回既有 admission。`ROUND_ALREADY_ADMITTED` 只作为 outcome 的 `sub_reason` 与异参冲突的审计 `detail.sub_reason`，不进入 `jobs.reason_code`。以下 7 条准入持久化坐标均标 `postgres`（`tests/integration/test_admission.py`），不叠 `docker`/`asan`；`test_conflicting_budget_snapshot_is_denied` 验证 `budget_snapshot_digest` 参与幂等比较，最后两条验证 admission 的 envelope 必须同时绑定当前 approval 链尾与 frozen plan。
+
 | 测试坐标 | 断言点 | 首次运行的预期失败信息 |
 | --- | --- | --- |
 | `tests/contract/test_envelope.py::test_policy_admission_never_writes_review` | policy 准入后 `reviews` 无新行，`admissions` 恰一行 | `AssertionError: reviews row created for policy admission` |
@@ -101,14 +103,24 @@ T11 只验证图结构与节点幂等；policy 准入、轮次与预算容量的
 | `tests/contract/test_admission.py::test_admission_predicate_recomputes_offline` | 仅凭信封、父审批、seed、轮次与预算快照重算得到同一决定 | `AssertionError: recomputed admission differs from recorded decision` |
 | `tests/contract/test_admission.py::test_non_recomputable_admission_cites_campaign_bundle` | 不可重算的 admission 带 campaign 摘要与标注 | `KeyError: 'supporting_bundle_digest'` |
 | `tests/contract/test_admission.py::test_policy_admission_appends_round_admitted_event` | 准入成功追加 `round_admitted`，拒绝追加 `round_admission_denied` | `KeyError: 'round_admitted'` |
+| `tests/contract/test_admission.py::test_admission_envelope_must_match_approval` | 调用方 envelope 与 approval 链尾的 `envelope_digest` 不符时拒绝（`ADMISSION_DENIED` + `PARENT_APPROVAL_ENVELOPE_MISMATCH`），只产生 denied 事件 | `AssertionError: unapproved envelope was admitted` |
+| `tests/contract/test_admission.py::test_admission_plan_envelope_must_match` | 调用方 envelope 与 frozen plan 的 `envelope_digest` 不符时拒绝（`ADMISSION_DENIED` + `PLAN_ENVELOPE_MISMATCH`），不写 admission 行 | `AssertionError: plan envelope mismatch was admitted` |
 | `tests/unit/test_orchestration_graph.py::test_verify_iteration_requires_round_and_budget_capacity` | 无剩余轮次或余额时不回到 `hypothesis_aggregator`（由 T12 验收） | `AssertionError: new round created after max_rounds` |
 | `tests/contract/test_admission.py::test_round_beyond_max_rounds_is_denied` | `round_no > max_rounds` 由 predicate 拒绝，不依赖唯一约束 | `AssertionError: round beyond max_rounds was created` |
+| `tests/integration/test_admission.py::test_policy_admission_persists_one_row_and_one_event`（`postgres`） | 首次准入写一行 `admissions(approval_kind='policy')` 与一条 `round_admitted`，不写 `reviews`/`family_approvals` | `AssertionError: policy admission did not persist one row and one event` |
+| `tests/integration/test_admission.py::test_predicate_denial_writes_round_admission_denied_event`（`postgres`） | 谓词拒绝（如 `round_no > max_rounds`）不写 `admissions`，写一条 `round_admission_denied` | `AssertionError: predicate denial did not persist a denied event` |
+| `tests/integration/test_admission.py::test_idempotent_readmission_writes_no_second_event`（`postgres`） | 同参重入返回 `already_admitted`，不新增行、不写事件，返回既有 admission | `AssertionError: idempotent readmission wrote a second event` |
+| `tests/integration/test_admission.py::test_conflicting_readmission_is_denied`（`postgres`） | 同 `(parent_job_id, round_no)` 异参冲突返回 `ADMISSION_DENIED` + `sub_reason=ROUND_ALREADY_ADMITTED`，写一条 denied 事件 | `AssertionError: conflicting readmission was accepted` |
+| `tests/integration/test_admission.py::test_conflicting_budget_snapshot_is_denied`（`postgres`） | 同 `(parent_job_id, round_no)` 但 `budget_snapshot_digest` 不同的重入返回 `ADMISSION_DENIED` + `sub_reason=ROUND_ALREADY_ADMITTED`，不新增 admissions 行，写一条 denied 事件 | `AssertionError: conflicting budget snapshot was accepted` |
+| `tests/integration/test_admission.py::test_unapproved_envelope_is_denied`（`postgres`） | 用不是 approval 链尾信封的 body 调 `record_admission`：返回 denied、`sub_reason=PARENT_APPROVAL_ENVELOPE_MISMATCH`、0 行 admissions、恰 1 条 denied 事件 | `AssertionError: unapproved envelope was admitted` |
+| `tests/integration/test_admission.py::test_plan_envelope_mismatch_is_denied`（`postgres`） | plan 的 `envelope_digest` 与 approval 不同时，admitted envelope 也被拒：`sub_reason=PLAN_ENVELOPE_MISMATCH`、0 行 admissions、恰 1 条 denied 事件 | `AssertionError: plan envelope mismatch was admitted` |
 | `tests/contract/test_budget_ledger.py::test_concurrent_charge_cannot_overdraw_family_budget` | 两个数据库连接模拟竞争，最多一笔成功，余额不为负 | `AssertionError: remaining_total_seconds is negative` |
 | `tests/contract/test_budget_ledger.py::test_recovery_does_not_charge_twice` | 同一 `(job_id, step_key, attempt_no)` 恢复后只扣一次 | `AssertionError: budget charged twice after recovery` |
 | `tests/contract/test_budget_ledger.py::test_retry_with_new_attempt_charges_again` | 重试产生新 `attempt_no` 并再次扣费 | `AssertionError: retry was free` |
 | `tests/contract/test_budget_ledger.py::test_fuzz_charge_decrements_both_budgets` | fuzz charge 同时扣总预算与 fuzz 子预算，`fuzz_seconds <= seconds` | `AssertionError: fuzz charge only decremented one budget` |
 | `tests/contract/test_budget_ledger.py::test_exhaustion_returns_budget_exhausted_terminal` | 预算耗尽进入终态并返回 `BUDGET_EXHAUSTED` | `AssertionError: exhausted family created another round` |
 | `tests/contract/test_budget_ledger.py::test_report_budget_includes_fuzz_sub_budget` | report 预算 6 个字段齐全，可由 charge 按 family 重建 | `KeyError: 'remaining_fuzz_seconds'` |
+| `tests/integration/test_review_locks.py::test_family_approval_initializes_budget_ledger`（`postgres`） | 真实 `record_review(decision="approve")` 在审批事务内创建 1 行 `budget_ledger`（caps 来自已批准 envelope，remaining=max）；`charge_step_budget` 可扣 1 秒；同参重批幂等、不新增行、不重置 spent | `AssertionError: family approval did not initialize budget_ledger` |
 | `tests/contract/test_reuse.py::test_validation_reuses_campaign_build_and_detects_mismatch` | 校验包带 `reuse_origin`；任一版本摘要不符返回 `REUSE_MISMATCH` | `KeyError: 'reuse_origin'` |
 | `tests/contract/test_export.py::test_export_family_keeps_campaign_and_rounds` | family 导出含 campaign 与每轮独立 bundle，摘要不变 | `KeyError: 'campaign'` |
 | `tests/contract/test_evidence_v2.py::test_family_export_keeps_each_round_independently_verifiable` | family 导出后每轮 bundle 仍能独立 verify | `AssertionError: family export rewrote a round manifest` |
@@ -286,6 +298,9 @@ T15 实现新增坐标（P3）。下列坐标不在原计划表内，是实现�
 | `tests/contract/test_intel_fetch.py::test_snapshot_provider_maps_failures_to_reason_codes` | 读不到、读取出错、摘要不符、登记摘要格式非法、登记给别的案例各归其原因码与细因；provider 不抛异常 | 同上 |
 | `tests/contract/test_intel_fetch.py::test_snapshot_provider_reads_pinned_snapshots_without_network` | 离线案例只读固定快照，不触达抓取、连接层或 socket | 同上 |
 | `tests/contract/test_intel_fetch.py::test_snapshot_provider_summary_never_carries_url_credentials`（自审加固） | 就绪摘要里的来源 URL 不含账号口令；URL 缺失或无法解析为 `POLICY_DENIED` | `AssertionError: assert 'https://admi...0001.txt' == 'https://advi...0001.txt'` |
+| `tests/contract/test_intel_fetch.py::test_snapshot_provider_source_url_must_name_an_https_origin`（评审加固） | 来源 URL 必须是 https 源:裸词、他 scheme、`javascript:`、无主机、端口不可解析、空白与控制字符都 `SOURCE_URL_INVALID`,且在打开快照前拒绝 | `AssertionError: not-a-url` |
+| `tests/contract/test_intel_fetch.py::test_snapshot_provider_rejects_bytes_uses_as_a_license_denial`（评审加固） | `permitted_uses` 为 bytes/bytearray → `POLICY_DENIED`/`LICENSE_REJECTED`(只认 list/tuple/set/frozenset,与 intel_fetch 注册表门对齐),不再误归类为材料不可读 | `assert 'MATERIAL_MISSING' == 'POLICY_DENIED'` |
+| `tests/contract/test_intel_fetch.py::test_snapshot_provider_fails_closed_when_a_later_source_is_refused`（评审加固） | 多来源 fail-closed:第二个来源无许可整案阻断并点名来源;全通过时就绪摘要是第一个来源的 | ※ 未触发 RED(既有行为,评审建议加钉) |
 | `tests/contract/test_net_adapter.py::test_production_resolver_dedups_answers_preserving_order` | 生产 DNS 解析器答案去重且保序 | `ModuleNotFoundError: No module named 'datacon.tools.net_adapter'` |
 | `tests/contract/test_net_adapter.py::test_production_resolver_fails_closed_when_the_dns_budget_expires` | DNS 预算到期 → `DNS_TIMEOUT`，等待由预算而非查找本身结束 | 同上 |
 | `tests/contract/test_net_adapter.py::test_production_resolver_reports_unresolvable_hosts_fail_closed` | 名字不可解析 → `DNS_FAILED` | 同上 |
