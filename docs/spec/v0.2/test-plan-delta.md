@@ -174,6 +174,62 @@ T11 只验证图结构与节点幂等；policy 准入、轮次与预算容量的
 | `tests/contract/test_net_adapter.py::test_outlet_transport_fails_closed_on_unframed_or_oversized_bodies` | 无单一 `Content-Length` → `RESPONSE_UNFRAMED`；声明超上限 → `OUTLET_RESPONSE_TOO_LARGE` 且正文流不启动 | 同上 |
 | `tests/contract/test_net_adapter.py::test_outlet_transport_surfaces_truncated_and_non_json_bodies` | 截断传播 `CONTENT_TRUNCATED`；非严格 JSON 或非对象 → `OUTLET_BAD_JSON` | 同上 |
 
+T14 实现新增坐标（P3）。下列 38 条不在原计划表内，是实现与自审过程中补上的，与上表同属 T14 验收。标注「自审加固」的坐标来自对 T14 三个模块的逐行自审：先用探针复现缺陷，再写成 RED，修复后转绿。原计划坐标 `test_model_finding_must_be_hypothesis` 已归位到上表登记的 `test_model_outlet.py`。带「†」的失败信息是 P3 用探针对当时的实现直接观察到的行为，不是 pytest 的输出行。
+
+- **两处规范的解释**（已定，写在实现里）：
+  - security-design-delta §2.5「脱敏规则命中禁止字段 → 阻止发送」：按「先遮蔽，再对整个请求体扫一遍，仍有密钥类内容才阻止发送并记录原因」执行（`REDACTION_REJECTED`）。可遮蔽的形态遮蔽后照发；只有遮蔽覆盖不到的位置（例如字典的键名）残留密钥时才阻断。
+  - §2.3「任何自由文本命令、shell 片段……视为非法输出并阻断」：T14 **不按文本特征阻断**。封闭的 `AgentOutput` 结构里没有命令或工具调用的落点；命令注入类缺陷的假设本身就会含 shell 文本，按文本阻断会误伤。此点已获 Sasuke0723 在 #48 评审中确认（同意以结构封闭为门禁边界）。
+- **签名规则与信封一致**：`experiment_spec.validate_signature` 对值与类型的规则跟 `state._envelope_signature_set` 相同（`operation` 为 `READ` 或 `WRITE`，`access_size` 为 1 到 2^31-1），由 `test_signature_rules_agree_with_the_envelope_validator` 防漂移；文本字段另加两条更严的规则（无控制字符、不超过 200 字符）。
+- **标注集版本格式**：`b04-annotations-v1`、一个加号、`sha256:` 加 samples 的规范化摘要（`b04_eval.annotation_set_version`），加载时核对摘要。评审修正（#48，Sasuke0723 指出）：实现与本登记曾误写为冒号，ADR-003 第 12 条与 `tasks.md` 冻结的是 `<label>+<digest>`。
+- **尚未由坐标验证的几点**（要求不变）：连接与读取超时、重定向目标与证书校验的强制属于传输适配层，T14 的出口只把校验过的 endpoint 与脱敏后的请求体交给注入的传输层；B04 报告的分桶维度（按 family、模式、confidence）与证据引用有效率、契约拒绝率尚未实现，等真实标注集；信封交叉校验（`mutation_constraints` 是否为 `mutation_limits` 的子集、`input_family` 是否在允许集合内、目标是否落在版本与源码范围内）不在 T14 本轮。
+- **最后防线的范围**：出口体按结构逐个字符串扫描（键名也算），不扫序列化后的 JSON 文本——JSON 的结构本身（`token": "`）会被读成键值形式的口令，曾使 `parse_token` 这样的普通键名阻断整次请求。以凭据词结尾的字典键名（`auth_token`、`DB_PASSWORD`，也包括 `max_token`）其值被遮蔽而不是阻断；空值保持原样。
+- **已知限制**：12 位十六进制的容器短 ID 不遮蔽（与 git 短提交号无法区分）；不带账号口令的内部 URL 不遮蔽；以凭据词结尾的键名下的值一律遮蔽，无法区分凭据与同名配置（`max_token: 4096`）；`sort -u names.txt`、`psql -U admin` 这类命令会被多遮蔽紧随其后的一个词；散文里 `token:`、`password:` 后面紧随的一个词会被遮蔽。
+- 带「※」的失败信息是对加固前实现（提交 `ca0a9a2`）实测得到的；标「未保留」的三条是实现与测试同轮提交的收尾用例，没有留下首次失败记录。
+
+| 测试坐标 | 断言点 | 首次运行的预期失败信息 |
+| --- | --- | --- |
+| `tests/contract/test_model_outlet.py::test_online_outlet_requires_explicit_provider` | 在线出口缺 provider → `PROVIDER_REQUIRED`，传输层零调用 | 未保留 |
+| `tests/contract/test_model_outlet.py::test_connection_errors_fall_back_like_timeouts` | 连接错误、`OSError` 与超时同样回退 `fallback_offline` | 未保留 |
+| `tests/contract/test_model_outlet.py::test_constructor_job_id_flows_into_request_path_audit` | 构造时传入的 job_id 进入在线与离线两条路径的审计 | 未保留 |
+| `tests/contract/test_model_outlet.py::test_redaction_masks_the_whole_private_key_block`（自审加固） | 私钥整块被遮蔽；缺 END 时抹到文本末尾 | `AssertionError: private key material survived redaction` |
+| `tests/contract/test_model_outlet.py::test_redaction_masks_common_token_shapes`（自审加固） | GitHub 细粒度令牌、Stripe、Google、GitLab、PyPI、JWT、`Bearer`、`Basic`、口令赋值各形态被遮蔽 | `AssertionError: token shape survived redaction` |
+| `tests/contract/test_model_outlet.py::test_redaction_masks_windows_unc_and_single_segment_paths`（自审加固） | Windows 盘符路径、UNC 路径、单段绝对路径变为 `[PATH]`；紧挨字母或数字的斜杠不受影响 | `AssertionError: assert 'opened C:\\U…' == 'opened [PATH] …'` |
+| `tests/contract/test_model_outlet.py::test_redaction_masks_command_line_credentials`（自审加固） | 命令行里的凭据（`curl -u`、`--user`、`--password=`）只遮蔽值 | ※ `AssertionError: assert 'curl -u admi…' == 'curl -u [RED…'` |
+| `tests/contract/test_model_outlet.py::test_redaction_keeps_plain_factual_sentences` | 防过度脱敏的守卫：普通技术描述原样保留 | 守卫用例，自始通过 |
+| `tests/contract/test_model_outlet.py::test_redaction_reaches_nested_field_values`（自审加固） | 允许字段的值是嵌套的列表或字典时，令牌、私钥、连接串同样被遮蔽 | `AssertionError: assert 'ghp_…' not in '{"stage": …'` |
+| `tests/contract/test_model_outlet.py::test_outlet_rejects_bytes_and_unserializable_field_values`（自审加固） | bytes、非有限浮点、非字符串键等 → `FIELD_TYPE_REJECTED`，传输层不被调用 | `TypeError: Object of type bytes is not JSON serializable` |
+| `tests/contract/test_model_outlet.py::test_outlet_blocks_a_body_that_still_carries_a_secret`（自审加固） | 密钥藏在字典键名里 → `REDACTION_REJECTED`，传输层不被调用 | `Failed: DID NOT RAISE OutletError` |
+| `tests/contract/test_model_outlet.py::test_allowlist_matches_on_path_segment_boundaries`（自审加固） | 白名单 `/v1` 放行 `/v1` 与 `/v1/x`，拒绝 `/v1evil` | `AssertionError: external model request attempted in offline mode` |
+| `tests/contract/test_model_outlet.py::test_allowlist_matches_the_port`（自审加固） | 白名单匹配端口；未写端口按 443 | `AssertionError: external model request attempted in offline mode` |
+| `tests/contract/test_model_outlet.py::test_endpoint_rejects_userinfo_and_dot_segments`（自审加固） | 带账号口令的 endpoint、含点段或 `%2e%2e` 的路径被拒 | `Failed: DID NOT RAISE OutletError` |
+| `tests/contract/test_model_outlet.py::test_allowlist_entries_reject_userinfo_and_dot_segments`（自审加固） | 白名单条目自身带账号口令、点段或编码的点时构造器拒绝 | ※ `Failed: DID NOT RAISE OutletError` |
+| `tests/contract/test_model_outlet.py::test_model_audit_requires_a_job_id`（自审加固） | `job_id` 必须是可解析为 UUID 的字符串 | `Failed: DID NOT RAISE OutletError` |
+| `tests/contract/test_model_outlet.py::test_model_audit_enforces_the_offline_invariants`（自审加固） | `provider="offline"` 时版本、摘要为 null，耗时为 0，`outcome="offline"` | `Failed: DID NOT RAISE OutletError` |
+| `tests/contract/test_model_outlet.py::test_model_audit_rejects_malformed_versions_and_outcomes`（自审加固） | 版本非字符串、空的脱敏版本、词表外的 outcome、非有限耗时被拒 | `Failed: DID NOT RAISE OutletError` |
+| `tests/contract/test_model_outlet.py::test_online_outlet_requires_model_and_prompt_versions`（自审加固） | 缺模型版本或 prompt 版本 → 在触达传输层之前拒绝 | `Failed: DID NOT RAISE OutletError` |
+| `tests/contract/test_model_outlet.py::test_outlet_requires_a_job_id_before_any_request`（自审加固） | 没有 job_id 的出口拒绝一切请求，传输层零调用 | `Failed: DID NOT RAISE OutletError` |
+| `tests/contract/test_model_outlet.py::test_address_denied_transport_failure_blocks_as_outlet_error`（自审加固） | 连接层拒绝地址 → `ENDPOINT_ADDRESS_REJECTED` | `SafeHttpError: address answer is in the shared rejection set` |
+| `tests/contract/test_model_outlet.py::test_other_safe_http_failures_fall_back_offline`（自审加固） | 连接层其它失败回退 `fallback_offline` | `SafeHttpError: guarded step failed` |
+| `tests/contract/test_model_outlet.py::test_unexpected_transport_errors_block_as_outlet_errors`（自审加固） | 其它传输异常 → `TRANSPORT_FAILED`，带审计 | `RuntimeError: transport crashed` |
+| `tests/contract/test_model_outlet.py::test_rejected_model_output_keeps_an_audit_trail`（自审加固） | 输出被拒后 `OutletError` 带审计，含实际外发请求体的摘要 | `AttributeError: 'OutletError' object has no attribute 'model_audit'` |
+| `tests/contract/test_model_outlet.py::test_ordinary_key_names_do_not_block_a_structured_field`（自审加固） | 结构化字段里以凭据词结尾的普通键名（如 `parse_token`）不再阻断整次请求；键名原样保留，其值被遮蔽 | † `OutletError: … (key-value credential); refusing to send it`（请求被 `REDACTION_REJECTED` 阻断） |
+| `tests/contract/test_model_outlet.py::test_credential_named_keys_have_their_value_masked`（自审加固） | 被拆成键值对的凭据（`auth_token`、`password`、数字、容器）其值被遮蔽；空值保持 | † `OutletError: … (key-value credential); refusing to send it`（请求被 `REDACTION_REJECTED` 阻断） |
+| `tests/contract/test_model_outlet.py::test_outlet_rejects_values_the_strict_encoder_cannot_carry`（自审加固） | 孤立的代理字符、超出转换上限的整数 → `FIELD_TYPE_REJECTED`，不漏出编码器的异常 | † `UnicodeEncodeError: 'utf-8' codec can't encode character '\ud800'` |
+| `tests/contract/test_experiment_spec.py::test_experiment_spec_rejects_unknown_keys_in_sub_objects`（自审加固） | 两个子对象是封闭键集，命令、shell 键被拒 | `Failed: DID NOT RAISE ExperimentSpecError` |
+| `tests/contract/test_experiment_spec.py::test_experiment_spec_validates_sub_object_value_types`（自审加固） | 子对象的值类型、必填字段、`access_size` 的类型 | `Failed: DID NOT RAISE ExperimentSpecError` |
+| `tests/contract/test_experiment_spec.py::test_experiment_spec_rejects_absolute_or_traversing_target_path`（自审加固） | `target_path` 是仓库相对路径 | `Failed: DID NOT RAISE ExperimentSpecError` |
+| `tests/contract/test_experiment_spec.py::test_experiment_spec_bounds_symbol_family_and_rationale`（自审加固） | 符号、输入族与说明文字的词法和长度界限 | `Failed: DID NOT RAISE ExperimentSpecError` |
+| `tests/contract/test_experiment_spec.py::test_signature_match_distinguishes_bool_and_float_from_int`（自审加固） | 签名比较要求值与类型都相同 | `AssertionError: assert True is False` |
+| `tests/contract/test_experiment_spec.py::test_signature_rules_agree_with_the_envelope_validator`（自审加固） | 同一批签名过本模块与信封两边的校验，结论一致 | ※ `ImportError: cannot import name 'validate_signature'` |
+| `tests/contract/test_experiment_spec.py::test_experiment_spec_rejects_non_text_confidence`（自审加固） | `confidence` 非文本 → `ExperimentSpecError`，不漏出原始异常 | ※ `TypeError: cannot use 'list' as a set element` |
+| `tests/contract/test_experiment_spec.py::test_experiment_spec_bounds_lengths_and_control_characters`（自审加固） | C1 控制字符被拒；文本与列表字段有上界 | ※ `Failed: DID NOT RAISE ExperimentSpecError` |
+| `tests/contract/test_b04_hypothesis_quality.py::test_annotation_set_rejects_malformed_samples`（自审加固） | 样本不是对象、缺字段、行号无序、签名不合法、文件不是 JSON → `ANNOTATION_INVALID` | `Failed: DID NOT RAISE B04GateError` |
+| `tests/contract/test_b04_hypothesis_quality.py::test_annotation_version_binds_the_annotation_digest`（自审加固） | 版本串符合格式且摘要与 samples 一致；改样本不升版本被拒 | `Failed: DID NOT RAISE B04GateError` |
+| `tests/contract/test_b04_hypothesis_quality.py::test_annotation_version_requires_the_canonical_separator`（自审加固） | 版本串只认 `b04-annotations-v1+sha256:…` 一种写法；评审修正后冒号也是被拒的分隔符 | ※ `Failed: DID NOT RAISE B04GateError` |
+| `tests/contract/test_experiment_spec.py::test_experiment_spec_requires_at_least_one_evidence_ref`（评审加固） | `evidence_refs` 空列表 → `ExperimentSpecError`（非空要求，与 finding 层 `agent_contracts` 一致） | ※ `Failed: DID NOT RAISE ExperimentSpecError` |
+| `tests/contract/test_experiment_spec.py::test_experiment_spec_checks_log_reference_grammar`（评审加固） | `log/build:`/`log/fuzz:` 引用按 §11 冻结语法（`contracts.parse_log_evidence_ref`）校验：降序区间、非法 selector、fuzz 带区间被拒，v0.1 形式照常通过 | ※ `Failed: DID NOT RAISE ExperimentSpecError` |
+| `tests/contract/test_b04_hypothesis_quality.py::test_a_hit_requires_the_same_case`（评审加固） | 命中要求 `case_id` 一致：同一上游文件被其他 case 复用时不得交叉命中 | ※ `assert 1.0 == 0` |
+
 ### T15 在线情报
 
 T15 可以先独立实现采集，但最终验收依赖 T10 的 `intel_snapshot`/`license_record` 角色与 T11 的 `intel` 节点。
