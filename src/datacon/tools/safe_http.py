@@ -364,15 +364,23 @@ class GuardedConnection:
             )
 
     def send_request(
-        self, method: str, path: str, headers: Mapping[str, str]
+        self,
+        method: str,
+        path: str,
+        headers: Mapping[str, str],
+        body: bytes | None = None,
     ) -> None:
-        """Send one origin-form, bodyless request with the Host pinned.
+        """Send one origin-form request, bodyless or with exact bytes.
 
         The peer is rechecked first (a mismatch aborts with zero bytes
         sent), any caller-supplied ``Host`` header is dropped and replaced
         by the original hostname, and CR/LF inside the method, path or a
         header line is rejected so no string can inject extra headers or a
-        second request.
+        second request. With a ``body``, the caller's ``Content-Length``
+        is dropped too and replaced by the exact byte count, and the body
+        leaves as its own write after the head so the wire carries
+        byte-for-byte what was handed in - the canonical-JSON basis the
+        outlet's ``request_digest`` is taken over.
         """
         self._recheck_peer()
         self._reject_line_injection(method)
@@ -387,10 +395,17 @@ class GuardedConnection:
             if name.lower() == "host":
                 # A forged Host header must not survive the pinning.
                 continue
+            if body is not None and name.lower() == "content-length":
+                # The length is computed from the body, never trusted.
+                continue
             self._reject_line_injection(name)
             self._reject_line_injection(value)
             lines.append(f"{name}: {value}")
+        if body is not None:
+            lines.append(f"Content-Length: {len(body)}")
         self._socket.sendall(("\r\n".join(lines) + "\r\n\r\n").encode("utf-8"))
+        if body is not None:
+            self._socket.sendall(body)
 
     @staticmethod
     def _parse_header_lines(raw_lines: list[bytes]) -> dict[str, str]:
