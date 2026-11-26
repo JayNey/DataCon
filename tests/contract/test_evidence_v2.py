@@ -12,7 +12,12 @@ from pathlib import Path
 from uuid import uuid4
 
 import pytest
-from test_evidence import MATERIAL_DIGESTS, _update_build, make_bundle
+from test_evidence import (
+    MATERIAL_DIGESTS,
+    _rewrite_manifested_file,
+    _update_build,
+    make_bundle,
+)
 
 from datacon import contracts, evidence
 from datacon.evidence import BundleError, export_bundle, verify_bundle
@@ -973,6 +978,170 @@ def test_v1_build_record_still_requires_input_aliases(tmp_path):
         verify_bundle(info.root)
     assert raised.value.reason_code in ("DIGEST_MISMATCH", "INVALID_MANIFEST")
     assert "missing=" in raised.value.message
+
+
+@pytest.mark.parametrize(
+    "alias",
+    [
+        "inputs/normal.txt",
+        "inputs/candidate.txt",
+        "./inputs/normal.txt",
+        "inputs/./candidate.txt",
+        "a/../inputs/normal.txt",
+        "/inputs/normal.txt",
+    ],
+)
+def test_v2_build_metadata_rejects_input_alias_variants(tmp_path, alias):
+    """D4 must cover the archived build metadata, not only report.json."""
+    files = _base_files(execution=True, campaign=False)
+    root = _write_v2_bundle(
+        tmp_path,
+        _manifest("execution"),
+        files,
+        name="v2-build-metadata-alias",
+    )
+    metadata = {
+        "version": "vulnerable",
+        "staged_materials": {"harness.c": DIGEST, alias: OTHER_DIGEST},
+    }
+    _rewrite_manifested_file(
+        root,
+        "build/vulnerable/metadata.json",
+        json.dumps(metadata).encode() + b"\n",
+    )
+    with pytest.raises(BundleError, match="input aliases"):
+        verify_bundle(root)
+
+
+def test_v2_execution_metadata_rejects_input_aliases(tmp_path):
+    """The execution metadata is another carrier of the v2 build list."""
+    files = _base_files(execution=True, campaign=False)
+    root = _write_v2_bundle(
+        tmp_path,
+        _manifest("execution"),
+        files,
+        name="v2-execution-metadata-alias",
+    )
+    execution = {
+        "builds": [
+            {
+                "version": "vulnerable",
+                "staged_materials": {
+                    "harness.c": DIGEST,
+                    "a/../inputs/candidate.txt": OTHER_DIGEST,
+                },
+            }
+        ]
+    }
+    _rewrite_manifested_file(
+        root,
+        "metadata/execution.json",
+        json.dumps(execution).encode() + b"\n",
+    )
+    with pytest.raises(BundleError, match="input aliases"):
+        verify_bundle(root)
+
+
+def test_v2_blocked_build_metadata_rejects_input_aliases(tmp_path):
+    """A blocked v2 bundle may not smuggle a v1 build record either."""
+    manifest = _manifest("blocked")
+    files = _blocked_files(manifest)
+    files["build/vulnerable/metadata.json"] = (
+        "build_metadata",
+        json.dumps(
+            {
+                "version": "vulnerable",
+                "staged_materials": {"inputs/normal.txt": DIGEST},
+            }
+        ).encode()
+        + b"\n",
+    )
+    root = _write_v2_bundle(
+        tmp_path, manifest, files, name="blocked-build-metadata-alias"
+    )
+    with pytest.raises(BundleError, match="input aliases"):
+        verify_bundle(root)
+
+
+def test_v2_build_record_with_material_only_is_accepted(tmp_path):
+    """D4 only rejects the two aliases, not ordinary build materials."""
+    files = _base_files(execution=True, campaign=False)
+    root = _write_v2_bundle(
+        tmp_path,
+        _manifest("execution"),
+        files,
+        name="v2-build-material-only",
+    )
+    metadata = {
+        "version": "vulnerable",
+        "staged_materials": {"harness.c": DIGEST, "vulnerable/parser.c": OTHER_DIGEST},
+    }
+    _rewrite_manifested_file(
+        root,
+        "build/vulnerable/metadata.json",
+        json.dumps(metadata).encode() + b"\n",
+    )
+    assert verify_bundle(root).manifest["bundle_kind"] == "execution"
+
+
+def test_v2_non_reuse_plan_and_report_must_not_claim_build_ref(tmp_path):
+    """Fixed/non-reuse execution must keep both provenance pointers null."""
+    manifest = _manifest("execution")
+    files = _base_files(execution=True, campaign=False)
+    files["plan.json"] = (
+        "plan",
+        json.dumps({"schema_version": 2, "build_ref": _build_ref()}).encode()
+        + b"\n",
+    )
+    plan_root = _write_v2_bundle(
+        tmp_path, manifest, files, name="non-reuse-plan-build-ref"
+    )
+    with pytest.raises(BundleError, match="non-reuse plan"):
+        verify_bundle(plan_root)
+
+    report_files = _base_files(execution=True, campaign=False)
+    report_files["report.json"] = (
+        "report_json",
+        json.dumps({"schema_version": 2, "build_ref": _build_ref()}).encode()
+        + b"\n",
+    )
+    report_root = _write_v2_bundle(
+        tmp_path, manifest, report_files, name="non-reuse-report-build-ref"
+    )
+    with pytest.raises(BundleError, match="non-reuse report"):
+        verify_bundle(report_root)
+
+
+def test_v2_build_provenance_faces_are_fixed(tmp_path):
+    """D39 allows only the three reviewed provenance face names."""
+    allowed = _base_files(execution=True, campaign=False)
+    allowed["build/vulnerable/build_provenance/cc-shim.log"] = (
+        "build_provenance",
+        b"cc-shim\n",
+    )
+    allowed["build/fixed/build_provenance/shell-face.log"] = (
+        "build_provenance",
+        b"shell-face\n",
+    )
+    root = _write_v2_bundle(
+        tmp_path, _manifest("execution"), allowed, name="provenance-faces"
+    )
+    assert verify_bundle(root).manifest["bundle_kind"] == "execution"
+
+    for bad_face in ("evil.txt", "nested/compile_commands.json"):
+        files = _base_files(execution=True, campaign=False)
+        files[f"build/vulnerable/build_provenance/{bad_face}"] = (
+            "build_provenance",
+            b"[]\n",
+        )
+        bad_root = _write_v2_bundle(
+            tmp_path,
+            _manifest("execution"),
+            files,
+            name="bad-provenance-" + bad_face.replace("/", "-"),
+        )
+        with pytest.raises(BundleError, match="fixed face path"):
+            verify_bundle(bad_root)
 
 
 @pytest.mark.parametrize("bundle_kind", ["execution", "campaign", "blocked"])
