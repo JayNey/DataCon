@@ -1077,7 +1077,14 @@ def analysis_progress(
 
 
 def begin_execution(dsn: str, job_id: UUID, *, generation: int) -> bool:
-    """Move a READY job to RUNNING under the current claim's generation."""
+    """Move a READY job to RUNNING under the current claim's generation.
+
+    A job that is already RUNNING is an idempotent re-entry and returns True
+    even if its family has been rejected into BLOCKED in the meantime, matching
+    ``finish_execution``/``charge_step_budget`` so the active generation can
+    still settle. The family AGGREGATING and pending-envelope gates only apply
+    to the READY -> RUNNING transition.
+    """
     with _connect(dsn) as connection:
         identity = connection.execute(
             "SELECT job_contract_version, job_kind, family_id, round_no "
@@ -1114,15 +1121,20 @@ def begin_execution(dsn: str, job_id: UUID, *, generation: int) -> bool:
                 or family["job_kind"] != "family"
             ):
                 raise StateError("the child parent is not a v2 family")
+        job = _locked_job(connection, job_id, generation=generation)
+        if job["state"] == "RUNNING":
+            # A child that is already RUNNING keeps its idempotent re-entry even
+            # when the family was rejected in the meantime, matching
+            # finish_execution and charge_step_budget: the running generation
+            # must still be able to settle. The family-state gate below only
+            # governs the READY -> RUNNING transition.
+            return True
+        if is_v2_child:
             if family["state"] != "AGGREGATING":
                 raise StateError(
                     "cannot start execution while the family is "
                     f"{family['state']}"
                 )
-        job = _locked_job(connection, job_id, generation=generation)
-        if job["state"] == "RUNNING":
-            return True
-        if is_v2_child:
             pending_envelope = connection.execute(
                 "SELECT 1 FROM family_envelopes "
                 "WHERE family_id = %s AND status = 'pending' LIMIT 1",
@@ -3203,10 +3215,16 @@ def record_admission(
                 raise StateError(
                     f"admission family is {family['state']}, not AGGREGATING"
                 )
-            if round_job["state"] in _TERMINAL_JOB_STATES:
+            if round_job["state"] not in ("QUEUED", "PREPARING", "READY"):
+                # Admission happens strictly before execution. A RUNNING,
+                # ARCHIVING or AWAITING_REVIEW round is already executing (or
+                # has executed), and a terminal one is gone; none may create an
+                # admissions row or a round_admission_denied event. The same
+                # inputs of an existing admission still take the idempotent
+                # early return above, whatever the round state.
                 raise StateError(
-                    "admission round job is in terminal state "
-                    f"{round_job['state']}"
+                    "admission round job is not in an admission-eligible "
+                    f"state {round_job['state']}"
                 )
             pending_envelope = connection.execute(
                 "SELECT 1 FROM family_envelopes "
@@ -4059,7 +4077,7 @@ def charge_step_budget(
     charge_kind: str,
     elapsed_seconds: Any,
     elapsed_fuzz_seconds: Any = 0,
-    generation: int | None = None,
+    generation: int,
 ) -> BudgetChargeOutcome:
     """Charge one step in an independent short transaction.
 
@@ -4068,14 +4086,14 @@ def charge_step_budget(
     ``UPDATE ... WHERE remaining >= charged`` is the only mutation, so a
     concurrent or timed-out charge can never overdraw the family budget.
 
-    When ``generation`` is supplied, a new charge is additionally fenced by the
-    worker's generation and lease under the job row lock. An already-recorded
-    charge is still recovered by its idempotency key: a lease change or a
-    terminal state must not erase an accounted step.
+    ``generation`` is required: a new charge is fenced by the worker's
+    generation and its still-active lease under the job row lock, matching the
+    other same-generation APIs. Omitting it is a ``TypeError``, not a way to
+    skip the fence. An already-recorded charge is still recovered by its
+    idempotency key before that fence, so a lease change or a terminal state
+    cannot erase an accounted step.
     """
-    if generation is not None and (
-        type(generation) is not int or generation < 1
-    ):
+    if type(generation) is not int or generation < 1:
         raise StateError("generation must be a positive integer")
     charge_kind, attempt_no, elapsed, fuzz_elapsed = _validate_charge_input(
         step_key=step_key,
@@ -4156,25 +4174,25 @@ def charge_step_budget(
                     "cannot charge budget while job is in state "
                     f"{job_row['state']}"
                 )
-            if generation is not None:
-                # Evaluate the database clock only after both row locks are
-                # held. A transaction-start now() could predate the lock wait
-                # and would let a worker whose lease expired during the wait
-                # still pass the fence.
-                db_now = connection.execute(
-                    "SELECT clock_timestamp() AS db_now"
-                ).fetchone()["db_now"]
-                if job_row["generation"] != generation:
-                    raise StaleGeneration(
-                        "execution generation is no longer current"
-                    )
-                if (
-                    job_row["lease_expires_at"] is None
-                    or job_row["lease_expires_at"] <= db_now
-                ):
-                    raise StaleGeneration(
-                        "the worker lease is no longer active"
-                    )
+            # Evaluate the database clock only after both row locks are held.
+            # A transaction-start now() could predate the lock wait and would
+            # let a worker whose lease expired during the wait still pass the
+            # fence. The fence is unconditional for every new charge: omitting
+            # generation is no longer a way to bypass the lease.
+            db_now = connection.execute(
+                "SELECT clock_timestamp() AS db_now"
+            ).fetchone()["db_now"]
+            if job_row["generation"] != generation:
+                raise StaleGeneration(
+                    "execution generation is no longer current"
+                )
+            if (
+                job_row["lease_expires_at"] is None
+                or job_row["lease_expires_at"] <= db_now
+            ):
+                raise StaleGeneration(
+                    "the worker lease is no longer active"
+                )
 
             gate = budget_gate(ledger, fuzz=charge_kind == "fuzz")
             if not gate.allowed:

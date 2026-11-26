@@ -1028,8 +1028,9 @@ def test_begin_execution_idempotent_for_running_child_during_non_tightening_pend
         == "RUNNING"
     )
 
-    # Rejecting the family still blocks begin_execution because the family
-    # AGGREGATING check stays before the RUNNING idempotency return.
+    # Rejecting the family blocks a READY child from starting, but a child that
+    # is already RUNNING keeps its idempotent re-entry and can still settle its
+    # execution: the family-state check runs only after the RUNNING return.
     rejected = state.record_review(
         isolated_database.dsn,
         family_id,
@@ -1039,7 +1040,29 @@ def test_begin_execution_idempotent_for_running_child_during_non_tightening_pend
         envelope_digest=proposed["envelope_digest"],
     )
     assert rejected.status == "applied", rejected.message
-    with pytest.raises(state.StateError, match="BLOCKED"):
+    assert _row(
+        isolated_database,
+        "SELECT state FROM jobs WHERE job_id = %s",
+        (family_id,),
+    )[0] == "BLOCKED"
+    assert (
         state.begin_execution(
             isolated_database.dsn, child_id, generation=claimed["generation"]
         )
+        is True
+    )
+    finished = state.finish_execution(
+        isolated_database.dsn,
+        child_id,
+        generation=claimed["generation"],
+        state="BLOCKED",
+        reason_code="REVIEW_REJECTED",
+        verdict=None,
+        verdict_reason=None,
+    )
+    assert finished is True
+    assert _row(
+        isolated_database,
+        "SELECT state FROM jobs WHERE job_id = %s",
+        (child_id,),
+    )[0] == "BLOCKED"

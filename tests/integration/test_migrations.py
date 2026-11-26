@@ -676,6 +676,12 @@ def test_budget_ledger_has_no_cross_remaining_check(isolated_database):
         round_no=1,
         state_name="RUNNING",
     )
+    isolated_database.connection.execute(
+        "UPDATE jobs SET generation = 1, lease_owner = 'worker-a', "
+        "lease_expires_at = clock_timestamp() + interval '1 hour' "
+        "WHERE job_id = %s",
+        (child_id,),
+    )
     try:
         ledger = state.initialize_budget_ledger(
             isolated_database.dsn,
@@ -692,6 +698,7 @@ def test_budget_ledger_has_no_cross_remaining_check(isolated_database):
     try:
         first_charge = state.charge_step_budget(
             isolated_database.dsn,
+            generation=1,
             family_id=family_id,
             job_id=child_id,
             step_key="prepare-build",
@@ -707,6 +714,7 @@ def test_budget_ledger_has_no_cross_remaining_check(isolated_database):
 
     outcome = state.charge_step_budget(
         isolated_database.dsn,
+        generation=1,
         family_id=family_id,
         job_id=child_id,
         step_key="build",

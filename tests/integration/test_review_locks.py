@@ -3324,11 +3324,15 @@ def test_family_approval_initializes_budget_ledger(
     assert ledger["remaining_fuzz_seconds"] == 300
 
     isolated_database.connection.execute(
-        "UPDATE jobs SET state = 'RUNNING', stage = 'execute' WHERE job_id = %s",
+        "UPDATE jobs SET state = 'RUNNING', stage = 'execute', "
+        "lease_owner = 'worker-a', "
+        "lease_expires_at = clock_timestamp() + interval '10 minutes' "
+        "WHERE job_id = %s",
         (seed["child_id"],),
     )
     charge = state.charge_step_budget(
         isolated_database.dsn,
+        generation=2,
         family_id=seed["family_id"],
         job_id=seed["child_id"],
         step_key="build",
@@ -3369,11 +3373,15 @@ def test_reapproval_tightens_budget_ledger_and_propose_rejects_below_spent(
     assert first_approval.status == "applied", first_approval.message
 
     isolated_database.connection.execute(
-        "UPDATE jobs SET state = 'RUNNING', stage = 'execute' WHERE job_id = %s",
+        "UPDATE jobs SET state = 'RUNNING', stage = 'execute', "
+        "lease_owner = 'worker-a', "
+        "lease_expires_at = clock_timestamp() + interval '10 minutes' "
+        "WHERE job_id = %s",
         (seed["child_id"],),
     )
     charge = state.charge_step_budget(
         isolated_database.dsn,
+        generation=2,
         family_id=family_id,
         job_id=seed["child_id"],
         step_key="fuzz",
@@ -3477,6 +3485,7 @@ def test_charge_step_budget_concurrent_with_propose_envelope_and_record_review_n
         first_approval=True,
         pending_envelope=None,
         child_state="RUNNING",
+        lease=True,
     )
     family_id = seed["family_id"]
     child_id = seed["child_id"]
@@ -3516,6 +3525,7 @@ def test_charge_step_budget_concurrent_with_propose_envelope_and_record_review_n
                 barrier.wait(timeout=10)
                 results["charge"] = state.charge_step_budget(
                     isolated_database.dsn,
+                    generation=1,
                     family_id=family_id,
                     job_id=child_id,
                     step_key=f"propose-race-{i}",
@@ -3570,6 +3580,7 @@ def test_charge_step_budget_concurrent_with_propose_envelope_and_record_review_n
                 barrier.wait(timeout=10)
                 results["charge"] = state.charge_step_budget(
                     isolated_database.dsn,
+                    generation=1,
                     family_id=family_id,
                     job_id=child_id,
                     step_key=f"review-race-{i}",
@@ -3618,6 +3629,7 @@ def test_charge_step_budget_concurrent_with_propose_envelope_and_record_review_n
                 barrier.wait(timeout=10)
                 results["charge"] = state.charge_step_budget(
                     isolated_database.dsn,
+                    generation=1,
                     family_id=family_id,
                     job_id=child_id,
                     step_key=f"tighten-race-{i}",

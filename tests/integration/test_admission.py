@@ -460,15 +460,17 @@ def test_record_admission_denies_exhausted_ledger_even_with_forged_snapshot(
     isolated_database.connection.execute(
         "INSERT INTO jobs (job_id, request, state, stage, submitted_at, "
         "job_contract_version, family_id, job_kind, parent_job_id, round_no, "
-        "generation) "
+        "generation, lease_owner, lease_expires_at) "
         "VALUES (%s, %s, 'RUNNING', 'execute', clock_timestamp(), 2, %s, "
-        "'campaign', %s, NULL, 1)",
+        "'campaign', %s, NULL, 1, 'worker-a', "
+        "clock_timestamp() + interval '1 hour')",
         (campaign_id, Jsonb({"schema_version": 2}), family_id, family_id),
     )
     charge = state.charge_step_budget(
         isolated_database.dsn,
         family_id=family_id,
         job_id=campaign_id,
+        generation=1,
         step_key="drain",
         attempt_no=1,
         charge_kind="general",
@@ -502,15 +504,17 @@ def test_record_admission_rejects_snapshot_exceeding_ledger(isolated_database):
     isolated_database.connection.execute(
         "INSERT INTO jobs (job_id, request, state, stage, submitted_at, "
         "job_contract_version, family_id, job_kind, parent_job_id, round_no, "
-        "generation) "
+        "generation, lease_owner, lease_expires_at) "
         "VALUES (%s, %s, 'RUNNING', 'execute', clock_timestamp(), 2, %s, "
-        "'campaign', %s, NULL, 1)",
+        "'campaign', %s, NULL, 1, 'worker-a', "
+        "clock_timestamp() + interval '1 hour')",
         (campaign_id, Jsonb({"schema_version": 2}), family_id, family_id),
     )
     charge = state.charge_step_budget(
         isolated_database.dsn,
         family_id=family_id,
         job_id=campaign_id,
+        generation=1,
         step_key="build",
         attempt_no=1,
         charge_kind="general",
@@ -994,6 +998,62 @@ def test_record_admission_rejects_terminal_round_job(
         _admit(isolated_database, seed)
     assert _admissions(isolated_database, family_id, 2) == []
     assert _events(isolated_database, child_id) == []
+
+
+@pytest.mark.parametrize("round_state", ["RUNNING", "ARCHIVING", "AWAITING_REVIEW"])
+def test_record_admission_rejects_round_job_past_the_admission_phase(
+    isolated_database, round_state
+):
+    seed = _seed_family(isolated_database)
+    family_id, child_id, _envelope_value = seed
+    isolated_database.connection.execute(
+        "UPDATE jobs SET state = %s WHERE job_id = %s",
+        (round_state, child_id),
+    )
+
+    with pytest.raises(state.StateError, match=round_state):
+        _admit(isolated_database, seed)
+    assert _admissions(isolated_database, family_id, 2) == []
+    assert _events(isolated_database, child_id) == []
+
+
+@pytest.mark.parametrize("round_state", ["QUEUED", "PREPARING", "READY"])
+def test_record_admission_accepts_pre_execution_round_job(
+    isolated_database, round_state
+):
+    seed = _seed_family(isolated_database)
+    family_id, child_id, _envelope_value = seed
+    isolated_database.connection.execute(
+        "UPDATE jobs SET state = %s WHERE job_id = %s",
+        (round_state, child_id),
+    )
+
+    outcome = _admit(isolated_database, seed)
+
+    assert outcome.admitted
+    assert len(_admissions(isolated_database, family_id, 2)) == 1
+    assert [event[0] for event in _events(isolated_database, child_id)] == [
+        "round_admitted"
+    ]
+
+
+def test_readmission_stays_idempotent_after_round_enters_running(isolated_database):
+    seed = _seed_family(isolated_database)
+    family_id, child_id, _envelope_value = seed
+    first = _admit(isolated_database, seed)
+    assert first.admitted
+    isolated_database.connection.execute(
+        "UPDATE jobs SET state = 'RUNNING' WHERE job_id = %s",
+        (child_id,),
+    )
+
+    same = _admit(isolated_database, seed)
+
+    assert same.status == "already_admitted"
+    assert len(_admissions(isolated_database, family_id, 2)) == 1
+    assert [event[0] for event in _events(isolated_database, child_id)] == [
+        "round_admitted"
+    ]
 
 
 def test_record_admission_validates_plan_round_no_and_candidate_seed(

@@ -102,6 +102,16 @@ def _ledger(**overrides) -> dict:
     return ledger
 
 
+def _activate_lease(database, job_id, generation: int) -> None:
+    """Give a seeded RUNNING child the active lease owned by its generation."""
+    database.connection.execute(
+        "UPDATE jobs SET lease_owner = 'worker-a', "
+        "lease_expires_at = clock_timestamp() + interval '1 hour', "
+        "generation = %s WHERE job_id = %s",
+        (generation, job_id),
+    )
+
+
 def _charge(
     ledger,
     charges,
@@ -265,6 +275,20 @@ def test_fuzz_cap_uses_min_of_both_budgets():
     assert denied.reason_code == "BUDGET_EXHAUSTED"
     assert denied.hard_timeout_seconds == 0
 
+    # Discriminators against a "total budget only" implementation: the fuzz
+    # sub-budget alone must deny the start even when the total has room, and
+    # it must cap the hard timeout even when the total is larger.
+    no_fuzz = _ledger(remaining_total_seconds=50, remaining_fuzz_seconds=0)
+    denied_fuzz = state.budget_gate(no_fuzz, fuzz=True)
+    assert not denied_fuzz.allowed
+    assert denied_fuzz.reason_code == "BUDGET_EXHAUSTED"
+    assert denied_fuzz.hard_timeout_seconds == 0
+
+    fuzz_bound = _ledger(remaining_total_seconds=50, remaining_fuzz_seconds=7)
+    fuzz_gate = state.budget_gate(fuzz_bound, fuzz=True)
+    assert fuzz_gate.allowed
+    assert fuzz_gate.hard_timeout_seconds == 7
+
 
 @pytest.mark.postgres
 def test_concurrent_charge_cannot_overdraw_family_budget(budget_database):
@@ -292,6 +316,7 @@ def test_concurrent_charge_cannot_overdraw_family_budget(budget_database):
         max_total_seconds=100,
         max_fuzz_seconds=60,
     )
+    _activate_lease(budget_database, child_id, 1)
 
     barrier = threading.Barrier(2)
     outcomes: list = []
@@ -303,6 +328,7 @@ def test_concurrent_charge_cannot_overdraw_family_budget(budget_database):
             outcomes.append(
                 state.charge_step_budget(
                     budget_database.dsn,
+                    generation=1,
                     family_id=family_id,
                     job_id=child_id,
                     step_key=step_key,
@@ -415,9 +441,11 @@ def test_postgres_charge_step_budget_recovery_retry_fuzz_exhaustion_and_reconcil
         max_total_seconds=100,
         max_fuzz_seconds=60,
     )
+    _activate_lease(budget_database, child_id, 2)
 
     first = state.charge_step_budget(
         budget_database.dsn,
+        generation=2,
         family_id=family_id,
         job_id=child_id,
         step_key="build",
@@ -431,6 +459,7 @@ def test_postgres_charge_step_budget_recovery_retry_fuzz_exhaustion_and_reconcil
 
     recovered = state.charge_step_budget(
         budget_database.dsn,
+        generation=2,
         family_id=family_id,
         job_id=child_id,
         step_key="build",
@@ -446,6 +475,7 @@ def test_postgres_charge_step_budget_recovery_retry_fuzz_exhaustion_and_reconcil
 
     retry = state.charge_step_budget(
         budget_database.dsn,
+        generation=2,
         family_id=family_id,
         job_id=child_id,
         step_key="build",
@@ -457,6 +487,7 @@ def test_postgres_charge_step_budget_recovery_retry_fuzz_exhaustion_and_reconcil
 
     fuzz_frac = state.charge_step_budget(
         budget_database.dsn,
+        generation=2,
         family_id=family_id,
         job_id=child_id,
         step_key="fuzz-frac",
@@ -472,6 +503,7 @@ def test_postgres_charge_step_budget_recovery_retry_fuzz_exhaustion_and_reconcil
 
     fuzz_zero = state.charge_step_budget(
         budget_database.dsn,
+        generation=2,
         family_id=family_id,
         job_id=child_id,
         step_key="fuzz-zero",
@@ -487,6 +519,7 @@ def test_postgres_charge_step_budget_recovery_retry_fuzz_exhaustion_and_reconcil
 
     exhausted = state.charge_step_budget(
         budget_database.dsn,
+        generation=2,
         family_id=family_id,
         job_id=child_id,
         step_key="replay",
@@ -545,10 +578,12 @@ def test_postgres_charge_step_budget_rejects_wrong_family_and_family_self_job(
         "'round', %s, 1, 1)",
         (child_b, Jsonb({"schema_version": 2}), family_b, family_b),
     )
+    _activate_lease(budget_database, child_b, 1)
 
     with pytest.raises(state.StateError):
         state.charge_step_budget(
             budget_database.dsn,
+            generation=1,
             family_id=family_a,
             job_id=family_a,
             step_key="build",
@@ -560,6 +595,7 @@ def test_postgres_charge_step_budget_rejects_wrong_family_and_family_self_job(
     with pytest.raises(state.StateError):
         state.charge_step_budget(
             budget_database.dsn,
+            generation=1,
             family_id=family_a,
             job_id=child_b,
             step_key="build",
@@ -691,9 +727,11 @@ def test_postgres_charge_step_budget_ledger_is_canonical_json(budget_database):
         max_total_seconds=20,
         max_fuzz_seconds=10,
     )
+    _activate_lease(budget_database, child_id, 2)
 
     charged = state.charge_step_budget(
         budget_database.dsn,
+        generation=2,
         family_id=family_id,
         job_id=child_id,
         step_key="build",
@@ -707,6 +745,7 @@ def test_postgres_charge_step_budget_ledger_is_canonical_json(budget_database):
 
     recovered = state.charge_step_budget(
         budget_database.dsn,
+        generation=2,
         family_id=family_id,
         job_id=child_id,
         step_key="build",
@@ -720,6 +759,7 @@ def test_postgres_charge_step_budget_ledger_is_canonical_json(budget_database):
 
     exhausted_on_charge = state.charge_step_budget(
         budget_database.dsn,
+        generation=2,
         family_id=family_id,
         job_id=child_id,
         step_key="replay",
@@ -733,6 +773,7 @@ def test_postgres_charge_step_budget_ledger_is_canonical_json(budget_database):
 
     exhausted_at_gate = state.charge_step_budget(
         budget_database.dsn,
+        generation=2,
         family_id=family_id,
         job_id=child_id,
         step_key="replay-2",
@@ -776,10 +817,12 @@ def test_postgres_budget_ledger_apis_return_consistent_json_safe_records(
         max_total_seconds=100,
         max_fuzz_seconds=60,
     )
+    _activate_lease(budget_database, child_id, 1)
     loaded = state.load_budget_ledger(budget_database.dsn, family_id)
     assert loaded is not None
     charged = state.charge_step_budget(
         budget_database.dsn,
+        generation=1,
         family_id=family_id,
         job_id=child_id,
         step_key="build",
@@ -885,9 +928,11 @@ def test_postgres_charge_step_budget_rejects_awaiting_review_and_terminal_new_ch
         max_total_seconds=100,
         max_fuzz_seconds=60,
     )
+    _activate_lease(budget_database, child_id, 1)
 
     first = state.charge_step_budget(
         budget_database.dsn,
+        generation=1,
         family_id=family_id,
         job_id=child_id,
         step_key="build",
@@ -904,6 +949,7 @@ def test_postgres_charge_step_budget_rejects_awaiting_review_and_terminal_new_ch
     with pytest.raises(state.StateError, match="AWAITING_REVIEW"):
         state.charge_step_budget(
             budget_database.dsn,
+            generation=1,
             family_id=family_id,
             job_id=child_id,
             step_key="new-while-awaiting",
@@ -919,6 +965,7 @@ def test_postgres_charge_step_budget_rejects_awaiting_review_and_terminal_new_ch
     with pytest.raises(state.StateError, match="BLOCKED"):
         state.charge_step_budget(
             budget_database.dsn,
+            generation=1,
             family_id=family_id,
             job_id=child_id,
             step_key="new-while-blocked",
@@ -928,6 +975,7 @@ def test_postgres_charge_step_budget_rejects_awaiting_review_and_terminal_new_ch
         )
     recovered_blocked = state.charge_step_budget(
         budget_database.dsn,
+        generation=1,
         family_id=family_id,
         job_id=child_id,
         step_key="build",
@@ -947,6 +995,7 @@ def test_postgres_charge_step_budget_rejects_awaiting_review_and_terminal_new_ch
     with pytest.raises(state.StateError, match="COMPLETED"):
         state.charge_step_budget(
             budget_database.dsn,
+            generation=1,
             family_id=family_id,
             job_id=child_id,
             step_key="new-while-completed",
@@ -956,6 +1005,7 @@ def test_postgres_charge_step_budget_rejects_awaiting_review_and_terminal_new_ch
         )
     recovered_completed = state.charge_step_budget(
         budget_database.dsn,
+        generation=1,
         family_id=family_id,
         job_id=child_id,
         step_key="build",
@@ -995,6 +1045,7 @@ def test_postgres_charge_step_budget_whitelist_allows_running_archiving_and_reje
         max_total_seconds=100,
         max_fuzz_seconds=60,
     )
+    _activate_lease(budget_database, child_id, 1)
 
     for pre_active_state in ("QUEUED", "PREPARING", "READY"):
         budget_database.connection.execute(
@@ -1004,6 +1055,7 @@ def test_postgres_charge_step_budget_whitelist_allows_running_archiving_and_reje
         with pytest.raises(state.StateError, match=pre_active_state):
             state.charge_step_budget(
                 budget_database.dsn,
+                generation=1,
                 family_id=family_id,
                 job_id=child_id,
                 step_key=f"charge-in-{pre_active_state.lower()}",
@@ -1022,6 +1074,7 @@ def test_postgres_charge_step_budget_whitelist_allows_running_archiving_and_reje
     )
     running_charge = state.charge_step_budget(
         budget_database.dsn,
+        generation=1,
         family_id=family_id,
         job_id=child_id,
         step_key="build",
@@ -1037,6 +1090,7 @@ def test_postgres_charge_step_budget_whitelist_allows_running_archiving_and_reje
     )
     archiving_charge = state.charge_step_budget(
         budget_database.dsn,
+        generation=1,
         family_id=family_id,
         job_id=child_id,
         step_key="archive",
@@ -1054,6 +1108,7 @@ def test_postgres_charge_step_budget_whitelist_allows_running_archiving_and_reje
     )
     blocked_family_charge = state.charge_step_budget(
         budget_database.dsn,
+        generation=1,
         family_id=family_id,
         job_id=child_id,
         step_key="archive-after-family-blocked",
@@ -1081,6 +1136,7 @@ def test_postgres_charge_step_budget_whitelist_allows_running_archiving_and_reje
         with pytest.raises(state.StateError, match=state_name):
             state.charge_step_budget(
                 budget_database.dsn,
+                generation=1,
                 family_id=family_id,
                 job_id=child_id,
                 step_key=f"new-in-{state_name.lower()}",
@@ -1090,6 +1146,7 @@ def test_postgres_charge_step_budget_whitelist_allows_running_archiving_and_reje
             )
         recovered = state.charge_step_budget(
             budget_database.dsn,
+            generation=1,
             family_id=family_id,
             job_id=child_id,
             step_key="build",
@@ -1149,13 +1206,13 @@ def test_postgres_charge_step_budget_rejects_invalid_generation(budget_database)
         with pytest.raises(state.StateError, match="generation"):
             state.charge_step_budget(
                 budget_database.dsn,
+                generation=bad_generation,  # type: ignore[arg-type]
                 family_id=family_id,
                 job_id=child_id,
                 step_key=f"invalid-generation-{index}",
                 attempt_no=1,
                 charge_kind="general",
                 elapsed_seconds=5,
-                generation=bad_generation,  # type: ignore[arg-type]
             )
 
     summary = state.family_budget_summary(budget_database.dsn, family_id)
@@ -1177,13 +1234,13 @@ def test_postgres_charge_step_budget_fences_stale_generation_and_inactive_lease(
     ):
         state.charge_step_budget(
             budget_database.dsn,
+            generation=1,
             family_id=family_id,
             job_id=child_id,
             step_key="stale-generation",
             attempt_no=1,
             charge_kind="general",
             elapsed_seconds=5,
-            generation=1,
         )
     summary = state.family_budget_summary(budget_database.dsn, family_id)
     assert summary["spent_seconds"] == 0
@@ -1199,13 +1256,13 @@ def test_postgres_charge_step_budget_fences_stale_generation_and_inactive_lease(
     ):
         state.charge_step_budget(
             budget_database.dsn,
+            generation=2,
             family_id=family_id,
             job_id=child_id,
             step_key="expired-lease",
             attempt_no=1,
             charge_kind="general",
             elapsed_seconds=5,
-            generation=2,
         )
     summary = state.family_budget_summary(budget_database.dsn, family_id)
     assert summary["spent_seconds"] == 0
@@ -1220,13 +1277,13 @@ def test_postgres_charge_step_budget_fences_stale_generation_and_inactive_lease(
     ):
         state.charge_step_budget(
             budget_database.dsn,
+            generation=2,
             family_id=family_id,
             job_id=child_id,
             step_key="missing-lease",
             attempt_no=1,
             charge_kind="general",
             elapsed_seconds=5,
-            generation=2,
         )
     summary = state.family_budget_summary(budget_database.dsn, family_id)
     assert summary["spent_seconds"] == 0
@@ -1246,13 +1303,13 @@ def test_postgres_charge_step_budget_fences_stale_generation_and_inactive_lease(
     )
     charged = state.charge_step_budget(
         budget_database.dsn,
+        generation=2,
         family_id=family_id,
         job_id=child_id,
         step_key="active-generation",
         attempt_no=1,
         charge_kind="general",
         elapsed_seconds=5,
-        generation=2,
     )
     assert charged.status == "charged"
     summary = state.family_budget_summary(budget_database.dsn, family_id)
@@ -1270,13 +1327,13 @@ def test_postgres_charge_step_budget_recovers_after_generation_and_lease_change(
 
     first = state.charge_step_budget(
         budget_database.dsn,
+        generation=2,
         family_id=family_id,
         job_id=child_id,
         step_key="build",
         attempt_no=1,
         charge_kind="general",
         elapsed_seconds=10,
-        generation=2,
     )
     assert first.status == "charged"
 
@@ -1289,13 +1346,13 @@ def test_postgres_charge_step_budget_recovers_after_generation_and_lease_change(
     )
     recovered = state.charge_step_budget(
         budget_database.dsn,
+        generation=1,
         family_id=family_id,
         job_id=child_id,
         step_key="build",
         attempt_no=1,
         charge_kind="general",
         elapsed_seconds=10,
-        generation=1,
     )
     assert recovered.status == "recovered"
     assert recovered.charge == first.charge
@@ -1309,6 +1366,52 @@ def test_postgres_charge_step_budget_recovers_after_generation_and_lease_change(
             (family_id,),
         ).fetchone()[0]
         == 1
+    )
+
+
+@pytest.mark.postgres
+def test_postgres_charge_step_budget_requires_generation_for_new_charges(
+    budget_database,
+):
+    family_id, child_id = _seed_running_child_for_fencing(budget_database)
+    # Even with an expired lease, a caller cannot obtain a new charge by
+    # forgetting the generation: the keyword is mandatory, so Python rejects
+    # the call before any row is touched. An explicit None is not a generation
+    # either and must fail closed.
+    budget_database.connection.execute(
+        "UPDATE jobs SET lease_expires_at = clock_timestamp() "
+        "- interval '1 minute' WHERE job_id = %s",
+        (child_id,),
+    )
+    with pytest.raises(TypeError, match="generation"):
+        state.charge_step_budget(  # type: ignore[call-arg]
+            budget_database.dsn,
+            family_id=family_id,
+            job_id=child_id,
+            step_key="omitted-generation",
+            attempt_no=1,
+            charge_kind="general",
+            elapsed_seconds=5,
+        )
+    with pytest.raises(state.StateError, match="generation"):
+        state.charge_step_budget(
+            budget_database.dsn,
+            generation=None,  # type: ignore[arg-type]
+            family_id=family_id,
+            job_id=child_id,
+            step_key="null-generation",
+            attempt_no=1,
+            charge_kind="general",
+            elapsed_seconds=5,
+        )
+    summary = state.family_budget_summary(budget_database.dsn, family_id)
+    assert summary["spent_seconds"] == 0
+    assert (
+        budget_database.connection.execute(
+            "SELECT count(*) FROM budget_charges WHERE family_id = %s",
+            (family_id,),
+        ).fetchone()[0]
+        == 0
     )
 
 
@@ -1431,10 +1534,12 @@ def test_postgres_charge_step_budget_guards_charge_kind_recovery_and_input_valid
         max_total_seconds=100,
         max_fuzz_seconds=60,
     )
+    _activate_lease(budget_database, child_id, 1)
 
     # 1. general -> fuzz mismatch on same idempotency key raises StateError
     first_general = state.charge_step_budget(
         budget_database.dsn,
+        generation=1,
         family_id=family_id,
         job_id=child_id,
         step_key="shared-step",
@@ -1446,6 +1551,7 @@ def test_postgres_charge_step_budget_guards_charge_kind_recovery_and_input_valid
     with pytest.raises(state.StateError, match="charge_kind"):
         state.charge_step_budget(
             budget_database.dsn,
+            generation=1,
             family_id=family_id,
             job_id=child_id,
             step_key="shared-step",
@@ -1458,6 +1564,7 @@ def test_postgres_charge_step_budget_guards_charge_kind_recovery_and_input_valid
     # 2. fuzz -> general mismatch on same idempotency key raises StateError
     first_fuzz = state.charge_step_budget(
         budget_database.dsn,
+        generation=1,
         family_id=family_id,
         job_id=child_id,
         step_key="fuzz-step",
@@ -1470,6 +1577,7 @@ def test_postgres_charge_step_budget_guards_charge_kind_recovery_and_input_valid
     with pytest.raises(state.StateError, match="charge_kind"):
         state.charge_step_budget(
             budget_database.dsn,
+            generation=1,
             family_id=family_id,
             job_id=child_id,
             step_key="fuzz-step",
@@ -1482,6 +1590,7 @@ def test_postgres_charge_step_budget_guards_charge_kind_recovery_and_input_valid
     with pytest.raises(state.StateError, match="elapsed_fuzz_seconds"):
         state.charge_step_budget(
             budget_database.dsn,
+            generation=1,
             family_id=family_id,
             job_id=child_id,
             step_key="general-with-fuzz",
@@ -1496,6 +1605,7 @@ def test_postgres_charge_step_budget_guards_charge_kind_recovery_and_input_valid
         with pytest.raises(state.StateError, match="step_key"):
             state.charge_step_budget(
                 budget_database.dsn,
+                generation=1,
                 family_id=family_id,
                 job_id=child_id,
                 step_key=bad_step_key,
@@ -1613,6 +1723,7 @@ def test_postgres_charge_step_budget_rejects_fuzz_elapsed_exceeding_elapsed(
         max_total_seconds=100,
         max_fuzz_seconds=60,
     )
+    _activate_lease(budget_database, round_id, 2)
     for attempt_no, (elapsed, fuzz_elapsed) in enumerate(
         ((5, 20), (1.0, 1.1)), start=1
     ):
@@ -1621,6 +1732,7 @@ def test_postgres_charge_step_budget_rejects_fuzz_elapsed_exceeding_elapsed(
         ):
             state.charge_step_budget(
                 budget_database.dsn,
+                generation=2,
                 family_id=family_id,
                 job_id=round_id,
                 step_key="fuzz-overlong",
