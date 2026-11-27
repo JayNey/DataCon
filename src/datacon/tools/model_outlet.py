@@ -837,34 +837,44 @@ def validate_model_audit_document(value: Any) -> dict[str, Any]:
             "model_audit.allowed_fields_digest must be a sha256 digest",
             sub_reason="AUDIT_INVALID",
         )
-    record = build_model_audit(
-        job_id=value["job_id"],
-        stage=value["stage"],
-        provider=value["provider"],
-        model_version=value["model_version"],
-        prompt_version=value["prompt_version"],
-        redaction_version=value["redaction_version"],
-        request_digest=value["request_digest"],
-        response_digest=value["response_digest"],
-        duration_seconds=value["duration_seconds"],
-        outcome=value["outcome"],
-    )
+    try:
+        record = build_model_audit(
+            job_id=value["job_id"],
+            stage=value["stage"],
+            provider=value["provider"],
+            model_version=value["model_version"],
+            prompt_version=value["prompt_version"],
+            redaction_version=value["redaction_version"],
+            request_digest=value["request_digest"],
+            response_digest=value["response_digest"],
+            duration_seconds=value["duration_seconds"],
+            outcome=value["outcome"],
+        )
+    except OutletError as error:
+        if error.sub_reason == "PROVIDER_MISSING":
+            # The outlet's admission token stays with the writer; an
+            # archived document that cannot have been written compliantly
+            # is a shape fault of the archive.
+            raise OutletError(str(error), sub_reason="AUDIT_INVALID") from error
+        raise
     return {**record, "allowed_fields_digest": allowed_fields_digest}
 
 
 def verify_model_audit_document(
-    value: Any, *, job_id: str | None, report_model_audit: Any
+    value: Any, *, job_id: str, report_model_audit: Any
 ) -> dict[str, Any]:
     """Validate an archived ``model/audit.json`` and bind it to its bundle.
 
-    The audit was produced by the child job the bundle belongs to
-    (``job_id``; ``None`` skips that check), and ``report.model_audit`` is
-    exactly its six-field summary - a report may not describe another
-    provider, version or outcome than the audit it archives. Returns the
-    normalized record.
+    Called for ``execution`` and ``campaign`` bundles; ``blocked`` bundles
+    carry no audit and never call this. The audit was produced by the child
+    job the bundle belongs to (``job_id``, required: a caller that cannot
+    name the job has no anchor to verify against), and
+    ``report.model_audit`` is exactly its six-field summary - a report may
+    not describe another provider, version or outcome than the audit it
+    archives. Returns the normalized record.
     """
     record = validate_model_audit_document(value)
-    if job_id is not None and record["job_id"] != job_id:
+    if record["job_id"] != job_id:
         raise OutletError(
             "model/audit.json was produced by another job",
             sub_reason="AUDIT_INVALID",

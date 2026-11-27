@@ -1557,8 +1557,8 @@ def test_model_audit_document_rejects_shape_and_digest_faults():
         with pytest.raises(OutletError) as excinfo:
             validate_model_audit_document(document)
         assert excinfo.value.sub_reason == "AUDIT_INVALID", label
-    # A null provider keeps the record's own verdict: the report may not
-    # leave it empty either.
+    # A null provider is the writer's admission token; in an archived
+    # document it is a shape fault like any other.
     with pytest.raises(OutletError) as excinfo:
         validate_model_audit_document(record | {"provider": None})
-    assert excinfo.value.sub_reason == "PROVIDER_MISSING"
+    assert excinfo.value.sub_reason == "AUDIT_INVALID"

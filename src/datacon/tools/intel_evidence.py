@@ -22,6 +22,12 @@ snapshot is whatever the source served - not necessarily text - and
 before any collection was recorded keeps its four collection fields null
 rather than inventing them.
 
+Sizing and duplication, recorded per the spec owner's review: the body
+ceiling is the collection ceiling (32 MiB), so the worst-case document is
+about 43 MiB of base64 - within the bundle reader's 128 MiB per-file cap -
+and an offline case's document duplicates the bytes already archived as
+``materials/advisory``, which is the price of a self-verifying bundle.
+
 The document shapes are T15's proposal pending the spec owner's blessing.
 The module imports only ``jsonutil`` and ``intel_fetch`` on purpose:
 ``evidence.py`` will import it, and it must not pull in the orchestration
@@ -34,12 +40,13 @@ import base64
 import binascii
 from typing import Any, Mapping, NamedTuple, Sequence
 
-from datacon import jsonutil
+from datacon import contracts, jsonutil
 from datacon.tools.intel_fetch import (
     MAX_DECOMPRESSED_BYTES,
     IntelFetchError,
     license_rejection,
     public_source_url,
+    strip_url_credentials,
 )
 
 __all__ = [
@@ -362,9 +369,15 @@ def build_intel_documents(
             "the registered snapshot digest does not describe the snapshot bytes",
             sub_reason="DIGEST_MISMATCH",
         )
-    # A registration may hand its grant over as a tuple (the ``IntelSource``
-    # shape); the document archives it as the array it is.
-    registered_uses = list(permitted_uses) if isinstance(permitted_uses, tuple) else permitted_uses
+    # A registration may hand its grant over as a tuple, set or frozenset
+    # (the ``IntelSource`` shape); the document archives it as the array it
+    # is, in a deterministic order for unordered containers.
+    if isinstance(permitted_uses, (tuple, list)):
+        registered_uses: object = list(permitted_uses)
+    elif isinstance(permitted_uses, (set, frozenset)):
+        registered_uses = sorted(permitted_uses)
+    else:
+        registered_uses = permitted_uses  # let _permitted_uses refuse it
     uses = _permitted_uses(registered_uses, "LICENSE_DOCUMENT_INVALID")
 
     snapshot_document: dict[str, Any] = {
@@ -419,6 +432,7 @@ def validate_snapshot_document(value: Any) -> dict[str, Any]:
     fetched_at = document["fetched_at"]
     http_status = document["http_status"]
     tool_version = document["tool_version"]
+    redirect_chain_digest = document["redirect_chain_digest"]
     collection = (fetched_at, http_status, tool_version)
     if any(item is None for item in collection) and not all(
         item is None for item in collection
@@ -426,6 +440,12 @@ def validate_snapshot_document(value: Any) -> dict[str, Any]:
         raise IntelEvidenceError(
             "snapshot fetched_at, http_status and tool_version record one"
             " collection together: all three or none",
+            sub_reason=invalid,
+        )
+    if fetched_at is None and redirect_chain_digest is not None:
+        # No collection was recorded, so no redirect was followed either.
+        raise IntelEvidenceError(
+            "snapshot.redirect_chain_digest requires a recorded collection",
             sub_reason=invalid,
         )
     if fetched_at is not None:
@@ -436,7 +456,6 @@ def validate_snapshot_document(value: Any) -> dict[str, Any]:
             )
         fetched_at = _require_rfc3339(fetched_at, "snapshot.fetched_at", invalid)
         tool_version = _require_text(tool_version, "snapshot.tool_version", invalid)
-    redirect_chain_digest = document["redirect_chain_digest"]
     if redirect_chain_digest is not None:
         redirect_chain_digest = _require_digest(
             redirect_chain_digest, "snapshot.redirect_chain_digest", invalid
@@ -514,18 +533,37 @@ def verify_intel_documents(
     snapshot: Mapping[str, Any],
     license_record: Mapping[str, Any],
     *,
+    case_id: str,
     report_intel: Mapping[str, Any],
-    plan_intel: Mapping[str, Any] | None = None,
+    plan_intel: Mapping[str, Any],
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Verify a bundle's intel material and re-derive its verdict offline.
 
+    Called for ``execution`` and ``campaign`` bundles; ``blocked`` bundles
+    carry neither document and never call this. Everything is required on
+    purpose: a caller that forgets an input must fail loudly, not silently
+    skip a check.
+
     Both documents must validate, describe one registered source and one
-    snapshot, agree with the closed three-field ``report.intel`` and - when
-    the plan's own intel summary is given - with ``plan.intel``. The
-    archived grant must then permit the system use: a bundle whose license
-    record does not allow what was done with the material cannot stand as
-    evidence that it was allowed in (``POLICY_DENIED`` / ``LICENSE_REJECTED``).
-    Returns the two normalized documents.
+    snapshot, and be anchored to the bundle's own ``case_id``: the two
+    documents agreeing with each other is not enough, because both could
+    describe another case's material (``SOURCE_CONFLICT`` /
+    ``SOURCE_CASE_MISMATCH``). ``source_id`` has no offline anchor - the
+    case registry is not in the bundle - so it is display-only here until
+    a registration digest is archived with the plan.
+
+    ``report_intel`` is the closed three-field summary, and ``plan_intel``
+    is validated by the same closed rule the plan itself is frozen under
+    (``contracts._intel``: four fields, non-empty https ``sources``, no
+    unknown keys), then bound: ``content_digest`` and ``collected_at`` must
+    name this snapshot's collection, and ``sources`` - the sources this
+    analysis relies on - must include the snapshot's ``source_url``,
+    compared after credential stripping on both sides.
+
+    The archived grant must finally permit the system use: a bundle whose
+    license record does not allow what was done with the material cannot
+    stand as evidence that it was allowed in (``POLICY_DENIED`` /
+    ``LICENSE_REJECTED``). Returns the two normalized documents.
     """
 
     def mismatch(message: str) -> IntelEvidenceError:
@@ -538,6 +576,15 @@ def verify_intel_documents(
             raise mismatch(
                 f"intel/snapshot.json and intel/license.json disagree on {field}"
             )
+    if snapshot_document["case_id"] != case_id:
+        # The anchor outside the two documents: material filed for another
+        # case is a factual mismatch, not a binding fault.
+        raise IntelEvidenceError(
+            "intel/snapshot.json and intel/license.json are filed for case"
+            f" {snapshot_document['case_id']!r}, not {case_id!r}",
+            reason_code="SOURCE_CONFLICT",
+            sub_reason="SOURCE_CASE_MISMATCH",
+        )
     if not isinstance(report_intel, Mapping):
         raise mismatch("report.intel must be a JSON object")
     if set(report_intel) != REPORT_INTEL_FIELDS:
@@ -550,34 +597,35 @@ def verify_intel_documents(
             raise mismatch(
                 f"report.intel.{field} does not match intel/snapshot.json"
             )
-    if plan_intel is not None:
-        if not isinstance(plan_intel, Mapping):
-            raise mismatch("plan.intel must be a JSON object")
-        if plan_intel.get("content_digest") != snapshot_document["snapshot_digest"]:
-            raise mismatch(
-                "plan.intel.content_digest does not match the archived snapshot"
-            )
-        collected_at = plan_intel.get("collected_at")
-        try:
-            # The normalized UTC spelling: an offset that names the same
-            # instant is the same collection time.
-            collected_at = jsonutil.require_rfc3339(
-                collected_at, "plan.intel.collected_at"
-            )
-        except ValueError as error:
-            raise mismatch(str(error)) from error
-        if (
-            snapshot_document["fetched_at"] is not None
-            and snapshot_document["fetched_at"] != collected_at
-        ):
-            raise mismatch(
-                "plan.intel.collected_at does not match the snapshot's fetched_at"
-            )
-        sources = plan_intel.get("sources")
-        if not isinstance(sources, list) or not all(
-            isinstance(source, str) for source in sources
-        ):
-            raise mismatch("plan.intel.sources must be a list of source URLs")
+    if not isinstance(plan_intel, Mapping):
+        raise mismatch("plan.intel must be a JSON object")
+    try:
+        # The plan freezes intel through this very rule; verifying the
+        # bundle against anything looser would not be binding to the plan.
+        normalized_plan_intel = contracts._intel(plan_intel)
+    except ValueError as error:
+        raise mismatch(f"plan.intel is not the frozen shape: {error}") from error
+    if normalized_plan_intel["content_digest"] != snapshot_document["snapshot_digest"]:
+        raise mismatch(
+            "plan.intel.content_digest does not match the archived snapshot"
+        )
+    collected_at = normalized_plan_intel["collected_at"]
+    if (
+        snapshot_document["fetched_at"] is not None
+        and snapshot_document["fetched_at"] != collected_at
+    ):
+        raise mismatch(
+            "plan.intel.collected_at does not match the snapshot's fetched_at"
+        )
+    # Sources are compared after credential stripping on both sides: the
+    # plan may carry a credentialled spelling of the same origin.
+    stripped_sources = {
+        strip_url_credentials(source) for source in normalized_plan_intel["sources"]
+    }
+    if snapshot_document["source_url"] not in stripped_sources:
+        raise mismatch(
+            "plan.intel.sources does not include the snapshot's source URL"
+        )
     rejected = license_rejection(
         license_document["license"], license_document["permitted_uses"]
     )

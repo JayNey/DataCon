@@ -142,29 +142,31 @@ def _plan_intel(**overrides: object) -> dict:
     return plan_intel
 
 
-def _verify(snapshot=None, license_record=None, report_intel=None, plan_intel=_UNSET):
+def _verify(snapshot=None, license_record=None, report_intel=None, plan_intel=None, case_id=CASE_ID):
     from datacon.tools.intel_evidence import verify_intel_documents
 
     arguments = {
+        "case_id": case_id,
         "snapshot": _snapshot_document() if snapshot is None else snapshot,
         "license_record": _license_document() if license_record is None else license_record,
         "report_intel": _report_intel() if report_intel is None else report_intel,
+        "plan_intel": _plan_intel() if plan_intel is None else plan_intel,
     }
-    if plan_intel is not _UNSET:
-        arguments["plan_intel"] = plan_intel
     return verify_intel_documents(**arguments)
 
 
 def _refused(**arguments) -> Exception:
     """Run ``verify_intel_documents`` over the defaults plus ``arguments``."""
+    from datacon.tools.intel_evidence import verify_intel_documents
+
     verify_arguments = {
+        "case_id": CASE_ID,
         "snapshot": _snapshot_document(),
         "license_record": _license_document(),
         "report_intel": _report_intel(),
+        "plan_intel": _plan_intel(),
     }
     verify_arguments.update(arguments)
-    from datacon.tools.intel_evidence import verify_intel_documents
-
     with pytest.raises(Exception) as excinfo:
         verify_intel_documents(**verify_arguments)
     return excinfo.value
@@ -621,3 +623,132 @@ def test_intel_evidence_imports_without_the_execution_graph():
         [sys.executable, "-c", code], capture_output=True, text=True, check=True
     )
     assert completed.stdout.strip() == "[]"
+
+
+def test_intel_documents_anchor_the_case():
+    # The two documents agreeing with each other is not enough: both could
+    # describe another case's material. The case the bundle is filed for is
+    # the anchor outside the documents.
+    other_case = _build(case_id="cve-2099-0002")
+    verified_snapshot, _verified_license = _verify(
+        snapshot=dict(other_case.snapshot),
+        license_record=dict(other_case.license_record),
+        case_id="cve-2099-0002",
+    )
+    assert verified_snapshot["case_id"] == "cve-2099-0002"
+
+    error = _refused(
+        snapshot=dict(other_case.snapshot),
+        license_record=dict(other_case.license_record),
+    )
+    assert (error.reason_code, error.sub_reason) == (
+        "SOURCE_CONFLICT",
+        "SOURCE_CASE_MISMATCH",
+    )
+
+
+def test_intel_documents_require_their_anchors():
+    from datacon.tools.intel_evidence import verify_intel_documents
+
+    # A caller that forgets an anchor must fail loudly, not silently skip
+    # the check it anchors.
+    with pytest.raises(TypeError):
+        verify_intel_documents(
+            _snapshot_document(),
+            _license_document(),
+            case_id=CASE_ID,
+            report_intel=_report_intel(),
+        )
+    with pytest.raises(TypeError):
+        verify_intel_documents(
+            _snapshot_document(),
+            _license_document(),
+            report_intel=_report_intel(),
+            plan_intel=_plan_intel(),
+        )
+
+    from datacon.tools.model_outlet import (
+        build_model_audit,
+        verify_model_audit_document,
+    )
+
+    audit = build_model_audit(
+        job_id="0f8fad5b-d9cb-469f-a165-70867728950e",
+        stage="hypothesis_aggregator",
+        provider="offline",
+        allowed_fields=("patch_diff",),
+    )
+    with pytest.raises(TypeError):
+        verify_model_audit_document(audit, report_model_audit={
+            "provider": "offline",
+            "model_version": None,
+            "prompt_version": None,
+            "allowed_fields_digest": audit["allowed_fields_digest"],
+            "redaction_version": "redaction-v1",
+            "outcome": "offline",
+        })
+
+
+def test_plan_intel_follows_the_frozen_shape():
+    # plan.intel is validated by the same closed rule the plan itself is
+    # frozen under: four fields, a safe snapshot path, a non-empty list of
+    # https sources, no unknown keys.
+    for label, plan_intel in (
+        ("empty sources", _plan_intel(sources=[])),
+        ("non-https source", _plan_intel(sources=["ftp://advisory.example.com/x"])),
+        ("unsafe snapshot path", _plan_intel(snapshot="../escape")),
+        ("absolute snapshot path", _plan_intel(snapshot="/etc/passwd")),
+        ("unknown key", _plan_intel() | {"extra": 1}),
+        ("missing key", {k: v for k, v in _plan_intel().items() if k != "sources"}),
+    ):
+        error = _refused(plan_intel=plan_intel)
+        assert (error.reason_code, error.sub_reason) == (
+            "MATERIAL_MISSING",
+            "INTEL_BINDING_MISMATCH",
+        ), label
+
+
+def test_plan_sources_must_include_the_snapshot_source_url():
+    # sources names what this analysis relies on: the snapshot's own origin
+    # has to be among them. The comparison strips credentials on both
+    # sides, so a credentialled spelling of the same origin still matches.
+    error = _refused(
+        plan_intel=_plan_intel(sources=["https://mirror.example.org/x"])
+    )
+    assert (error.reason_code, error.sub_reason) == (
+        "MATERIAL_MISSING",
+        "INTEL_BINDING_MISMATCH",
+    )
+    _verify(
+        plan_intel=_plan_intel(
+            sources=["https://user:pw@advisory.example.com/cve-2099-0001.txt"]
+        )
+    )
+
+
+def test_snapshot_redirect_requires_a_collection():
+    from datacon.tools.intel_evidence import (
+        IntelEvidenceError,
+        validate_snapshot_document,
+    )
+
+    # No collection was recorded, so no redirect was followed either.
+    document = _snapshot_document(record=None)
+    assert document["redirect_chain_digest"] is None
+    with pytest.raises(IntelEvidenceError) as excinfo:
+        validate_snapshot_document(document | {"redirect_chain_digest": REDIRECT_CHAIN_DIGEST})
+    assert (excinfo.value.reason_code, excinfo.value.sub_reason) == (
+        "MATERIAL_MISSING",
+        "SNAPSHOT_DOCUMENT_INVALID",
+    )
+
+
+def test_license_document_builder_accepts_sets():
+    # The IntelSource shape may hand the grant over as a set or frozenset;
+    # the document archives it as the array it is, in a deterministic order.
+    for granted in ({"research", "reproduction"}, frozenset({"reproduction", "research"})):
+        documents = _build(permitted_uses=granted)
+        assert documents.license_record["permitted_uses"] == [
+            "reproduction",
+            "research",
+        ]
