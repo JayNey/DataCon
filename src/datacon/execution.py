@@ -3924,16 +3924,19 @@ def _evidence_artifacts(
             + b"\n",
         ),
     }
-    if context_admission is not None and not blocked:
-        # The bundle contract (evidence.py) forbids admission.json on a
-        # blocked bundle: an admission only ever documents permission for a
-        # round that was going to run, not the blocked outcome itself. A
-        # blocked policy round therefore archives without its admission
-        # document; review.json below stays allowed on every bundle kind.
-        artifacts["admission.json"] = (
-            "admission",
-            jsonutil.canonical_bytes(dict(context_admission)) + b"\n",
-        )
+    if context_admission is not None:
+        # A policy round is admitted by its admission, never by the
+        # family's first-plan review: the elif below must not fire for it,
+        # whatever ExecutionContext carries. On a blocked bundle the
+        # admission is dropped too (the bundle contract in evidence.py
+        # forbids admission.json there - an admission documents permission
+        # for a round that was going to run, not the blocked outcome), so
+        # a blocked policy round archives with neither approval document.
+        if not blocked:
+            artifacts["admission.json"] = (
+                "admission",
+                jsonutil.canonical_bytes(dict(context_admission)) + b"\n",
+            )
     elif context_review is not None:
         artifacts["review.json"] = (
             "review",
@@ -5976,6 +5979,9 @@ def _finish_blocked(
     work_root = context.run_root / context.job_id_text / context.plan_digest.split(":")[1]
     build_root = work_root / "run"
     build_root.mkdir(parents=True, exist_ok=True)
+    # One decision, two consumers: the report's bundle_kind and the
+    # writer's approval gate must not drift apart.
+    bundle_kind = "blocked" if _is_v2_context(context) else "execution"
     report, markdown = _build_report(
         context,
         verdict="BLOCKED",
@@ -5989,7 +5995,7 @@ def _finish_blocked(
             "target execution blocked"
         ],
         error=f"{error.reason_code}: {error.message}",
-        bundle_kind="blocked" if _is_v2_context(context) else "execution",
+        bundle_kind=bundle_kind,
     )
     try:
         digest, path, archive_error = _archive(
@@ -6004,11 +6010,10 @@ def _finish_blocked(
                 runs=runs or [],
                 probe=probe,
                 execution_metadata={},
-                # The report above is a blocked bundle for v2 contexts; the
-                # verifier rejects a blocked bundle that still carries the
-                # policy admission, so the writer must drop it here (v1 has
-                # no admission row and is unchanged).
-                blocked=_is_v2_context(context),
+                # The verifier rejects a blocked bundle that still carries
+                # the policy admission, so the writer drops it here (v1
+                # has no admission row and is unchanged).
+                blocked=bundle_kind == "blocked",
             ),
             verdict="BLOCKED",
         )

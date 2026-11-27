@@ -5309,10 +5309,86 @@ def test_policy_round_blocked_mid_execution_archives_blocked_bundle(
     assert finished["evidence_path"] == result.evidence_path
     verified = evidence.verify_bundle(result.evidence_path)
     assert "admission.json" not in verified.file_data
+    # A blocked policy round carries neither approval document: not its
+    # admission (forbidden on blocked bundles) and not the family's
+    # first-plan review (a policy round is never human-reviewed).
+    assert "review.json" not in verified.file_data
     report = json.loads(verified.file_data["report.json"])
     assert report["bundle_kind"] == "blocked"
     assert report["reason_code"] == "POLICY_DENIED"
+    assert report["review"] is None
 
+
+
+def test_policy_round_failed_partial_bundle_keeps_admission_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """SF-3 contrast for #63: a policy round that FAILS (not blocked).
+
+    The partial FAILED bundle is an execution bundle, which must carry
+    exactly one approval document: this round's admission.json, never the
+    family's review.json. If a future change wrongly passes blocked= to
+    this path too, the admission would vanish and the verifier would
+    reject the bundle.
+    """
+    run_root, _ = _configure_isolated_roots(tmp_path, monkeypatch)
+    spec = _cmake_spec()
+    face = _cmake_compile_commands_bytes(
+        flags=["-fsanitize=address", "-g", "-O1", "-I../include", "-D_GNU_SOURCE"]
+    )
+    parent_approval = "sha256:" + "e" * 64
+    job, plan, plan_digest, review = _setup_fixture_plan_and_job(
+        version=2, build_spec=spec
+    )
+    plan["parent_approval_digest"] = parent_approval
+    plan_digest = contracts.plan_digest(plan)
+    mem_state = _InMemoryState(job, plan, plan_digest, review)
+    mem_state.install(monkeypatch)
+    mem_state.review = {
+        "reviewer_id": "family-reviewer",
+        "decision": "approve",
+        "plan_digest": "sha256:" + "9" * 64,
+        "decided_at": review["decided_at"],
+    }
+    mem_state.admission = {
+        "admission_id": str(uuid4()),
+        "job_id": str(job["job_id"]),
+        "parent_job_id": str(job["parent_job_id"]),
+        "round_no": plan["round_no"],
+        "approval_kind": "policy",
+        "envelope_digest": plan["envelope_digest"],
+        "parent_approval_digest": parent_approval,
+        "seed_digest": plan["inputs"]["candidate"],
+        "predicate_version": "admission-v1",
+        "recomputable": True,
+        "supporting_bundle_digest": None,
+        "decided_at": "2099-01-01T00:00:00Z",
+    }
+    build_error = SandboxError(
+        "missing provenance face",
+        reason_code=build_provenance.BUILD_PROVENANCE_MISSING,
+    )
+    fake_sandbox = _FakeSandbox(
+        image_digest=plan["image_digest"],
+        build_recipe_digest=plan["build_recipe_digest"],
+        faces={"vulnerable": face, "fixed": None},
+        face_name="compile_commands.json",
+        build_error_by_version={"fixed": build_error},
+    )
+    result = execution.run_execution(
+        "dsn",
+        job["job_id"],
+        1,
+        case_root=str(FIXTURE_CASES),
+        run_root=run_root,
+        sandbox=fake_sandbox,
+    )
+    assert result.state == "FAILED", result
+    assert result.reason_code == build_provenance.BUILD_PROVENANCE_MISSING
+    assert result.evidence_path, "failed policy round archived no evidence"
+    verified = evidence.verify_bundle(result.evidence_path)
+    assert "admission.json" in verified.file_data
+    assert "review.json" not in verified.file_data
 
 def test_human_review_round_blocked_still_archives(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -5368,3 +5444,68 @@ def test_human_review_round_blocked_still_archives(
     verified = evidence.verify_bundle(result.evidence_path)
     assert "review.json" in verified.file_data
     assert "admission.json" not in verified.file_data
+
+
+def test_evidence_artifacts_policy_blocked_never_falls_back_to_review(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """SF-1 pin for #63: the elif must not fire for a policy round.
+
+    The production path clears ``context.review`` when it adopts an
+    admission, so the end-to-end test cannot see this; this coordinate
+    simulates the unguarded state - a context that carries both the
+    admission and the family review - and requires the blocked write to
+    carry neither approval document.
+    """
+    run_root, _ = _configure_isolated_roots(tmp_path, monkeypatch)
+    spec = _cmake_spec()
+    parent_approval = "sha256:" + "e" * 64
+    job, plan, plan_digest, review = _setup_fixture_plan_and_job(
+        version=2, build_spec=spec
+    )
+    plan["parent_approval_digest"] = parent_approval
+    plan_digest = contracts.plan_digest(plan)
+    mem_state = _InMemoryState(job, plan, plan_digest, review)
+    mem_state.install(monkeypatch)
+    mem_state.review = {
+        "reviewer_id": "family-reviewer",
+        "decision": "approve",
+        "plan_digest": "sha256:" + "9" * 64,
+        "decided_at": review["decided_at"],
+    }
+    mem_state.admission = {
+        "admission_id": str(uuid4()),
+        "job_id": str(job["job_id"]),
+        "parent_job_id": str(job["parent_job_id"]),
+        "round_no": plan["round_no"],
+        "approval_kind": "policy",
+        "envelope_digest": plan["envelope_digest"],
+        "parent_approval_digest": parent_approval,
+        "seed_digest": plan["inputs"]["candidate"],
+        "predicate_version": "admission-v1",
+        "recomputable": True,
+        "supporting_bundle_digest": None,
+        "decided_at": "2099-01-01T00:00:00Z",
+    }
+    context = execution._load_context(
+        "dsn",
+        job["job_id"],
+        1,
+        case_root=str(FIXTURE_CASES),
+        run_root=run_root,
+    )
+    # The unguarded precondition: both approval documents on one context.
+    context.review = review
+
+    artifacts = execution._evidence_artifacts(
+        context,
+        run_root / "run",
+        builds={},
+        runs=[],
+        probe=None,
+        execution_metadata={},
+        blocked=True,
+    )
+
+    assert "admission.json" not in artifacts
+    assert "review.json" not in artifacts

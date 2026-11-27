@@ -174,6 +174,8 @@ T11 只验证图结构与节点幂等；policy 准入、轮次与预算容量的
 | `tests/contract/test_release.py::test_release_manifest_keeps_contract_version_one` | release smoke/B03 仍按 `contract_version=1` 校验，v2 smoke 不混入 | `AssertionError: release manifest contract_version changed` |
 | `tests/contract/test_build_spec_execution.py::test_policy_round_blocked_mid_execution_archives_blocked_bundle` | policy 轮次执行中途被阻断时归档 blocked 包且不携带 `admission.json`，终态为 `BLOCKED`（真实阻断原因）而非 `FAILED(EVIDENCE_WRITE_FAILED)` 无证据包 | `AssertionError: ExecutionResult(state='FAILED', verdict=None, verdict_reason=None, evidence_digest=None, evidence_path=None, reason_code='EVIDENCE_WRITE_FAILED')` |
 | `tests/contract/test_build_spec_execution.py::test_human_review_round_blocked_still_archives` | 对照：人批轮次执行中途被阻断（审核被改写 → `PLAN_MISMATCH`）仍归档 blocked 包（携带 `review.json`），门控不得改坏这条正路 | 未触发 RED（既有行为对照） |
+| `tests/contract/test_build_spec_execution.py::test_evidence_artifacts_policy_blocked_never_falls_back_to_review`（评审加固 SF-1） | 单元级钉住不安全前提：context 同时携带 admission 与 review 时，blocked 写包两者都不产出（`elif` 不得为 policy 轮次点火；生产路径靠 `_load_context` 清空 review 才安全，e2e 测不出） | ※ `AssertionError: assert 'review.json' not in {'plan.json': …}` |
+| `tests/contract/test_build_spec_execution.py::test_policy_round_failed_partial_bundle_keeps_admission_only`（评审加固 SF-3） | 对照：policy 轮次构建失败（非阻断）的 partial FAILED 包是 execution 包，恰好携带本轮 `admission.json`、不携带 `review.json`，`verify_bundle` 通过；此路径误传 `blocked=` 会被此坐标抓住 | ※ 未触发 RED（既有行为对照） |
 
 ### T14 模型出口与 ExperimentSpec
 
