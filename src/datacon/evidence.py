@@ -4411,6 +4411,59 @@ def _verify_v2_replay_layout(
             )
 
 
+def _verify_v2_report_verdict_binding(
+    bundle_kind: str,
+    verdict: Any,
+    manifest_reason: Any,
+    report: Mapping[str, Any],
+) -> None:
+    """Bind report ``verdict``/``state``/``reason_code``/``rule`` to the manifest.
+
+    §8 requires ``report.verdict == report.state`` and a ``reason_code`` that
+    matches the manifest (campaign: all null); §12.5 makes any contradiction
+    fail closed. Absent keys are tolerated because the T10 skeleton fixtures
+    and imported partial bundles may omit them, but a present key never
+    disagrees with the manifest. For execution bundles the rule trace written
+    by the verdict engine must name the same verdict/reason, and a ``FAILED``
+    bundle never carries a rule trace (the production writer archives every
+    ``FAILED`` outcome with ``rule: null``).
+    """
+    for key in ("verdict", "state"):
+        if key in report and report[key] != verdict:
+            raise BundleError(
+                "INVALID_MANIFEST",
+                f"report.json {key} ({report[key]!r}) does not match manifest "
+                f"verdict ({verdict!r})",
+            )
+    if "reason_code" in report and report["reason_code"] != manifest_reason:
+        raise BundleError(
+            "INVALID_MANIFEST",
+            f"report.json reason_code ({report['reason_code']!r}) does not match "
+            f"manifest reason_code ({manifest_reason!r})",
+        )
+    if bundle_kind != "execution" or "rule" not in report:
+        return
+    rule = report["rule"]
+    if rule is None:
+        return
+    if verdict == "FAILED":
+        raise BundleError(
+            "INVALID_MANIFEST",
+            "report.json rule must be null for a FAILED execution bundle",
+        )
+    if not isinstance(rule, Mapping):
+        raise BundleError(
+            "INVALID_MANIFEST", "report.json rule must be a JSON object or null"
+        )
+    for key, expected in (("verdict", verdict), ("reason_code", manifest_reason)):
+        if key in rule and rule[key] != expected:
+            raise BundleError(
+                "INVALID_MANIFEST",
+                f"report.json rule.{key} ({rule[key]!r}) does not match manifest "
+                f"{key} ({expected!r})",
+            )
+
+
 def _is_partial_execution(
     bundle_kind: str,
     verdict: Any,
@@ -4709,16 +4762,20 @@ def _verify_bundle_v2(
     roles = {entry["role"] for entry in entries}
     data: dict[str, bytes] | None = None
     partial_execution = False
-    if bundle_kind == "execution" and verdict in ("FAILED", "INCONCLUSIVE"):
-        # The partial decision depends on report.rule and reason_code, so read
-        # the listed files once here and reuse the verified bytes below. A
-        # malformed/missing report still fails closed before any layout is
-        # accepted.
+    if bundle_kind in ("execution", "campaign"):
+        # The report binding and the partial decision both depend on
+        # report.json, so read the listed files once here and reuse the
+        # verified bytes below. A malformed/missing report still fails closed
+        # before any layout is accepted.
         data = _read_listed_files(root_path, listed)
         report = _parse_json_file(data, "report.json")
-        partial_execution = _is_partial_execution(
-            bundle_kind, verdict, manifest_reason, report, listed
+        _verify_v2_report_verdict_binding(
+            bundle_kind, verdict, manifest_reason, report
         )
+        if bundle_kind == "execution" and verdict in ("FAILED", "INCONCLUSIVE"):
+            partial_execution = _is_partial_execution(
+                bundle_kind, verdict, manifest_reason, report, listed
+            )
     required_roles, required_paths = _v2_required_roles_and_paths(
         bundle_kind, partial_execution
     )

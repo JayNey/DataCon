@@ -2268,7 +2268,7 @@ def test_v2_defensive_face_consistency_blocked_cap_and_partial_report_contradict
             partial_files,
             name=f"partial-contradiction-{label}",
         )
-        with pytest.raises(BundleError, match="missing required roles"):
+        with pytest.raises(BundleError, match="missing required roles|does not match manifest|rule must be null"):
             verify_bundle(root)
 
 
@@ -2399,7 +2399,7 @@ def test_b1_partial_failed_enforces_state_reason_rule_and_non_hollow_evidence(
             files,
             name=f"b1-{label}",
         )
-        with pytest.raises(BundleError, match="missing required roles"):
+        with pytest.raises(BundleError, match="missing required roles|does not match manifest|rule must be null"):
             verify_bundle(root)
 
     # 3. Legitimate pre-build FAILED bundle with non-empty error diagnostic verifies cleanly.
@@ -2804,3 +2804,137 @@ def test_s3_and_s4_exact_build_provenance_artifact_and_blocked_cross_version_fac
     )
     with pytest.raises(BundleError, match="face filenames must match"):
         verify_bundle(blocked_s4_root)
+
+
+def _bound_report(**fields):
+    report = {
+        "build_provenance_rules_version": "build-provenance-v1",
+        "build_provenance": _report_build_provenance(),
+    }
+    report.update(fields)
+    return ("report_json", json.dumps(report, sort_keys=True).encode("utf-8") + b"\n")
+
+
+def _complete_with_report(**fields):
+    files = _base_files(execution=True, campaign=False)
+    files["report.json"] = _bound_report(**fields)
+    return files
+
+
+def _campaign_with_report(**fields):
+    files = _base_files(execution=False, campaign=True)
+    files["report.json"] = _bound_report(**fields)
+    return files
+
+
+def _pre_build_failed_files():
+    """FAILED before any build, in the shape ``_finish_failed`` writes (§8)."""
+    files = _partial_execution_files()
+    for relative in [path for path in files if path.startswith("build/")]:
+        del files[relative]
+    files["report.json"] = _bound_report(
+        verdict="FAILED",
+        state="FAILED",
+        reason_code="BUILD_FAILED",
+        rule=None,
+        missing=["execution failed"],
+        error="BUILD_FAILED: vulnerable build exited 2",
+        evidence_complete=False,
+        build_provenance=_report_build_provenance(comparable=False),
+    )
+    return files
+
+
+@pytest.mark.parametrize(
+    ("bundle_kind", "verdict", "reason", "files", "match"),
+    [
+        pytest.param(
+            "execution", "REPRODUCED", None,
+            _complete_with_report(verdict="REPRODUCED", state="NOT_REPRODUCED"),
+            "state", id="complete-state-drift",
+        ),
+        pytest.param(
+            "execution", "INCONCLUSIVE", "EVIDENCE_INCOMPLETE",
+            _complete_with_report(verdict="REPRODUCED", state="REPRODUCED"),
+            "verdict", id="complete-verdict-drift",
+        ),
+        pytest.param(
+            "execution", "INCONCLUSIVE", "EVIDENCE_INCOMPLETE",
+            _complete_with_report(reason_code="BUILD_FAILED"),
+            "reason_code", id="complete-reason-drift",
+        ),
+        pytest.param(
+            "execution", "INCONCLUSIVE", "EVIDENCE_INCOMPLETE",
+            _complete_with_report(
+                rule={"verdict": "REPRODUCED", "reason_code": None}
+            ),
+            "rule", id="complete-rule-verdict-drift",
+        ),
+        pytest.param(
+            "execution", "FAILED", "BUILD_PROVENANCE_MISSING",
+            _complete_with_report(
+                verdict="FAILED",
+                state="FAILED",
+                reason_code="BUILD_PROVENANCE_MISSING",
+                rule={"verdict": "FAILED", "reason_code": "BUILD_PROVENANCE_MISSING"},
+            ),
+            "rule", id="failed-with-rule-trace",
+        ),
+        pytest.param(
+            "campaign", None, None,
+            _campaign_with_report(verdict=None, state="REPRODUCED"),
+            "state", id="campaign-state-not-null",
+        ),
+        pytest.param(
+            "execution", "FAILED", "BUILD_PROVENANCE_MISSING",
+            {
+                **_partial_execution_files(),
+                "report.json": _bound_report(
+                    verdict="FAILED",
+                    state="REPRODUCED",
+                    reason_code="BUILD_FAILED",
+                    rule={"verdict": "REPRODUCED"},
+                    build_provenance=_report_build_provenance(comparable=False),
+                ),
+            },
+            "state", id="partial-failed-self-contradictory",
+        ),
+        pytest.param(
+            "execution", "INCONCLUSIVE", "EVIDENCE_INCOMPLETE",
+            {
+                **_partial_execution_files(),
+                "report.json": _bound_report(
+                    state="REPRODUCED",
+                    rule=None,
+                    build_provenance=_report_build_provenance(comparable=False),
+                ),
+            },
+            "state", id="partial-inconclusive-state-drift",
+        ),
+    ],
+)
+def test_v2_report_verdict_state_reason_are_bound_to_manifest(
+    tmp_path, bundle_kind, verdict, reason, files, match
+):
+    """B-1 (§8, §12.5): report verdict/state/reason_code/rule never contradict the manifest."""
+    root = _write_v2_bundle(
+        tmp_path,
+        _manifest(bundle_kind, verdict=verdict, reason=reason),
+        files,
+        name=f"bound-{bundle_kind}",
+    )
+    with pytest.raises(BundleError, match=match):
+        verify_bundle(root)
+
+
+def test_v2_pre_build_failed_bundle_in_writer_shape_verifies(tmp_path):
+    """B-1 anti-false-kill: ``_finish_failed`` before any build still verifies."""
+    root = _write_v2_bundle(
+        tmp_path,
+        _manifest("execution", verdict="FAILED", reason="BUILD_FAILED"),
+        _pre_build_failed_files(),
+        name="pre-build-failed",
+    )
+    verified = verify_bundle(root)
+    assert verified.manifest["verdict"] == "FAILED"
+    assert not any(path.startswith("build/") for path in verified.file_data)
