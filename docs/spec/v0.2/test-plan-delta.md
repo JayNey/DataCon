@@ -303,6 +303,13 @@ T15 实现新增坐标（P3）。下列坐标不在原计划表内，是实现�
 | `tests/contract/test_intel_fetch.py::test_snapshot_provider_source_url_must_name_an_https_origin`（评审加固） | 来源 URL 必须是 https 源:裸词、他 scheme、`javascript:`、无主机、端口不可解析、空白与控制字符都 `SOURCE_URL_INVALID`,且在打开快照前拒绝 | `AssertionError: not-a-url` |
 | `tests/contract/test_intel_fetch.py::test_snapshot_provider_rejects_bytes_uses_as_a_license_denial`（评审加固） | `permitted_uses` 为 bytes/bytearray → `POLICY_DENIED`/`LICENSE_REJECTED`(只认 list/tuple/set/frozenset,与 intel_fetch 注册表门对齐),不再误归类为材料不可读 | `assert 'MATERIAL_MISSING' == 'POLICY_DENIED'` |
 | `tests/contract/test_intel_fetch.py::test_snapshot_provider_fails_closed_when_a_later_source_is_refused`（评审加固） | 多来源 fail-closed:第二个来源无许可整案阻断并点名来源;全通过时就绪摘要是第一个来源的 | ※ 未触发 RED(既有行为,评审建议加钉) |
+| `tests/contract/test_snapshot_store.py::test_snapshot_store_persists_body_and_record_content_addressed` | 七字段封闭记录按 canonical JSON 落盘,正文按 `by-digest/<xx>/<hex>` 内容寻址,返回相对路径与摘要 | `ModuleNotFoundError: No module named 'datacon.tools.snapshot_store'` |
+| `tests/contract/test_snapshot_store.py::test_snapshot_store_is_write_once_and_idempotent` | 写后只读:同记录同正文幂等;同正文新记录(新 fetched_at)追加记录文件、正文不动 | 同上 |
+| `tests/contract/test_snapshot_store.py::test_snapshot_store_refuses_a_corrupted_body_at_the_digest_path` | 内容寻址路径上既有字节与待存不符(损坏)→ 失败关闭,不覆盖 | 同上 |
+| `tests/contract/test_snapshot_store.py::test_snapshot_store_validates_the_closed_record_shape` | 记录键集封闭(缺/多拒),`content_digest` 必须诚实描述正文 | 同上 |
+| `tests/contract/test_snapshot_store.py::test_snapshot_files_are_read_only` | 快照与记录文件无写位 | 同上 |
+| `tests/contract/test_snapshot_store.py::test_snapshot_loader_reads_pinned_snapshots` | 生产 loader 按登记相对路径读;缺失→None;绝对/穿越/反斜杠路径→None(不越根) | 同上 |
+| `tests/contract/test_snapshot_store.py::test_snapshot_store_composes_with_the_snapshot_provider` | 存储写入→登记→`SnapshotIntelProvider`+生产 loader 离线闭环 ready;磁盘篡改→`DIGEST_MISMATCH` | 同上 |
 | `tests/contract/test_net_adapter.py::test_production_resolver_dedups_answers_preserving_order` | 生产 DNS 解析器答案去重且保序 | `ModuleNotFoundError: No module named 'datacon.tools.net_adapter'` |
 | `tests/contract/test_net_adapter.py::test_production_resolver_fails_closed_when_the_dns_budget_expires` | DNS 预算到期 → `DNS_TIMEOUT`，等待由预算而非查找本身结束 | 同上 |
 | `tests/contract/test_net_adapter.py::test_production_resolver_reports_unresolvable_hosts_fail_closed` | 名字不可解析 → `DNS_FAILED` | 同上 |
