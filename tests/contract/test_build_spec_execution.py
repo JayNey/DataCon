@@ -4047,9 +4047,11 @@ def test_s4_stale_lock_is_irrelevant_and_symlinked_log_is_rejected(tmp_path):
 
 def test_s4_term_during_shim_does_not_leave_a_lock(tmp_path):
     """S-4: TERM exits the shim and leaves no lock/temp artifact to block retries."""
+    import select
+
     log_path = tmp_path / "cc-shim.log"
     stub_cc = tmp_path / "slow-clang"
-    stub_cc.write_text("#!/bin/sh\nexec sleep 30\n", encoding="utf-8")
+    stub_cc.write_text("#!/bin/sh\necho READY\nexec sleep 30\n", encoding="utf-8")
     stub_cc.chmod(0o755)
     shim_path = tmp_path / "cc-shim"
     shim_path.write_text(
@@ -4062,9 +4064,14 @@ def test_s4_term_during_shim_does_not_leave_a_lock(tmp_path):
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
-    time.sleep(0.3)
-    proc.terminate()
-    proc.communicate(timeout=5)
+    try:
+        assert proc.stdout is not None
+        readable, _, _ = select.select([proc.stdout], [], [], 5.0)
+        assert readable, "stub compiler did not signal readiness before timeout"
+        assert proc.stdout.readline() == b"READY\n"
+    finally:
+        proc.terminate()
+        proc.communicate(timeout=5)
     assert not (tmp_path / "cc-shim.log.lock").exists()
     # A completed fragment is harmless and will be merged by the runner; only
     # an in-flight temp (or a leftover lock) could block a retry.
@@ -4308,6 +4315,8 @@ def test_b7_policy_round_writes_admission_not_review(tmp_path, monkeypatch):
     job, plan, plan_digest, review = _setup_fixture_plan_and_job(
         version=2, build_spec=spec
     )
+    plan["parent_approval_digest"] = "sha256:" + "e" * 64
+    plan_digest = contracts.plan_digest(plan)
     mem_state = _InMemoryState(job, plan, plan_digest, review)
     mem_state.install(monkeypatch)
     # A guided family's human review is bound to the first plan, not this
@@ -4590,3 +4599,518 @@ def test_nonblocking_cmake_configure_attached_and_separate_P_rejected(
     with pytest.raises(SandboxError) as exc_info:
         prepare_build_spec_execution(spec)
     assert exc_info.value.reason_code == build_provenance.BUILD_PROVENANCE_MISSING
+
+
+# ---------------------------------------------------------------------------
+# PR-A regression tests (D1, D2, NB1, NB3, NB4)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "label,configure_argv",
+    [
+        (
+            "typed-bool-off-single",
+            [
+                "cmake",
+                "-S",
+                ".",
+                "-B",
+                "build",
+                "-DCMAKE_EXPORT_COMPILE_COMMANDS:BOOL=OFF",
+            ],
+        ),
+        (
+            "typed-bool-off-two-token",
+            [
+                "cmake",
+                "-S",
+                ".",
+                "-B",
+                "build",
+                "-D",
+                "CMAKE_EXPORT_COMPILE_COMMANDS:BOOL=OFF",
+            ],
+        ),
+        (
+            "wildcard-unset-after-on",
+            [
+                "cmake",
+                "-S",
+                ".",
+                "-B",
+                "build",
+                "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON",
+                "-UCMAKE_EXPORT_COMPILE_*",
+            ],
+        ),
+        (
+            "wildcard-unset-two-token",
+            [
+                "cmake",
+                "-S",
+                ".",
+                "-B",
+                "build",
+                "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON",
+                "-U",
+                "CMAKE_EXPORT_*",
+            ],
+        ),
+        (
+            "typed-install-prefix-escape-single",
+            [
+                "cmake",
+                "-S",
+                ".",
+                "-B",
+                "build",
+                "-DCMAKE_INSTALL_PREFIX:PATH=/etc",
+            ],
+        ),
+        (
+            "typed-install-prefix-escape-two-token",
+            [
+                "cmake",
+                "-S",
+                ".",
+                "-B",
+                "build",
+                "-D",
+                "CMAKE_INSTALL_PREFIX:FILEPATH=/etc",
+            ],
+        ),
+        (
+            "typed-runtime-output-escape",
+            [
+                "cmake",
+                "-S",
+                ".",
+                "-B",
+                "build",
+                "-DCMAKE_RUNTIME_OUTPUT_DIRECTORY:PATH=/tmp/evil",
+            ],
+        ),
+        (
+            "install-prefix-flag-two-token",
+            [
+                "cmake",
+                "-S",
+                ".",
+                "-B",
+                "build",
+                "--install-prefix",
+                "/etc",
+            ],
+        ),
+        (
+            "install-prefix-flag-equals",
+            [
+                "cmake",
+                "-S",
+                ".",
+                "-B",
+                "build",
+                "--install-prefix=/etc",
+            ],
+        ),
+        (
+            "lowercase-on-cannot-override-off",
+            [
+                "cmake",
+                "-S",
+                ".",
+                "-B",
+                "build",
+                "-DCMAKE_EXPORT_COMPILE_COMMANDS=OFF",
+                "-Dcmake_export_compile_commands=ON",
+            ],
+        ),
+        (
+            "per-config-runtime-output-escape",
+            [
+                "cmake",
+                "-S",
+                ".",
+                "-B",
+                "build",
+                "-DCMAKE_RUNTIME_OUTPUT_DIRECTORY_RELEASE=/etc",
+            ],
+        ),
+        (
+            "per-config-archive-output-typed-escape",
+            [
+                "cmake",
+                "-S",
+                ".",
+                "-B",
+                "build",
+                "-DCMAKE_ARCHIVE_OUTPUT_DIRECTORY_DEBUG:PATH=/etc",
+            ],
+        ),
+        (
+            "per-config-library-output-escape",
+            [
+                "cmake",
+                "-S",
+                ".",
+                "-B",
+                "build",
+                "-DCMAKE_LIBRARY_OUTPUT_DIRECTORY_MINSIZEREL=/etc",
+            ],
+        ),
+        (
+            "quoted-install-prefix-double",
+            [
+                "cmake",
+                "-S",
+                ".",
+                "-B",
+                "build",
+                '-DCMAKE_INSTALL_PREFIX="/etc"',
+            ],
+        ),
+        (
+            "quoted-install-prefix-single",
+            [
+                "cmake",
+                "-S",
+                ".",
+                "-B",
+                "build",
+                "-DCMAKE_INSTALL_PREFIX='/etc'",
+            ],
+        ),
+    ],
+)
+def test_d1_cmake_typed_vars_wildcard_unset_and_install_prefix_fail_closed(
+    label: str, configure_argv: list[str]
+):
+    """D1: typed -D<VAR>:<TYPE>=..., wildcard -U, and --install-prefix fail closed."""
+    spec = _cmake_spec(configure=configure_argv)
+    decision = build_provenance.validate_build_spec_for_freeze(spec)
+    assert decision.ok is False, f"{label}: freeze validation must reject"
+    assert decision.reason_code == build_provenance.BUILD_PROVENANCE_MISSING
+
+    with pytest.raises(SandboxError) as exc_info:
+        prepare_build_spec_execution(spec)
+    assert exc_info.value.reason_code == build_provenance.BUILD_PROVENANCE_MISSING
+
+
+def test_d1_cmake_has_export_and_disables_share_typed_and_unset_semantics():
+    """D1: cmake_has_export_compile_commands agrees with cmake_disables_compile_commands."""
+    typed_off = [
+        "cmake",
+        "-S",
+        ".",
+        "-B",
+        "build",
+        "-DCMAKE_EXPORT_COMPILE_COMMANDS:BOOL=OFF",
+    ]
+    assert build_provenance.cmake_disables_compile_commands(typed_off) is True
+    assert build_provenance.cmake_has_export_compile_commands(typed_off) is False
+
+    wildcard_unset = [
+        "cmake",
+        "-S",
+        ".",
+        "-B",
+        "build",
+        "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON",
+        "-UCMAKE_EXPORT_COMPILE_*",
+    ]
+    assert build_provenance.cmake_disables_compile_commands(wildcard_unset) is True
+    assert build_provenance.cmake_has_export_compile_commands(wildcard_unset) is False
+
+    # Lowercase variable does NOT enable CMake's case-sensitive export; auto-inject =ON.
+    lowercase_only = [
+        "cmake",
+        "-S",
+        ".",
+        "-B",
+        "build",
+        "-Dcmake_export_compile_commands=ON",
+    ]
+    assert build_provenance.cmake_disables_compile_commands(lowercase_only) is False
+    assert build_provenance.cmake_has_export_compile_commands(lowercase_only) is False
+    lower_plan = prepare_build_spec_execution(_cmake_spec(configure=lowercase_only))
+    assert "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON" in lower_plan.configure
+
+    # Valid typed =ON and valid --install-prefix inside /work remain allowed.
+    valid_typed = [
+        "cmake",
+        "-S",
+        ".",
+        "-B",
+        "build",
+        "-DCMAKE_EXPORT_COMPILE_COMMANDS:BOOL=ON",
+        "-DCMAKE_INSTALL_PREFIX:PATH=/work/install",
+        "--install-prefix",
+        "stage",
+    ]
+    assert build_provenance.cmake_disables_compile_commands(valid_typed) is False
+    assert build_provenance.cmake_has_export_compile_commands(valid_typed) is True
+    spec = _cmake_spec(configure=valid_typed)
+    assert build_provenance.validate_build_spec_for_freeze(spec).ok is True
+    plan = prepare_build_spec_execution(spec)
+    assert list(plan.configure) == valid_typed
+
+
+@pytest.mark.parametrize("install_argv", [["make", "install"], []])
+def test_d2_make_runner_merges_cc_shim_fragments_with_and_without_install(
+    tmp_path: Path, install_argv: list[str]
+):
+    """D2: make runner shifts install argv before cc_shim_merge_log so fragments always merge."""
+    from dataclasses import replace
+
+    work = tmp_path / "work"
+    work.mkdir()
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    log_path = work / ".datacon-cc-shim.log"
+    frag_dir = work / ".datacon-cc-shim.log.d"
+
+    stub_cc = bin_dir / "real-clang"
+    stub_cc.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    stub_cc.chmod(0o755)
+    shim_path = bin_dir / "cc-shim"
+    shim_path.write_text(
+        render_cc_shim_script(real_compiler=str(stub_cc), log_path=str(log_path)),
+        encoding="utf-8",
+    )
+    shim_path.chmod(0o755)
+
+    fake_make = bin_dir / "make"
+    fake_make.write_text(
+        "#!/bin/sh\n"
+        "set -eu\n"
+        'if [ "${1:-}" = "install" ]; then\n'
+        f'  "{shim_path}" -fsanitize=address -g -O1 -Iinclude -D_GNU_SOURCE -c src/inst.c -o inst.o\n'
+        f'  printf "installed\\n" > "{work}/installed.flag"\n'
+        "else\n"
+        f'  "{shim_path}" -fsanitize=address -g -O1 -Iinclude -D_GNU_SOURCE -c src/parser.c -o parser.o\n'
+        f'  printf "ELF-PARSER" > "{work}/parser"\n'
+        "fi\n",
+        encoding="utf-8",
+    )
+    fake_make.chmod(0o755)
+
+    spec = {
+        **_make_spec(),
+        "build": ["make", "parser"],
+        "install": install_argv,
+        "outputs": ["parser"],
+    }
+    plan = prepare_build_spec_execution(spec)
+    plan_for_host = replace(
+        plan,
+        primary_output_container_path=str(work / "parser"),
+        output_container_paths=(("parser", str(work / "parser")),),
+        provenance_face_container_path=str(log_path),
+    )
+    cmd = build_runner_command(
+        plan_for_host,
+        stage_fixture=False,
+        emit_result_marker=True,
+        wait_for_release=False,
+    )
+    env = os.environ.copy()
+    env["PATH"] = f"{bin_dir}:{env.get('PATH', '')}"
+    proc = subprocess.run(
+        cmd,
+        cwd=str(work),
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "DATACON_BUILD_RESULT code=0 size=10 " in proc.stderr
+    assert log_path.is_file(), "cc-shim fragments were not merged into target log"
+    assert not frag_dir.exists(), "fragment directory must be cleaned after merge"
+    lines = [
+        jsonutil.loads_strict(line)
+        for line in log_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    expected_count = 2 if install_argv else 1
+    assert len(lines) == expected_count
+    if install_argv:
+        assert (work / "installed.flag").is_file()
+
+
+@pytest.mark.parametrize(
+    "reserved_output",
+    [
+        "metadata.json",
+        "metadata.json/sub",
+        "build.log",
+        "build.log/sub",
+        "build_provenance",
+        "build_provenance/compile_commands.json",
+        "build_provenance/nested/file.log",
+    ],
+)
+def test_nb1_reserved_d39_build_output_paths_rejected(reserved_output: str):
+    """NB1: build_spec.outputs rejects D39 reserved build file/directory names."""
+    with pytest.raises(ValueError, match="reserved"):
+        build_provenance.validate_build_spec_output_path(reserved_output, 0)
+
+    spec = _cmake_spec(outputs=[reserved_output])
+    decision = build_provenance.validate_build_spec_for_freeze(spec)
+    assert decision.ok is False
+    assert decision.reason_code == build_provenance.BUILD_PROVENANCE_MISSING
+
+    with pytest.raises(SandboxError) as exc_info:
+        prepare_build_spec_execution(spec)
+    assert exc_info.value.reason_code == build_provenance.BUILD_PROVENANCE_MISSING
+
+
+def test_nb1_custom_primary_output_replays_and_reuses_build_step(
+    tmp_path: Path, monkeypatch
+):
+    """NB1: outputs=['bin/custom_target'] succeeds in replay and build step reuse."""
+    run_root, _ = _configure_isolated_roots(tmp_path, monkeypatch)
+    spec = _cmake_spec(outputs=["bin/custom_target"])
+    face = _cmake_compile_commands_bytes(
+        flags=["-fsanitize=address", "-g", "-O1", "-I../include", "-D_GNU_SOURCE"]
+    )
+    job, plan, plan_digest, review = _setup_fixture_plan_and_job(
+        version=2, build_spec=spec
+    )
+    mem_state = _InMemoryState(job, plan, plan_digest, review)
+    mem_state.install(monkeypatch)
+    fake_sandbox = _FakeSandbox(
+        image_digest=plan["image_digest"],
+        build_recipe_digest=plan["build_recipe_digest"],
+        faces={"vulnerable": face, "fixed": face},
+        face_name="compile_commands.json",
+        build_outputs={"bin/custom_target": b"ELF-CUSTOM-TARGET"},
+    )
+    result = execution.run_execution(
+        "dsn",
+        job["job_id"],
+        1,
+        case_root=str(FIXTURE_CASES),
+        run_root=run_root,
+        sandbox=fake_sandbox,
+    )
+    assert result.state == "REPRODUCED", (result, mem_state.finished_calls)
+    assert len(fake_sandbox.replay_calls) == 6
+    assert len(fake_sandbox.build_calls) == 2
+
+    # Second generation reuses the persisted custom primary output without rebuilding.
+    mem_state.job["generation"] = 2
+    mem_state.job["state"] = "RUNNING"
+    second_sandbox = _FakeSandbox(
+        image_digest=plan["image_digest"],
+        build_recipe_digest=plan["build_recipe_digest"],
+        faces={"vulnerable": face, "fixed": face},
+        face_name="compile_commands.json",
+        build_outputs={"bin/custom_target": b"ELF-CUSTOM-TARGET"},
+    )
+    second = execution.run_execution(
+        "dsn",
+        job["job_id"],
+        2,
+        case_root=str(FIXTURE_CASES),
+        run_root=run_root,
+        sandbox=second_sandbox,
+    )
+    assert second.state == "REPRODUCED", second
+    assert second_sandbox.build_calls == [], "custom primary output build should be reused"
+
+
+def test_nb3_policy_admission_parent_approval_digest_mismatch_blocked(
+    tmp_path: Path, monkeypatch
+):
+    """NB3: policy admission with mismatched parent_approval_digest fails closed at load and recheck."""
+    run_root, _ = _configure_isolated_roots(tmp_path, monkeypatch)
+    spec = _cmake_spec()
+    face = _cmake_compile_commands_bytes(
+        flags=["-fsanitize=address", "-g", "-O1", "-I../include", "-D_GNU_SOURCE"]
+    )
+    plan_parent_approval = "sha256:" + "e" * 64
+    wrong_parent_approval = "sha256:" + "f" * 64
+
+    job, plan, plan_digest, review = _setup_fixture_plan_and_job(
+        version=2, build_spec=spec
+    )
+    plan["parent_approval_digest"] = plan_parent_approval
+    plan_digest = contracts.plan_digest(plan)
+    mem_state = _InMemoryState(job, plan, plan_digest, review)
+    mem_state.install(monkeypatch)
+    mem_state.review = {
+        "reviewer_id": "family-reviewer",
+        "decision": "approve",
+        "plan_digest": "sha256:" + "9" * 64,
+        "decided_at": review["decided_at"],
+    }
+    mem_state.admission = {
+        "admission_id": str(uuid4()),
+        "job_id": str(job["job_id"]),
+        "parent_job_id": str(job["parent_job_id"]),
+        "round_no": plan["round_no"],
+        "approval_kind": "policy",
+        "envelope_digest": plan["envelope_digest"],
+        "parent_approval_digest": wrong_parent_approval,
+        "seed_digest": plan["inputs"]["candidate"],
+        "predicate_version": "admission-v1",
+        "recomputable": True,
+        "supporting_bundle_digest": None,
+        "decided_at": "2099-01-01T00:00:00Z",
+    }
+    fake_sandbox = _FakeSandbox(
+        image_digest=plan["image_digest"],
+        build_recipe_digest=plan["build_recipe_digest"],
+        faces={"vulnerable": face, "fixed": face},
+        face_name="compile_commands.json",
+    )
+    result = execution.run_execution(
+        "dsn",
+        job["job_id"],
+        1,
+        case_root=str(FIXTURE_CASES),
+        run_root=run_root,
+        sandbox=fake_sandbox,
+    )
+    assert result.state == "BLOCKED"
+    assert result.reason_code == "PLAN_MISMATCH"
+    assert fake_sandbox.probe_calls == 0
+
+    # Also verify pre-execution recheck (_assert_context_unchanged) rejects drift
+    # on parent_approval_digest, parent_job_id, round_no, and seed_digest.
+    mem_state.job["state"] = "RUNNING"
+    mem_state.admission["parent_approval_digest"] = plan_parent_approval
+    context = execution._load_context(
+        "dsn", job["job_id"], 1, case_root=str(FIXTURE_CASES), run_root=run_root
+    )
+    for field, bad_value in (
+        ("parent_approval_digest", wrong_parent_approval),
+        ("parent_job_id", str(uuid4())),
+        ("round_no", (plan["round_no"] or 1) + 99),
+        ("seed_digest", "sha256:" + "0" * 64),
+    ):
+        original = mem_state.admission[field]
+        mem_state.admission[field] = bad_value
+        try:
+            with pytest.raises(execution.ExecutionBlocked) as exc_info:
+                execution._assert_context_unchanged("dsn", context)
+            assert exc_info.value.reason_code == "PLAN_MISMATCH", field
+        finally:
+            mem_state.admission[field] = original
+
+
+def test_nb4_merge_cc_shim_log_rejects_symlink_fragment(tmp_path: Path):
+    """NB4: merge_cc_shim_log fails closed with SandboxPolicyError on symlinked fragment."""
+    log_path = tmp_path / "cc-shim.log"
+    frag_dir = tmp_path / "cc-shim.log.d"
+    frag_dir.mkdir()
+    secret = tmp_path / "secret.txt"
+    secret.write_text('{"cwd":"/work","argv":["clang","-c","a.c"]}\n', encoding="utf-8")
+    (frag_dir / "fragment-1-aaaa.jsonl").symlink_to(secret)
+
+    with pytest.raises(SandboxPolicyError, match="symlink"):
+        merge_cc_shim_log(log_path)
+    assert not log_path.exists()

@@ -10,6 +10,7 @@ from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass
+import fnmatch
 import hashlib
 from pathlib import Path, PurePosixPath
 import posixpath
@@ -52,10 +53,6 @@ _WS_RE: Final[re.Pattern[str]] = re.compile(r"\s+")
 _SHELL_META_RE: Final[re.Pattern[str]] = re.compile(r"[\s;&|`$<>\"'\\()]")
 _CONTROL_RE: Final[re.Pattern[str]] = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 _ENV_KEY_RE: Final[re.Pattern[str]] = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-_CMAKE_EXPORT_RE: Final[re.Pattern[str]] = re.compile(
-    r"^CMAKE_EXPORT_COMPILE_COMMANDS(?::[A-Za-z0-9_]+)?=(.*)$",
-    re.IGNORECASE,
-)
 _CMAKE_FALSE_VALUES: Final[frozenset[str]] = frozenset(
     {"", "0", "off", "false", "no", "n", "ignore", "notfound"}
 )
@@ -172,9 +169,22 @@ _CMAKE_OUTPUT_PATH_VARS: Final[frozenset[str]] = frozenset(
         "CMAKE_LIBRARY_OUTPUT_DIRECTORY",
     }
 )
+_CMAKE_OUTPUT_DIR_PREFIXES: Final[tuple[str, ...]] = (
+    "CMAKE_RUNTIME_OUTPUT_DIRECTORY_",
+    "CMAKE_ARCHIVE_OUTPUT_DIRECTORY_",
+    "CMAKE_LIBRARY_OUTPUT_DIRECTORY_",
+)
 _BUILD_ENV_PATH_VARS: Final[frozenset[str]] = frozenset(
     {"DESTDIR"} | set(_CMAKE_OUTPUT_PATH_VARS)
 )
+
+
+def _is_cmake_output_path_var(name: str) -> bool:
+    """Return True for CMake install/output directory variables, including per-config forms."""
+    return name in _CMAKE_OUTPUT_PATH_VARS or any(
+        name.startswith(prefix) and len(name) > len(prefix)
+        for prefix in _CMAKE_OUTPUT_DIR_PREFIXES
+    )
 _MAKE_VAR_ASSIGN_RE: Final[re.Pattern[str]] = re.compile(
     r"^\s*(?:(?:export|override)\s+)*([A-Za-z_][A-Za-z0-9_]*)\s*(?::::=|::=|:=|\?=|\+=|!=|=)"
 )
@@ -1091,7 +1101,8 @@ def _iter_cmake_var_operations(
             index += 1
             continue
         if operation == "D":
-            name, separator, value = expression.partition("=")
+            raw_name, separator, value = expression.partition("=")
+            name = raw_name.split(":", 1)[0]
             operations.append(("D", name, value if separator else ""))
         else:
             operations.append(("U", expression, None))
@@ -1103,14 +1114,20 @@ def cmake_export_compile_commands_state(
 ) -> tuple[str, str | None] | None:
     """Return the final ``(-D|-U, value)`` operation for the export variable.
 
-    ``-D`` and ``-U`` are applied in configure order. ``None`` means the
-    variable was never touched. A trailing ``-U`` (or a falsey final ``-D``)
-    means compile_commands.json is disabled for the effective configuration.
+    ``-D`` and ``-U`` are applied in configure order. ``-D<VAR>:<TYPE>=<VAL>``
+    strips ``:<TYPE>`` before matching, and ``-U<PATTERN>`` applies CMake
+    glob matching (``fnmatchcase``). ``None`` means the variable was never
+    touched. A trailing ``-U`` (or a falsey final ``-D``) means
+    compile_commands.json is disabled for the effective configuration.
     """
     state: tuple[str, str | None] | None = None
     for operation, name, value in _iter_cmake_var_operations(configure):
-        if name == "CMAKE_EXPORT_COMPILE_COMMANDS":
-            state = (operation, value)
+        if operation == "D" and name == "CMAKE_EXPORT_COMPILE_COMMANDS":
+            state = ("D", value)
+        elif operation == "U" and fnmatch.fnmatchcase(
+            "CMAKE_EXPORT_COMPILE_COMMANDS", name
+        ):
+            state = ("U", None)
     return state
 
 
@@ -1118,31 +1135,22 @@ def iter_cmake_export_compile_commands_values(
     configure: Sequence[str],
 ) -> list[str]:
     """Return all ``CMAKE_EXPORT_COMPILE_COMMANDS`` values in ``configure`` (quote-aware)."""
-    values: list[str] = []
-    i = 0
-    total = len(configure)
-    while i < total:
-        tok = _clean_token(configure[i])
-        define_expr: str | None = None
-        if tok == "-D" and i + 1 < total:
-            define_expr = _clean_token(configure[i + 1])
-            i += 2
-        elif tok.startswith("-D") and len(tok) > 2:
-            define_expr = _clean_token(tok[2:])
-            i += 1
-        else:
-            i += 1
-            continue
-
-        match = _CMAKE_EXPORT_RE.fullmatch(define_expr)
-        if match is not None:
-            values.append(match.group(1))
-    return values
+    return [
+        value
+        for operation, name, value in _iter_cmake_var_operations(configure)
+        if operation == "D"
+        and name == "CMAKE_EXPORT_COMPILE_COMMANDS"
+        and value is not None
+    ]
 
 
 def cmake_has_export_compile_commands(configure: Sequence[str]) -> bool:
-    """Return True if ``configure`` explicitly defines ``CMAKE_EXPORT_COMPILE_COMMANDS``."""
-    return bool(iter_cmake_export_compile_commands_values(configure))
+    """Return True if ``configure`` leaves ``CMAKE_EXPORT_COMPILE_COMMANDS`` enabled."""
+    state = cmake_export_compile_commands_state(configure)
+    if state is None:
+        return False
+    operation, value = state
+    return operation == "D" and value is not None and not _is_cmake_false_value(value)
 
 
 def cmake_disables_compile_commands(configure: Sequence[str]) -> bool:
@@ -1234,22 +1242,27 @@ def validate_work_path_arg(value: Any, *, label: str) -> str:
         raise ValueError(f"{label} must be a non-empty path string")
     if has_control_chars(value) or "\\" in value:
         raise ValueError(f"{label} must not contain control characters or backslashes")
-    if value.startswith("/"):
-        if value.startswith("//"):
-            raise ValueError(f"{label} must not be a //-prefixed path: {value!r}")
-        norm = posixpath.normpath(value)
-        if norm == "/work" or norm.startswith("/work/"):
-            return norm
-        raise ValueError(f"{label} must stay inside /work: {value!r}")
-    norm = posixpath.normpath(value)
-    if (
-        norm.startswith("/")
-        or norm == ".."
-        or norm.startswith("../")
-        or ".." in PurePosixPath(norm).parts
-    ):
-        raise ValueError(f"{label} escapes /work: {value!r}")
-    return norm
+    if value.strip().startswith(('"', "'")):
+        raise ValueError(f"{label} must not be wrapped or prefixed with quotes: {value!r}")
+    for candidate in (value, value.replace('"', "").replace("'", "")):
+        if not candidate.strip():
+            raise ValueError(f"{label} must be a non-empty path string")
+        if candidate.startswith("/"):
+            if candidate.startswith("//"):
+                raise ValueError(f"{label} must not be a //-prefixed path: {value!r}")
+            norm = posixpath.normpath(candidate)
+            if norm != "/work" and not norm.startswith("/work/"):
+                raise ValueError(f"{label} must stay inside /work: {value!r}")
+        else:
+            norm = posixpath.normpath(candidate)
+            if (
+                norm.startswith("/")
+                or norm == ".."
+                or norm.startswith("../")
+                or ".." in PurePosixPath(norm).parts
+            ):
+                raise ValueError(f"{label} escapes /work: {value!r}")
+    return posixpath.normpath(value)
 
 
 def validate_build_spec_output_path(raw_output: str, index: int) -> tuple[str, str]:
@@ -1270,6 +1283,15 @@ def validate_build_spec_output_path(raw_output: str, index: int) -> tuple[str, s
         or has_shell_metachars(norm_rel)
     ):
         raise ValueError(f"unsafe build_spec.outputs[{index}]: {raw_output!r}")
+    if PurePosixPath(norm_rel).parts[0] in (
+        "metadata.json",
+        "build.log",
+        "build_provenance",
+    ):
+        raise ValueError(
+            f"build_spec.outputs[{index}] conflicts with reserved D39 build "
+            f"artifact path: {raw_output!r}"
+        )
     return norm_rel, f"/work/{norm_rel}"
 
 
@@ -1324,7 +1346,7 @@ def validate_build_spec_env(env: Any) -> str | None:
             )
         if not isinstance(val, str) or has_control_chars(val):
             return f"build_spec.env[{key!r}] must be a string without control characters"
-        if upper_key in _BUILD_ENV_PATH_VARS:
+        if upper_key in _BUILD_ENV_PATH_VARS or _is_cmake_output_path_var(upper_key):
             try:
                 validate_work_path_arg(val, label=f"build_spec.env[{key!r}]")
             except ValueError as error:
@@ -1358,7 +1380,7 @@ def validate_effective_build_env(
             return f"effective build env has a credential-like variable {key!r}"
         if not isinstance(val, str) or has_control_chars(val):
             return f"effective build env[{key!r}] must be a string without control chars"
-        if upper_key in _BUILD_ENV_PATH_VARS:
+        if upper_key in _BUILD_ENV_PATH_VARS or _is_cmake_output_path_var(upper_key):
             try:
                 validate_work_path_arg(val, label=f"effective build env[{key!r}]")
             except ValueError as error:
@@ -1528,12 +1550,25 @@ def _validate_cmake_command_paths(
             value = tok[2:]
             label = "configure -B"
             index += 1
+        elif tok == "--install-prefix":
+            if index + 1 >= total:
+                return (
+                    "build_spec.configure (cmake) --install-prefix requires a directory"
+                )
+            value = configure[index + 1]
+            label = "configure --install-prefix"
+            index += 2
+        elif tok.startswith("--install-prefix="):
+            value = tok.split("=", 1)[1]
+            label = "configure --install-prefix"
+            index += 1
         elif tok in ("-D", "-U") and index + 1 < total:
-            expression = configure[index + 1]
+            expression = _clean_token(configure[index + 1])
             index += 2
             if tok == "-D":
-                name, _separator, raw_value = expression.partition("=")
-                if name in _CMAKE_OUTPUT_PATH_VARS:
+                raw_name, _separator, raw_value = expression.partition("=")
+                name = raw_name.split(":", 1)[0]
+                if _is_cmake_output_path_var(name):
                     try:
                         validate_work_path_arg(
                             raw_value, label=f"configure -D{name}"
@@ -1542,11 +1577,12 @@ def _validate_cmake_command_paths(
                         return str(error)
             continue
         elif (tok.startswith("-D") or tok.startswith("-U")) and len(tok) > 2:
-            expression = tok[2:]
+            expression = _clean_token(tok[2:])
             index += 1
             if tok.startswith("-D"):
-                name, _separator, raw_value = expression.partition("=")
-                if name in _CMAKE_OUTPUT_PATH_VARS:
+                raw_name, _separator, raw_value = expression.partition("=")
+                name = raw_name.split(":", 1)[0]
+                if _is_cmake_output_path_var(name):
                     try:
                         validate_work_path_arg(
                             raw_value, label=f"configure -D{name}"
