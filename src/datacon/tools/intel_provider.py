@@ -57,11 +57,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Mapping, Protocol, Sequence, runtime_checkable
 
-from urllib.parse import urlsplit
-
 from datacon import jsonutil
 from datacon.orchestration import IntelResult
-from datacon.tools.intel_fetch import MAX_WIRE_BYTES, SYSTEM_USE, strip_url_credentials
+from datacon.tools.intel_fetch import (
+    MAX_WIRE_BYTES,
+    IntelFetchError,
+    license_rejection,
+    public_source_url,
+)
 
 
 class _Blocked(Exception):
@@ -170,68 +173,33 @@ def _public_source_url(source: IntelSource) -> str:
     control character each name no trustworthy origin. A registration
     whose URL is missing, not text or unparseable names no provenance at
     all, and is refused before its snapshot is opened: material that
-    cannot be attributed to a source is policy, not content.
+    cannot be attributed to a source is policy, not content. The rule is
+    ``intel_fetch.public_source_url``, so the evidence verifier applies the
+    same one offline; here a refusal is the provider's ``POLICY_DENIED``.
     """
-    url = source.source_url
-    if not isinstance(url, str) or not url.strip():
-        raise _Blocked(
-            "POLICY_DENIED",
-            "SOURCE_URL_INVALID",
-            f"intel source {_source_id(source)!r} registers no source URL",
-            _source_id(source),
-        )
-    if any(character.isspace() or ord(character) < 0x20 for character in url):
-        raise _Blocked(
-            "POLICY_DENIED",
-            "SOURCE_URL_INVALID",
-            f"intel source {_source_id(source)!r} registers a source URL"
-            " carrying whitespace or a control character",
-            _source_id(source),
-        )
     try:
-        stripped = strip_url_credentials(url)
-        parts = urlsplit(stripped)
-        # Reading ``port`` is what turns an unparseable port into a
-        # ValueError; username/password cannot survive the stripping.
-        _ = parts.port
-        if parts.scheme != "https" or not parts.hostname:
-            raise ValueError("the URL names no https origin")
-        if parts.username is not None or parts.password is not None:
-            raise ValueError("credentials survived the stripping")
-    except ValueError as error:
+        return public_source_url(source.source_url)
+    except IntelFetchError as error:
         raise _Blocked(
             "POLICY_DENIED",
-            "SOURCE_URL_INVALID",
-            f"intel source {_source_id(source)!r} registers a source URL"
-            f" that cannot be parsed: {error}",
+            error.sub_reason,
+            f"intel source {_source_id(source)!r} registers no usable source"
+            f" URL: {error.message}",
             _source_id(source),
         ) from error
-    return stripped
 
 
 def _license_rejection(source: IntelSource) -> str | None:
     """Return why ``source``'s license is refused, or ``None`` when it passes.
 
-    This is the offline twin of ``intel_fetch.check_license``: same verdict
-    and same ``LICENSE_REJECTED`` fine reason. It is kept local because that
-    gate compares the license a fetched snapshot claims with a registry entry
-    keyed by source host. Here the registration itself is the license record
-    -- there is no second claim to compare against -- and sources are keyed
-    by case, not by host.
+    The registration itself is the license record - there is no second claim
+    to compare against, unlike ``intel_fetch.check_license``, which matches a
+    fetched snapshot's claim against a host-keyed registry entry - and the
+    sources are keyed by case, not by host. The verdict is
+    ``intel_fetch.license_rejection`` over the registration's grant, so the
+    evidence verifier reaches the same one offline.
     """
-    license_id = source.license
-    if not isinstance(license_id, str) or not license_id.strip():
-        return "no license is registered"
-    uses = source.permitted_uses
-    # ``in`` on a text value is a substring test, and on bytes/bytearray it
-    # is a TypeError that would read as unreadable material; a malformed
-    # record grants nothing either way. Only list/tuple/set/frozenset name
-    # permissions, exactly like intel_fetch's registry gate.
-    if not isinstance(uses, (list, tuple, set, frozenset)):
-        return "its permitted uses are not registered as a list"
-    if SYSTEM_USE not in uses:
-        return f"its license does not permit {SYSTEM_USE!r}"
-    return None
+    return license_rejection(source.license, source.permitted_uses)
 
 
 def _ready(source: IntelSource) -> IntelResult:
