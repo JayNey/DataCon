@@ -3330,3 +3330,204 @@ def test_nonblocking_6_persist_build_oversize_face_and_campaign_inputs_none_and_
     assert ("/work/build/libhelper.so", MAX_ARTIFACT_BYTES) in captured_extra
     assert ("/work/build/parser", MAX_ARTIFACT_BYTES) in captured_extra
     assert ("/work/build/compile_commands.json", MAX_PROVENANCE_FACE_BYTES) in captured_extra
+
+
+def _reviewed_shell_spec(build: list[str]) -> dict[str, Any]:
+    return {
+        **_shell_spec(
+            face_digest="sha256:" + "a" * 64,
+            review={
+                "reviewer_id": "reviewer-01",
+                "reviewed_at": "2099-01-01T00:00:00Z",
+                "face_kind": "build_log",
+            },
+        ),
+        "build": list(build),
+    }
+
+
+@pytest.mark.parametrize(
+    "forbidden_key",
+    [
+        "MAKEFLAGS",
+        "GNUMAKEFLAGS",
+        "MAKEOVERRIDES",
+        "MAKEFILES",
+        "MFLAGS",
+        "BASH_ENV",
+        "ENV",
+    ],
+)
+def test_n1_make_and_shell_env_override_vars_rejected_in_freeze_and_prepare(
+    forbidden_key: str,
+):
+    """N1: Make/shell env override variables are rejected in BuildSpec.env."""
+    for spec in (
+        _cmake_spec(),
+        _make_spec(),
+        _reviewed_shell_spec(["sh", "./build.sh"]),
+    ):
+        spec["env"][forbidden_key] = "CC=clang"
+        decision = build_provenance.validate_build_spec_for_freeze(spec)
+        assert decision.ok is False, (
+            f"freeze must reject env.{forbidden_key} for kind={spec['kind']}"
+        )
+        assert decision.reason_code == build_provenance.BUILD_PROVENANCE_MISSING
+
+        with pytest.raises(SandboxError) as exc_info:
+            prepare_build_spec_execution(spec)
+        assert exc_info.value.reason_code == build_provenance.BUILD_PROVENANCE_MISSING
+
+
+@pytest.mark.parametrize(
+    "label,bad_spec",
+    [
+        (
+            "make-cli-makeflags",
+            {**_make_spec(), "build": ["make", "MAKEFLAGS=CC=clang"]},
+        ),
+        (
+            "make-cli-gnumakeflags",
+            {**_make_spec(), "build": ["make", "GNUMAKEFLAGS=--eval=CC:=clang"]},
+        ),
+        (
+            "make-cli-makeoverrides",
+            {**_make_spec(), "build": ["make", "MAKEOVERRIDES=CC=clang"]},
+        ),
+        (
+            "make-cli-makefiles",
+            {**_make_spec(), "build": ["make", "MAKEFILES=evil.mk"]},
+        ),
+        (
+            "cmake-build-native-makeflags",
+            _cmake_spec(build=["cmake", "--build", "build", "--", "MAKEFLAGS=CC=clang"]),
+        ),
+    ],
+)
+def test_n1_make_cli_env_override_vars_rejected_in_freeze_and_prepare(
+    label: str, bad_spec: dict[str, Any]
+):
+    """N1: Make/CMake native CLI variable overrides for Make env vars are rejected."""
+    decision = build_provenance.validate_build_spec_for_freeze(bad_spec)
+    assert decision.ok is False, f"{label}: freeze validation must reject"
+    assert decision.reason_code == build_provenance.BUILD_PROVENANCE_MISSING
+
+    with pytest.raises(SandboxError) as exc_info:
+        prepare_build_spec_execution(bad_spec)
+    assert exc_info.value.reason_code == build_provenance.BUILD_PROVENANCE_MISSING
+
+
+@pytest.mark.parametrize(
+    "label,bad_spec",
+    [
+        ("make-abbrev-ev-eq", {**_make_spec(), "build": ["make", "--ev=CC:=clang"]}),
+        (
+            "make-abbrev-ev-arg",
+            {**_make_spec(), "build": ["make", "--ev", "$(eval CC:=clang)"]},
+        ),
+        ("make-abbrev-eva-eq", {**_make_spec(), "build": ["make", "--eva=CC:=clang"]}),
+        ("make-abbrev-en", {**_make_spec(), "build": ["make", "--en"]}),
+        ("make-attached-E", {**_make_spec(), "build": ["make", "-ECC:=clang"]}),
+        ("make-bundled-ke", {**_make_spec(), "build": ["make", "-ke", "parser"]}),
+        ("make-bundled-se", {**_make_spec(), "build": ["make", "-se", "parser"]}),
+        (
+            "cmake-build-native-abbrev-ev",
+            _cmake_spec(build=["cmake", "--build", "build", "--", "--ev=CC:=clang"]),
+        ),
+    ],
+)
+def test_n2_make_abbreviated_long_and_attached_short_flags_rejected(
+    label: str, bad_spec: dict[str, Any]
+):
+    """N2: GNU Make getopt_long abbreviations (--ev/--en), attached -E, and bundled -e fail closed."""
+    decision = build_provenance.validate_build_spec_for_freeze(bad_spec)
+    assert decision.ok is False, f"{label}: freeze validation must reject"
+    assert decision.reason_code == build_provenance.BUILD_PROVENANCE_MISSING
+
+    with pytest.raises(SandboxError) as exc_info:
+        prepare_build_spec_execution(bad_spec)
+    assert exc_info.value.reason_code == build_provenance.BUILD_PROVENANCE_MISSING
+
+
+@pytest.mark.parametrize(
+    "valid_build",
+    [
+        ["make", "-f", "Makefile", "parser"],
+        ["make", "-fMakefile", "parser"],
+        ["make", "-C", "release", "parser"],
+        ["make", "-Crelease", "parser"],
+    ],
+)
+def test_n2_valid_make_short_arg_flags_remain_allowed(valid_build: list[str]):
+    """N2: valid make -f/-C flags (separate or attached, even containing 'e') remain allowed."""
+    spec = {**_make_spec(), "build": valid_build}
+    decision = build_provenance.validate_build_spec_for_freeze(spec)
+    assert decision.ok is True, f"valid make build {valid_build!r} must pass: {decision.error_detail}"
+    plan = prepare_build_spec_execution(spec)
+    assert list(plan.build) == valid_build
+
+
+@pytest.mark.parametrize(
+    "label,bad_build",
+    [
+        ("sh-plus-e-c", ["sh", "+e", "-c", "id"]),
+        ("bin-sh-plus-f-c", ["/bin/sh", "+f", "-c", "env"]),
+        ("direct-plus-e", ["+e"]),
+        ("direct-plus-script-path", ["+e/build.sh"]),
+    ],
+)
+def test_n3_shell_plus_option_prefix_rejected_in_freeze_and_prepare(
+    label: str, bad_build: list[str]
+):
+    """N3: POSIX sh '+' option prefixes are rejected in both sh and direct-script branches."""
+    spec = _reviewed_shell_spec(bad_build)
+    decision = build_provenance.validate_build_spec_for_freeze(spec)
+    assert decision.ok is False, f"{label}: freeze validation must reject"
+    assert decision.reason_code == build_provenance.BUILD_PROVENANCE_MISSING
+
+    with pytest.raises(SandboxError) as exc_info:
+        prepare_build_spec_execution(spec)
+    assert exc_info.value.reason_code == build_provenance.BUILD_PROVENANCE_MISSING
+
+
+@pytest.mark.parametrize(
+    "valid_build",
+    [
+        ["sh", "./build.sh"],
+        ["./build.sh"],
+    ],
+)
+def test_n3_valid_shell_relative_scripts_remain_allowed(valid_build: list[str]):
+    """N3: valid relative shell script invocations continue to pass freeze and prepare."""
+    spec = _reviewed_shell_spec(valid_build)
+    decision = build_provenance.validate_build_spec_for_freeze(spec)
+    assert decision.ok is True, f"valid shell build {valid_build!r} must pass: {decision.error_detail}"
+    plan = prepare_build_spec_execution(spec)
+    assert list(plan.build) == valid_build
+
+
+@pytest.mark.parametrize(
+    "label,configure_argv",
+    [
+        (
+            "cmake-attached-P",
+            ["cmake", "-S", ".", "-B", "build", "-Pevil.cmake"],
+        ),
+        (
+            "cmake-separate-P",
+            ["cmake", "-S", ".", "-B", "build", "-P", "evil.cmake"],
+        ),
+    ],
+)
+def test_nonblocking_cmake_configure_attached_and_separate_P_rejected(
+    label: str, configure_argv: list[str]
+):
+    """Non-blocking: cmake configure rejects both attached -P<file> and separate -P <file>."""
+    spec = _cmake_spec(configure=configure_argv)
+    decision = build_provenance.validate_build_spec_for_freeze(spec)
+    assert decision.ok is False, f"{label}: freeze validation must reject"
+    assert decision.reason_code == build_provenance.BUILD_PROVENANCE_MISSING
+
+    with pytest.raises(SandboxError) as exc_info:
+        prepare_build_spec_execution(spec)
+    assert exc_info.value.reason_code == build_provenance.BUILD_PROVENANCE_MISSING

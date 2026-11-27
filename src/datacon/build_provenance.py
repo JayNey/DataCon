@@ -84,6 +84,13 @@ FORBIDDEN_BUILD_ENV_KEYS: Final[frozenset[str]] = frozenset(
         "TMPDIR",
         "HOME",
         "ASAN_OPTIONS",
+        "MAKEFLAGS",
+        "GNUMAKEFLAGS",
+        "MAKEOVERRIDES",
+        "MAKEFILES",
+        "MFLAGS",
+        "BASH_ENV",
+        "ENV",
     }
 )
 _CREDENTIAL_ENV_PREFIXES: Final[tuple[str, ...]] = (
@@ -117,6 +124,13 @@ _FORBIDDEN_MAKE_CLI_VARS: Final[frozenset[str]] = frozenset(
         "SHELL",
         "MAKESHELL",
         "MAKE",
+        "MAKEFLAGS",
+        "GNUMAKEFLAGS",
+        "MAKEOVERRIDES",
+        "MAKEFILES",
+        "MFLAGS",
+        "BASH_ENV",
+        "ENV",
         "PATH",
         "LD_PRELOAD",
         "LD_LIBRARY_PATH",
@@ -1226,19 +1240,18 @@ def _validate_make_cli_args(args: Sequence[str], *, label: str) -> str | None:
                 after_double_dash = True
                 continue
             if tok.startswith("--"):
-                if (
-                    tok == "--eval"
-                    or tok.startswith("--eval=")
-                    or tok == "--environment-overrides"
-                    or tok.startswith("--environment-overrides=")
-                    or tok.startswith("--env")
-                ):
+                if tok.startswith(("--ev", "--en")):
                     return (
                         f"{label} must not pass eval or environment-override flag {tok!r}"
                     )
                 if tok in _MAKE_LONG_ARG_OPTS:
                     skip_next = True
                 continue
+            if tok.startswith("-E"):
+                return (
+                    f"{label} must not pass eval (-E) or environment-override "
+                    f"(-e) flag in {tok!r}"
+                )
             if tok.startswith("-") and len(tok) > 1:
                 for pos, ch in enumerate(tok[1:]):
                     if ch in ("E", "e"):
@@ -1278,7 +1291,7 @@ def _validate_shell_command(argv: Sequence[str], *, label: str) -> str | None:
         if len(argv) < 2:
             return f"{label} using {first!r} requires a relative script path"
         script = argv[1]
-        if script.startswith("-"):
+        if script.startswith(("-", "+")):
             return f"{label} must not pass shell flags such as {script!r} (no sh -c)"
         try:
             jsonutil.safe_relative_path(script, f"{label}[1]")
@@ -1286,7 +1299,7 @@ def _validate_shell_command(argv: Sequence[str], *, label: str) -> str | None:
             return str(exc)
         return None
 
-    if "/" in first and not first.startswith("/") and not first.startswith("-"):
+    if "/" in first and not first.startswith(("/", "-", "+")):
         try:
             jsonutil.safe_relative_path(first, f"{label}[0]")
         except ValueError as exc:
@@ -1317,7 +1330,7 @@ def validate_build_spec_commands(
                 f"(got {got!r})"
             )
         for tok in configure[1:]:
-            if tok in _FORBIDDEN_CMAKE_CONFIGURE_FLAGS:
+            if tok in _FORBIDDEN_CMAKE_CONFIGURE_FLAGS or tok.startswith("-P"):
                 return (
                     f"build_spec.configure (cmake) must not use execution mode flag {tok!r}"
                 )
