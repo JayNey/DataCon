@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from uuid import uuid4
 
+import pytest
+
 from test_evidence_v2 import _base_files, _manifest, _write_v2_bundle
 
 from datacon import evidence
@@ -62,8 +64,8 @@ def _index(*, campaign_digest, round_digests):
     )
 
 
-def _archive(tmp_path, index):
-    family_json = tmp_path / "archive" / "family.json"
+def _archive(tmp_path, index, *, name="archive"):
+    family_json = tmp_path / name / "family.json"
     evidence.finalize_family_index(family_json, index)
     return family_json
 
@@ -130,3 +132,116 @@ def test_family_index_is_byte_identical_to_export(tmp_path):
     ).read_bytes() == (campaign / "manifest.json").read_bytes(), (
         "export rewrote the campaign manifest"
     )
+
+
+def test_export_family_rejects_duplicate_round_numbers(tmp_path):
+    round1, digest1 = _bundle(tmp_path, kind="execution", name="dup-round-1")
+    round1b, digest1b = _bundle(tmp_path, kind="execution", name="dup-round-1b")
+    family_json = _archive(
+        tmp_path,
+        _index(campaign_digest=None, round_digests=[(1, digest1)]),
+    )
+
+    with pytest.raises(evidence.BundleError, match="round_no"):
+        evidence.export_family(
+            family_json,
+            tmp_path / "export",
+            rounds=[(1, round1), (1, round1b)],
+        )
+    assert not (tmp_path / "export").exists()
+    assert digest1b
+
+
+def test_export_family_rejects_a_non_empty_target(tmp_path):
+    round1, digest1 = _bundle(tmp_path, kind="execution", name="non-empty-round")
+    family_json = _archive(
+        tmp_path,
+        _index(campaign_digest=None, round_digests=[(1, digest1)]),
+    )
+    target = tmp_path / "export"
+    target.mkdir()
+    (target / "keep.txt").write_text("occupied", encoding="utf-8")
+
+    with pytest.raises(evidence.BundleError, match="not empty"):
+        evidence.export_family(family_json, target, rounds=[(1, round1)])
+
+
+def test_export_family_rejects_a_symlink_target(tmp_path):
+    round1, digest1 = _bundle(tmp_path, kind="execution", name="symlink-round")
+    family_json = _archive(
+        tmp_path,
+        _index(campaign_digest=None, round_digests=[(1, digest1)]),
+    )
+    real = tmp_path / "real-target"
+    real.mkdir()
+    link = tmp_path / "linked-target"
+    link.symlink_to(real, target_is_directory=True)
+
+    with pytest.raises(evidence.BundleError, match="symlink"):
+        evidence.export_family(family_json, link, rounds=[(1, round1)])
+
+
+def test_export_family_rejects_a_trusted_digest_mismatch(tmp_path):
+    round1, digest1 = _bundle(tmp_path, kind="execution", name="digest-round")
+    family_json = _archive(
+        tmp_path,
+        _index(campaign_digest=None, round_digests=[(1, digest1)]),
+    )
+
+    with pytest.raises(evidence.BundleError) as raised:
+        evidence.export_family(
+            family_json,
+            tmp_path / "export",
+            rounds=[(1, round1)],
+            expected_family_digest="sha256:" + "0" * 64,
+        )
+    assert raised.value.reason_code == "DIGEST_MISMATCH"
+    assert not (tmp_path / "export").exists()
+
+
+def test_export_family_rejects_campaign_source_mismatch(tmp_path):
+    round1, digest1 = _bundle(tmp_path, kind="execution", name="campaign-round")
+    campaign, campaign_digest = _bundle(
+        tmp_path, kind="campaign", name="campaign-extra"
+    )
+    # The index has no campaign, but the caller supplies one.
+    family_json = _archive(
+        tmp_path,
+        _index(campaign_digest=None, round_digests=[(1, digest1)]),
+    )
+
+    with pytest.raises(evidence.BundleError, match="campaign"):
+        evidence.export_family(
+            family_json,
+            tmp_path / "export",
+            campaign_source=campaign,
+            rounds=[(1, round1)],
+        )
+
+    # The index has a campaign, but the caller omits it.
+    with_campaign = _archive(
+        tmp_path,
+        _index(campaign_digest=campaign_digest, round_digests=[(1, digest1)]),
+        name="archive-with-campaign",
+    )
+    with pytest.raises(evidence.BundleError, match="campaign"):
+        evidence.export_family(with_campaign, tmp_path / "export2", rounds=[(1, round1)])
+
+
+def test_export_family_fixed_family_has_no_campaign(tmp_path):
+    round1, digest1 = _bundle(
+        tmp_path, kind="execution", name="fixed-round-1"
+    )
+    family_json = _archive(
+        tmp_path,
+        _index(campaign_digest=None, round_digests=[(1, digest1)]),
+    )
+
+    info = evidence.export_family(
+        family_json, tmp_path / "export", rounds=[(1, round1)]
+    )
+
+    assert not (tmp_path / "export" / "campaign").exists()
+    assert (tmp_path / "export" / "rounds" / "1").is_dir()
+    assert info.campaign_digest is None
+    assert verify_bundle(tmp_path / "export" / "rounds" / "1").manifest_digest == digest1

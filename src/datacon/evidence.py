@@ -4438,9 +4438,12 @@ FAMILY_INDEX_KIND = "family_index"
 MAX_FAMILY_INDEX_BYTES = 4 * 1024 * 1024
 # A round entry records the terminal job state, never an "archived" state:
 # archival lives in jobs.evidence_status and must not leak into the enum.
+# A round index entry is the terminal *job* state of a validation round.
+# ``COMPLETED`` is the campaign/family terminal introduced by D40 and is not a
+# validation-round verdict; allowing it here would let a campaign completion
+# masquerade as a round conclusion.
 _FAMILY_ROUND_STATES = frozenset(
     {
-        "COMPLETED",
         "REPRODUCED",
         "NOT_REPRODUCED",
         "INCONCLUSIVE",
@@ -4500,12 +4503,28 @@ def _family_fail(message: str) -> None:
 
 
 def _family_uuid(value: Any, label: str) -> str:
+    """Return ``value`` only when it is canonical lowercase provider text.
+
+    ``uuid.UUID`` accepts braces, ``urn:uuid:`` prefixes and uppercase input;
+    the family index schema requires the canonical provider representation so
+    two spellings can never name the same family under a different digest.
+    """
+    if not isinstance(value, str):
+        raise BundleError(
+            "INVALID_MANIFEST", f"family index {label} must be a UUID"
+        )
     try:
-        return str(uuid.UUID(str(value)))
+        parsed = uuid.UUID(value)
     except (TypeError, ValueError, AttributeError) as error:
         raise BundleError(
             "INVALID_MANIFEST", f"family index {label} must be a UUID"
         ) from error
+    if str(parsed) != value:
+        raise BundleError(
+            "INVALID_MANIFEST",
+            f"family index {label} must be a canonical lowercase UUID",
+        )
+    return value
 
 
 def _family_digest(value: Any, label: str) -> str:
@@ -4542,11 +4561,14 @@ def validate_family_index(document: Any) -> None:
         if unknown:
             detail.append("unknown " + ", ".join(sorted(unknown)))
         _family_fail("fields are invalid: " + "; ".join(detail))
-    if document["schema_version"] != FAMILY_INDEX_SCHEMA_VERSION:
-        _family_fail(f"schema_version must be {FAMILY_INDEX_SCHEMA_VERSION}")
+    if (
+        type(document["schema_version"]) is not int
+        or document["schema_version"] != FAMILY_INDEX_SCHEMA_VERSION
+    ):
+        _family_fail(f"schema_version must be integer {FAMILY_INDEX_SCHEMA_VERSION}")
     if document["kind"] != FAMILY_INDEX_KIND:
         _family_fail(f"kind must be {FAMILY_INDEX_KIND!r}")
-    _family_uuid(document["family_id"], "family_id")
+    family_id = _family_uuid(document["family_id"], "family_id")
     if document["state"] != "COMPLETED":
         _family_fail("state must be 'COMPLETED'")
     created_at = document["created_at"]
@@ -4588,11 +4610,21 @@ def validate_family_index(document: Any) -> None:
         _family_digest(entry["evidence_digest"], f"{label}.evidence_digest")
 
     campaign = document["campaign"]
+    campaign_job_id: str | None = None
     if campaign is not None:
         if not isinstance(campaign, dict) or set(campaign) != _FAMILY_CAMPAIGN_FIELDS:
             _family_fail("campaign fields are invalid")
-        _family_uuid(campaign["job_id"], "campaign.job_id")
+        campaign_job_id = _family_uuid(campaign["job_id"], "campaign.job_id")
         _family_digest(campaign["bundle_digest"], "campaign.bundle_digest")
+    if campaign is None and not rounds:
+        _family_fail("a fixed family must contain at least one round")
+    if family_id in seen_jobs or (
+        campaign_job_id is not None
+        and (campaign_job_id == family_id or campaign_job_id in seen_jobs)
+    ):
+        _family_fail(
+            "family_id, campaign.job_id and rounds[].job_id must be distinct"
+        )
 
     budget = document["budget"]
     if not isinstance(budget, dict) or set(budget) != set(_FAMILY_BUDGET_FIELDS):
@@ -4769,6 +4801,7 @@ def finalize_family_index(
     *,
     expected_digest: str | None = None,
     complete: Callable[[str, str], None] | None = None,
+    replace_unprotected: bool = False,
     file_mode: int = 0o444,
 ) -> FamilyIndexInfo:
     """Ensure ``family.json`` exists and only then compute its digest.
@@ -4777,8 +4810,15 @@ def finalize_family_index(
     ``complete_family`` replays the same bytes instead of rewriting them with a
     new ``created_at``. When a rebuilt document is supplied, every field except
     the archive timestamp must still match the existing index; a stale or
-    tampered file fails closed. ``complete`` is invoked only after validation
-    and digest computation succeed.
+    tampered file fails closed.
+
+    ``replace_unprotected`` is only for a family that is still ``AGGREGATING``
+    and has no database evidence pointer: a leftover ``family.json`` from an
+    aborted attempt (for example with an older approval digest) is an orphan,
+    not the authoritative index, so it may be atomically replaced. A completed
+    family always passes ``False`` and can never be overwritten.
+    ``complete`` is invoked only after validation and digest computation
+    succeed.
     """
     family_path = Path(path)
     if family_path.name != FAMILY_INDEX_FILENAME:
@@ -4795,15 +4835,33 @@ def finalize_family_index(
 
     if family_path.exists() or family_path.is_symlink():
         existing = load_family_index(family_path)
-        if candidate_document is not None:
-            for field in _FAMILY_INDEX_FIELDS - {"created_at", "schema_version", "kind", "state"}:
-                if existing.document[field] != candidate_document[field]:
+        replaced = False
+        if candidate_document is not None and candidate is not None:
+            mismatch = [
+                field
+                for field in _FAMILY_INDEX_FIELDS - {"created_at"}
+                if existing.document[field] != candidate_document[field]
+            ]
+            if mismatch:
+                if not replace_unprotected:
                     _family_fail(
-                        f"existing {field} does not match the rebuilt index"
+                        f"existing {mismatch[0]} does not match the rebuilt index"
                     )
-            if existing.document["state"] != "COMPLETED":
+                _atomic_write_family_index(
+                    family_path, candidate, file_mode=file_mode
+                )
+                replaced = True
+            elif existing.document["state"] != "COMPLETED":
                 _family_fail("existing state must be 'COMPLETED'")
-        info = existing
+        if replaced:
+            info = FamilyIndexInfo(
+                path=family_path,
+                document=candidate_document,
+                data=candidate,
+                digest="sha256:" + hashlib.sha256(candidate).hexdigest(),
+            )
+        else:
+            info = existing
     else:
         if candidate is None or candidate_document is None:
             raise BundleError("INVALID_MANIFEST", "family index is missing")
@@ -4856,6 +4914,11 @@ def export_family(
             if type(round_no) is not int:
                 raise BundleError(
                     "INVALID_MANIFEST", "family export round_no must be an integer"
+                )
+            if round_no in round_sources:
+                raise BundleError(
+                    "INVALID_MANIFEST",
+                    f"family export round_no {round_no} is duplicated",
                 )
             round_sources[round_no] = Path(source)
     except (TypeError, ValueError) as error:

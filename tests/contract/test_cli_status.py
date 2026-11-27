@@ -8,12 +8,14 @@ covered by ``tests/integration/test_family_archive_recovery.py``.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
+import json
 from uuid import UUID
 
 import pytest
 
-from datacon import evidence, state
+from datacon import cli, evidence, state
 
 FAMILY_ID = UUID("2f1c0f5e-3d7a-4b6c-9f10-2a4b6c8d0e11")
 CAMPAIGN_ID = UUID("9a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d")
@@ -60,7 +62,13 @@ class _Rows:
 
 
 class _StatusConnection:
-    """Minimal recording double for the four status queries."""
+    """Minimal recording double for the family status queries.
+
+    ``review`` is the row the ``reviews`` table would return for the family;
+    it must carry ``decision`` so a rejected first plan is not silently
+    treated as a human approval. ``transaction``/``SET TRANSACTION`` exist so
+    the real repeatable-read wrapper can be exercised without PostgreSQL.
+    """
 
     def __init__(
         self,
@@ -71,6 +79,8 @@ class _StatusConnection:
         admissions=(),
         ledger=None,
         charges=(),
+        approval_tail=(),
+        envelopes=(),
     ):
         self.job = job
         self.children = list(children)
@@ -78,6 +88,12 @@ class _StatusConnection:
         self.admissions = list(admissions)
         self.ledger = ledger
         self.charges = list(charges)
+        self.approval_tail = list(approval_tail)
+        self.envelopes = list(envelopes)
+        self.statements: list[str] = []
+
+    def transaction(self):
+        return contextlib.nullcontext()
 
     def __enter__(self):
         return self
@@ -86,16 +102,35 @@ class _StatusConnection:
         return False
 
     def execute(self, query, params=None):
+        self.statements.append(query)
+        if "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ" in query:
+            return _Rows([])
         if "FROM budget_ledger" in query:
             return _Rows([self.ledger] if self.ledger is not None else [])
         if "FROM budget_charges" in query:
             return _Rows(self.charges)
         if "FROM reviews" in query:
-            return _Rows([self.review] if self.review is not None else [])
+            if (
+                self.review is None
+                or "decision = 'approve'" in query
+                and self.review.get("decision") != "approve"
+            ):
+                return _Rows([])
+            return _Rows([self.review])
+        if "FROM family_approvals" in query:
+            return _Rows(self.approval_tail)
+        if "FROM family_envelopes" in query:
+            return _Rows(self.envelopes)
         if "FROM admissions" in query:
             return _Rows([{"job_id": job_id} for job_id in self.admissions])
         if "parent_job_id" in query:
             return _Rows(self.children)
+        if "SELECT job_kind FROM jobs" in query:
+            return _Rows(
+                [{"job_kind": self.job["job_kind"]}]
+                if self.job is not None
+                else []
+            )
         if "FROM jobs j" in query:
             return _Rows([self.job] if self.job is not None else [])
         raise AssertionError(f"unexpected status query: {query}")
@@ -240,7 +275,7 @@ def test_campaign_status_lists_campaign_and_rounds(monkeypatch):
     connection = _StatusConnection(
         job=_family_job(),
         children=[_campaign_child(), *_round_children()],
-        review={"plan_digest": CAMPAIGN_PLAN},
+        review={"plan_digest": CAMPAIGN_PLAN, "decision": "approve"},
         admissions=[ROUND1_ID, ROUND2_ID],
         ledger=LEDGER,
         charges=CHARGES,
@@ -285,7 +320,7 @@ def test_campaign_and_family_terminal_state_completed(monkeypatch):
     running = _StatusConnection(
         job=_family_job(state_name="AGGREGATING"),
         children=[_campaign_child("COMPLETED")],
-        review={"plan_digest": CAMPAIGN_PLAN},
+        review={"plan_digest": CAMPAIGN_PLAN, "decision": "approve"},
         ledger=LEDGER,
         charges=CHARGES,
     )
@@ -305,7 +340,7 @@ def test_campaign_and_family_terminal_state_completed(monkeypatch):
             evidence_digest=APPROVAL_DIGEST,
         ),
         children=[_campaign_child("COMPLETED")],
-        review={"plan_digest": CAMPAIGN_PLAN},
+        review={"plan_digest": CAMPAIGN_PLAN, "decision": "approve"},
         ledger=LEDGER,
         charges=CHARGES,
     )
@@ -345,7 +380,7 @@ def test_family_completed_sets_evidence_path_and_digest(monkeypatch, tmp_path):
                 evidence_digest=expected_digest,
             ),
             children=[_campaign_child(), *_round_children()],
-            review={"plan_digest": CAMPAIGN_PLAN},
+            review={"plan_digest": CAMPAIGN_PLAN, "decision": "approve"},
             admissions=[ROUND1_ID, ROUND2_ID],
             ledger=LEDGER,
             charges=CHARGES,
@@ -399,7 +434,7 @@ def test_round_status_uses_terminal_state_and_evidence_status(monkeypatch):
         _StatusConnection(
             job=_family_job(state_name="AGGREGATING"),
             children=[*_round_children()],
-            review={"plan_digest": ROUND1_PLAN},
+            review={"plan_digest": ROUND1_PLAN, "decision": "approve"},
             admissions=[ROUND2_ID],
             ledger=LEDGER,
             charges=CHARGES,
@@ -423,3 +458,162 @@ def test_round_status_uses_terminal_state_and_evidence_status(monkeypatch):
     assert payload["rounds"][1]["admission_kind"] == "policy"
     assert payload["rounds"][0]["plan_digest"] == ROUND1_PLAN
     assert payload["rounds"][1]["job_id"] == str(ROUND2_ID)
+
+
+# ---------------------------------------------------------------------------
+# S-2: status reports the effective D42 envelope max_rounds
+# ---------------------------------------------------------------------------
+
+
+def test_status_max_rounds_uses_approval_envelope_tail(monkeypatch):
+    envelope_digest = "sha256:" + "b" * 64
+    connection = _StatusConnection(
+        job=_family_job(max_rounds=8),
+        children=[_campaign_child()],
+        review={"plan_digest": CAMPAIGN_PLAN, "decision": "approve"},
+        ledger=LEDGER,
+        charges=CHARGES,
+        approval_tail=[
+            {
+                "approval_digest": APPROVAL_DIGEST,
+                "envelope_digest": envelope_digest,
+            }
+        ],
+        envelopes=[{"envelope_json": {"max_rounds": 4}}],
+    )
+    _install(monkeypatch, connection)
+
+    payload = state.status("postgresql://unused", FAMILY_ID)
+
+    assert payload["family"]["max_rounds"] == 4
+
+
+def test_status_max_rounds_falls_back_to_request(monkeypatch):
+    connection = _StatusConnection(
+        job=_family_job(max_rounds=8),
+        children=[_campaign_child()],
+        review={"plan_digest": CAMPAIGN_PLAN, "decision": "approve"},
+        ledger=LEDGER,
+        charges=CHARGES,
+    )
+    _install(monkeypatch, connection)
+
+    payload = state.status("postgresql://unused", FAMILY_ID)
+
+    assert payload["family"]["max_rounds"] == 8
+
+
+def test_status_max_rounds_fixed_family_falls_back_to_one(monkeypatch):
+    job = _family_job(max_rounds=8)
+    job["request"] = {
+        "schema_version": 2,
+        "exploration": {"mode": "fixed"},
+    }
+    connection = _StatusConnection(
+        job=job,
+        children=[
+            _child(
+                ROUND1_ID,
+                job_kind="round",
+                round_no=1,
+                state_name="REPRODUCED",
+                plan_digest=ROUND1_PLAN,
+                evidence_digest=ROUND1_DIGEST,
+            )
+        ],
+        review={"plan_digest": ROUND1_PLAN, "decision": "approve"},
+        ledger=LEDGER,
+        charges=CHARGES,
+    )
+    _install(monkeypatch, connection)
+
+    payload = state.status("postgresql://unused", FAMILY_ID)
+
+    assert payload["family"]["max_rounds"] == 1
+    assert payload["campaign"] is None
+
+
+# ---------------------------------------------------------------------------
+# S-3: only an approve decision marks the first plan as human-admitted
+# ---------------------------------------------------------------------------
+
+
+def test_rejected_first_plan_is_not_a_human_admission(monkeypatch):
+    connection = _StatusConnection(
+        job=_family_job(),
+        children=[_campaign_child(), *_round_children()],
+        review={"plan_digest": CAMPAIGN_PLAN, "decision": "reject"},
+        admissions=[ROUND1_ID, ROUND2_ID],
+        ledger=LEDGER,
+        charges=CHARGES,
+    )
+    _install(monkeypatch, connection)
+
+    payload = state.status("postgresql://unused", FAMILY_ID)
+
+    assert payload["campaign"]["admission_kind"] is None, (
+        "a rejected first plan was reported as human-admitted"
+    )
+    assert [entry["admission_kind"] for entry in payload["rounds"]] == [
+        "policy",
+        "policy",
+    ]
+
+
+# ---------------------------------------------------------------------------
+# S-4: family status reads one repeatable-read snapshot
+# ---------------------------------------------------------------------------
+
+
+def test_family_status_reads_inside_repeatable_read_transaction(monkeypatch):
+    connection = _StatusConnection(
+        job=_family_job(),
+        children=[_campaign_child(), *_round_children()],
+        review={"plan_digest": CAMPAIGN_PLAN, "decision": "approve"},
+        admissions=[ROUND1_ID, ROUND2_ID],
+        ledger=LEDGER,
+        charges=CHARGES,
+    )
+    _install(monkeypatch, connection)
+
+    state.status("postgresql://unused", FAMILY_ID)
+
+    isolation = [
+        index
+        for index, query in enumerate(connection.statements)
+        if "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ" in query
+    ]
+    assert len(isolation) == 1
+    assert isolation[0] == 1, (
+        "SET TRANSACTION must be the first statement of the family snapshot"
+    )
+    snapshot_reads = [
+        index
+        for index, query in enumerate(connection.statements)
+        if "parent_job_id" in query
+        or "FROM reviews" in query
+        or "FROM family_approvals" in query
+        or "FROM budget_ledger" in query
+    ]
+    assert snapshot_reads and all(index > isolation[0] for index in snapshot_reads)
+
+
+# ---------------------------------------------------------------------------
+# S-5: a StateError from status is a controlled CLI error
+# ---------------------------------------------------------------------------
+
+
+def test_cli_status_maps_state_error_to_exit_3(monkeypatch, capsys):
+    monkeypatch.setenv("DATACON_DATABASE_URL", "postgresql://unused")
+
+    def _boom(dsn, job_id):
+        raise state.StateError("budget ledger does not reconcile with charges")
+
+    monkeypatch.setattr(cli.store, "status", _boom)
+
+    code = cli.main(["status", str(FAMILY_ID)])
+
+    assert code == 3
+    payload = json.loads(capsys.readouterr().err)
+    assert payload["reason_code"] == "STATE_ERROR"
+    assert "reconcile" in payload["message"]

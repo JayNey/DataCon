@@ -198,6 +198,8 @@ def _status(args) -> int:
         return _error(1, "DATABASE_NOT_CONFIGURED", "set DATACON_DATABASE_URL")
     try:
         result = store.status(dsn, job_id)
+    except state.StateError as error:
+        return _error(3, "STATE_ERROR", str(error))
     except psycopg.Error as error:
         return _error(1, "DATABASE_ERROR", _database_error_message(error))
     if result is None:
@@ -389,6 +391,12 @@ def _export(args) -> int:
         return _error(1, "DATABASE_ERROR", _database_error_message(error))
     if job is None:
         return _error(3, "JOB_NOT_FOUND", "job does not exist")
+    if job.get("job_kind") == "family":
+        return _error(
+            2,
+            "INVALID_REQUEST",
+            "use --family FAMILY_ID to export a family",
+        )
     if (
         job.get("evidence_status") != "archived"
         or not job.get("evidence_path")
