@@ -2774,3 +2774,80 @@ def test_release_contract_version_is_not_derived_from_contracts_schema():
     finally:
         contracts.SCHEMA_VERSION = original
         importlib.reload(release)
+
+
+def test_release_manifest_keeps_contract_version_one(tmp_path):
+    from datacon import contracts
+
+    assert contracts.SCHEMA_VERSION == 1
+    assert contracts.SCHEMA_VERSION_V2 == 2
+    assert release.CONTRACT_VERSION == 1
+
+    manifest = _sample_rc_manifest()
+    assert manifest["contract_version"] == 1
+    assert manifest["schema_version"] == 1
+    assert manifest["toolchain_image_digest"] == release.TOOLCHAIN_IMAGE_DIGEST
+    release.validate_release_candidate_manifest(manifest)
+
+    promoted_backend = _backend()
+    approval_v1 = _approval(manifest)
+    promoted = release.promote_and_smoke(
+        manifest=manifest,
+        expected_manifest_digest=approval_v1["candidate_digest"],
+        approval=approval_v1,
+        backend=promoted_backend,
+        smoke_checks={"cli_smoke": lambda: True},
+        rollback_fn=lambda prev: {"restored_image": prev["image_id"], "ok": True},
+    )
+    assert promoted["status"] == "promoted"
+    assert promoted_backend.active_release()["config"]["contract_version"] == 1
+
+    manifest_v2 = dict(manifest, contract_version=contracts.SCHEMA_VERSION_V2)
+    with pytest.raises(release.ReleaseGateError, match="contract_version"):
+        release.validate_release_candidate_manifest(manifest_v2)
+
+    approval_v2 = _approval(manifest, contract_version=contracts.SCHEMA_VERSION_V2)
+    with pytest.raises(release.ReleaseGateError, match="contract_version"):
+        release.verify_promotion_gate(
+            manifest,
+            expected_manifest_digest=approval_v2["candidate_digest"],
+            approval=approval_v2,
+        )
+
+    backend = _backend()
+    with pytest.raises(release.ReleaseGateError, match="contract_version"):
+        release.promote_and_smoke(
+            manifest=manifest,
+            expected_manifest_digest=approval_v2["candidate_digest"],
+            approval=approval_v2,
+            backend=backend,
+            smoke_checks={"cli_smoke": lambda: True},
+            rollback_fn=lambda prev: {"restored_image": prev["image_id"], "ok": True},
+        )
+    assert backend.switches == []
+    assert backend.audits == []
+
+    # B03 acceptance path stays on v1 compatibility (schema_version=1, pinned v1 toolchain).
+    root = _b03_case_root(tmp_path)
+    admission = _frozen_admission()
+    assert admission["schema_version"] == 1
+    assert admission["build"]["toolchain_image"] == release.TOOLCHAIN_IMAGE
+    review = _review_for(admission, root)
+    bundle_out = tmp_path / "b03-v1-bundle"
+    acceptance = release.run_b03_acceptance(
+        admission=admission,
+        sandbox=FakeB03Sandbox(toolchain=release.TOOLCHAIN_IMAGE),
+        normal_input=(root / "inputs" / "normal.txt").read_bytes(),
+        candidate_input=(root / "inputs" / "candidate.txt").read_bytes(),
+        bundle_out=bundle_out,
+        storage_ref="vault://datacon/private/b03/CVE-2019-13224/manifest.json",
+        review=review,
+        case_root=root,
+        job_id="22222222-2222-4222-8222-222222222222",
+    )
+    assert acceptance["schema_version"] == 1
+    verified = evidence.verify_bundle(bundle_out)
+    assert verified.manifest["schema_version"] == 1
+    report = json.loads(verified.file_data["report.json"])
+    assert report["schema_version"] == 1
+

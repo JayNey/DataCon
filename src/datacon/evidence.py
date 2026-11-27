@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 import hashlib
 import os
 from pathlib import Path, PurePosixPath
+import posixpath
 import re
 import shlex
 import shutil
@@ -205,6 +206,33 @@ _V2_REQUIRED_PATHS = {
         "envelope.json": "envelope",
         "budget/snapshot.json": "budget_snapshot",
     },
+}
+# A FAILED or pre-rule INCONCLUSIVE execution bundle is allowed to archive
+# only the evidence that was actually produced. It still carries the fixed
+# documents needed to interpret the partial run, but build/replay roles are
+# required only when their paths exist (and are always validated when they do).
+# This is deliberately narrower than the full execution role table: a complete
+# REPRODUCED/NOT_REPRODUCED/rule-backed INCONCLUSIVE bundle keeps the strict
+# table, and empty replay/build files never satisfy the partial layout.
+_V2_PARTIAL_EXECUTION_REQUIRED_ROLES = frozenset(
+    {
+        "report_json",
+        "report_markdown",
+        "plan",
+        "envelope",
+        "budget_snapshot",
+        "execution_metadata",
+        "case_config",
+    }
+)
+_V2_PARTIAL_EXECUTION_REQUIRED_PATHS = {
+    "report.json": "report_json",
+    "report.md": "report_markdown",
+    "plan.json": "plan",
+    "envelope.json": "envelope",
+    "budget/snapshot.json": "budget_snapshot",
+    "metadata/execution.json": "execution_metadata",
+    "metadata/case.json": "case_config",
 }
 _ENTRY_FIELDS = frozenset({"path", "role", "size_bytes", "sha256"})
 # Closed top-level key set for Manifest v2 (§8 / §12.5). Blocked bundles may
@@ -671,9 +699,19 @@ def write_bundle(
         entries.sort(key=lambda item: item["path"])
 
         roles = {entry["role"] for entry in entries}
+        partial_execution = False
         if schema_version == contracts.SCHEMA_VERSION_V2:
-            required_roles = _V2_REQUIRED_ROLES[bundle_kind]
+            payload_verdict = (
+                verdict if isinstance(verdict, str) else report.get("verdict")
+            )
+            partial_execution = _is_partial_execution(
+                bundle_kind, payload_verdict, report
+            )
+            required_roles, required_paths = _v2_required_roles_and_paths(
+                bundle_kind, partial_execution
+            )
         else:
+            required_paths = _REQUIRED_PATHS
             required_roles = (
                 _REQUIRED_ROLES
                 if bundle_kind == "execution"
@@ -694,8 +732,12 @@ def write_bundle(
                     payloads, plan_digest=plan_digest, report=report
                 )
             else:
-                _require_required_paths(listed, _V2_REQUIRED_PATHS[bundle_kind])
-                _verify_v2_layout(listed, bundle_kind)
+                _require_required_paths(listed, required_paths)
+                _verify_v2_layout(
+                    listed,
+                    bundle_kind,
+                    partial_execution=partial_execution,
+                )
         elif bundle_kind == "execution":
             _require_required_paths(listed, _REQUIRED_PATHS)
         else:
@@ -3576,12 +3618,321 @@ def _v2_required_role_paths(
         )
 
 
-def _verify_v2_build_layout(listed: Mapping[str, Mapping[str, Any]]) -> None:
+# D4: v2 build records describe build materials only. The two reviewed input
+# aliases stay in the frozen v1 branch; a v2 build record that stages them is
+# rejected rather than silently accepting an input digest in build provenance.
+_V2_BUILD_INPUT_ALIASES = frozenset(
+    {"inputs/normal.txt", "inputs/candidate.txt"}
+)
+# D39: only the three reviewed provenance faces are fixed build evidence.
+_V2_BUILD_PROVENANCE_FACES = frozenset(
+    {"compile_commands.json", "cc-shim.log", "shell-face.log"}
+)
+
+
+def _normalized_v2_staged_key(value: Any) -> str | None:
+    """Normalize a staged-material key for the D4 alias comparison.
+
+    ``staged_materials`` keys are POSIX paths. ``posixpath.normpath`` folds
+    ``./`` and ``a/../`` spellings that would otherwise bypass an exact-key
+    check; a leading slash is stripped so an absolute spelling cannot hide an
+    input alias either.
+    """
+    if not isinstance(value, str):
+        return None
+    return posixpath.normpath(value.replace("\\", "/")).lstrip("/")
+
+
+def _check_v2_build_record(record: Mapping[str, Any], label: str) -> None:
+    """Reject a v1 input alias in one v2 build record.
+
+    A record without ``staged_materials`` is not a build-material record and is
+    left to the later semantic replay; when the map is present every key is
+    normalized before comparison.
+    """
+    staged = record.get("staged_materials")
+    if staged is None:
+        return
+    if not isinstance(staged, Mapping):
+        raise BundleError(
+            "INVALID_MANIFEST",
+            f"{label}.staged_materials must be an object",
+        )
+    aliases = sorted(
+        key
+        for key in staged
+        if _normalized_v2_staged_key(key) in _V2_BUILD_INPUT_ALIASES
+    )
+    if aliases:
+        raise BundleError(
+            "INVALID_MANIFEST",
+            f"{label} must not stage v1 input aliases: " + ", ".join(aliases),
+        )
+
+
+def _check_v2_build_list(builds: Any, label: str) -> None:
+    if not isinstance(builds, list):
+        raise BundleError("INVALID_MANIFEST", f"{label} must be a list")
+    for index, build in enumerate(builds):
+        if not isinstance(build, Mapping):
+            raise BundleError(
+                "INVALID_MANIFEST", f"{label}[{index}] must be an object"
+            )
+        _check_v2_build_record(build, f"{label}[{index}]")
+
+
+def _verify_v2_build_records(
+    listed: Mapping[str, Mapping[str, Any]], data: Mapping[str, bytes]
+) -> None:
+    """Reject v1-only input aliases in every v2 build-record carrier.
+
+    D4 applies to the archived build metadata and the execution metadata as
+    well as ``report.json["builds"]``; checking only the report left a
+    reproducible bypass. The scan is additive so a carrier without a build
+    list or a record without ``staged_materials`` is not rejected here.
+    """
+    report = _parse_json_file(data, "report.json")
+    if "builds" in report:
+        _check_v2_build_list(report["builds"], "report.json.builds")
+
+    execution_metadata = data.get("metadata/execution.json")
+    if execution_metadata is not None:
+        execution = _parse_json_file(data, "metadata/execution.json")
+        if "builds" in execution:
+            _check_v2_build_list(
+                execution["builds"], "metadata/execution.json.builds"
+            )
+
+    # Scan every build_metadata role entry, not only the two fixed default
+    # paths: a blocked bundle could otherwise place a build record elsewhere
+    # and bypass both D4 and the D39 path check.
+    for path, entry in listed.items():
+        if entry["role"] == "build_metadata":
+            _check_v2_build_record(_parse_json_file(data, path), path)
+
+
+def _verify_v2_reuse_artifacts(
+    plan_build_ref: Mapping[str, Any], data: Mapping[str, bytes]
+) -> None:
+    """Bind the archived build bytes to the plan's per-version digests.
+
+    A validation bundle is self-contained only when its own ``build.log`` and
+    default ``parser`` bytes hash to the same digests declared in the plan's
+    authoritative ``build_ref``. Manifest self-hashes alone prove nothing
+    about the campaign build that was reused.
+    """
+    artifacts = plan_build_ref["artifacts"]
+    for version in _REPLAY_VERSIONS:
+        prefix = f"build/{version}/"
+        shipped_artifacts = sorted(
+            path
+            for path in data
+            if path.startswith(prefix)
+            and path
+            not in (prefix + "metadata.json", prefix + "build.log")
+            and not path.startswith(prefix + "build_provenance/")
+        )
+        default_artifact = prefix + "parser"
+        if shipped_artifacts != [default_artifact]:
+            # Custom BuildSpec.outputs/multi-artifact binding belongs to T13.
+            # Until it lands, fail closed instead of raising KeyError or
+            # silently verifying only the default parser.
+            raise BundleError(
+                "INVALID_MANIFEST",
+                f"{version} build artifact layout is not the default parser; "
+                "custom/multi-artifact binding is not supported yet",
+            )
+        expected = artifacts[version]
+        for field, relative in (
+            ("build_log_digest", prefix + "build.log"),
+            ("artifact_digest", default_artifact),
+        ):
+            actual = _digest(data[relative])
+            if actual != expected[field]:
+                raise BundleError(
+                    "REUSE_MISMATCH",
+                    f"{relative} sha256 does not match plan "
+                    f"build_ref.{version}.{field}",
+                )
+
+
+def _verify_v2_reuse_plan(
+    manifest: Mapping[str, Any], data: Mapping[str, bytes]
+) -> None:
+    """Bind a reusable validation bundle to the plan's authoritative build_ref.
+
+    The plan's ``build_ref`` is the single authority (§8). The manifest copies
+    it for offline inventory and ``reuse_origin`` points at the campaign; a
+    disagreement between any of the three is a reuse mismatch, not a silent
+    fallback. The plan itself is bound by ``plan_digest`` so copying its JSON
+    fields into the manifest cannot launder a modified plan.
+    """
+    plan = _parse_json_file(data, "plan.json")
+    if plan.get("schema_version") != contracts.SCHEMA_VERSION_V2:
+        raise BundleError(
+            "INVALID_MANIFEST",
+            "a reuse execution plan requires schema_version=2",
+        )
+    try:
+        actual_plan_digest = contracts.plan_digest(plan)
+    except (KeyError, TypeError, ValueError) as error:
+        raise BundleError(
+            "INVALID_MANIFEST", f"plan.json is not a valid Plan v2: {error}"
+        ) from error
+    if actual_plan_digest != manifest.get("plan_digest"):
+        raise BundleError(
+            "DIGEST_MISMATCH",
+            "manifest plan_digest does not match plan.json",
+        )
+
+    plan_build_ref = plan.get("build_ref")
+    if not isinstance(plan_build_ref, Mapping):
+        raise BundleError(
+            "INVALID_MANIFEST", "a reuse execution plan requires build_ref"
+        )
+    normalized_plan_ref = _v2_build_ref(plan_build_ref, "plan.build_ref")
+    normalized_manifest_ref = _v2_build_ref(
+        manifest.get("build_ref"), "build_ref"
+    )
+    if normalized_plan_ref != normalized_manifest_ref:
+        raise BundleError(
+            "REUSE_MISMATCH",
+            "manifest build_ref must equal plan.build_ref",
+        )
+    _v2_reuse_origin(
+        manifest.get("reuse_origin"), "reuse_origin", normalized_plan_ref
+    )
+    _verify_v2_reuse_artifacts(normalized_plan_ref, data)
+
+    report = _parse_json_file(data, "report.json")
+    if report.get("plan_digest") != manifest.get("plan_digest"):
+        raise BundleError(
+            "INVALID_MANIFEST",
+            "report.plan_digest does not match manifest/plan",
+        )
+    if report.get("build_ref") != manifest.get("build_ref"):
+        raise BundleError(
+            "REUSE_MISMATCH", "report.build_ref does not match manifest"
+        )
+    if report.get("reuse_origin") != manifest.get("reuse_origin"):
+        raise BundleError(
+            "REUSE_MISMATCH", "report.reuse_origin does not match manifest"
+        )
+
+
+def _verify_v2_non_reuse(data: Mapping[str, bytes], bundle_kind: str) -> None:
+    """A fixed/non-reuse plan and report must not claim a reused campaign."""
+    plan = _parse_json_file(data, "plan.json")
+    if plan.get("build_ref") is not None:
+        raise BundleError(
+            "INVALID_MANIFEST", "a non-reuse plan must not carry build_ref"
+        )
+    report = _parse_json_file(data, "report.json")
+    if report.get("build_ref") is not None or report.get("reuse_origin") is not None:
+        raise BundleError(
+            "INVALID_MANIFEST",
+            "a non-reuse report must not carry build_ref/reuse_origin",
+        )
+    if bundle_kind == "campaign":
+        for field in ("verdict", "reason_code", "state"):
+            if report.get(field) is not None:
+                raise BundleError(
+                    "INVALID_MANIFEST",
+                    f"campaign report must not carry {field}",
+                )
+
+
+def _verify_v2_build_role_paths(
+    listed: Mapping[str, Mapping[str, Any]]
+) -> None:
+    """D39 role+path check for every build role, including blocked bundles.
+
+    A blocked bundle only relaxes identity fields; it does not allow a build
+    role at an arbitrary path. Non-default artifact names are allowed at the
+    path level because BuildSpec.outputs may name them; reuse byte binding
+    rejects unsupported layouts separately.
+    """
+    for path, entry in listed.items():
+        role = entry["role"]
+        if role not in _V2_BUILD_ROLES:
+            continue
+        parts = PurePosixPath(path).parts
+        if len(parts) < 3 or parts[0] != "build" or parts[1] not in _REPLAY_VERSIONS:
+            raise BundleError(
+                "INVALID_MANIFEST",
+                f"build evidence {path} is not at a fixed build path",
+            )
+        relative = "/".join(parts[2:])
+        if role == "build_metadata" and relative != "metadata.json":
+            raise BundleError(
+                "INVALID_MANIFEST",
+                f"build metadata {path} must live at build/<version>/metadata.json",
+            )
+        if role == "build_log" and relative != "build.log":
+            raise BundleError(
+                "INVALID_MANIFEST",
+                f"build log {path} must live at build/<version>/build.log",
+            )
+        if role == "build_artifact" and (
+            relative in ("metadata.json", "build.log")
+            or relative.startswith("build_provenance/")
+        ):
+            raise BundleError(
+                "INVALID_MANIFEST",
+                f"build artifact {path} collides with a non-artifact build role",
+            )
+        if role == "build_provenance":
+            if not relative.startswith("build_provenance/"):
+                raise BundleError(
+                    "INVALID_MANIFEST",
+                    f"build provenance {path} must live under build/<version>/build_provenance/",
+                )
+            face = relative[len("build_provenance/") :]
+            if face not in _V2_BUILD_PROVENANCE_FACES:
+                raise BundleError(
+                    "INVALID_MANIFEST",
+                    f"build provenance face {path} is not at a fixed face path",
+                )
+
+
+def _verify_v2_build_layout(
+    listed: Mapping[str, Mapping[str, Any]], *, partial_execution: bool = False
+) -> None:
     for version in _REPLAY_VERSIONS:
         prefix = f"build/{version}/"
         group = {
             path: entry for path, entry in listed.items() if path.startswith(prefix)
         }
+        if partial_execution:
+            # A partial execution bundle may have no build directory at all (a
+            # pre-build block), or only the produce/build evidence that exists.
+            # If a version group exists, its core log/metadata must be present;
+            # a build_artifact is optional because a failed build may have no
+            # verified artifact. Every present entry is still role/path checked.
+            if group:
+                _v2_required_role_paths(
+                    listed, prefix + "metadata.json", "build_metadata"
+                )
+                _v2_required_role_paths(
+                    listed, prefix + "build.log", "build_log"
+                )
+            for path, entry in group.items():
+                relative = path[len(prefix) :]
+                if relative in ("metadata.json", "build.log"):
+                    continue
+                if relative.startswith("build_provenance/"):
+                    if entry["role"] != "build_provenance":
+                        raise BundleError(
+                            "INVALID_MANIFEST",
+                            f"evidence {path} must carry the build_provenance role",
+                        )
+                    continue
+                if entry["role"] != "build_artifact":
+                    raise BundleError(
+                        "INVALID_MANIFEST",
+                        f"evidence {path} must carry the build_artifact role",
+                    )
+            continue
         if not group:
             raise BundleError(
                 "INVALID_MANIFEST", f"manifest is missing build/{version}/ evidence"
@@ -3598,6 +3949,12 @@ def _verify_v2_build_layout(listed: Mapping[str, Mapping[str, Any]]) -> None:
                     raise BundleError(
                         "INVALID_MANIFEST",
                         f"evidence {path} must carry the build_provenance role",
+                    )
+                face = relative[len("build_provenance/") :]
+                if face not in _V2_BUILD_PROVENANCE_FACES:
+                    raise BundleError(
+                        "INVALID_MANIFEST",
+                        f"build provenance face {path} is not at a fixed face path",
                     )
                 continue
             if entry["role"] != "build_artifact":
@@ -3622,10 +3979,13 @@ def _verify_v2_build_layout(listed: Mapping[str, Mapping[str, Any]]) -> None:
 
 
 def _verify_v2_replay_layout(
-    listed: Mapping[str, Mapping[str, Any]], bundle_kind: str
+    listed: Mapping[str, Mapping[str, Any]],
+    bundle_kind: str,
+    *,
+    require_complete: bool = True,
 ) -> None:
     expected = _v2_replay_expected_paths()
-    if bundle_kind == "execution":
+    if bundle_kind == "execution" and require_complete:
         for path, role in expected.items():
             _v2_required_role_paths(listed, path, role)
     for path, entry in listed.items():
@@ -3648,9 +4008,44 @@ def _verify_v2_replay_layout(
                 )
 
 
+def _is_partial_execution(
+    bundle_kind: str,
+    verdict: Any,
+    report: Mapping[str, Any],
+) -> bool:
+    """Return True for a FAILED or rule-less INCONCLUSIVE execution bundle."""
+    if bundle_kind != "execution":
+        return False
+    if verdict == "FAILED":
+        return True
+    if verdict != "INCONCLUSIVE":
+        return False
+    return report.get("rule") is None
+
+
+def _v2_required_roles_and_paths(
+    bundle_kind: str, partial_execution: bool
+) -> tuple[frozenset[str], Mapping[str, str]]:
+    if bundle_kind == "blocked":
+        return _BLOCKED_REQUIRED_ROLES, {}
+    if partial_execution:
+        return (
+            _V2_PARTIAL_EXECUTION_REQUIRED_ROLES,
+            _V2_PARTIAL_EXECUTION_REQUIRED_PATHS,
+        )
+    return _V2_REQUIRED_ROLES[bundle_kind], _V2_REQUIRED_PATHS[bundle_kind]
+
+
 def _verify_v2_layout(
-    listed: Mapping[str, Mapping[str, Any]], bundle_kind: str
+    listed: Mapping[str, Mapping[str, Any]],
+    bundle_kind: str,
+    *,
+    partial_execution: bool = False,
 ) -> None:
+    if bundle_kind not in ("execution", "campaign"):
+        # Blocked bundles do not run the build layout; keep D39's role/path
+        # guard first so a build role cannot hide at an arbitrary path.
+        _verify_v2_build_role_paths(listed)
     for path, role in _V2_FIXED_PATH_ROLES.items():
         entry = listed.get(path)
         if entry is not None and entry["role"] != role:
@@ -3676,14 +4071,25 @@ def _verify_v2_layout(
             )
 
     if bundle_kind in ("execution", "campaign"):
-        for path, role in (
+        fixed_metadata = [
             ("metadata/execution.json", "execution_metadata"),
-            ("metadata/probe.json", "probe"),
             ("metadata/case.json", "case_config"),
-        ):
+        ]
+        if not partial_execution:
+            fixed_metadata.insert(1, ("metadata/probe.json", "probe"))
+        for path, role in fixed_metadata:
             _v2_required_role_paths(listed, path, role)
-        _verify_v2_build_layout(listed)
-        _verify_v2_replay_layout(listed, bundle_kind)
+        _verify_v2_build_layout(
+            listed, partial_execution=partial_execution
+        )
+        # T13a's partial-build role errors keep precedence; D39 still rejects
+        # any build role left at a non-fixed path after the layout check.
+        _verify_v2_build_role_paths(listed)
+        _verify_v2_replay_layout(
+            listed,
+            bundle_kind,
+            require_complete=not partial_execution,
+        )
 
     has_review = "review.json" in listed
     has_admission = "admission.json" in listed
@@ -3827,6 +4233,13 @@ def _verify_bundle_v2(
     the later evidence-v2 tasks (T13/T14). The generic inventory walk and
     digest checks are shared with v1 so path traversal, symlinks, extra/missing
     files and digest tampering keep the same guarantees.
+
+    T13a adds one narrow partial-execution layout: a ``FAILED`` execution or an
+    ``INCONCLUSIVE`` execution whose report has no rule trace may archive only
+    the evidence that was actually produced. The fixed documents (report, plan,
+    envelope, budget, execution/case metadata) are still mandatory; build and
+    replay roles are validated whenever present, but an absent build artifact
+    or replay file is not fabricated to satisfy the full role table.
     """
     (
         job_id,
@@ -3840,8 +4253,22 @@ def _verify_bundle_v2(
     seen: set[str] = set()
     for entry in files:
         entries.append(_validate_entry(entry, seen, _V2_ROLE_NAMES))
+    listed = {entry["path"]: entry for entry in entries}
     roles = {entry["role"] for entry in entries}
-    required_roles = _V2_REQUIRED_ROLES[bundle_kind]
+    data: dict[str, bytes] | None = None
+    partial_execution = False
+    if bundle_kind == "execution" and verdict in ("FAILED", "INCONCLUSIVE"):
+        # The partial decision depends on report.rule, so read the listed files
+        # once here and reuse the verified bytes below. A malformed/missing
+        # report still fails closed before any layout is accepted.
+        data = _read_listed_files(root_path, listed)
+        report = _parse_json_file(data, "report.json")
+        partial_execution = _is_partial_execution(
+            bundle_kind, verdict, report
+        )
+    required_roles, required_paths = _v2_required_roles_and_paths(
+        bundle_kind, partial_execution
+    )
     if not required_roles <= roles:
         missing = sorted(required_roles - roles)
         raise BundleError(
@@ -3849,13 +4276,23 @@ def _verify_bundle_v2(
             "manifest is missing required roles: " + ", ".join(missing),
         )
 
-    listed = {entry["path"]: entry for entry in entries}
     if bundle_kind == "blocked":
         _require_blocked_paths(listed)
     else:
-        _require_required_paths(listed, _V2_REQUIRED_PATHS[bundle_kind])
-    _verify_v2_layout(listed, bundle_kind)
-    data = _read_listed_files(root_path, listed)
+        _require_required_paths(listed, required_paths)
+    _verify_v2_layout(
+        listed, bundle_kind, partial_execution=partial_execution
+    )
+    if data is None:
+        data = _read_listed_files(root_path, listed)
+    _verify_v2_build_records(listed, data)
+    if bundle_kind == "execution":
+        if manifest.get("reuse_origin") is not None:
+            _verify_v2_reuse_plan(manifest, data)
+        else:
+            _verify_v2_non_reuse(data, bundle_kind)
+    elif bundle_kind == "campaign":
+        _verify_v2_non_reuse(data, bundle_kind)
     if bundle_kind == "blocked":
         _verify_v2_blocked_semantics(
             job_id=job_id,
