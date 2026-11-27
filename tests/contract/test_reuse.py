@@ -16,7 +16,12 @@ import json
 from uuid import uuid4
 
 import pytest
-from test_evidence_v2 import _base_files, _manifest, _write_v2_bundle
+from test_evidence_v2 import (
+    _base_files,
+    _manifest,
+    _report_build_provenance,
+    _write_v2_bundle,
+)
 from test_plan_family import ROUND_PLAN_V2
 
 from datacon import jsonutil
@@ -164,6 +169,7 @@ def _write_validation(
         "schema_version": 2,
         "plan_digest": manifest["plan_digest"],
         "build_provenance_rules_version": manifest["build_provenance_rules_version"],
+        "build_provenance": _report_build_provenance(),
         "build_ref": resolved_report_build_ref,
         "reuse_origin": resolved_report_origin,
     }

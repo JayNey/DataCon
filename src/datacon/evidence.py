@@ -1060,10 +1060,17 @@ def _validate_v2_manifest_header(
         )
 
     rules_version = manifest.get("build_provenance_rules_version")
-    if identity_kind:
+    if identity_kind or rules_version is not None:
         _v2_text(rules_version, "build_provenance_rules_version")
-    elif rules_version is not None:
-        _v2_text(rules_version, "build_provenance_rules_version")
+        if (
+            rules_version != rules_version.strip()
+            or build_provenance.has_control_chars(rules_version)
+        ):
+            raise BundleError(
+                "INVALID_MANIFEST",
+                "manifest build_provenance_rules_version must not have "
+                "leading/trailing whitespace or control characters",
+            )
     try:
         jsonutil.require_rfc3339(manifest.get("created_at"), "manifest.created_at")
     except ValueError as error:
@@ -3940,8 +3947,7 @@ def _verify_v2_build_role_paths(
                 f"build log {path} must live at build/<version>/build.log",
             )
         if role == "build_artifact" and (
-            relative in ("metadata.json", "build.log")
-            or relative.startswith("build_provenance/")
+            parts[2] in ("metadata.json", "build.log", "build_provenance")
         ):
             raise BundleError(
                 "INVALID_MANIFEST",
@@ -3965,19 +3971,53 @@ def _verify_v2_build_role_paths(
                     f"manifest must carry at most one build_provenance face for build/{version}/",
                 )
             provenance_faces_by_version[version] = face
+    if (
+        len(provenance_faces_by_version) == 2
+        and provenance_faces_by_version["vulnerable"]
+        != provenance_faces_by_version["fixed"]
+    ):
+        raise BundleError(
+            "INVALID_MANIFEST",
+            "build_provenance face filenames must match across vulnerable and fixed "
+            f"({provenance_faces_by_version['vulnerable']} vs "
+            f"{provenance_faces_by_version['fixed']})",
+        )
+
+
+_V2_REPORT_PROVENANCE_KEYS = frozenset({"vulnerable", "fixed", "comparable"})
+_V2_REPORT_PROVENANCE_VERSION_KEYS = frozenset({"face", "declared", "effective"})
+
+
+def _verify_v2_flag_list(value: Any, label: str) -> None:
+    if not isinstance(value, list):
+        raise BundleError("INVALID_MANIFEST", f"{label} must be a list of strings")
+    for item in value:
+        if not isinstance(item, str) or build_provenance.has_control_chars(item):
+            raise BundleError(
+                "INVALID_MANIFEST",
+                f"{label} entries must be strings without control characters",
+            )
 
 
 def _verify_v2_provenance_rules_version(
     manifest: Mapping[str, Any],
     data: Mapping[str, bytes],
     listed: Mapping[str, Mapping[str, Any]],
+    *,
+    partial_execution: bool = False,
 ) -> None:
-    """Bind ``build_provenance_rules_version`` and ``build_spec.kind`` face names."""
+    """Bind ``build_provenance_rules_version``, ``report.build_provenance`` and ``build_spec.kind``."""
     expected = manifest.get("build_provenance_rules_version")
-    if not isinstance(expected, str) or not expected.strip():
+    if (
+        not isinstance(expected, str)
+        or not expected
+        or expected != expected.strip()
+        or build_provenance.has_control_chars(expected)
+    ):
         raise BundleError(
             "INVALID_MANIFEST",
-            "manifest build_provenance_rules_version must be a non-empty string",
+            "manifest build_provenance_rules_version must be a trimmed non-empty "
+            "string without control characters",
         )
     report = _parse_json_file(data, "report.json")
     report_rules = report.get("build_provenance_rules_version")
@@ -3995,35 +4035,146 @@ def _verify_v2_provenance_rules_version(
             "plan.json build_provenance_rules_version is missing or does not "
             "match manifest",
         )
-    plan_build_spec = plan.get("build_spec")
-    if isinstance(plan_build_spec, Mapping) and "kind" in plan_build_spec:
-        kind = plan_build_spec.get("kind")
-        expected_face = (
-            build_provenance.FACE_FILENAMES.get(kind)
-            if isinstance(kind, str)
-            else None
-        )
-        if expected_face is None:
+
+    archived_faces: dict[str, str] = {}
+    for path, entry in listed.items():
+        if entry["role"] != "build_provenance":
+            continue
+        parts = PurePosixPath(path).parts
+        if len(parts) == 4 and parts[0] == "build" and parts[1] in _REPLAY_VERSIONS:
+            archived_faces[parts[1]] = parts[3]
+
+    expected_kind_face: str | None = None
+    if "build_spec" in plan and plan["build_spec"] is not None:
+        plan_build_spec = plan["build_spec"]
+        if not isinstance(plan_build_spec, Mapping):
             raise BundleError(
                 "INVALID_MANIFEST",
-                f"plan.json build_spec.kind is not a supported provenance kind: {kind!r}",
+                "plan.json build_spec must be a JSON object",
             )
-        for path, entry in listed.items():
-            if entry["role"] != "build_provenance":
-                continue
-            face = PurePosixPath(path).name
-            if face != expected_face:
+        if "kind" in plan_build_spec:
+            kind = plan_build_spec.get("kind")
+            expected_kind_face = (
+                build_provenance.FACE_FILENAMES.get(kind)
+                if isinstance(kind, str)
+                else None
+            )
+            if expected_kind_face is None:
                 raise BundleError(
                     "INVALID_MANIFEST",
-                    f"build provenance face {path} does not match plan build_spec.kind "
-                    f"{kind!r} (expected {expected_face})",
+                    f"plan.json build_spec.kind is not a supported provenance kind: {kind!r}",
                 )
+            for version, face in archived_faces.items():
+                if face != expected_kind_face:
+                    raise BundleError(
+                        "INVALID_MANIFEST",
+                        f"build provenance face build/{version}/build_provenance/{face} "
+                        f"does not match plan build_spec.kind {kind!r} "
+                        f"(expected {expected_kind_face})",
+                    )
+
+    # B-2 (§8): report.json["build_provenance"] is a closed 3-key object
+    # ({vulnerable, fixed, comparable}) bound to archived faces and build_spec.kind.
+    report_prov = report.get("build_provenance")
+    if not isinstance(report_prov, Mapping):
+        raise BundleError(
+            "INVALID_MANIFEST",
+            "report.json build_provenance must be a JSON object",
+        )
+    if set(report_prov) != _V2_REPORT_PROVENANCE_KEYS:
+        raise BundleError(
+            "INVALID_MANIFEST",
+            "report.json build_provenance must contain exactly "
+            "vulnerable, fixed, and comparable",
+        )
+    comparable = report_prov["comparable"]
+    if type(comparable) is not bool:
+        raise BundleError(
+            "INVALID_MANIFEST",
+            "report.json build_provenance.comparable must be a boolean",
+        )
+    if comparable and len(archived_faces) != 2:
+        raise BundleError(
+            "INVALID_MANIFEST",
+            "report.json build_provenance.comparable=true requires both "
+            "archived build_provenance faces",
+        )
+    report_faces: dict[str, str] = {}
+    for version in _REPLAY_VERSIONS:
+        ver_entry = report_prov[version]
+        if not isinstance(ver_entry, Mapping):
+            raise BundleError(
+                "INVALID_MANIFEST",
+                f"report.json build_provenance.{version} must be a JSON object",
+            )
+        if set(ver_entry) != _V2_REPORT_PROVENANCE_VERSION_KEYS:
+            raise BundleError(
+                "INVALID_MANIFEST",
+                f"report.json build_provenance.{version} must contain exactly "
+                "face, declared, and effective",
+            )
+        _verify_v2_flag_list(
+            ver_entry["declared"], f"report.json build_provenance.{version}.declared"
+        )
+        _verify_v2_flag_list(
+            ver_entry["effective"], f"report.json build_provenance.{version}.effective"
+        )
+        face_val = ver_entry["face"]
+        if not isinstance(face_val, str) or build_provenance.has_control_chars(
+            face_val
+        ):
+            raise BundleError(
+                "INVALID_MANIFEST",
+                f"report.json build_provenance.{version}.face must be a string "
+                "without control characters",
+            )
+        archived_face = archived_faces.get(version)
+        if archived_face is not None and face_val != archived_face:
+            raise BundleError(
+                "INVALID_MANIFEST",
+                f"report.json build_provenance.{version}.face ({face_val!r}) does not "
+                f"match archived face {archived_face!r}",
+            )
+        if expected_kind_face is not None and face_val != expected_kind_face:
+            raise BundleError(
+                "INVALID_MANIFEST",
+                f"report.json build_provenance.{version}.face ({face_val!r}) does not "
+                f"match plan build_spec.kind face {expected_kind_face!r}",
+            )
+        if not partial_execution or comparable:
+            if face_val not in _V2_BUILD_PROVENANCE_FACES:
+                raise BundleError(
+                    "INVALID_MANIFEST",
+                    f"report.json build_provenance.{version}.face ({face_val!r}) "
+                    "is not a known provenance face filename",
+                )
+        elif face_val != "" and face_val not in _V2_BUILD_PROVENANCE_FACES:
+            raise BundleError(
+                "INVALID_MANIFEST",
+                f"report.json build_provenance.{version}.face ({face_val!r}) "
+                "is not a known provenance face filename",
+            )
+        report_faces[version] = face_val
+    if (
+        report_faces["vulnerable"]
+        and report_faces["fixed"]
+        and report_faces["vulnerable"] != report_faces["fixed"]
+    ):
+        raise BundleError(
+            "INVALID_MANIFEST",
+            "report.json build_provenance face filenames must match across "
+            f"vulnerable and fixed ({report_faces['vulnerable']} vs "
+            f"{report_faces['fixed']})",
+        )
 
 
-def _records_candidate_crash_seeds(
-    document: Mapping[str, Any], label: str
-) -> bool:
-    has_seeds = False
+def _candidate_crash_seed_lower_bound(
+    document: Mapping[str, Any],
+    label: str,
+    *,
+    seen_seed_digests: set[str],
+) -> int:
+    required = 0
     for list_key in ("candidate_seeds", "crash_seeds"):
         if list_key not in document or document[list_key] is None:
             continue
@@ -4033,21 +4184,18 @@ def _records_candidate_crash_seeds(
                 "INVALID_MANIFEST",
                 f"{label} {list_key} must be a list",
             )
-        if len(value) > 0:
-            has_seeds = True
+        required = max(required, len(value))
     if "crashes" in document and document["crashes"] is not None:
         crashes = document["crashes"]
         if isinstance(crashes, list):
-            if len(crashes) > 0:
-                has_seeds = True
+            required = max(required, len(crashes))
         elif type(crashes) is int:
             if crashes < 0:
                 raise BundleError(
                     "INVALID_MANIFEST",
                     f"{label} crashes must be a non-negative integer or list",
                 )
-            if crashes > 0:
-                has_seeds = True
+            required = max(required, crashes)
         else:
             raise BundleError(
                 "INVALID_MANIFEST",
@@ -4062,30 +4210,66 @@ def _records_candidate_crash_seeds(
                 "INVALID_MANIFEST",
                 f"{label} {count_key} must be a non-negative integer",
             )
-        if value > 0:
-            has_seeds = True
-    return has_seeds
+        required = max(required, value)
+    if "seed_digest" in document and document["seed_digest"] is not None:
+        seed_digest = document["seed_digest"]
+        if (
+            not isinstance(seed_digest, str)
+            or not seed_digest
+            or seed_digest != seed_digest.strip()
+            or build_provenance.has_control_chars(seed_digest)
+        ):
+            raise BundleError(
+                "INVALID_MANIFEST",
+                f"{label} seed_digest must be a trimmed non-empty string",
+            )
+        seen_seed_digests.add(seed_digest)
+        required = max(required, 1)
+    if "fuzz" in document and document["fuzz"] is not None:
+        nested_fuzz = document["fuzz"]
+        if not isinstance(nested_fuzz, Mapping):
+            raise BundleError(
+                "INVALID_MANIFEST",
+                f"{label} fuzz must be a JSON object",
+            )
+        nested_required = _candidate_crash_seed_lower_bound(
+            nested_fuzz,
+            f"{label}.fuzz",
+            seen_seed_digests=seen_seed_digests,
+        )
+        required = max(required, nested_required)
+    return required
 
 
 def _verify_v2_campaign_crash_seeds(
     listed: Mapping[str, Mapping[str, Any]], data: Mapping[str, bytes]
 ) -> None:
-    """Require a ``crash_seed`` role whenever a campaign records candidate crash seeds."""
+    """Require sufficient ``crash_seed`` entries whenever a campaign records candidate seeds."""
     report = _parse_json_file(data, "report.json")
-    has_candidate_seeds = _records_candidate_crash_seeds(report, "report.json")
+    seen_seed_digests: set[str] = set()
+    required_crash_seeds = _candidate_crash_seed_lower_bound(
+        report, "report.json", seen_seed_digests=seen_seed_digests
+    )
     for path, entry in listed.items():
         if entry["role"] != "fuzz_provenance":
             continue
         fuzz_prov = _parse_json_file(data, path)
-        if _records_candidate_crash_seeds(fuzz_prov, path):
-            has_candidate_seeds = True
-    if has_candidate_seeds and "crash_seed" not in {
-        entry["role"] for entry in listed.values()
-    }:
+        required_crash_seeds = max(
+            required_crash_seeds,
+            _candidate_crash_seed_lower_bound(
+                fuzz_prov, path, seen_seed_digests=seen_seed_digests
+            ),
+        )
+    required_crash_seeds = max(required_crash_seeds, len(seen_seed_digests))
+    actual_crash_seeds = sum(
+        1 for entry in listed.values() if entry["role"] == "crash_seed"
+    )
+    if actual_crash_seeds < required_crash_seeds:
         raise BundleError(
             "INVALID_MANIFEST",
-            "campaign bundle records candidate crash seed(s) but is missing "
-            "a crash_seed role entry",
+            f"campaign bundle records at least {required_crash_seeds} candidate "
+            f"crash seed(s) but only carries {actual_crash_seeds} crash_seed "
+            "role entry(s)",
         )
 
 
@@ -4126,6 +4310,15 @@ def _verify_v2_build_layout(
                     )
                 provenance_faces.append(face)
                 continue
+            if PurePosixPath(relative).parts[0] in (
+                "metadata.json",
+                "build.log",
+                "build_provenance",
+            ):
+                raise BundleError(
+                    "INVALID_MANIFEST",
+                    f"build artifact {path} collides with a non-artifact build role",
+                )
             if entry["role"] != "build_artifact":
                 raise BundleError(
                     "INVALID_MANIFEST",
@@ -4225,14 +4418,17 @@ def _is_partial_execution(
     report: Mapping[str, Any],
     listed: Mapping[str, Mapping[str, Any]],
 ) -> bool:
-    """Return True for a FAILED or legitimate pre-rule INCONCLUSIVE bundle.
+    """Return True for a legitimate partial FAILED or pre-rule INCONCLUSIVE bundle.
 
-    Rejects contradictory ``report.verdict`` or ``evidence_complete: true``.
-    For ``INCONCLUSIVE``, requires an explicit ``"rule": null`` key in
-    ``report.json`` (omitting ``"rule"`` is rejected), a pre-rule reason code
-    from ``_V2_PARTIAL_INCONCLUSIVE_REASONS``, and either role-verified runtime
-    evidence (probe/build/replay) or explicit pre-rule failure diagnostics
-    (``missing`` or ``error``), blocking empty hollow shells.
+    Applies the same anti-hollow-shell guard to both ``FAILED`` and
+    ``INCONCLUSIVE``:
+    - rejects contradictory ``report.verdict``, ``report.state``,
+      ``report.reason_code``, or ``evidence_complete: true``;
+    - requires an explicit ``"rule": null`` key in ``report.json``;
+    - requires a valid non-null ``reason_code`` (``reason_allowed_v2("FAILED", ...)``
+      for ``FAILED``, or ``_V2_PARTIAL_INCONCLUSIVE_REASONS`` for ``INCONCLUSIVE``);
+    - requires either role-verified runtime evidence (probe/build/replay) or
+      explicit non-empty failure diagnostics (``missing`` or ``error``).
     """
     if bundle_kind != "execution":
         return False
@@ -4240,14 +4436,20 @@ def _is_partial_execution(
         return False
     if "verdict" in report and report["verdict"] != verdict:
         return False
+    if "state" in report and report["state"] != verdict:
+        return False
     if report.get("evidence_complete") is True:
         return False
-    if verdict == "FAILED":
-        return True
     if "rule" not in report or report["rule"] is not None:
         return False
-    if reason_code not in _V2_PARTIAL_INCONCLUSIVE_REASONS:
+    if not isinstance(reason_code, str) or not reason_code:
         return False
+    if verdict == "FAILED":
+        if not reason_allowed_v2("FAILED", reason_code):
+            return False
+    else:
+        if reason_code not in _V2_PARTIAL_INCONCLUSIVE_REASONS:
+            return False
     if "reason_code" in report and report["reason_code"] != reason_code:
         return False
     probe_entry = listed.get("metadata/probe.json")
@@ -4538,7 +4740,9 @@ def _verify_bundle_v2(
         data = _read_listed_files(root_path, listed)
     _verify_v2_build_records(listed, data)
     if bundle_kind in ("execution", "campaign"):
-        _verify_v2_provenance_rules_version(manifest, data, listed)
+        _verify_v2_provenance_rules_version(
+            manifest, data, listed, partial_execution=partial_execution
+        )
     if bundle_kind == "execution":
         if manifest.get("reuse_origin") is not None:
             _verify_v2_reuse_plan(manifest, data)
