@@ -117,7 +117,7 @@ class ExecutionContext:
     job: dict[str, Any]
     plan: dict[str, Any]
     plan_digest: str
-    review: dict[str, Any]
+    review: dict[str, Any] | None
     case: CaseDefinition
     case_root: Path
     manifest_case: dict[str, Any]
@@ -134,6 +134,9 @@ class ExecutionContext:
     reserve_seconds: float
     material_payloads: dict[str, bytes] = field(default_factory=dict)
     cleanup_errors: list[str] = field(default_factory=list)
+    envelope: dict[str, Any] | None = None
+    budget_summary: dict[str, int] = field(default_factory=dict)
+    admission: dict[str, Any] | None = None
 
     @property
     def job_id_text(self) -> str:
@@ -430,6 +433,23 @@ def _validate_v2_spec_and_flags(
     return _check_declared_compile_flags_consistency(context)
 
 
+def _patch_explained_units(context: ExecutionContext) -> tuple[str, ...]:
+    """Return source paths changed by the reviewed patch/analysis.
+
+    A compile unit that exists on only one side is legitimate when the patch
+    adds or removes that source file. ``verify_build_provenance`` uses these
+    paths to exempt only patch-explained differences; everything else still
+    fails closed.
+    """
+    analysis = context.plan.get("analysis")
+    if not isinstance(analysis, Mapping):
+        return ()
+    changed = analysis.get("changed_paths")
+    if not isinstance(changed, list):
+        return ()
+    return tuple(item for item in changed if isinstance(item, str) and item.strip())
+
+
 def _verify_v2_single_build_provenance(
     context: ExecutionContext,
     build_root: Path,
@@ -533,6 +553,7 @@ def _verify_v2_single_build_provenance(
             vulnerable_face=raw_face,
             fixed_face=raw_face,
             repo_root=repo_root,
+            patch_explained_units=_patch_explained_units(context),
         )
         eff = list(parsed.effective_flags)
         summary = _make_provenance_summary(
@@ -686,6 +707,7 @@ def _verify_v2_build_provenance(
             vulnerable_face=vuln_face,
             fixed_face=fixed_face,
             repo_root=repo_root,
+            patch_explained_units=_patch_explained_units(context),
         )
         return _ProvenanceCheckOutcome(
             comparable=prov_result.comparable,
@@ -1123,14 +1145,60 @@ def _load_context(
         raise ExecutionBlocked(
             "PLAN_MISMATCH", "frozen plan digest does not match its content"
         )
-    if review is None or review["decision"] != "approve":
-        raise ExecutionBlocked(
-            "PLAN_MISMATCH", "an approved review bound to the plan is required"
-        )
-    if review["plan_digest"] != plan_row["plan_digest"]:
-        raise ExecutionBlocked(
-            "PLAN_MISMATCH", "the approval is bound to a different plan"
-        )
+    admission: dict[str, Any] | None = None
+    review_binds_plan = (
+        review is not None
+        and review.get("decision") == "approve"
+        and review.get("plan_digest") == plan_row["plan_digest"]
+    )
+    if not review_binds_plan and is_v2 and job.get("job_kind") == "round":
+        # A family-scoped human review approves the first plan, not every
+        # later round. If it does not bind this frozen plan, the round must
+        # carry its own policy admission; the family review must never be
+        # silently reused for a later round.
+        try:
+            admission = state.get_admission(dsn, job_id)
+        except state.StateError as error:
+            raise ExecutionBlocked(
+                "MATERIAL_MISSING", f"the policy admission is unavailable: {error}"
+            ) from error
+        if admission is not None:
+            if admission.get("approval_kind") != "policy":
+                raise ExecutionBlocked(
+                    "PLAN_MISMATCH", "the admission is not a policy admission"
+                )
+            if admission.get("envelope_digest") != plan.get("envelope_digest"):
+                raise ExecutionBlocked(
+                    "PLAN_MISMATCH",
+                    "the policy admission envelope differs from the frozen plan",
+                )
+            if (
+                admission.get("parent_job_id") != str(job.get("parent_job_id"))
+                or admission.get("round_no") != plan.get("round_no")
+            ):
+                raise ExecutionBlocked(
+                    "PLAN_MISMATCH",
+                    "the policy admission is bound to a different family round",
+                )
+            plan_inputs = plan.get("inputs")
+            if (
+                isinstance(plan_inputs, Mapping)
+                and admission.get("seed_digest") != plan_inputs.get("candidate")
+            ):
+                raise ExecutionBlocked(
+                    "PLAN_MISMATCH",
+                    "the policy admission seed differs from the frozen plan",
+                )
+            review = None
+    if admission is None:
+        if review is None or review["decision"] != "approve":
+            raise ExecutionBlocked(
+                "PLAN_MISMATCH", "an approved review bound to the plan is required"
+            )
+        if review["plan_digest"] != plan_row["plan_digest"]:
+            raise ExecutionBlocked(
+                "PLAN_MISMATCH", "the approval is bound to a different plan"
+            )
 
     request = job["request"]
     if request.get("limits") != plan["limits"]:
@@ -1186,6 +1254,53 @@ def _load_context(
                 "PLAN_MISMATCH",
                 "plan build_recipe_digest does not match canonical build_spec",
             )
+        if plan["build_spec"].get("kind") == "shell":
+            recipe_relative = manifest["build_recipe"]
+            try:
+                recipe_bytes, _actual = case.read_material(
+                    recipe_relative, materials.get(recipe_relative)
+                )
+            except CaseConfigurationError as error:
+                raise ExecutionBlocked(error.reason_code, error.message) from error
+            recipe_digest = jsonutil.digest_bytes(recipe_bytes)
+            declared_recipe_digest = plan["build_spec"].get(
+                "shell_recipe_digest"
+            )
+            if declared_recipe_digest != recipe_digest:
+                raise ExecutionBlocked(
+                    "BUILD_PROVENANCE_MISSING",
+                    "build_spec.shell_recipe_digest does not match the executed "
+                    f"build recipe {recipe_relative!r}: expected {recipe_digest}, "
+                    f"got {declared_recipe_digest!r}",
+                )
+            build_argv = plan["build_spec"].get("build")
+            script_operand: str | None = None
+            if isinstance(build_argv, list) and build_argv:
+                first = build_argv[0]
+                if (
+                    isinstance(first, str)
+                    and first in ("sh", "/bin/sh", "/usr/bin/sh")
+                    and len(build_argv) >= 2
+                    and isinstance(build_argv[1], str)
+                ):
+                    script_operand = build_argv[1]
+                elif isinstance(first, str):
+                    script_operand = first
+            try:
+                script_relative = jsonutil.safe_relative_path(
+                    script_operand, "build_spec.build script"
+                )
+            except ValueError as error:
+                raise ExecutionBlocked(
+                    "PLAN_MISMATCH",
+                    f"build_spec.build script is not a safe relative path: {error}",
+                ) from error
+            if PurePosixPath(script_relative) != PurePosixPath(recipe_relative):
+                raise ExecutionBlocked(
+                    "PLAN_MISMATCH",
+                    "build_spec.build script does not name the manifest "
+                    f"build_recipe {recipe_relative!r}",
+                )
     expected_materials: dict[str, tuple[str, Any]] = {
         "harness": (manifest["harness"], plan["harness_digest"]),
         "build_recipe": (
@@ -1339,6 +1454,52 @@ def _load_context(
     if deadline.tzinfo is None:
         deadline = deadline.replace(tzinfo=timezone.utc)
     limits = plan["limits"]
+    budget_summary: dict[str, int] = {}
+    envelope_doc: dict[str, Any] | None = None
+    if is_v2:
+        family_id = job.get("family_id")
+        if family_id is not None:
+            try:
+                budget_summary = state.family_budget_summary(dsn, family_id)
+            except state.StateError as error:
+                raise ExecutionBlocked(
+                    "MATERIAL_MISSING",
+                    f"the family budget ledger is unavailable: {error}",
+                ) from error
+        raw_envelope = job.get("envelope")
+        if not isinstance(raw_envelope, Mapping):
+            family_id = job.get("family_id")
+            if family_id is not None:
+                try:
+                    raw_envelope = state.get_family_envelope(
+                        dsn, family_id, plan["envelope_digest"]
+                    )
+                except state.StateError as error:
+                    raise ExecutionBlocked(
+                        "MATERIAL_MISSING",
+                        f"the approved family envelope is unavailable: {error}",
+                    ) from error
+        if isinstance(raw_envelope, Mapping):
+            try:
+                normalized_envelope = contracts.normalize_envelope(raw_envelope)
+            except ValueError as error:
+                raise ExecutionBlocked(
+                    "PLAN_MISMATCH", f"job envelope is invalid: {error}"
+                ) from error
+            if (
+                contracts.envelope_digest(normalized_envelope)
+                != plan.get("envelope_digest")
+            ):
+                raise ExecutionBlocked(
+                    "PLAN_MISMATCH",
+                    "job envelope body does not match the frozen plan envelope_digest",
+                )
+            envelope_doc = normalized_envelope
+        elif job.get("job_kind") in ("round", "campaign"):
+            raise ExecutionBlocked(
+                "MATERIAL_MISSING",
+                "the approved envelope body is not available to the executor",
+            )
     context = ExecutionContext(
         job_id=job_id,
         generation=generation,
@@ -1346,6 +1507,7 @@ def _load_context(
         plan=plan,
         plan_digest=plan_row["plan_digest"],
         review=review,
+        admission=admission,
         case=case,
         case_root=registry.root,
         manifest_case=manifest_case,
@@ -1376,6 +1538,8 @@ def _load_context(
         compile_args=compile_args,
         deadline_at=deadline,
         reserve_seconds=_reserve_seconds(limits["execute_seconds"]),
+        envelope=envelope_doc,
+        budget_summary=budget_summary,
     )
     return context
 
@@ -1419,7 +1583,25 @@ def _assert_context_unchanged(
             )
     except ValueError as error:
         raise ExecutionBlocked("PLAN_MISMATCH", f"the frozen plan is invalid: {error}") from error
-    if review is None or review["decision"] != "approve" or review["plan_digest"] != context.plan_digest:
+    if getattr(context, "admission", None) is not None:
+        try:
+            admission = state.get_admission(dsn, context.job_id)
+        except state.StateError as error:
+            raise ExecutionBlocked(
+                "MATERIAL_MISSING", f"the policy admission changed: {error}"
+            ) from error
+        if (
+            admission is None
+            or admission.get("approval_kind") != "policy"
+            or admission.get("envelope_digest")
+            != context.plan.get("envelope_digest")
+        ):
+            raise ExecutionBlocked("PLAN_MISMATCH", "the policy admission changed")
+    elif (
+        review is None
+        or review["decision"] != "approve"
+        or review["plan_digest"] != context.plan_digest
+    ):
         raise ExecutionBlocked("PLAN_MISMATCH", "the approved review changed")
     # ``material_root`` is the directory containing case materials, not the
     # registry root. Reload from the registry root captured when the context
@@ -2988,7 +3170,46 @@ def _persist_build(
         anchor=context.run_root,
     )
     artifact_path = directory / "parser"
-    if result.artifact is not None and result.artifact_digest is not None:
+    outputs_map: dict[str, str] = {}
+    output_digests: dict[str, str] = {}
+    if result.outputs:
+        primary_archive_path: str | None = None
+        primary_output = result.metadata.get("primary_output")
+        for output in result.outputs:
+            try:
+                archive_relative = jsonutil.safe_relative_path(
+                    output.archive_path, "build output archive path"
+                )
+            except ValueError as error:
+                raise ExecutionFailed(
+                    "BUILD_FAILED", f"unusable build output archive path: {error}"
+                ) from error
+            output_path = directory / PurePosixPath(archive_relative)
+            _write_run_file(
+                run_root,
+                output_path,
+                output.data,
+                0o555,
+                scope_root=generation_root,
+                anchor=context.run_root,
+            )
+            if _digest(output.data) != output.digest:
+                raise ExecutionFailed(
+                    "BUILD_FAILED",
+                    f"build output {output.relative_path!r} digest changed",
+                )
+            outputs_map[output.relative_path] = str(
+                output_path.relative_to(run_root)
+            )
+            output_digests[output.relative_path] = output.digest
+            if output.relative_path == primary_output:
+                primary_archive_path = str(output_path.relative_to(run_root))
+        if primary_archive_path is None:
+            raise ExecutionFailed(
+                "BUILD_FAILED", "primary build output is missing from the result"
+            )
+        artifact_path = run_root / PurePosixPath(primary_archive_path)
+    elif result.artifact is not None and result.artifact_digest is not None:
         _write_run_file(
             run_root,
             artifact_path,
@@ -3057,6 +3278,9 @@ def _persist_build(
         "log": _digest(result.log),
         "artifact": result.artifact_digest,
     }
+    if outputs_map:
+        files_map["outputs"] = outputs_map
+        file_digests_map["outputs"] = output_digests
     if provenance_face_path is not None and provenance_face_digest is not None:
         files_map["provenance_face"] = str(provenance_face_path.relative_to(run_root))
         file_digests_map["provenance_face"] = provenance_face_digest
@@ -3221,6 +3445,7 @@ def _build_report(
     bundle_kind: str = "execution",
 ) -> tuple[dict[str, Any], str]:
     is_v2 = _is_v2_context(context)
+    context_review = getattr(context, "review", None)
     plan_inputs = context.plan.get("inputs")
     report_inputs: dict[str, Any] | None
     if isinstance(plan_inputs, Mapping):
@@ -3254,14 +3479,22 @@ def _build_report(
             "isolation": context.plan["isolation"],
             "probe": probe,
         },
-        "budget": context.plan["limits"],
+        "budget": (
+            dict(context.budget_summary)
+            if is_v2 and context.budget_summary
+            else context.plan["limits"]
+        ),
         "inputs": report_inputs,
-        "review": {
-            "reviewer_id": context.review["reviewer_id"],
-            "decision": context.review["decision"],
-            "decided_at": jsonutil.timestamp(context.review["decided_at"]),
-            "plan_digest": context.review["plan_digest"],
-        },
+        "review": (
+            {
+                "reviewer_id": context_review["reviewer_id"],
+                "decision": context_review["decision"],
+                "decided_at": jsonutil.timestamp(context_review["decided_at"]),
+                "plan_digest": context_review["plan_digest"],
+            }
+            if context_review is not None
+            else None
+        ),
         "signature": context.plan["asan_signature"],
         "builds": [dict(item) for item in builds.values()],
         "replays": [dict(item) for item in runs],
@@ -3560,6 +3793,32 @@ def _verified_run_file(
     return data
 
 
+def _verified_build_output(
+    run_root: Path,
+    payload: Mapping[str, Any],
+    relative_output: str,
+) -> bytes | None:
+    """Read one archived multi-output artifact and verify its recorded digest."""
+    files = payload.get("files")
+    digests = payload.get("file_digests")
+    if not isinstance(files, Mapping) or not isinstance(digests, Mapping):
+        return None
+    recorded = files.get("outputs")
+    expected = digests.get("outputs")
+    if not isinstance(recorded, Mapping) or not isinstance(expected, Mapping):
+        return None
+    relative_path = recorded.get(relative_output)
+    expected_digest = expected.get(relative_output)
+    suffix = "/" + PurePosixPath(relative_output).name
+    path = _run_root_path(run_root, relative_path, suffix)
+    if path is None:
+        return None
+    data = _read_run_file_bounded(path, max_bytes=MAX_ARTIFACT_BYTES)
+    if data is None or _digest(data) != expected_digest:
+        return None
+    return data
+
+
 def _case_materials(
     context: ExecutionContext,
 ) -> dict[str, tuple[str, bytes]]:
@@ -3637,21 +3896,11 @@ def _evidence_artifacts(
     execution_metadata: Mapping[str, Any],
 ) -> dict[str, tuple[str, bytes | Path]]:
     is_v2 = _is_v2_context(context)
+    context_admission = getattr(context, "admission", None)
+    context_review = getattr(context, "review", None)
     build_spec = _build_spec_from_context(context)
     artifacts: dict[str, tuple[str, bytes | Path]] = {
         "plan.json": ("plan", jsonutil.canonical_bytes(context.plan) + b"\n"),
-        "review.json": (
-            "review",
-            jsonutil.canonical_bytes(
-                {
-                    "reviewer_id": context.review["reviewer_id"],
-                    "decision": context.review["decision"],
-                    "plan_digest": context.review["plan_digest"],
-                    "decided_at": jsonutil.timestamp(context.review["decided_at"]),
-                }
-            )
-            + b"\n",
-        ),
         "metadata/execution.json": (
             "execution_metadata",
             jsonutil.canonical_bytes(execution_metadata) + b"\n",
@@ -3664,29 +3913,44 @@ def _evidence_artifacts(
             + b"\n",
         ),
     }
-    if is_v2:
-        envelope_doc = context.job.get("envelope")
-        if not isinstance(envelope_doc, Mapping):
-            exploration = context.job.get("request", {}).get("exploration")
-            envelope_doc = {
-                "envelope_digest": context.plan.get("envelope_digest"),
-                "mode": exploration.get("mode", "fixed")
-                if isinstance(exploration, Mapping)
-                else "fixed",
-            }
-        artifacts["envelope.json"] = (
-            "envelope",
-            jsonutil.canonical_bytes(dict(envelope_doc)) + b"\n",
+    if context_admission is not None:
+        artifacts["admission.json"] = (
+            "admission",
+            jsonutil.canonical_bytes(dict(context_admission)) + b"\n",
         )
-        artifacts["budget/snapshot.json"] = (
-            "budget_snapshot",
+    elif context_review is not None:
+        artifacts["review.json"] = (
+            "review",
             jsonutil.canonical_bytes(
                 {
-                    "limits": context.plan["limits"],
-                    "plan_digest": context.plan_digest,
+                    "reviewer_id": context_review["reviewer_id"],
+                    "decision": context_review["decision"],
+                    "plan_digest": context_review["plan_digest"],
+                    "decided_at": jsonutil.timestamp(context_review["decided_at"]),
                 }
             )
             + b"\n",
+        )
+    if is_v2:
+        if context.envelope is None:
+            raise BundleError(
+                "EVIDENCE_INCOMPLETE",
+                "the approved envelope body is not available to the executor; "
+                "refusing to write a placeholder envelope.json",
+            )
+        artifacts["envelope.json"] = (
+            "envelope",
+            jsonutil.canonical_bytes(dict(context.envelope)) + b"\n",
+        )
+        if not context.budget_summary:
+            raise BundleError(
+                "EVIDENCE_INCOMPLETE",
+                "the family budget ledger summary is not available; refusing to "
+                "write a placeholder budget/snapshot.json",
+            )
+        artifacts["budget/snapshot.json"] = (
+            "budget_snapshot",
+            jsonutil.canonical_bytes(dict(context.budget_summary)) + b"\n",
         )
     if probe is not None:
         artifacts["metadata/probe.json"] = (
@@ -3698,11 +3962,27 @@ def _evidence_artifacts(
         if not build:
             continue
         log = _verified_run_file(run_root, build, "log", "/build.log")
-        artifact = _verified_run_file(run_root, build, "artifact", "/parser")
         if log is not None:
             artifacts[f"build/{version}/build.log"] = ("build_log", log)
-        if artifact is not None:
-            artifacts[f"build/{version}/parser"] = ("build_artifact", artifact)
+        files = build.get("files")
+        outputs = files.get("outputs") if isinstance(files, Mapping) else None
+        if isinstance(outputs, Mapping) and outputs:
+            for rel_out in sorted(outputs):
+                data = _verified_build_output(run_root, build, str(rel_out))
+                if data is not None:
+                    artifacts[f"build/{version}/{rel_out}"] = (
+                        "build_artifact",
+                        data,
+                    )
+        else:
+            artifact = _verified_run_file(
+                run_root, build, "artifact", "/parser"
+            )
+            if artifact is not None:
+                artifacts[f"build/{version}/parser"] = (
+                    "build_artifact",
+                    artifact,
+                )
         artifacts[f"build/{version}/metadata.json"] = (
             "build_metadata",
             jsonutil.canonical_bytes(dict(build)) + b"\n",
@@ -4242,23 +4522,27 @@ def _write_v2_bundle_dir(
         (target / "manifest.json").chmod(file_mode)
         evidence._apply_bundle_modes(target, dir_mode=dir_mode, file_mode=file_mode)
 
-        # Complete execution, campaign, and blocked bundles must pass the full
-        # offline v2 verifier. Pre-replay FAILED and partial INCONCLUSIVE
-        # execution bundles (such as BUILD_PROVENANCE_MISSING, build TIMEOUT,
-        # or SANDBOX_ERROR / RUN_INCOMPLETE with <6 replays, where
-        # report["rule"] is None) preserve partial logs, faces, and metadata
-        # without fabricating replay files, so their manifest header, entries,
-        # roles, D39 provenance paths, and markdown bindings are verified above.
-        is_complete_inconclusive = (
-            effective_verdict == "INCONCLUSIVE"
-            and report.get("rule") is not None
+        # Every bundle that is published must pass the full offline v2
+        # verifier. T13a's partial layout accepts FAILED / pre-rule
+        # INCONCLUSIVE bundles without fabricated replay files. If a bundle
+        # still fails verification, this path fails closed with an explicit
+        # BLOCKED_ON_T13A marker rather than skipping verification.
+        partial_execution = bundle_kind == "execution" and effective_verdict in (
+            "FAILED",
+            "INCONCLUSIVE",
         )
-        if (
-            bundle_kind in ("blocked", "campaign")
-            or effective_verdict in ("REPRODUCED", "NOT_REPRODUCED")
-            or is_complete_inconclusive
-        ):
+        try:
             verify_bundle(target)
+        except BundleError as verifier_error:
+            if partial_execution:
+                raise BundleError(
+                    "EVIDENCE_INCOMPLETE",
+                    "BLOCKED_ON_T13A: partial execution evidence cannot be "
+                    "published as bundle_kind=execution because it fails "
+                    f"offline verification ({verifier_error.reason_code}: "
+                    f"{verifier_error.message})",
+                ) from verifier_error
+            raise
         return evidence.BundleInfo(
             root=target,
             manifest=manifest,
@@ -4670,25 +4954,39 @@ def _archive_only(dsn: str, context: ExecutionContext) -> ExecutionResult:
     except (state.StateError, state.StaleGeneration):
         return ExecutionResult("STALE")
     if archive_error is not None:
+        blocked_on_t13a = "BLOCKED_ON_T13A" in archive_error
+        finished_state = decision.verdict if blocked_on_t13a else "FAILED"
+        finished_reason = (
+            decision.reason_code if blocked_on_t13a else "EVIDENCE_WRITE_FAILED"
+        )
         try:
             finished = state.finish_execution(
                 dsn,
                 context.job_id,
                 generation=context.generation,
-                state="FAILED",
-                reason_code="EVIDENCE_WRITE_FAILED",
-                verdict=None,
-                verdict_reason=None,
+                state=finished_state,
+                reason_code=finished_reason,
+                verdict=decision.verdict if blocked_on_t13a else None,
+                verdict_reason=decision.reason_code if blocked_on_t13a else None,
                 evidence_status="failed",
                 evidence_error=archive_error,
-                last_error="evidence bundle could not be written during archive recovery",
+                last_error=(
+                    "partial evidence is not publishable until T13a"
+                    if blocked_on_t13a
+                    else "evidence bundle could not be written during archive recovery"
+                ),
                 stage="failed",
             )
         except (state.StateError, state.StaleGeneration):
             return ExecutionResult("STALE")
         if not finished:
             return ExecutionResult("STALE")
-        return ExecutionResult("FAILED", reason_code="EVIDENCE_WRITE_FAILED")
+        return ExecutionResult(
+            finished_state,
+            verdict=decision.verdict if blocked_on_t13a else None,
+            verdict_reason=decision.reason_code if blocked_on_t13a else None,
+            reason_code=finished_reason,
+        )
     final_state = decision.verdict
     reason_code = (
         None
@@ -5299,6 +5597,14 @@ def _reusable_build(
         data = _read_run_file_bounded(path, max_bytes=limit)
         if data is None or _digest(data) != digests.get(key):
             return False
+    outputs = files.get("outputs")
+    if isinstance(outputs, Mapping) and outputs:
+        for relative_output in outputs:
+            if (
+                _verified_build_output(run_root, payload, str(relative_output))
+                is None
+            ):
+                return False
     if check_provenance_face and files.get("provenance_face") is not None:
         if _verified_provenance_face(run_root, payload) is None:
             return False
@@ -5796,25 +6102,44 @@ def _finish_failed(
         digest = path = None
         archive_error = str(archive_failure)
     if archive_error is not None:
+        blocked_on_t13a = "BLOCKED_ON_T13A" in archive_error
+        finished_state = terminal if blocked_on_t13a else "FAILED"
+        finished_reason = (
+            error.reason_code if blocked_on_t13a else "EVIDENCE_WRITE_FAILED"
+        )
         try:
             finished = state.finish_execution(
                 dsn,
                 job_id,
                 generation=generation,
-                state="FAILED",
-                reason_code="EVIDENCE_WRITE_FAILED",
-                verdict=None,
-                verdict_reason=None,
+                state=finished_state,
+                reason_code=finished_reason,
+                verdict=terminal if (incomplete and blocked_on_t13a) else None,
+                verdict_reason=(
+                    error.reason_code if (incomplete and blocked_on_t13a) else None
+                ),
                 evidence_status="failed",
                 evidence_error=archive_error,
-                last_error=error.message,
+                last_error=(
+                    f"{error.message}; partial evidence is not publishable "
+                    "until T13a"
+                    if blocked_on_t13a
+                    else error.message
+                ),
                 stage="failed",
             )
         except (state.StateError, state.StaleGeneration):
             return ExecutionResult("STALE")
         if not finished:
             return ExecutionResult("STALE")
-        return ExecutionResult("FAILED", reason_code="EVIDENCE_WRITE_FAILED")
+        return ExecutionResult(
+            finished_state,
+            verdict=terminal if (incomplete and blocked_on_t13a) else None,
+            verdict_reason=(
+                error.reason_code if (incomplete and blocked_on_t13a) else None
+            ),
+            reason_code=finished_reason,
+        )
     try:
         finished = state.finish_execution(
             dsn,

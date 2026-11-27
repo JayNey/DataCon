@@ -89,6 +89,7 @@ FORBIDDEN_BUILD_ENV_KEYS: Final[frozenset[str]] = frozenset(
         "MAKEOVERRIDES",
         "MAKEFILES",
         "MFLAGS",
+        "SHELL",
         "BASH_ENV",
         "ENV",
     }
@@ -151,6 +152,28 @@ _MAKE_LONG_ARG_OPTS: Final[frozenset[str]] = frozenset(
         "--new-file",
         "--assume-new",
     }
+)
+_MAKE_PATH_LONG_OPTS: Final[dict[str, str]] = {
+    "--directory": "make directory",
+    "--file": "makefile",
+    "--makefile": "makefile",
+    "--include-dir": "make include directory",
+    "--old-file": "make old-file",
+    "--assume-old": "make old-file",
+    "--what-if": "make what-if file",
+    "--new-file": "make new-file",
+    "--assume-new": "make new-file",
+}
+_CMAKE_OUTPUT_PATH_VARS: Final[frozenset[str]] = frozenset(
+    {
+        "CMAKE_INSTALL_PREFIX",
+        "CMAKE_RUNTIME_OUTPUT_DIRECTORY",
+        "CMAKE_ARCHIVE_OUTPUT_DIRECTORY",
+        "CMAKE_LIBRARY_OUTPUT_DIRECTORY",
+    }
+)
+_BUILD_ENV_PATH_VARS: Final[frozenset[str]] = frozenset(
+    {"DESTDIR"} | set(_CMAKE_OUTPUT_PATH_VARS)
 )
 _MAKE_VAR_ASSIGN_RE: Final[re.Pattern[str]] = re.compile(
     r"^\s*(?:(?:export|override)\s+)*([A-Za-z_][A-Za-z0-9_]*)\s*(?::::=|::=|:=|\?=|\+=|!=|=)"
@@ -923,7 +946,11 @@ def verify_build_provenance(
 
     issues: list[str] = []
 
-    # 1. Check declared ⊆ effective (multiset inclusion) for BOTH versions per CU.
+    # 1. Check declared ⊆ effective as one flat multiset per version.
+    # §8 defines the effective set as the ordered aggregate across compile
+    # units (``_summarize_effective_flags``), so a flag that appears in one CU
+    # covers the declaration; per-CU enforcement would reject a valid two-CU
+    # build that splits `-DFEATURE_A` / `-DFEATURE_B` across files.
     declared_items = _flag_items(normalized_declared)
     declared_counts = Counter(declared_items)
     ordered_unique_declared = list(dict.fromkeys(declared_items))
@@ -931,18 +958,20 @@ def verify_build_provenance(
         ("vulnerable", vuln_units),
         ("fixed", fixed_units),
     ):
-        for unit_path, unit_flags in version_units.items():
-            effective_counts = Counter(_flag_items(unit_flags))
-            missing_parts = [
-                f"{' '.join(item)} (declared={declared_counts[item]}, effective={effective_counts[item]})"
-                for item in ordered_unique_declared
-                if effective_counts[item] < declared_counts[item]
-            ]
-            if missing_parts:
-                issues.append(
-                    f"{version_label} ({kind}/{face_name}) unit {unit_path} "
-                    f"missing declared flag(s): {', '.join(missing_parts)}"
-                )
+        effective_counts = Counter(
+            _flag_items(_summarize_effective_flags(version_units))
+        )
+        missing_parts = [
+            f"{' '.join(item)} (declared={declared_counts[item]}, "
+            f"effective={effective_counts[item]})"
+            for item in ordered_unique_declared
+            if effective_counts[item] < declared_counts[item]
+        ]
+        if missing_parts:
+            issues.append(
+                f"{version_label} ({kind}/{face_name}) missing declared flag(s): "
+                f"{', '.join(missing_parts)}"
+            )
 
     # 2. Check missing units across versions unless explicitly patch-explained.
     vuln_keys = set(vuln_units)
@@ -1036,6 +1065,55 @@ def _is_cmake_false_value(value: str) -> bool:
     return lowered in _CMAKE_FALSE_VALUES or lowered.endswith("-notfound")
 
 
+def _iter_cmake_var_operations(
+    configure: Sequence[str],
+) -> list[tuple[str, str, str | None]]:
+    """Return ordered ``(operation, variable, value)`` for CMake -D/-U tokens."""
+    operations: list[tuple[str, str, str | None]] = []
+    index = 0
+    total = len(configure)
+    while index < total:
+        tok = _clean_token(configure[index])
+        operation: str | None = None
+        expression: str | None = None
+        if tok in ("-D", "-U") and index + 1 < total:
+            operation = tok[1]
+            expression = _clean_token(configure[index + 1])
+            index += 2
+        elif (
+            len(tok) > 2
+            and tok[:2] in ("-D", "-U")
+        ):
+            operation = tok[1]
+            expression = _clean_token(tok[2:])
+            index += 1
+        else:
+            index += 1
+            continue
+        if operation == "D":
+            name, separator, value = expression.partition("=")
+            operations.append(("D", name, value if separator else ""))
+        else:
+            operations.append(("U", expression, None))
+    return operations
+
+
+def cmake_export_compile_commands_state(
+    configure: Sequence[str],
+) -> tuple[str, str | None] | None:
+    """Return the final ``(-D|-U, value)`` operation for the export variable.
+
+    ``-D`` and ``-U`` are applied in configure order. ``None`` means the
+    variable was never touched. A trailing ``-U`` (or a falsey final ``-D``)
+    means compile_commands.json is disabled for the effective configuration.
+    """
+    state: tuple[str, str | None] | None = None
+    for operation, name, value in _iter_cmake_var_operations(configure):
+        if name == "CMAKE_EXPORT_COMPILE_COMMANDS":
+            state = (operation, value)
+    return state
+
+
 def iter_cmake_export_compile_commands_values(
     configure: Sequence[str],
 ) -> list[str]:
@@ -1068,11 +1146,21 @@ def cmake_has_export_compile_commands(configure: Sequence[str]) -> bool:
 
 
 def cmake_disables_compile_commands(configure: Sequence[str]) -> bool:
-    """Return True if any ``CMAKE_EXPORT_COMPILE_COMMANDS`` define in ``configure`` is falsey."""
-    return any(
-        _is_cmake_false_value(val)
-        for val in iter_cmake_export_compile_commands_values(configure)
-    )
+    """Return True if the final export setting disables compile_commands.json.
+
+    The check simulates ``-D``/``-U`` in configure order: ``-D...=ON`` followed
+    by ``-U...`` is disabled, while ``-U...`` followed by ``-D...=ON`` is
+    enabled. Earlier writes must not mask a later unset.
+    """
+    state = cmake_export_compile_commands_state(configure)
+    if state is None:
+        return False
+    operation, value = state
+    if operation == "U":
+        return True
+    assert value is not None
+    return _is_cmake_false_value(value)
+
 
 
 def extract_cmake_build_dir(configure: Sequence[str]) -> tuple[str, str]:
@@ -1131,6 +1219,37 @@ def extract_cmake_build_dir(configure: Sequence[str]) -> tuple[str, str]:
     ):
         raise ValueError(f"cmake build directory escapes /work: {raw_dir!r}")
     return norm, f"/work/{norm}/compile_commands.json"
+
+
+def validate_work_path_arg(value: Any, *, label: str) -> str:
+    """Validate one build path argument and return its normalized form.
+
+    Only paths inside the container's writable ``/work`` tmpfs (``/work`` or
+    ``/work/...``) and safe repository-relative paths are accepted. Absolute
+    host paths, ``//`` prefix paths and any ``..`` traversal are rejected, so
+    ``cmake --build /etc``, ``make -C /etc`` or ``DESTDIR=/tmp/evil`` cannot
+    redirect the build outside the reviewed tree.
+    """
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{label} must be a non-empty path string")
+    if has_control_chars(value) or "\\" in value:
+        raise ValueError(f"{label} must not contain control characters or backslashes")
+    if value.startswith("/"):
+        if value.startswith("//"):
+            raise ValueError(f"{label} must not be a //-prefixed path: {value!r}")
+        norm = posixpath.normpath(value)
+        if norm == "/work" or norm.startswith("/work/"):
+            return norm
+        raise ValueError(f"{label} must stay inside /work: {value!r}")
+    norm = posixpath.normpath(value)
+    if (
+        norm.startswith("/")
+        or norm == ".."
+        or norm.startswith("../")
+        or ".." in PurePosixPath(norm).parts
+    ):
+        raise ValueError(f"{label} escapes /work: {value!r}")
+    return norm
 
 
 def validate_build_spec_output_path(raw_output: str, index: int) -> tuple[str, str]:
@@ -1205,6 +1324,45 @@ def validate_build_spec_env(env: Any) -> str | None:
             )
         if not isinstance(val, str) or has_control_chars(val):
             return f"build_spec.env[{key!r}] must be a string without control characters"
+        if upper_key in _BUILD_ENV_PATH_VARS:
+            try:
+                validate_work_path_arg(val, label=f"build_spec.env[{key!r}]")
+            except ValueError as error:
+                return str(error)
+    return None
+
+
+def validate_effective_build_env(
+    env: Mapping[str, Any],
+    *,
+    allowed_executor_keys: Iterable[str] = (),
+) -> str | None:
+    """Defense-in-depth check of the final container environment.
+
+    Executor-owned keys (``TMPDIR``/``HOME``/``ASAN_OPTIONS`` and the fixed
+    ``DATACON_BUILD_VERSION``) are allowed; everything else is held to the
+    same closed rule as ``build_spec.env``. This catches a future code path
+    that merges an author-controlled mapping without re-validating it.
+    """
+    allowed = {key.upper() for key in allowed_executor_keys}
+    for key, val in env.items():
+        if not isinstance(key, str) or not _ENV_KEY_RE.fullmatch(key):
+            return f"effective build env key is invalid: {key!r}"
+        upper_key = key.upper()
+        if upper_key in FORBIDDEN_BUILD_ENV_KEYS and upper_key not in allowed:
+            return (
+                f"effective build env must not override sensitive environment "
+                f"variable {key!r}"
+            )
+        if upper_key.startswith(_CREDENTIAL_ENV_PREFIXES) and upper_key not in allowed:
+            return f"effective build env has a credential-like variable {key!r}"
+        if not isinstance(val, str) or has_control_chars(val):
+            return f"effective build env[{key!r}] must be a string without control chars"
+        if upper_key in _BUILD_ENV_PATH_VARS:
+            try:
+                validate_work_path_arg(val, label=f"effective build env[{key!r}]")
+            except ValueError as error:
+                return str(error)
     return None
 
 
@@ -1229,23 +1387,37 @@ def _is_allowed_system_tool(token: str, *, allowed_names: frozenset[str]) -> boo
 
 
 def _validate_make_cli_args(args: Sequence[str], *, label: str) -> str | None:
-    skip_next = False
+    """Reject Make eval/env overrides and any path option that escapes /work."""
     after_double_dash = False
-    for index, tok in enumerate(args):
-        if skip_next:
-            skip_next = False
-            continue
+    index = 0
+    total = len(args)
+    while index < total:
+        tok = args[index]
         if not after_double_dash:
             if tok == "--":
                 after_double_dash = True
+                index += 1
                 continue
             if tok.startswith("--"):
                 if tok.startswith(("--ev", "--en")):
                     return (
                         f"{label} must not pass eval or environment-override flag {tok!r}"
                     )
-                if tok in _MAKE_LONG_ARG_OPTS:
-                    skip_next = True
+                name, separator, inline_value = tok.partition("=")
+                path_label = _MAKE_PATH_LONG_OPTS.get(name)
+                if path_label is not None:
+                    if separator:
+                        raw_path = inline_value
+                    else:
+                        if index + 1 >= total:
+                            return f"{label} {name} requires a path argument"
+                        index += 1
+                        raw_path = args[index]
+                    try:
+                        validate_work_path_arg(raw_path, label=f"{label} {name}")
+                    except ValueError as error:
+                        return str(error)
+                index += 1
                 continue
             if tok.startswith("-E"):
                 return (
@@ -1253,18 +1425,36 @@ def _validate_make_cli_args(args: Sequence[str], *, label: str) -> str | None:
                     f"(-e) flag in {tok!r}"
                 )
             if tok.startswith("-") and len(tok) > 1:
-                for pos, ch in enumerate(tok[1:]):
-                    if ch in ("E", "e"):
+                position = 1
+                while position < len(tok):
+                    character = tok[position]
+                    if character in ("E", "e"):
                         return (
                             f"{label} must not pass eval (-E) or environment-override "
                             f"(-e) flag in {tok!r}"
                         )
-                    if ch in ("C", "f", "I", "o", "W"):
-                        if pos == len(tok) - 2:
-                            skip_next = True
+                    if character in ("C", "f", "I", "o", "W"):
+                        rest = tok[position + 1 :]
+                        if rest:
+                            raw_path = rest
+                        else:
+                            if index + 1 >= total:
+                                return (
+                                    f"{label} -{character} requires a path argument"
+                                )
+                            index += 1
+                            raw_path = args[index]
+                        try:
+                            validate_work_path_arg(
+                                raw_path, label=f"{label} -{character}"
+                            )
+                        except ValueError as error:
+                            return str(error)
                         break
-                    if ch in ("j", "l", "O"):
+                    if character in ("j", "l", "O"):
                         break
+                    position += 1
+                index += 1
                 continue
 
         match = _MAKE_VAR_ASSIGN_RE.match(tok)
@@ -1277,8 +1467,8 @@ def _validate_make_cli_args(args: Sequence[str], *, label: str) -> str | None:
                 return (
                     f"{label}[{index}] must not override {var_name!r} on the command line"
                 )
+        index += 1
     return None
-
 
 def _validate_shell_command(argv: Sequence[str], *, label: str) -> str | None:
     for index, tok in enumerate(argv):
@@ -1312,6 +1502,122 @@ def _validate_shell_command(argv: Sequence[str], *, label: str) -> str | None:
     )
 
 
+def _validate_cmake_command_paths(
+    configure: Sequence[str],
+    build: Sequence[str],
+    install: Sequence[str],
+) -> str | None:
+    """Constrain every CMake directory/install/output path to /work."""
+    index = 0
+    total = len(configure)
+    while index < total:
+        tok = configure[index]
+        value: str | None = None
+        label = "configure"
+        if tok in ("-S", "-B"):
+            if index + 1 >= total:
+                return f"build_spec.configure (cmake) {tok} requires a directory"
+            value = configure[index + 1]
+            label = f"configure {tok}"
+            index += 2
+        elif tok.startswith("-S") and len(tok) > 2:
+            value = tok[2:]
+            label = "configure -S"
+            index += 1
+        elif tok.startswith("-B") and len(tok) > 2:
+            value = tok[2:]
+            label = "configure -B"
+            index += 1
+        elif tok in ("-D", "-U") and index + 1 < total:
+            expression = configure[index + 1]
+            index += 2
+            if tok == "-D":
+                name, _separator, raw_value = expression.partition("=")
+                if name in _CMAKE_OUTPUT_PATH_VARS:
+                    try:
+                        validate_work_path_arg(
+                            raw_value, label=f"configure -D{name}"
+                        )
+                    except ValueError as error:
+                        return str(error)
+            continue
+        elif (tok.startswith("-D") or tok.startswith("-U")) and len(tok) > 2:
+            expression = tok[2:]
+            index += 1
+            if tok.startswith("-D"):
+                name, _separator, raw_value = expression.partition("=")
+                if name in _CMAKE_OUTPUT_PATH_VARS:
+                    try:
+                        validate_work_path_arg(
+                            raw_value, label=f"configure -D{name}"
+                        )
+                    except ValueError as error:
+                        return str(error)
+            continue
+        else:
+            index += 1
+            continue
+        if value is not None:
+            try:
+                validate_work_path_arg(value, label=f"build_spec.{label}")
+            except ValueError as error:
+                return str(error)
+    if len(build) >= 3:
+        try:
+            validate_work_path_arg(
+                build[2], label="build_spec.build cmake --build directory"
+            )
+        except ValueError as error:
+            return str(error)
+        cursor = 3
+        while cursor < len(build):
+            if build[cursor] == "--":
+                native_err = _validate_make_cli_args(
+                    build[cursor + 1 :], label="build_spec.build"
+                )
+                if native_err is not None:
+                    return native_err
+                break
+            if build[cursor] == "--target" and cursor + 1 < len(build):
+                cursor += 2
+                continue
+            if build[cursor] == "--config" and cursor + 1 < len(build):
+                cursor += 2
+                continue
+            cursor += 1
+    if install:
+        if len(install) >= 3:
+            try:
+                validate_work_path_arg(
+                    install[2], label="build_spec.install cmake --install directory"
+                )
+            except ValueError as error:
+                return str(error)
+        cursor = 3
+        while cursor < len(install):
+            if install[cursor] == "--prefix":
+                if cursor + 1 >= len(install):
+                    return "build_spec.install cmake --prefix requires a directory"
+                try:
+                    validate_work_path_arg(
+                        install[cursor + 1], label="build_spec.install --prefix"
+                    )
+                except ValueError as error:
+                    return str(error)
+                cursor += 2
+                continue
+            if install[cursor].startswith("--prefix="):
+                try:
+                    validate_work_path_arg(
+                        install[cursor].split("=", 1)[1],
+                        label="build_spec.install --prefix",
+                    )
+                except ValueError as error:
+                    return str(error)
+            cursor += 1
+    return None
+
+
 def validate_build_spec_commands(
     kind: str,
     *,
@@ -1334,6 +1640,9 @@ def validate_build_spec_commands(
                 return (
                     f"build_spec.configure (cmake) must not use execution mode flag {tok!r}"
                 )
+        path_err = _validate_cmake_command_paths(configure, build, install)
+        if path_err is not None:
+            return path_err
         if not build or not _is_allowed_system_tool(
             build[0], allowed_names=_CMAKE_TOOL_NAMES
         ):

@@ -1224,3 +1224,117 @@ def test_v2_blocked_verify_rejects_an_unknown_review_decision(tmp_path):
         verify_bundle(root)
     assert raised.value.reason_code == "INVALID_MANIFEST"
     assert "approve or reject" in raised.value.message
+
+
+def _partial_execution_files():
+    """A FAILED execution bundle with only the produced vulnerable build."""
+    files = _base_files(execution=True, campaign=False)
+    for version in VERSIONS:
+        for phase in PHASES:
+            base = f"replay/{version}/{phase}/"
+            for suffix in ("stdout.log", "stderr.log", "metadata.json"):
+                files.pop(base + suffix, None)
+    for relative in list(files):
+        if relative.startswith("build/fixed/"):
+            del files[relative]
+    files["report.json"] = ("report_json", b'{"rule":null}\n')
+    files.pop("metadata/probe.json", None)
+    return files
+
+
+def test_verify_v2_failed_partial_bundle_accepts_produced_roles(tmp_path):
+    """T13a: FAILED bundles require only the evidence that was produced."""
+    root = _write_v2_bundle(
+        tmp_path,
+        _manifest("execution", verdict="FAILED", reason="BUILD_PROVENANCE_MISSING"),
+        _partial_execution_files(),
+        name="failed-partial",
+    )
+    verified = verify_bundle(root)
+    assert verified.manifest["verdict"] == "FAILED"
+    assert "build/vulnerable/build.log" in verified.file_data
+    assert "build/fixed/build.log" not in verified.file_data
+    assert not any(path.startswith("replay/") for path in verified.file_data)
+
+
+def test_verify_v2_partial_inconclusive_without_rule_is_accepted(tmp_path):
+    """T13a: INCONCLUSIVE + report.rule=None uses the partial layout."""
+    files = _partial_execution_files()
+    files["report.json"] = ("report_json", b'{"rule":null}\n')
+    root = _write_v2_bundle(
+        tmp_path,
+        _manifest("execution", verdict="INCONCLUSIVE", reason="EVIDENCE_INCOMPLETE"),
+        files,
+        name="inconclusive-partial",
+    )
+    verify_bundle(root)
+
+
+def test_verify_v2_complete_inconclusive_still_requires_full_roles(tmp_path):
+    """T13a: a rule-backed INCONCLUSIVE bundle keeps the strict role table."""
+    files = _partial_execution_files()
+    files["report.json"] = ("report_json", b'{"rule":{"verdict":"INCONCLUSIVE"}}\n')
+    root = _write_v2_bundle(
+        tmp_path,
+        _manifest("execution", verdict="INCONCLUSIVE", reason="EVIDENCE_INCOMPLETE"),
+        files,
+        name="inconclusive-complete",
+    )
+    with pytest.raises(BundleError, match="missing required roles"):
+        verify_bundle(root)
+
+
+def test_verify_v2_partial_bundle_rejects_misplaced_or_wrong_role_replay(tmp_path):
+    """T13a: present replay bytes must still use the fixed path and role."""
+    files = _partial_execution_files()
+    files["replay/vulnerable/normal/stdout.log"] = ("asan_log", b"fake\n")
+    root = _write_v2_bundle(
+        tmp_path,
+        _manifest("execution", verdict="FAILED", reason="BUILD_PROVENANCE_MISSING"),
+        files,
+        name="bad-replay-role",
+    )
+    with pytest.raises(BundleError, match="must carry the normal_output role"):
+        verify_bundle(root)
+
+    files = _partial_execution_files()
+    files["fake/replay/stdout.log"] = ("normal_output", b"fake\n")
+    root = _write_v2_bundle(
+        tmp_path,
+        _manifest("execution", verdict="FAILED", reason="BUILD_PROVENANCE_MISSING"),
+        files,
+        name="bad-replay-path",
+    )
+    with pytest.raises(BundleError, match="not at a fixed replay path"):
+        verify_bundle(root)
+
+
+def test_verify_v2_partial_bundle_rejects_wrong_build_role(tmp_path):
+    """T13a: a produced build path cannot borrow an unrelated role."""
+    files = _partial_execution_files()
+    files["build/vulnerable/parser"] = ("build_log", b"fake\n")
+    root = _write_v2_bundle(
+        tmp_path,
+        _manifest("execution", verdict="FAILED", reason="BUILD_PROVENANCE_MISSING"),
+        files,
+        name="bad-build-role",
+    )
+    with pytest.raises(BundleError, match="must carry the build_artifact role"):
+        verify_bundle(root)
+
+
+def test_verify_v2_partial_bundle_still_requires_envelope_and_budget(tmp_path):
+    """T13a must not weaken the fixed documents required for interpretation."""
+    for relative in ("envelope.json", "budget/snapshot.json"):
+        files = _partial_execution_files()
+        del files[relative]
+        root = _write_v2_bundle(
+            tmp_path,
+            _manifest(
+                "execution", verdict="FAILED", reason="BUILD_PROVENANCE_MISSING"
+            ),
+            files,
+            name="partial-missing-" + relative.replace("/", "-"),
+        )
+        with pytest.raises(BundleError, match="missing required roles"):
+            verify_bundle(root)

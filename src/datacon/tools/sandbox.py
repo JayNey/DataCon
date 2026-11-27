@@ -201,6 +201,16 @@ class ProbeReport:
 
 
 @dataclass(frozen=True)
+class BuildOutput:
+    """One verified ``BuildSpec.outputs`` artifact and its D39 archive path."""
+
+    relative_path: str
+    archive_path: str
+    data: bytes
+    digest: str
+
+
+@dataclass(frozen=True)
 class BuildResult:
     version: str
     status: str
@@ -218,6 +228,7 @@ class BuildResult:
     truncated_roles: tuple[str, ...] = ()
     provenance_face: bytes | None = None
     provenance_face_name: str | None = None
+    outputs: tuple[BuildOutput, ...] = ()
 
     def as_dict(self) -> dict[str, Any]:
         payload = {
@@ -435,7 +446,13 @@ def container_create_args(
     if limits.scratch_mib > 0:
         pass
     for key, value in sorted((env or {}).items()):
-        if key.upper().startswith(("DATACON_", "GITHUB_", "AWS_", "TOKEN", "SECRET")):
+        if (
+            key.upper().startswith(("GITHUB_", "AWS_", "TOKEN", "SECRET"))
+            or (
+                key.upper().startswith("DATACON_")
+                and key.upper() != "DATACON_BUILD_VERSION"
+            )
+        ):
             raise SandboxPolicyError(f"credential-like environment variable is not allowed: {key}")
         if not key or any(character in key for character in " =\x00"):
             raise SandboxPolicyError("container environment key is invalid")
@@ -1103,12 +1120,19 @@ def render_cc_shim_script(
 ) -> str:
     """Render a POSIX ``/bin/sh`` + ``awk`` cc-shim wrapper script.
 
-    Each invocation atomically appends one strict JSONL line
-    ``{"cwd": ..., "compiler": ..., "argv": [...]}`` to ``log_path`` with full
-    RFC 8259 string escaping (quotes, backslashes, control characters, spaces)
-    under ``LC_ALL=C`` serialized via ``flock`` (or a bounded POSIX ``mkdir``
-    lock fallback when ``flock`` is unavailable), then ``exec``s
-    ``real_compiler`` with exact verbatim ``"$@"`` and exit code.
+    Each invocation writes one strict JSONL line
+    ``{"cwd": ..., "compiler": ..., "argv": [...]}`` to a private fragment
+    below ``${log_path}.d`` with full RFC 8259 string escaping (quotes,
+    backslashes, control characters, spaces). No two shim processes ever share
+    a writable file or lock: the build runner later merges the completed
+    fragments into the fixed ``log_path`` as a single writer
+    (``render_cc_shim_merge_script``). This removes the 8 KiB stdio append
+    interleaving window instead of trying to make it rarer.
+
+    A fragment is emitted to a ``mktemp`` file and atomically renamed only
+    after the full JSON line is flushed, so a killed shim never leaves a
+    partial line for the merger. Then the real compiler is ``exec``-ed with
+    exact verbatim ``"$@"`` and its exit code.
     """
     if (
         not isinstance(real_compiler, str)
@@ -1168,8 +1192,24 @@ def render_cc_shim_script(
         "export PATH\n"
         f"_datacon_real_compiler={quoted_compiler}\n"
         f"_datacon_log_path={quoted_log_path}\n"
-        '_datacon_lock_path="${_datacon_log_path}.lock"\n'
-        'if [ -L "$_datacon_log_path" ] || [ -L "$_datacon_lock_path" ]; then\n'
+        '_datacon_log_dir="${_datacon_log_path}.d"\n'
+        '_datacon_tmp=""\n'
+        "_datacon_cleanup_tmp() {\n"
+        '  if [ -n "$_datacon_tmp" ]; then rm -f -- "$_datacon_tmp"; fi\n'
+        "}\n"
+        "trap '_datacon_cleanup_tmp; exit 130' INT\n"
+        "trap '_datacon_cleanup_tmp; exit 143' TERM\n"
+        "trap '_datacon_cleanup_tmp; exit 129' HUP\n"
+        "trap '_datacon_cleanup_tmp' EXIT\n"
+        'if [ -L "$_datacon_log_path" ] || [ -L "$_datacon_log_dir" ]; then\n'
+        "  exit 1\n"
+        "fi\n"
+        # Create the one fragment directory without following a planted
+        # symlink. ``mkdir -p`` would traverse an existing symlink.
+        'if ! mkdir -- "$_datacon_log_dir" 2>/dev/null; then\n'
+        '  if [ -L "$_datacon_log_dir" ] || [ ! -d "$_datacon_log_dir" ]; then exit 1; fi\n'
+        "fi\n"
+        'if [ -L "$_datacon_log_path" ] || [ -L "$_datacon_log_dir" ]; then\n'
         "  exit 1\n"
         "fi\n"
         "_datacon_cwd=$(pwd -P)\n"
@@ -1177,36 +1217,134 @@ def render_cc_shim_script(
         f"  LC_ALL=C awk -- '{awk_program}' "
         '"$_datacon_cwd" "$_datacon_real_compiler" "$@"\n'
         "}\n"
-        "if command -v flock >/dev/null 2>&1; then\n"
-        "  (\n"
-        "    flock -x 9 || exit 1\n"
-        '    if [ -L "$_datacon_log_path" ]; then exit 1; fi\n'
-        '    _datacon_emit_log "$@" >> "$_datacon_log_path"\n'
-        '  ) 9>"$_datacon_lock_path" || exit 1\n'
-        "else\n"
-        "  (\n"
-        "    _datacon_tries=0\n"
-        '    while ! mkdir "$_datacon_lock_path" 2>/dev/null; do\n'
-        "      _datacon_tries=$((_datacon_tries + 1))\n"
-        '      if [ "$_datacon_tries" -ge 600 ]; then\n'
-        "        exit 1\n"
-        "      fi\n"
-        "      sleep 0.05 2>/dev/null || sleep 1\n"
-        "    done\n"
-        "    trap 'rmdir \"$_datacon_lock_path\" 2>/dev/null || true' EXIT INT TERM HUP\n"
-        '    if [ -L "$_datacon_log_path" ]; then exit 1; fi\n'
-        '    _datacon_emit_log "$@" >> "$_datacon_log_path"\n'
-        "  ) || exit 1\n"
-        "fi\n"
+        '_datacon_tmp=$(mktemp "$_datacon_log_dir/.fragment.XXXXXX") || exit 1\n'
+        '_datacon_emit_log "$@" > "$_datacon_tmp" || exit 1\n'
+        '_datacon_suffix=${_datacon_tmp##*.}\n'
+        '_datacon_fragment="$_datacon_log_dir/fragment-$$-$_datacon_suffix.jsonl"\n'
+        'mv -- "$_datacon_tmp" "$_datacon_fragment" || exit 1\n'
+        '_datacon_tmp=""\n'
+        'trap - EXIT INT TERM HUP\n'
         'exec "$_datacon_real_compiler" "$@"\n'
     )
 
+
+def _cc_shim_merge_shell_lines(log_expression: str) -> list[str]:
+    """Return the single-writer fragment merge body used by sh and the runner."""
+    return [
+        # The runner enables ``set -f`` for its fixed argv vectors; the merger
+        # runs in a subshell, so restore globbing only here to expand the
+        # per-invocation fragment names.
+        "set +f",
+        "LC_ALL=C",
+        "export LC_ALL",
+        f"_datacon_log_path={log_expression}",
+        '_datacon_log_dir="${_datacon_log_path}.d"',
+        'if [ -L "$_datacon_log_path" ] || [ -L "$_datacon_log_dir" ]; then',
+        "  exit 1",
+        "fi",
+        'if [ ! -d "$_datacon_log_dir" ]; then',
+        "  exit 0",
+        "fi",
+        '_datacon_tmp="${_datacon_log_path}.merge.$$"',
+        ': > "$_datacon_tmp" || exit 1',
+        "_datacon_seen=0",
+        'for _datacon_fragment in "$_datacon_log_dir"/fragment-*.jsonl; do',
+        '  [ -f "$_datacon_fragment" ] || continue',
+        '  if [ -L "$_datacon_fragment" ]; then exit 1; fi',
+        '  cat -- "$_datacon_fragment" >> "$_datacon_tmp" || exit 1',
+        "  _datacon_seen=$((_datacon_seen + 1))",
+        "done",
+        'if [ "$_datacon_seen" -gt 0 ]; then',
+        '  if [ -L "$_datacon_log_path" ]; then exit 1; fi',
+        '  mv -- "$_datacon_tmp" "$_datacon_log_path" || exit 1',
+        "else",
+        '  rm -f -- "$_datacon_tmp"',
+        "fi",
+        'for _datacon_fragment in "$_datacon_log_dir"/fragment-*.jsonl; do',
+        '  [ -f "$_datacon_fragment" ] || continue',
+        '  rm -f -- "$_datacon_fragment" || exit 1',
+        "done",
+        'rmdir -- "$_datacon_log_dir" 2>/dev/null || true',
+        "exit 0",
+    ]
+
+
+def render_cc_shim_merge_script(log_path: str = DEFAULT_CC_SHIM_LOG_PATH) -> str:
+    """Return the single-writer merger for completed cc-shim fragments.
+
+    The build runner calls this after every build process has exited. It is the
+    only writer of the fixed face path: fragments are sorted by name and
+    concatenated into a temporary file that is atomically renamed, so a
+    concurrent reader can never observe an interleaved line.
+    """
+    if (
+        not isinstance(log_path, str)
+        or not log_path.strip()
+        or build_provenance.has_control_chars(log_path)
+    ):
+        raise SandboxPolicyError("log_path must be a non-empty string without control chars")
+    return "\n".join(
+        ["#!/bin/sh", "set -e", "LC_ALL=C", "export LC_ALL"]
+        + _cc_shim_merge_shell_lines(shlex.quote(log_path))
+    ) + "\n"
+
+def merge_cc_shim_log(log_path: Path | str) -> Path:
+    """Merge completed cc-shim fragments into ``log_path`` with one writer.
+
+    Mirrors :func:`render_cc_shim_merge_script` for host-side tests and
+    tooling. The log and fragment directory must not be symlinks; fragments
+    are sorted by name so the merge order is deterministic. The merged bytes
+    are written to an exclusive temporary file and atomically renamed, then
+    the consumed fragments are removed. A missing fragment directory is a
+    no-op (no log is created), which keeps "no compiler ran" observable as a
+    missing provenance face.
+    """
+    log = Path(log_path)
+    fragment_dir = log.with_name(log.name + ".d")
+    if log.is_symlink() or fragment_dir.is_symlink():
+        raise SandboxPolicyError("cc-shim log and fragment directory must not be symlinks")
+    if not fragment_dir.is_dir():
+        return log
+    fragments = sorted(
+        item
+        for item in fragment_dir.iterdir()
+        if item.name.startswith("fragment-")
+        and item.name.endswith(".jsonl")
+        and item.is_file()
+        and not item.is_symlink()
+    )
+    payload = b"".join(item.read_bytes() for item in fragments)
+    if not fragments:
+        return log
+    temporary = log.with_name(f".{log.name}.merge.{os.getpid()}.{uuid.uuid4().hex}")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(temporary, flags, 0o600)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
+    os.replace(temporary, log)
+    for item in fragments:
+        item.unlink()
+    try:
+        fragment_dir.rmdir()
+    except OSError:
+        pass
+    return log
 
 def render_build_runner_script(
     *,
     stage_fixture: bool = True,
     emit_result_marker: bool = True,
     wait_for_release: bool = True,
+    cc_shim_merge_log: str | None = None,
 ) -> str:
     """Return the fixed POSIX ``/bin/sh`` runner template for ``BuildSpec`` argv arrays.
 
@@ -1300,8 +1438,13 @@ def render_build_runner_script(
                 f'PATH="{_SAFE_SYSTEM_PATH}${{PATH:+:$PATH}}"',
                 "export PATH",
                 "if [ -d /fixture ]; then",
-                "  cp -RP /fixture/. /work/ 2>/dev/null || true",
-                "  chmod -R u+w /work 2>/dev/null || true",
+                "  if ! cp -RP /fixture/. /work/; then",
+                '    echo "datacon-build-runner: staging copy from /fixture failed" >&2',
+                "    exit 1",
+                "  fi",
+                "  if ! chmod -R u+w /work 2>/dev/null; then",
+                '    echo "datacon-build-runner: warning: chmod -R u+w /work failed" >&2',
+                "  fi",
                 "fi",
             ]
         )
@@ -1340,6 +1483,18 @@ def render_build_runner_script(
             "fi",
         ]
     )
+    if cc_shim_merge_log is not None:
+        lines.extend(
+            [
+                "# Every shim wrote a private fragment; this runner is the only",
+                "# writer of the fixed face, after all build processes exited.",
+                '_datacon_merge_log=$1',
+                "shift",
+                "(",
+                *_cc_shim_merge_shell_lines('"$_datacon_merge_log"'),
+                ") || exit 1",
+            ]
+        )
     if emit_result_marker:
         lines.extend(
             [
@@ -1375,6 +1530,7 @@ def build_runner_command(
     stage_fixture: bool = True,
     emit_result_marker: bool = True,
     wait_for_release: bool = True,
+    build_version: str | None = None,
 ) -> list[str]:
     """Assemble the exact argv command vector for executing ``plan`` without shell splicing."""
     clean_paths: list[str] = []
@@ -1390,10 +1546,19 @@ def build_runner_command(
         clean_paths.append(plan.provenance_face_container_path)
         seen_clean.add(plan.provenance_face_container_path)
         if plan.kind == "make":
-            lock_path = f"{plan.provenance_face_container_path}.lock"
-            if lock_path not in seen_clean:
-                clean_paths.append(lock_path)
-                seen_clean.add(lock_path)
+            fragment_dir = f"{plan.provenance_face_container_path}.d"
+            if fragment_dir not in seen_clean:
+                clean_paths.append(fragment_dir)
+                seen_clean.add(fragment_dir)
+    merge_log = (
+        plan.provenance_face_container_path if plan.kind == "make" else None
+    )
+    build_argv = list(plan.build)
+    if plan.kind == "shell" and build_version is not None:
+        # v1 always ran ``/bin/sh /fixture/build.sh {version}``. Keep the same
+        # fixed positional contract for v2 shell recipes instead of making the
+        # version an author-controlled argv element.
+        build_argv.append(build_version)
     return [
         "/bin/sh",
         "-c",
@@ -1401,6 +1566,7 @@ def build_runner_command(
             stage_fixture=stage_fixture,
             emit_result_marker=emit_result_marker,
             wait_for_release=wait_for_release,
+            cc_shim_merge_log=merge_log,
         ),
         "datacon-build-runner",
         plan.primary_output_container_path,
@@ -1408,10 +1574,11 @@ def build_runner_command(
         *clean_paths,
         str(len(plan.configure)),
         *plan.configure,
-        str(len(plan.build)),
-        *plan.build,
+        str(len(build_argv)),
+        *build_argv,
         str(len(plan.install)),
         *plan.install,
+        *([merge_log] if merge_log is not None else []),
     ]
 
 
@@ -2764,8 +2931,23 @@ printf 'uid=%s\nseccomp=%s\nseccomp_filters=%s\nno_new_privs=%s\ncap_eff=%s\ncgr
                 "TMPDIR": "/work",
                 "HOME": "/work",
                 "ASAN_OPTIONS": "detect_leaks=0",
+                "DATACON_BUILD_VERSION": version,
             }
             container_env.update(plan.env)
+            effective_env_error = build_provenance.validate_effective_build_env(
+                container_env,
+                allowed_executor_keys={
+                    "TMPDIR",
+                    "HOME",
+                    "ASAN_OPTIONS",
+                    "DATACON_BUILD_VERSION",
+                },
+            )
+            if effective_env_error is not None:
+                raise SandboxError(
+                    effective_env_error,
+                    reason_code=build_provenance.BUILD_PROVENANCE_MISSING,
+                )
 
             extra_copy_paths: list[tuple[str, int]] = []
             seen_copy_paths: set[str] = {
@@ -2788,7 +2970,7 @@ printf 'uid=%s\nseccomp=%s\nseccomp_filters=%s\nno_new_privs=%s\ncap_eff=%s\ncgr
 
             name, _ = self._create(
                 suffix=f"build-{version}",
-                command=list(plan.container_command),
+                command=build_runner_command(plan, build_version=version),
                 mounts=mounts,
                 env=container_env,
             )
@@ -2898,9 +3080,51 @@ printf 'uid=%s\nseccomp=%s\nseccomp_filters=%s\nno_new_privs=%s\ncap_eff=%s\ncgr
                         provenance_face = raw_face
 
             quota_hits = _quota_events(files)
+            outputs_meta: dict[str, Any] = {}
+            output_artifacts: list[BuildOutput] = []
+            outputs_valid = True
+            for rel_out, c_path in plan.output_container_paths:
+                out_bytes = (
+                    artifact
+                    if c_path == plan.primary_output_container_path
+                    else files.get(c_path)
+                )
+                valid = (
+                    out_bytes is not None
+                    and c_path not in truncated_streams
+                    and len(out_bytes) <= MAX_ARTIFACT_BYTES
+                )
+                if valid and out_bytes is not None:
+                    out_digest = "sha256:" + hashlib.sha256(out_bytes).hexdigest()
+                    outputs_meta[rel_out] = {
+                        "size_bytes": len(out_bytes),
+                        "sha256": out_digest,
+                    }
+                    archive_path = (
+                        "parser"
+                        if plan.primary_output == "parser"
+                        and len(plan.outputs) == 1
+                        else rel_out
+                    )
+                    output_artifacts.append(
+                        BuildOutput(
+                            relative_path=rel_out,
+                            archive_path=archive_path,
+                            data=out_bytes,
+                            digest=out_digest,
+                        )
+                    )
+                else:
+                    outputs_meta[rel_out] = None
+                    outputs_valid = False
             status = (
                 "completed"
-                if exit_code == 0 and artifact is not None and capture_error is None
+                if (
+                    exit_code == 0
+                    and artifact is not None
+                    and outputs_valid
+                    and capture_error is None
+                )
                 else "build_failed"
             )
             if timed_out:
@@ -2909,25 +3133,6 @@ printf 'uid=%s\nseccomp=%s\nseccomp_filters=%s\nno_new_privs=%s\ncap_eff=%s\ncgr
                 status = "infra_error"
             elif state.get("OOMKilled") or quota_hits:
                 status = "resource_limited"
-
-            outputs_meta: dict[str, Any] = {}
-            for rel_out, c_path in plan.output_container_paths:
-                out_bytes = (
-                    artifact
-                    if c_path == plan.primary_output_container_path
-                    else files.get(c_path)
-                )
-                if (
-                    out_bytes is not None
-                    and c_path not in truncated_streams
-                    and len(out_bytes) <= MAX_ARTIFACT_BYTES
-                ):
-                    outputs_meta[rel_out] = {
-                        "size_bytes": len(out_bytes),
-                        "sha256": "sha256:" + hashlib.sha256(out_bytes).hexdigest(),
-                    }
-                else:
-                    outputs_meta[rel_out] = None
 
             metadata: dict[str, Any] = {
                 "build_spec_kind": plan.kind,
@@ -2979,6 +3184,7 @@ printf 'uid=%s\nseccomp=%s\nseccomp_filters=%s\nno_new_privs=%s\ncap_eff=%s\ncgr
                 truncated_roles=truncated_roles,
                 provenance_face=provenance_face,
                 provenance_face_name=provenance_face_name,
+                outputs=tuple(output_artifacts),
             )
         finally:
             if work_fd >= 0:
