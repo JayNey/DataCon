@@ -103,9 +103,15 @@ def _write_v2_bundle(tmp_path: Path, manifest, files, *, name="v2-bundle"):
 
 def _base_files(*, execution, campaign):
     files = {
-        "report.json": ("report_json", b'{"report":true}\n'),
+        "report.json": (
+            "report_json",
+            b'{"report":true,"build_provenance_rules_version":"build-provenance-v1"}\n',
+        ),
         "report.md": ("report_markdown", b"# report\n"),
-        "plan.json": ("plan", b'{"plan":true}\n'),
+        "plan.json": (
+            "plan",
+            b'{"plan":true,"build_provenance_rules_version":"build-provenance-v1"}\n',
+        ),
         "envelope.json": ("envelope", b'{"envelope":true}\n'),
         "budget/snapshot.json": ("budget_snapshot", b'{"budget":true}\n'),
         "metadata/execution.json": ("execution_metadata", b"{}\n"),
@@ -1141,7 +1147,13 @@ def test_v2_non_reuse_plan_and_report_must_not_claim_build_ref(tmp_path):
     files = _base_files(execution=True, campaign=False)
     files["plan.json"] = (
         "plan",
-        json.dumps({"schema_version": 2, "build_ref": _build_ref()}).encode()
+        json.dumps(
+            {
+                "schema_version": 2,
+                "build_provenance_rules_version": "build-provenance-v1",
+                "build_ref": _build_ref(),
+            }
+        ).encode()
         + b"\n",
     )
     plan_root = _write_v2_bundle(
@@ -1153,7 +1165,13 @@ def test_v2_non_reuse_plan_and_report_must_not_claim_build_ref(tmp_path):
     report_files = _base_files(execution=True, campaign=False)
     report_files["report.json"] = (
         "report_json",
-        json.dumps({"schema_version": 2, "build_ref": _build_ref()}).encode()
+        json.dumps(
+            {
+                "schema_version": 2,
+                "build_provenance_rules_version": "build-provenance-v1",
+                "build_ref": _build_ref(),
+            }
+        ).encode()
         + b"\n",
     )
     report_root = _write_v2_bundle(
@@ -1168,7 +1186,12 @@ def test_campaign_report_must_not_carry_verdict_fields(tmp_path, field):
     """Campaign evidence must not carry a reproduction conclusion."""
     manifest = _manifest("campaign", verdict=None, reason=None)
     files = _base_files(execution=False, campaign=True)
-    report = {"schema_version": 2, "bundle_kind": "campaign", field: "REPRODUCED"}
+    report = {
+        "schema_version": 2,
+        "bundle_kind": "campaign",
+        "build_provenance_rules_version": "build-provenance-v1",
+        field: "REPRODUCED",
+    }
     files["report.json"] = (
         "report_json",
         json.dumps(report).encode() + b"\n",
@@ -1626,7 +1649,10 @@ def _partial_execution_files():
     for relative in list(files):
         if relative.startswith("build/fixed/"):
             del files[relative]
-    files["report.json"] = ("report_json", b'{"rule":null}\n')
+    files["report.json"] = (
+        "report_json",
+        b'{"rule":null,"build_provenance_rules_version":"build-provenance-v1"}\n',
+    )
     files.pop("metadata/probe.json", None)
     return files
 
@@ -1649,7 +1675,10 @@ def test_verify_v2_failed_partial_bundle_accepts_produced_roles(tmp_path):
 def test_verify_v2_partial_inconclusive_without_rule_is_accepted(tmp_path):
     """T13a: INCONCLUSIVE + report.rule=None uses the partial layout."""
     files = _partial_execution_files()
-    files["report.json"] = ("report_json", b'{"rule":null}\n')
+    files["report.json"] = (
+        "report_json",
+        b'{"rule":null,"build_provenance_rules_version":"build-provenance-v1"}\n',
+    )
     root = _write_v2_bundle(
         tmp_path,
         _manifest("execution", verdict="INCONCLUSIVE", reason="EVIDENCE_INCOMPLETE"),
@@ -1662,7 +1691,10 @@ def test_verify_v2_partial_inconclusive_without_rule_is_accepted(tmp_path):
 def test_verify_v2_complete_inconclusive_still_requires_full_roles(tmp_path):
     """T13a: a rule-backed INCONCLUSIVE bundle keeps the strict role table."""
     files = _partial_execution_files()
-    files["report.json"] = ("report_json", b'{"rule":{"verdict":"INCONCLUSIVE"}}\n')
+    files["report.json"] = (
+        "report_json",
+        b'{"rule":{"verdict":"INCONCLUSIVE"},"build_provenance_rules_version":"build-provenance-v1"}\n',
+    )
     root = _write_v2_bundle(
         tmp_path,
         _manifest("execution", verdict="INCONCLUSIVE", reason="EVIDENCE_INCOMPLETE"),
@@ -1788,3 +1820,107 @@ def test_family_export_keeps_each_round_independently_verifiable(tmp_path):
         assert (exported / "manifest.json").read_bytes() == (
             source / "manifest.json"
         ).read_bytes(), "family export rewrote a round manifest"
+
+
+def test_nb2_hollow_shell_inconclusive_bundle_rejected(tmp_path):
+    """NB2: 0-probe/0-build/0-replay hollow INCONCLUSIVE shells are rejected."""
+    base_hollow = {
+        path: item
+        for path, item in _partial_execution_files().items()
+        if not path.startswith("build/")
+    }
+
+    # Case 1: omits the "rule" key altogether.
+    omitted_rule = dict(base_hollow)
+    omitted_rule["report.json"] = (
+        "report_json",
+        b'{"build_provenance_rules_version":"build-provenance-v1"}\n',
+    )
+    root_omitted = _write_v2_bundle(
+        tmp_path,
+        _manifest("execution", verdict="INCONCLUSIVE", reason="EVIDENCE_INCOMPLETE"),
+        omitted_rule,
+        name="hollow-omitted-rule",
+    )
+    with pytest.raises(BundleError, match="missing required roles"):
+        verify_bundle(root_omitted)
+
+    # Case 2: explicit "rule": null but 0 probe/build/replay and no missing/error diagnostics.
+    empty_shell = dict(base_hollow)
+    empty_shell["report.json"] = (
+        "report_json",
+        b'{"rule":null,"build_provenance_rules_version":"build-provenance-v1"}\n',
+    )
+    root_empty = _write_v2_bundle(
+        tmp_path,
+        _manifest("execution", verdict="INCONCLUSIVE", reason="TIMEOUT"),
+        empty_shell,
+        name="hollow-empty-shell",
+    )
+    with pytest.raises(BundleError, match="missing required roles"):
+        verify_bundle(root_empty)
+
+    # Case 3: explicit "rule": null with a 6-replay verdict reason (INTERMITTENT).
+    bad_reason = _partial_execution_files()
+    bad_reason["report.json"] = (
+        "report_json",
+        b'{"rule":null,"missing":["x"],"build_provenance_rules_version":"build-provenance-v1"}\n',
+    )
+    root_bad_reason = _write_v2_bundle(
+        tmp_path,
+        _manifest("execution", verdict="INCONCLUSIVE", reason="INTERMITTENT"),
+        bad_reason,
+        name="partial-bad-reason",
+    )
+    with pytest.raises(BundleError, match="missing required roles"):
+        verify_bundle(root_bad_reason)
+
+    # Case 4: partial bundle with invalid build_provenance filename is rejected.
+    bad_face = _partial_execution_files()
+    bad_face["build/vulnerable/build_provenance/arbitrary.txt"] = (
+        "build_provenance",
+        b"bogus\n",
+    )
+    root_bad_face = _write_v2_bundle(
+        tmp_path,
+        _manifest("execution", verdict="FAILED", reason="BUILD_PROVENANCE_MISSING"),
+        bad_face,
+        name="partial-bad-face-name",
+    )
+    with pytest.raises(BundleError, match="fixed face path"):
+        verify_bundle(root_bad_face)
+
+
+def test_campaign_bundle_with_candidate_seeds_requires_crash_seed_role(tmp_path):
+    """T13: campaign recording candidate crash seeds without crash_seed role fails closed."""
+    files = _base_files(execution=False, campaign=True)
+    files["report.json"] = (
+        "report_json",
+        json.dumps(
+            {
+                "schema_version": 2,
+                "bundle_kind": "campaign",
+                "build_provenance_rules_version": "build-provenance-v1",
+                "candidate_seeds": [DIGEST],
+            }
+        ).encode("utf-8")
+        + b"\n",
+    )
+    missing_seed_root = _write_v2_bundle(
+        tmp_path,
+        _manifest("campaign", verdict=None, reason=None),
+        files,
+        name="campaign-missing-crash-seed",
+    )
+    with pytest.raises(BundleError, match="crash_seed"):
+        verify_bundle(missing_seed_root)
+
+    files["fuzz/crashes/seed-001.bin"] = ("crash_seed", b"CRASH\n")
+    ok_seed_root = _write_v2_bundle(
+        tmp_path,
+        _manifest("campaign", verdict=None, reason=None),
+        files,
+        name="campaign-with-crash-seed",
+    )
+    verified = verify_bundle(ok_seed_root)
+    assert "crash_seed" in {entry["role"] for entry in verified.manifest["files"]}

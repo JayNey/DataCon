@@ -155,6 +155,7 @@ def _write_validation(
     report = {
         "schema_version": 2,
         "plan_digest": manifest["plan_digest"],
+        "build_provenance_rules_version": manifest["build_provenance_rules_version"],
         "build_ref": resolved_report_build_ref,
         "reuse_origin": resolved_report_origin,
     }
@@ -368,3 +369,44 @@ def test_validation_rejects_non_default_build_artifact_layout(tmp_path):
     _remove_manifested_file(missing_root, "build/vulnerable/parser")
     with pytest.raises(BundleError):
         verify_bundle(missing_root)
+
+
+def test_validation_supports_custom_build_spec_single_output_reuse(tmp_path):
+    """T13a: reuse byte binding honors a single custom BuildSpec.outputs[0] path."""
+    build_ref = _campaign_build_ref()
+    custom_plan = _validation_plan(build_ref)
+    custom_plan["build_spec"]["outputs"] = ["bin/custom_target"]
+    custom_plan["build_recipe_digest"] = (
+        "sha256:"
+        + hashlib.sha256(
+            json.dumps(
+                custom_plan["build_spec"],
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+    )
+    root = _write_validation(
+        tmp_path,
+        "reuse-custom-declared-output",
+        build_ref=build_ref,
+        plan=custom_plan,
+        plan_digest_override=plan_digest(custom_plan),
+    )
+    for version in VERSIONS:
+        _rename_manifested_file(
+            root,
+            f"build/{version}/parser",
+            f"build/{version}/bin/custom_target",
+        )
+    verified = verify_bundle(root)
+    assert "build/vulnerable/bin/custom_target" in verified.file_data
+    assert "build/fixed/bin/custom_target" in verified.file_data
+
+    # Tampering the bound custom artifact bytes triggers REUSE_MISMATCH.
+    _rewrite_manifested_file(
+        root, "build/fixed/bin/custom_target", b"tampered custom target\n"
+    )
+    with pytest.raises(BundleError) as raised:
+        verify_bundle(root)
+    assert raised.value.reason_code == "REUSE_MISMATCH"
