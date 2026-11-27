@@ -1305,14 +1305,14 @@ def merge_cc_shim_log(log_path: Path | str) -> Path:
         raise SandboxPolicyError("cc-shim log and fragment directory must not be symlinks")
     if not fragment_dir.is_dir():
         return log
-    fragments = sorted(
-        item
-        for item in fragment_dir.iterdir()
-        if item.name.startswith("fragment-")
-        and item.name.endswith(".jsonl")
-        and item.is_file()
-        and not item.is_symlink()
-    )
+    fragments: list[Path] = []
+    for item in sorted(fragment_dir.iterdir()):
+        if not (item.name.startswith("fragment-") and item.name.endswith(".jsonl")):
+            continue
+        if item.is_symlink():
+            raise SandboxPolicyError(f"cc-shim fragment must not be a symlink: {item}")
+        if item.is_file():
+            fragments.append(item)
     payload = b"".join(item.read_bytes() for item in fragments)
     if not fragments:
         return log
@@ -1480,6 +1480,9 @@ def render_build_runner_script(
             'if [ "$_datacon_code" -eq 0 ] && [ "$_n_inst" -gt 0 ]; then',
             '  _datacon_run_first_n "$_n_inst" "$@"',
             "  _datacon_code=$?",
+            "fi",
+            'if [ "$_n_inst" -gt 0 ]; then',
+            '  shift "$_n_inst"',
             "fi",
         ]
     )
