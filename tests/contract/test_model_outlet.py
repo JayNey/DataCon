@@ -1458,3 +1458,107 @@ def test_outlet_rejects_values_the_strict_encoder_cannot_carry():
             )
         assert excinfo.value.sub_reason == "FIELD_TYPE_REJECTED", label
         assert transport.calls == [], label
+
+
+# --- R2: the archived model/audit.json document (interface contract delta 8) ---
+
+
+def test_model_audit_document_validates_offline_and_binds_to_the_report():
+    from datacon.tools.model_outlet import (
+        build_model_audit,
+        model_audit_summary,
+        verify_model_audit_document,
+        validate_model_audit_document,
+        OutletError,
+    )
+
+    record = build_model_audit(**_audit_kwargs())
+    # The archived document is this record as JSON text: whatever JSON does
+    # to the values on the way out and back must not change the verdict.
+    document = json.loads(json.dumps(record))
+    assert validate_model_audit_document(document) == record
+
+    online = build_model_audit(
+        job_id=JOB_ID,
+        stage="hypothesis_aggregator",
+        provider="vendor",
+        model_version="m-1",
+        prompt_version="p-1",
+        allowed_fields=("patch_diff",),
+        request_digest="sha256:" + "01" * 32,
+        response_digest="sha256:" + "02" * 32,
+        duration_seconds=1.5,
+        outcome="ok",
+    )
+    assert validate_model_audit_document(json.loads(json.dumps(online))) == online
+
+    summary = model_audit_summary(record)
+    assert set(summary) == {
+        "provider",
+        "model_version",
+        "prompt_version",
+        "allowed_fields_digest",
+        "redaction_version",
+        "outcome",
+    }
+    assert verify_model_audit_document(
+        document, job_id=JOB_ID, report_model_audit=summary
+    ) == record
+
+    # The audit belongs to the child job the bundle is for.
+    with pytest.raises(OutletError) as excinfo:
+        verify_model_audit_document(
+            document, job_id=str(uuid.uuid4()), report_model_audit=summary
+        )
+    assert excinfo.value.sub_reason == "AUDIT_INVALID"
+    # report.model_audit is exactly the six-field summary of the document.
+    for broken in (
+        summary | {"provider": "other-vendor"},
+        summary | {"outcome": "ok"},
+        {k: v for k, v in summary.items() if k != "outcome"},
+        summary | {"job_id": JOB_ID},
+        None,
+        [],
+    ):
+        with pytest.raises(OutletError) as excinfo:
+            verify_model_audit_document(
+                document, job_id=JOB_ID, report_model_audit=broken
+            )
+        assert excinfo.value.sub_reason == "AUDIT_INVALID"
+
+
+def test_model_audit_document_rejects_shape_and_digest_faults():
+    from datacon.tools.model_outlet import (
+        OutletError,
+        build_model_audit,
+        validate_model_audit_document,
+    )
+
+    record = build_model_audit(**_audit_kwargs())
+    assert set(record) == MODEL_AUDIT_FIELDS
+    broken = {
+        "unknown field": record | {"extra": 1},
+        "missing field": {k: v for k, v in record.items() if k != "stage"},
+        "not an object": [record],
+        "allowed fields digest is not a digest": record
+        | {"allowed_fields_digest": "sha256:not-a-digest"},
+        "allowed fields digest has no prefix": record
+        | {"allowed_fields_digest": "14" * 32},
+        "allowed fields digest is null": record | {"allowed_fields_digest": None},
+        "offline record claims a version": record | {"model_version": "m-1"},
+        "offline record claims a request digest": record
+        | {"request_digest": "sha256:" + "00" * 32},
+        "offline record claims time": record | {"duration_seconds": 1},
+        "job id is not a uuid": record | {"job_id": "job-1"},
+        "outcome outside the set": record | {"outcome": "fine"},
+        "stage is blank": record | {"stage": ""},
+    }
+    for label, document in broken.items():
+        with pytest.raises(OutletError) as excinfo:
+            validate_model_audit_document(document)
+        assert excinfo.value.sub_reason == "AUDIT_INVALID", label
+    # A null provider keeps the record's own verdict: the report may not
+    # leave it empty either.
+    with pytest.raises(OutletError) as excinfo:
+        validate_model_audit_document(record | {"provider": None})
+    assert excinfo.value.sub_reason == "PROVIDER_MISSING"
