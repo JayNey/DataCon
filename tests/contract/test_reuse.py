@@ -357,7 +357,13 @@ def test_validation_plan_digest_and_report_are_bound(tmp_path):
 
 
 def test_validation_rejects_non_default_build_artifact_layout(tmp_path):
-    """Custom/multi-output binding is deferred to T13, but must fail closed."""
+    """Without build_spec.outputs, reuse binds only the default ``parser``.
+
+    A renamed or additional artifact fails closed. Custom single-output reuse
+    is covered by ``test_validation_supports_custom_build_spec_single_output_reuse``;
+    multi-output reuse stays fail-closed because §3
+    ``build_ref.artifacts.<version>.artifact_digest`` is a single digest.
+    """
     # Single custom output: no default parser.
     custom_root = _write_validation(tmp_path, "reuse-custom-artifact")
     _rename_manifested_file(

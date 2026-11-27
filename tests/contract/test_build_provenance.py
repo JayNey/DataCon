@@ -159,9 +159,7 @@ def _write_v2_bundle(
     envelope_bytes = jsonutil.canonical_bytes(envelope) + b"\n"
 
     plan["envelope_digest"] = envelope_digest
-    plan_digest = jsonutil.digest_json(
-        {key: value for key, value in plan.items() if key != "analysis"}
-    )
+    plan_digest = contracts.plan_digest(plan)
     plan_bytes = jsonutil.canonical_bytes(plan) + b"\n"
 
     review_doc = {

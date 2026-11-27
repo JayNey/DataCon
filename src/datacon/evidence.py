@@ -3771,6 +3771,11 @@ def _verify_v2_reuse_artifacts(
     path; multi-output or invalid ``build_spec.outputs`` fail closed. Only when
     ``plan_build_spec`` is ``None`` does verification fall back to the default
     ``parser`` path.
+
+    Multi-output reuse is intentionally fail-closed: §3 defines
+    ``build_ref.artifacts.<version>.artifact_digest`` as one digest per
+    version, so binding several outputs requires extending the ``build_ref``
+    contract first rather than widening this verifier.
     """
     if plan_build_spec is None:
         expected_rel = "parser"
