@@ -1727,3 +1727,64 @@ def test_verify_v2_partial_bundle_still_requires_envelope_and_budget(tmp_path):
         )
         with pytest.raises(BundleError, match="missing required roles"):
             verify_bundle(root)
+
+
+def test_family_export_keeps_each_round_independently_verifiable(tmp_path):
+    """T12/TC-16: family export copies round bundles without rewriting them."""
+    campaign_root = _write_v2_bundle(
+        tmp_path,
+        _manifest("campaign", verdict=None, reason=None),
+        _base_files(execution=False, campaign=True),
+        name="family-campaign",
+    )
+    round_roots = [
+        _write_v2_bundle(
+            tmp_path,
+            _manifest("execution"),
+            _base_files(execution=True, campaign=False),
+            name=f"family-round-{round_no}",
+        )
+        for round_no in (1, 2)
+    ]
+    digests = [verify_bundle(root).manifest_digest for root in round_roots]
+    campaign_digest = verify_bundle(campaign_root).manifest_digest
+    index = evidence.build_family_index(
+        family_id=str(uuid4()),
+        created_at="2099-01-01T00:00:00Z",
+        family_approval_digest="sha256:" + "52" * 32,
+        rounds=[
+            {
+                "round_no": round_no,
+                "job_id": str(uuid4()),
+                "plan_digest": DIGEST,
+                "state": "INCONCLUSIVE",
+                "evidence_digest": digest,
+            }
+            for round_no, digest in zip((1, 2), digests)
+        ],
+        campaign={"job_id": str(uuid4()), "bundle_digest": campaign_digest},
+        budget={
+            "max_total_seconds": 900,
+            "max_fuzz_seconds": 300,
+            "spent_seconds": 540,
+            "spent_fuzz_seconds": 180,
+            "remaining_seconds": 360,
+            "remaining_fuzz_seconds": 120,
+        },
+    )
+    family_json = tmp_path / "family-archive" / "family.json"
+    evidence.finalize_family_index(family_json, index)
+
+    evidence.export_family(
+        family_json,
+        tmp_path / "family-export",
+        campaign_source=campaign_root,
+        rounds=list(zip((1, 2), round_roots)),
+    )
+
+    for round_no, source, digest in zip((1, 2), round_roots, digests):
+        exported = tmp_path / "family-export" / "rounds" / str(round_no)
+        assert verify_bundle(exported).manifest_digest == digest
+        assert (exported / "manifest.json").read_bytes() == (
+            source / "manifest.json"
+        ).read_bytes(), "family export rewrote a round manifest"

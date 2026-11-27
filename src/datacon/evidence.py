@@ -4426,3 +4426,580 @@ def export_bundle(
         manifest=copied.manifest,
         manifest_digest=copied.manifest_digest,
     )
+
+
+# ---------------------------------------------------------------------------
+# Family archive index and aggregate export (D43, T12)
+# ---------------------------------------------------------------------------
+
+FAMILY_INDEX_FILENAME = "family.json"
+FAMILY_INDEX_SCHEMA_VERSION = 2
+FAMILY_INDEX_KIND = "family_index"
+MAX_FAMILY_INDEX_BYTES = 4 * 1024 * 1024
+# A round entry records the terminal job state, never an "archived" state:
+# archival lives in jobs.evidence_status and must not leak into the enum.
+# A round index entry is the terminal *job* state of a validation round.
+# ``COMPLETED`` is the campaign/family terminal introduced by D40 and is not a
+# validation-round verdict; allowing it here would let a campaign completion
+# masquerade as a round conclusion.
+_FAMILY_ROUND_STATES = frozenset(
+    {
+        "REPRODUCED",
+        "NOT_REPRODUCED",
+        "INCONCLUSIVE",
+        "BLOCKED",
+        "FAILED",
+    }
+)
+_FAMILY_INDEX_FIELDS = frozenset(
+    {
+        "schema_version",
+        "kind",
+        "family_id",
+        "state",
+        "created_at",
+        "family_approval_digest",
+        "rounds",
+        "campaign",
+        "budget",
+    }
+)
+_FAMILY_ROUND_FIELDS = frozenset(
+    {"round_no", "job_id", "plan_digest", "state", "evidence_digest"}
+)
+_FAMILY_CAMPAIGN_FIELDS = frozenset({"job_id", "bundle_digest"})
+_FAMILY_BUDGET_FIELDS = (
+    "max_total_seconds",
+    "max_fuzz_seconds",
+    "spent_seconds",
+    "spent_fuzz_seconds",
+    "remaining_seconds",
+    "remaining_fuzz_seconds",
+)
+
+
+@dataclass(frozen=True)
+class FamilyIndexInfo:
+    path: Path
+    document: dict[str, Any]
+    data: bytes
+    digest: str
+
+
+@dataclass(frozen=True)
+class FamilyExportInfo:
+    root: Path
+    family: FamilyIndexInfo
+    round_digests: dict[int, str]
+    campaign_digest: str | None
+
+    @property
+    def family_digest(self) -> str:
+        return self.family.digest
+
+
+def _family_fail(message: str) -> None:
+    raise BundleError("INVALID_MANIFEST", f"family index {message}")
+
+
+def _family_uuid(value: Any, label: str) -> str:
+    """Return ``value`` only when it is canonical lowercase provider text.
+
+    ``uuid.UUID`` accepts braces, ``urn:uuid:`` prefixes and uppercase input;
+    the family index schema requires the canonical provider representation so
+    two spellings can never name the same family under a different digest.
+    """
+    if not isinstance(value, str):
+        raise BundleError(
+            "INVALID_MANIFEST", f"family index {label} must be a UUID"
+        )
+    try:
+        parsed = uuid.UUID(value)
+    except (TypeError, ValueError, AttributeError) as error:
+        raise BundleError(
+            "INVALID_MANIFEST", f"family index {label} must be a UUID"
+        ) from error
+    if str(parsed) != value:
+        raise BundleError(
+            "INVALID_MANIFEST",
+            f"family index {label} must be a canonical lowercase UUID",
+        )
+    return value
+
+
+def _family_digest(value: Any, label: str) -> str:
+    if not isinstance(value, str) or not _DIGEST.fullmatch(value):
+        raise BundleError(
+            "INVALID_MANIFEST",
+            f"family index {label} must be a sha256 digest",
+        )
+    return value
+
+
+def _family_int(value: Any, label: str) -> int:
+    if type(value) is not int:
+        raise BundleError(
+            "INVALID_MANIFEST", f"family index {label} must be an integer"
+        )
+    return value
+
+
+def validate_family_index(document: Any) -> None:
+    """Validate the D43 family index (not an evidence bundle).
+
+    The schema is closed: an unknown or missing field fails closed. A round's
+    ``state`` is the terminal job state; archived status never appears here.
+    """
+    if not isinstance(document, dict):
+        _family_fail("must be a JSON object")
+    if set(document) != _FAMILY_INDEX_FIELDS:
+        missing = _FAMILY_INDEX_FIELDS - set(document)
+        unknown = set(document) - _FAMILY_INDEX_FIELDS
+        detail = []
+        if missing:
+            detail.append("missing " + ", ".join(sorted(missing)))
+        if unknown:
+            detail.append("unknown " + ", ".join(sorted(unknown)))
+        _family_fail("fields are invalid: " + "; ".join(detail))
+    if (
+        type(document["schema_version"]) is not int
+        or document["schema_version"] != FAMILY_INDEX_SCHEMA_VERSION
+    ):
+        _family_fail(f"schema_version must be integer {FAMILY_INDEX_SCHEMA_VERSION}")
+    if document["kind"] != FAMILY_INDEX_KIND:
+        _family_fail(f"kind must be {FAMILY_INDEX_KIND!r}")
+    family_id = _family_uuid(document["family_id"], "family_id")
+    if document["state"] != "COMPLETED":
+        _family_fail("state must be 'COMPLETED'")
+    created_at = document["created_at"]
+    if not isinstance(created_at, str):
+        _family_fail("created_at must be an RFC 3339 timestamp")
+    try:
+        normalized = jsonutil.require_rfc3339(created_at, "family index created_at")
+    except ValueError as error:
+        _family_fail(str(error))
+    if normalized != created_at:
+        _family_fail("created_at must be a UTC 'Z' RFC 3339 timestamp")
+    _family_digest(
+        document["family_approval_digest"], "family_approval_digest"
+    )
+
+    rounds = document["rounds"]
+    if not isinstance(rounds, list):
+        _family_fail("rounds must be a list")
+    previous_round = 0
+    seen_jobs: set[str] = set()
+    for position, entry in enumerate(rounds):
+        label = f"rounds[{position}]"
+        if not isinstance(entry, dict) or set(entry) != _FAMILY_ROUND_FIELDS:
+            _family_fail(f"{label} fields are invalid")
+        round_no = entry["round_no"]
+        if type(round_no) is not int or round_no < 1:
+            _family_fail(f"{label}.round_no must be a positive integer")
+        if round_no <= previous_round:
+            _family_fail("rounds must be strictly ascending by round_no")
+        previous_round = round_no
+        job_id = _family_uuid(entry["job_id"], f"{label}.job_id")
+        if job_id in seen_jobs:
+            _family_fail(f"{label}.job_id is duplicated")
+        seen_jobs.add(job_id)
+        _family_digest(entry["plan_digest"], f"{label}.plan_digest")
+        state = entry["state"]
+        if not isinstance(state, str) or state not in _FAMILY_ROUND_STATES:
+            _family_fail(f"{label}.state is not a terminal job state")
+        _family_digest(entry["evidence_digest"], f"{label}.evidence_digest")
+
+    campaign = document["campaign"]
+    campaign_job_id: str | None = None
+    if campaign is not None:
+        if not isinstance(campaign, dict) or set(campaign) != _FAMILY_CAMPAIGN_FIELDS:
+            _family_fail("campaign fields are invalid")
+        campaign_job_id = _family_uuid(campaign["job_id"], "campaign.job_id")
+        _family_digest(campaign["bundle_digest"], "campaign.bundle_digest")
+    if campaign is None and not rounds:
+        _family_fail("a fixed family must contain at least one round")
+    if family_id in seen_jobs or (
+        campaign_job_id is not None
+        and (campaign_job_id == family_id or campaign_job_id in seen_jobs)
+    ):
+        _family_fail(
+            "family_id, campaign.job_id and rounds[].job_id must be distinct"
+        )
+
+    budget = document["budget"]
+    if not isinstance(budget, dict) or set(budget) != set(_FAMILY_BUDGET_FIELDS):
+        _family_fail("budget fields are invalid")
+    values = {
+        field: _family_int(budget[field], f"budget.{field}")
+        for field in _FAMILY_BUDGET_FIELDS
+    }
+    max_total = values["max_total_seconds"]
+    max_fuzz = values["max_fuzz_seconds"]
+    spent = values["spent_seconds"]
+    spent_fuzz = values["spent_fuzz_seconds"]
+    remaining = values["remaining_seconds"]
+    remaining_fuzz = values["remaining_fuzz_seconds"]
+    if max_total <= 0:
+        _family_fail("budget.max_total_seconds must be positive")
+    if not 0 <= max_fuzz <= max_total:
+        _family_fail("budget.max_fuzz_seconds must be within max_total_seconds")
+    if spent < 0 or spent_fuzz < 0 or spent_fuzz > spent:
+        _family_fail("budget spent fields are invalid")
+    if not 0 <= remaining <= max_total or not 0 <= remaining_fuzz <= max_fuzz:
+        _family_fail("budget remaining fields are invalid")
+    if spent + remaining != max_total or spent_fuzz + remaining_fuzz != max_fuzz:
+        _family_fail("budget does not reconcile with the ledger")
+
+
+def build_family_index(
+    *,
+    family_id: Any,
+    created_at: str,
+    family_approval_digest: str,
+    rounds: Any,
+    campaign: Mapping[str, Any] | None,
+    budget: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Assemble and validate one D43 family index document."""
+    entries = []
+    try:
+        for entry in rounds:
+            entries.append(
+                {
+                    "round_no": entry["round_no"],
+                    "job_id": str(entry["job_id"]),
+                    "plan_digest": entry["plan_digest"],
+                    "state": entry["state"],
+                    "evidence_digest": entry["evidence_digest"],
+                }
+            )
+    except (KeyError, TypeError) as error:
+        raise BundleError(
+            "INVALID_MANIFEST", "family index round input is incomplete"
+        ) from error
+    entries.sort(key=lambda entry: entry["round_no"])
+    campaign_document: dict[str, Any] | None = None
+    if campaign is not None:
+        try:
+            campaign_document = {
+                "job_id": str(campaign["job_id"]),
+                "bundle_digest": campaign["bundle_digest"],
+            }
+        except (KeyError, TypeError) as error:
+            raise BundleError(
+                "INVALID_MANIFEST", "family index campaign input is incomplete"
+            ) from error
+    budget_document = {field: budget[field] for field in _FAMILY_BUDGET_FIELDS}
+    document = {
+        "schema_version": FAMILY_INDEX_SCHEMA_VERSION,
+        "kind": FAMILY_INDEX_KIND,
+        "family_id": str(family_id),
+        "state": "COMPLETED",
+        "created_at": created_at,
+        "family_approval_digest": family_approval_digest,
+        "rounds": entries,
+        "campaign": campaign_document,
+        "budget": budget_document,
+    }
+    validate_family_index(document)
+    return document
+
+
+def canonical_family_index_bytes(document: Any) -> bytes:
+    validate_family_index(document)
+    return jsonutil.canonical_bytes(document) + b"\n"
+
+
+def _read_family_index(path: Path | str) -> tuple[dict[str, Any], bytes]:
+    family_path = Path(path)
+    if family_path.is_symlink():
+        raise BundleError("SYMLINK", "family index must not be a symlink")
+    try:
+        data = family_path.read_bytes()
+    except FileNotFoundError as error:
+        raise BundleError(
+            "INVALID_MANIFEST", "family index is missing"
+        ) from error
+    except OSError as error:
+        raise BundleError(
+            "EVIDENCE_NOT_AVAILABLE", f"family index cannot be read: {error}"
+        ) from error
+    if len(data) > MAX_FAMILY_INDEX_BYTES:
+        raise BundleError(
+            "INVALID_MANIFEST",
+            f"family index exceeds {MAX_FAMILY_INDEX_BYTES} bytes",
+        )
+    try:
+        document = jsonutil.loads_strict(data)
+    except jsonutil.StrictJsonError as error:
+        raise BundleError(
+            "INVALID_MANIFEST", f"family index is not strict JSON: {error}"
+        ) from error
+    validate_family_index(document)
+    if canonical_family_index_bytes(document) != data:
+        raise BundleError(
+            "INVALID_MANIFEST", "family index bytes are not canonical"
+        )
+    return document, data
+
+
+def _atomic_write_family_index(
+    path: Path, data: bytes, *, file_mode: int
+) -> None:
+    parent = path.parent
+    try:
+        parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+    except OSError as error:
+        raise BundleError(
+            "EVIDENCE_WRITE_FAILED", f"cannot create family evidence root: {error}"
+        ) from error
+    if parent.is_symlink():
+        raise BundleError("SYMLINK", "family evidence root must not be a symlink")
+    temporary = parent / f".{path.name}.tmp-{uuid.uuid4().hex}"
+    try:
+        with open(temporary, "xb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary, file_mode)
+        os.replace(temporary, path)
+        try:
+            directory = os.open(parent, os.O_RDONLY)
+        except OSError:
+            directory = None
+        if directory is not None:
+            try:
+                os.fsync(directory)
+            except OSError:
+                pass
+            finally:
+                os.close(directory)
+    except OSError as error:
+        try:
+            temporary.unlink()
+        except OSError:
+            pass
+        raise BundleError(
+            "EVIDENCE_WRITE_FAILED", f"cannot write family index: {error}"
+        ) from error
+
+
+def load_family_index(path: Path | str) -> FamilyIndexInfo:
+    family_path = Path(path)
+    document, data = _read_family_index(family_path)
+    return FamilyIndexInfo(
+        path=family_path,
+        document=document,
+        data=data,
+        digest="sha256:" + hashlib.sha256(data).hexdigest(),
+    )
+
+
+def finalize_family_index(
+    path: Path | str,
+    document: Mapping[str, Any] | None = None,
+    *,
+    expected_digest: str | None = None,
+    complete: Callable[[str, str], None] | None = None,
+    replace_unprotected: bool = False,
+    file_mode: int = 0o444,
+) -> FamilyIndexInfo:
+    """Ensure ``family.json`` exists and only then compute its digest.
+
+    The existing file always wins, so a crash after the atomic write but before
+    ``complete_family`` replays the same bytes instead of rewriting them with a
+    new ``created_at``. When a rebuilt document is supplied, every field except
+    the archive timestamp must still match the existing index; a stale or
+    tampered file fails closed.
+
+    ``replace_unprotected`` is only for a family that is still ``AGGREGATING``
+    and has no database evidence pointer: a leftover ``family.json`` from an
+    aborted attempt (for example with an older approval digest) is an orphan,
+    not the authoritative index, so it may be atomically replaced. A completed
+    family always passes ``False`` and can never be overwritten.
+    ``complete`` is invoked only after validation and digest computation
+    succeed.
+    """
+    family_path = Path(path)
+    if family_path.name != FAMILY_INDEX_FILENAME:
+        raise BundleError(
+            "INVALID_MANIFEST",
+            f"family index basename must be {FAMILY_INDEX_FILENAME}",
+        )
+    candidate: bytes | None = None
+    candidate_document: dict[str, Any] | None = None
+    if document is not None:
+        validate_family_index(document)
+        candidate_document = dict(document)
+        candidate = canonical_family_index_bytes(candidate_document)
+
+    if family_path.exists() or family_path.is_symlink():
+        existing = load_family_index(family_path)
+        replaced = False
+        if candidate_document is not None and candidate is not None:
+            mismatch = [
+                field
+                for field in _FAMILY_INDEX_FIELDS - {"created_at"}
+                if existing.document[field] != candidate_document[field]
+            ]
+            if mismatch:
+                if not replace_unprotected:
+                    _family_fail(
+                        f"existing {mismatch[0]} does not match the rebuilt index"
+                    )
+                _atomic_write_family_index(
+                    family_path, candidate, file_mode=file_mode
+                )
+                replaced = True
+            elif existing.document["state"] != "COMPLETED":
+                _family_fail("existing state must be 'COMPLETED'")
+        if replaced:
+            info = FamilyIndexInfo(
+                path=family_path,
+                document=candidate_document,
+                data=candidate,
+                digest="sha256:" + hashlib.sha256(candidate).hexdigest(),
+            )
+        else:
+            info = existing
+    else:
+        if candidate is None or candidate_document is None:
+            raise BundleError("INVALID_MANIFEST", "family index is missing")
+        _atomic_write_family_index(family_path, candidate, file_mode=file_mode)
+        info = FamilyIndexInfo(
+            path=family_path,
+            document=candidate_document,
+            data=candidate,
+            digest="sha256:" + hashlib.sha256(candidate).hexdigest(),
+        )
+
+    if expected_digest is not None and info.digest != expected_digest:
+        raise BundleError(
+            "DIGEST_MISMATCH", "family index digest does not match the trusted record"
+        )
+    if complete is not None:
+        complete(str(family_path), info.digest)
+    return info
+
+
+def export_family(
+    family_index: Path | str,
+    destination: Path | str,
+    *,
+    campaign_source: Path | str | None = None,
+    rounds: Any = (),
+    expected_family_digest: str | None = None,
+    dir_mode: int = 0o755,
+    file_mode: int = 0o644,
+) -> FamilyExportInfo:
+    """Aggregate-export a family without rewriting any bundle manifest.
+
+    Layout is fixed by interface §9: ``family.json``, ``campaign/`` and
+    ``rounds/<round_no>/``. Every round and the campaign are copied through
+    :func:`export_bundle`, so each directory stays an independently verifiable
+    bundle with the archived manifest bytes.
+    """
+    family = load_family_index(family_index)
+    if expected_family_digest is not None and (
+        family.digest != expected_family_digest
+    ):
+        raise BundleError(
+            "DIGEST_MISMATCH",
+            "the archived family index digest does not match the trusted record",
+        )
+    index = family.document
+    round_sources: dict[int, Path] = {}
+    try:
+        for round_no, source in rounds:
+            if type(round_no) is not int:
+                raise BundleError(
+                    "INVALID_MANIFEST", "family export round_no must be an integer"
+                )
+            if round_no in round_sources:
+                raise BundleError(
+                    "INVALID_MANIFEST",
+                    f"family export round_no {round_no} is duplicated",
+                )
+            round_sources[round_no] = Path(source)
+    except (TypeError, ValueError) as error:
+        raise BundleError(
+            "INVALID_MANIFEST", "family export rounds must be (round_no, source) pairs"
+        ) from error
+    index_rounds = {entry["round_no"]: entry for entry in index["rounds"]}
+    if set(round_sources) != set(index_rounds):
+        raise BundleError(
+            "INVALID_MANIFEST",
+            "family export round sources do not match the family index",
+        )
+    campaign_entry = index["campaign"]
+    if (campaign_entry is None) != (campaign_source is None):
+        raise BundleError(
+            "INVALID_MANIFEST",
+            "family export campaign source does not match the family index",
+        )
+
+    target = Path(destination)
+    if target.is_symlink():
+        raise BundleError("EXPORT_TARGET_NOT_EMPTY", "export target is a symlink")
+    if target.exists():
+        if not target.is_dir():
+            raise BundleError(
+                "EXPORT_TARGET_NOT_EMPTY", "export target is not a directory"
+            )
+        if any(target.iterdir()):
+            raise BundleError("EXPORT_TARGET_NOT_EMPTY", "export target is not empty")
+    try:
+        target_resolved = target.resolve()
+        family_resolved = family.path.parent.resolve()
+        if (
+            target_resolved == family_resolved
+            or family_resolved in target_resolved.parents
+        ):
+            raise BundleError(
+                "EXPORT_TARGET_NOT_EMPTY", "export target must be outside the family index"
+            )
+    except OSError as error:
+        raise BundleError("EXPORT_TARGET_NOT_EMPTY", str(error)) from error
+
+    parent = target.parent
+    parent.mkdir(parents=True, exist_ok=True)
+    temporary = parent / f".{target.name}.export-{uuid.uuid4().hex}"
+    temporary.mkdir(mode=dir_mode)
+    temporary.chmod(dir_mode)
+    round_digests: dict[int, str] = {}
+    campaign_digest: str | None = None
+    try:
+        (temporary / FAMILY_INDEX_FILENAME).write_bytes(family.data)
+        (temporary / FAMILY_INDEX_FILENAME).chmod(file_mode)
+        for round_no in sorted(round_sources):
+            exported = export_bundle(
+                round_sources[round_no],
+                temporary / "rounds" / str(round_no),
+                expected_manifest_digest=index_rounds[round_no]["evidence_digest"],
+                dir_mode=dir_mode,
+                file_mode=file_mode,
+            )
+            round_digests[round_no] = exported.manifest_digest
+        if campaign_source is not None and campaign_entry is not None:
+            exported = export_bundle(
+                campaign_source,
+                temporary / "campaign",
+                expected_manifest_digest=campaign_entry["bundle_digest"],
+                dir_mode=dir_mode,
+                file_mode=file_mode,
+            )
+            campaign_digest = exported.manifest_digest
+        if (temporary / FAMILY_INDEX_FILENAME).read_bytes() != family.data:
+            raise BundleError("DIGEST_MISMATCH", "export rewrote the family index")
+        if target.exists():
+            target.rmdir()
+        temporary.rename(target)
+    except BaseException:
+        shutil.rmtree(temporary, ignore_errors=True)
+        raise
+    return FamilyExportInfo(
+        root=target,
+        family=family,
+        round_digests=round_digests,
+        campaign_digest=campaign_digest,
+    )

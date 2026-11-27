@@ -709,6 +709,11 @@ def run_worker(
             # with the existing worker error semantics instead of being
             # swallowed.
             expired_envelopes = state_store.expire_pending_envelopes(dsn)
+            # T12/D43 minimal crash-recovery wiring: a family whose last child
+            # archived just before the process died must not stay AGGREGATING
+            # forever. The sweep is idempotent (the existing family.json bytes
+            # win) and only touches families with terminal children.
+            converged_families = state_store.converge_families(dsn)
             claimed = state_store.claim_next(
                 dsn, worker, lease_seconds=lease_seconds, execute=execute
             )
@@ -717,6 +722,7 @@ def run_worker(
                     return {
                         "processed": 0,
                         "expired_envelopes": expired_envelopes,
+                        "families_converged": len(converged_families),
                     }
                 time.sleep(poll_seconds)
                 continue
@@ -729,6 +735,7 @@ def run_worker(
                 run_root=run_root,
             )
             result["expired_envelopes"] = expired_envelopes
+            result["families_converged"] = len(converged_families)
             if once:
                 return result
 
