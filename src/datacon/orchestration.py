@@ -911,6 +911,19 @@ class IterationGate(Protocol):
     ) -> IterationDecision: ...
 
 
+MIN_STEP_BUDGET_SECONDS = 1
+
+
+def _has_budget_capacity(remaining: float | None) -> bool:
+    """Return whether an optional remaining balance can start one more step.
+
+    ``None`` means the caller does not track that budget. Otherwise the
+    balance must be at least ``MIN_STEP_BUDGET_SECONDS`` (the ``>= 1`` rule of
+    ``state.budget_gate``); ``0 < remaining < 1`` is exhausted.
+    """
+    return remaining is None or remaining >= MIN_STEP_BUDGET_SECONDS
+
+
 class DefaultIterationGate:
     """Checks verdict conclusiveness, ``max_rounds``, budget, and seed capacity."""
 
@@ -925,7 +938,7 @@ class DefaultIterationGate:
         remaining_fuzz_seconds: float | None = None,
         remaining_seeds: int | None = None,
     ) -> IterationDecision:
-        del family_id, remaining_fuzz_seconds
+        del family_id
         remaining_rounds = max(0, max_rounds - completed_round_no)
         if last_verdict in ("REPRODUCED", "NOT_REPRODUCED"):
             return IterationDecision(
@@ -948,12 +961,17 @@ class DefaultIterationGate:
                 remaining_rounds=0,
                 remaining_budget_seconds=remaining_budget_seconds,
             )
-        if remaining_budget_seconds is not None and remaining_budget_seconds <= 0:
+        # The total budget and the fuzz sub-budget apply together with
+        # max_rounds. The boundary matches ``state.budget_gate``: a step needs
+        # at least one whole second, so a fractional remainder is exhausted.
+        if not _has_budget_capacity(remaining_budget_seconds) or not (
+            _has_budget_capacity(remaining_fuzz_seconds)
+        ):
             return IterationDecision(
                 should_continue=False,
                 reason_code="BUDGET_EXHAUSTED",
                 remaining_rounds=remaining_rounds,
-                remaining_budget_seconds=0.0,
+                remaining_budget_seconds=remaining_budget_seconds,
             )
         if remaining_seeds is not None and remaining_seeds <= 0:
             return IterationDecision(
@@ -2768,11 +2786,12 @@ class OrchestrationRunner:
             campaign_child.state == "COMPLETED"
             and campaign_child.terminal_node == "archive"
         ):
-            remaining_total = _remaining_total()
             if not seeds:
                 stop_reason_code = "NO_REMAINING_SEEDS"
-            elif max_rounds == 0 or (
-                remaining_total is not None and remaining_total <= 0.0
+            elif (
+                max_rounds == 0
+                or not _has_budget_capacity(_remaining_total())
+                or not _has_budget_capacity(_remaining_fuzz())
             ):
                 stop_reason_code = "BUDGET_EXHAUSTED"
             else:

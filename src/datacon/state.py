@@ -473,6 +473,115 @@ def get_review(dsn: str, job_id: UUID) -> dict | None:
         ).fetchone()
 
 
+def _validate_later_v2_plan_in_tx(
+    connection, job: Mapping[str, Any], plan: Mapping[str, Any]
+) -> None:
+    """Bind a non-first v2 plan to the family approval chain tail.
+
+    The caller holds the family row ``FOR UPDATE``. Shared by ``freeze_plan``
+    and the lease-free ``create_round_child`` so a derived round can never be
+    frozen under weaker rules than a worker-frozen one.
+    """
+    parent_approval_digest = plan.get("parent_approval_digest")
+    if parent_approval_digest is None:
+        # A guided round 1 is a later plan even though its round_no is
+        # 1: the guided campaign was the first plan. Rejecting the
+        # null before any write keeps a frozen-but-unreviewed plan
+        # from sitting outside the approval chain.
+        raise StateError(
+            "a non-first v2 plan requires a non-null "
+            "parent_approval_digest"
+        )
+    # A pending re-approval invalidates the old chain tail for the
+    # next round: freezing now would bind a plan to an approval
+    # that the re-approval is about to supersede, leaving an
+    # immutable plan that can never be admitted. The family row is
+    # locked, so a concurrent propose-envelope cannot commit a new
+    # pending row between this check and the plan insert.
+    pending_envelope = connection.execute(
+        "SELECT 1 FROM family_envelopes "
+        "WHERE family_id = %s AND status = 'pending' LIMIT 1",
+        (job["family_id"],),
+    ).fetchone()
+    if pending_envelope is not None:
+        raise StateError(
+            "cannot freeze a non-first plan while an envelope "
+            "re-approval is pending"
+        )
+    # The family row is already locked FOR UPDATE above, so the
+    # approval chain tail cannot move while this check runs.
+    # first_plan_digest is intentionally not re-checked here: every
+    # family_approvals row is written by record_review against the
+    # family's first plan and the column is otherwise immutable,
+    # so the tail cannot name a different plan than the chain
+    # root. The plan body is still bound to the family/round above.
+    tails = connection.execute(
+        "SELECT prior.approval_digest, prior.envelope_digest "
+        "FROM family_approvals AS prior "
+        "WHERE prior.family_id = %s AND NOT EXISTS ("
+        "SELECT 1 FROM family_approvals AS later "
+        "WHERE later.supersedes = prior.approval_id)",
+        (job["family_id"],),
+    ).fetchall()
+    if len(tails) != 1:
+        raise StateError(
+            "a non-first v2 plan requires a single "
+            "family_approvals chain tail"
+        )
+    tail = tails[0]
+    if parent_approval_digest != tail["approval_digest"]:
+        raise StateError(
+            "plan parent_approval_digest does not match the "
+            "family_approvals chain tail"
+        )
+    if plan.get("envelope_digest") != tail["envelope_digest"]:
+        raise StateError(
+            "plan envelope_digest does not match the "
+            "family_approvals chain tail"
+        )
+    # The approval digest alone does not bind the plan's harness.
+    # Read the approved envelope body so a later plan cannot name
+    # a harness the operator never approved, and fail before the
+    # immutable plan row is written.
+    tail_envelope_row = connection.execute(
+        "SELECT envelope_json FROM family_envelopes "
+        "WHERE family_id = %s AND envelope_digest = %s",
+        (job["family_id"], tail["envelope_digest"]),
+    ).fetchone()
+    if tail_envelope_row is None:
+        raise StateError(
+            "a non-first v2 plan requires the approved envelope body"
+        )
+    try:
+        tail_envelope = _validate_envelope(
+            tail_envelope_row["envelope_json"]
+        )
+    except ValueError as error:
+        raise StateError(
+            f"approved envelope is invalid: {error}"
+        ) from error
+    if plan.get("harness_digest") != tail_envelope["harness_digest"]:
+        raise StateError(
+            "plan harness_digest does not match the approved "
+            "envelope body"
+        )
+    try:
+        tail_plan_signature = contracts.normalize_asan_signature(
+            plan["asan_signature"]
+        )
+    except (KeyError, ValueError) as error:
+        raise StateError(
+            f"plan asan_signature is invalid: {error}"
+        ) from error
+    if tail_plan_signature not in tail_envelope[
+        "accepted_signature_set"
+    ]:
+        raise StateError(
+            "plan asan_signature is outside the approved envelope "
+            "accepted_signature_set"
+        )
+
+
 def freeze_plan(
     dsn: str,
     job_id: UUID,
@@ -608,104 +717,7 @@ def freeze_plan(
                     "a fixed first plan must have parent_approval_digest=null"
                 )
             if not first_v2_plan:
-                parent_approval_digest = plan.get("parent_approval_digest")
-                if parent_approval_digest is None:
-                    # A guided round 1 is a later plan even though its round_no is
-                    # 1: the guided campaign was the first plan. Rejecting the
-                    # null before any write keeps a frozen-but-unreviewed plan
-                    # from sitting outside the approval chain.
-                    raise StateError(
-                        "a non-first v2 plan requires a non-null "
-                        "parent_approval_digest"
-                    )
-                # A pending re-approval invalidates the old chain tail for the
-                # next round: freezing now would bind a plan to an approval
-                # that the re-approval is about to supersede, leaving an
-                # immutable plan that can never be admitted. The family row is
-                # locked, so a concurrent propose-envelope cannot commit a new
-                # pending row between this check and the plan insert.
-                pending_envelope = connection.execute(
-                    "SELECT 1 FROM family_envelopes "
-                    "WHERE family_id = %s AND status = 'pending' LIMIT 1",
-                    (job["family_id"],),
-                ).fetchone()
-                if pending_envelope is not None:
-                    raise StateError(
-                        "cannot freeze a non-first plan while an envelope "
-                        "re-approval is pending"
-                    )
-                # The family row is already locked FOR UPDATE above, so the
-                # approval chain tail cannot move while this check runs.
-                # first_plan_digest is intentionally not re-checked here: every
-                # family_approvals row is written by record_review against the
-                # family's first plan and the column is otherwise immutable,
-                # so the tail cannot name a different plan than the chain
-                # root. The plan body is still bound to the family/round above.
-                tails = connection.execute(
-                    "SELECT prior.approval_digest, prior.envelope_digest "
-                    "FROM family_approvals AS prior "
-                    "WHERE prior.family_id = %s AND NOT EXISTS ("
-                    "SELECT 1 FROM family_approvals AS later "
-                    "WHERE later.supersedes = prior.approval_id)",
-                    (job["family_id"],),
-                ).fetchall()
-                if len(tails) != 1:
-                    raise StateError(
-                        "a non-first v2 plan requires a single "
-                        "family_approvals chain tail"
-                    )
-                tail = tails[0]
-                if parent_approval_digest != tail["approval_digest"]:
-                    raise StateError(
-                        "plan parent_approval_digest does not match the "
-                        "family_approvals chain tail"
-                    )
-                if plan.get("envelope_digest") != tail["envelope_digest"]:
-                    raise StateError(
-                        "plan envelope_digest does not match the "
-                        "family_approvals chain tail"
-                    )
-                # The approval digest alone does not bind the plan's harness.
-                # Read the approved envelope body so a later plan cannot name
-                # a harness the operator never approved, and fail before the
-                # immutable plan row is written.
-                tail_envelope_row = connection.execute(
-                    "SELECT envelope_json FROM family_envelopes "
-                    "WHERE family_id = %s AND envelope_digest = %s",
-                    (job["family_id"], tail["envelope_digest"]),
-                ).fetchone()
-                if tail_envelope_row is None:
-                    raise StateError(
-                        "a non-first v2 plan requires the approved envelope body"
-                    )
-                try:
-                    tail_envelope = _validate_envelope(
-                        tail_envelope_row["envelope_json"]
-                    )
-                except ValueError as error:
-                    raise StateError(
-                        f"approved envelope is invalid: {error}"
-                    ) from error
-                if plan.get("harness_digest") != tail_envelope["harness_digest"]:
-                    raise StateError(
-                        "plan harness_digest does not match the approved "
-                        "envelope body"
-                    )
-                try:
-                    tail_plan_signature = contracts.normalize_asan_signature(
-                        plan["asan_signature"]
-                    )
-                except (KeyError, ValueError) as error:
-                    raise StateError(
-                        f"plan asan_signature is invalid: {error}"
-                    ) from error
-                if tail_plan_signature not in tail_envelope[
-                    "accepted_signature_set"
-                ]:
-                    raise StateError(
-                        "plan asan_signature is outside the approved envelope "
-                        "accepted_signature_set"
-                    )
+                _validate_later_v2_plan_in_tx(connection, job, plan)
         normalized_envelope: dict[str, Any] | None = None
         if first_v2_plan:
             if envelope is None:
@@ -849,6 +861,253 @@ def freeze_plan(
             "plan_frozen",
             stage="review",
             detail={"plan_digest": plan_digest, "generation": generation},
+        )
+        return True
+
+
+_ROUND_CHILD_ACTIVE_STATES = (
+    "QUEUED",
+    "PREPARING",
+    "AWAITING_REVIEW",
+    "READY",
+    "RUNNING",
+    "ARCHIVING",
+)
+
+
+def create_round_child(
+    dsn: str,
+    *,
+    family_id: UUID | str,
+    round_no: int,
+    plan: Mapping[str, Any],
+    admission_inputs: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Derive one later-round child with its frozen plan, without a lease (T12).
+
+    Edges #23/#26 are family-level transitions: the runtime creates the round
+    child here, then calls ``record_admission`` before anything executes. The
+    child is inserted as ``READY`` with ``workflow_synced=true`` so the v2
+    claim gate keeps it unclaimable until a policy admission row exists; a
+    denied round is closed with ``block_round_child`` and never starts a
+    container. The plan is bound to the approval chain tail with exactly the
+    rules ``freeze_plan`` applies to a non-first plan.
+
+    ``admission_inputs`` (the envelope body, seed digest, ExperimentSpec and
+    campaign support the caller is about to admit with) is stored in the plan
+    row's ``summary`` so a crash between this call and ``record_admission`` can
+    be recovered by retrying the same admission (``unadmitted_round_children``).
+
+    Re-deriving the same ``(family, round_no)`` with the same plan returns the
+    existing child (``created=False``); a different plan raises
+    ``PlanConflict``. The family's children stay serial: no other child may be
+    non-terminal when a new round is derived.
+    """
+    try:
+        family_id = uuid.UUID(str(family_id))
+    except (TypeError, ValueError) as error:
+        raise StateError("family_id must be a UUID") from error
+    if type(round_no) is not int or round_no < 1:
+        raise StateError("round_no must be a positive integer")
+    if not isinstance(plan, Mapping):
+        raise StateError("plan must be a JSON object")
+    if plan.get("schema_version") != 2:
+        raise StateError("a round child requires a plan with schema_version=2")
+    if (
+        plan.get("family_id") != str(family_id)
+        or plan.get("parent_job_id") != str(family_id)
+    ):
+        raise StateError("plan family_id/parent_job_id do not match the family")
+    if plan.get("round_no") != round_no:
+        raise StateError("plan round_no does not match round_no")
+    try:
+        plan_digest = contracts.plan_digest(plan)
+    except (TypeError, ValueError) as error:
+        raise StateError(f"plan is invalid: {error}") from error
+    with _connect(dsn) as connection:
+        family = connection.execute(
+            "SELECT job_id, job_kind, job_contract_version, state, request "
+            "FROM jobs WHERE job_id = %s FOR UPDATE",
+            (family_id,),
+        ).fetchone()
+        if family is None:
+            raise StateError("the family does not exist")
+        if family["job_contract_version"] != 2 or family["job_kind"] != "family":
+            raise StateError("family_id is not a v2 family")
+        existing = connection.execute(
+            "SELECT j.job_id, j.state, p.plan_digest FROM jobs j "
+            "LEFT JOIN plans p ON p.job_id = j.job_id "
+            "WHERE j.parent_job_id = %s AND j.job_kind = 'round' "
+            "AND j.round_no = %s",
+            (family_id, round_no),
+        ).fetchone()
+        if existing is not None:
+            if existing["plan_digest"] != plan_digest:
+                raise PlanConflict(
+                    "a different plan is already frozen for this round"
+                )
+            return {
+                "job_id": str(existing["job_id"]),
+                "plan_digest": plan_digest,
+                "state": existing["state"],
+                "created": False,
+            }
+        if family["state"] != "AGGREGATING":
+            raise StateError(
+                f"cannot derive a round while the family is {family['state']}"
+            )
+        active = connection.execute(
+            "SELECT job_id FROM jobs WHERE parent_job_id = %s "
+            "AND job_kind IN ('campaign', 'round') "
+            "AND (state = ANY(%s) OR (state = 'BLOCKED' "
+            "AND workflow_synced = false)) LIMIT 1",
+            (family_id, list(_ROUND_CHILD_ACTIVE_STATES)),
+        ).fetchone()
+        if active is not None:
+            raise StateError(
+                "the family already has a non-terminal child; children run "
+                "serially"
+            )
+        _validate_later_v2_plan_in_tx(
+            connection, {"family_id": family_id}, plan
+        )
+        job_id = uuid.uuid4()
+        connection.execute(
+            "INSERT INTO jobs (job_id, request, state, stage, "
+            "job_contract_version, family_id, job_kind, parent_job_id, "
+            "round_no, workflow_synced) "
+            "VALUES (%s, %s, 'READY', 'admission', 2, %s, 'round', %s, %s, "
+            "true)",
+            (job_id, Jsonb(family["request"]), family_id, family_id, round_no),
+        )
+        connection.execute(
+            "INSERT INTO plans (plan_id, job_id, plan_digest, plan, summary) "
+            "VALUES (%s, %s, %s, %s, %s)",
+            (
+                uuid.uuid4(),
+                job_id,
+                plan_digest,
+                Jsonb(dict(plan)),
+                Jsonb(
+                    {}
+                    if admission_inputs is None
+                    else {"admission_inputs": dict(admission_inputs)}
+                ),
+            ),
+        )
+        _audit(
+            connection,
+            job_id,
+            "plan_frozen",
+            stage="admission",
+            detail={"plan_digest": plan_digest, "derived": True},
+        )
+        return {
+            "job_id": str(job_id),
+            "plan_digest": plan_digest,
+            "state": "READY",
+            "created": True,
+        }
+
+
+def check_round_derivation(
+    dsn: str, *, family_id: UUID | str, round_no: int
+) -> BudgetDecision:
+    """Gate a family-level transition before any round child is created (改9).
+
+    Order: the family's children run serially (a non-terminal child refuses
+    with ``sub_reason=CHILD_NOT_TERMINAL`` and no reason code: the family
+    simply is not ready); ``round_no`` beyond the effective ``max_rounds`` and
+    a total balance below one second refuse with ``BUDGET_EXHAUSTED``; a
+    guided family (``max_fuzz_seconds > 0``) also needs one second of fuzz
+    sub-budget. A refused transition creates nothing, and the family archives
+    through ``converge_families``.
+    """
+    try:
+        family_id = uuid.UUID(str(family_id))
+    except (TypeError, ValueError) as error:
+        raise StateError("family_id must be a UUID") from error
+    if type(round_no) is not int or round_no < 1:
+        raise StateError("round_no must be a positive integer")
+    with _connect(dsn) as connection:
+        family = connection.execute(
+            "SELECT job_kind, job_contract_version, request FROM jobs "
+            "WHERE job_id = %s",
+            (family_id,),
+        ).fetchone()
+        if (
+            family is None
+            or family["job_contract_version"] != 2
+            or family["job_kind"] != "family"
+        ):
+            raise StateError("family_id is not a v2 family")
+        active = connection.execute(
+            "SELECT 1 FROM jobs WHERE parent_job_id = %s "
+            "AND job_kind IN ('campaign', 'round') "
+            "AND (state = ANY(%s) OR (state = 'BLOCKED' "
+            "AND workflow_synced = false)) LIMIT 1",
+            (family_id, list(_ROUND_CHILD_ACTIVE_STATES)),
+        ).fetchone()
+        if active is not None:
+            return BudgetDecision(
+                False, None, 0, sub_reason="CHILD_NOT_TERMINAL"
+            )
+        max_rounds = _effective_family_max_rounds(
+            connection, family_id, family["request"]
+        )
+        ledger = connection.execute(
+            "SELECT " + _BUDGET_LEDGER_COLUMNS +
+            " FROM budget_ledger WHERE family_id = %s",
+            (family_id,),
+        ).fetchone()
+    if ledger is None:
+        raise StateError("budget ledger does not exist")
+    if round_no > max_rounds:
+        return BudgetDecision(
+            False, BUDGET_EXHAUSTED, 0, sub_reason="ROUND_BEYOND_MAX_ROUNDS"
+        )
+    gate = budget_gate(ledger, fuzz=ledger["max_fuzz_seconds"] > 0)
+    if not gate.allowed:
+        return BudgetDecision(
+            False, BUDGET_EXHAUSTED, 0, sub_reason=BUDGET_EXHAUSTED
+        )
+    return BudgetDecision(True, None, gate.hard_timeout_seconds, round_no)
+
+
+def block_round_child(
+    dsn: str, job_id: UUID | str, *, reason_code: str, message: str
+) -> bool:
+    """Close a derived, never-claimed round whose admission was denied.
+
+    Only a ``READY`` round still in the ``admission`` stage (never claimed,
+    generation 0, no lease) may be blocked here; anything else returns False.
+    The row is left ``workflow_synced=true`` so no worker claims it, and the
+    caller archives the blocked bundle with ``execution.record_blocked``.
+    """
+    try:
+        job_id = uuid.UUID(str(job_id))
+    except (TypeError, ValueError) as error:
+        raise StateError("job_id must be a UUID") from error
+    with _connect(dsn) as connection:
+        updated = connection.execute(
+            "UPDATE jobs SET state = 'BLOCKED', stage = 'blocked', "
+            "reason_code = %s, last_error = %s, "
+            "state_version = state_version + 1, updated_at = clock_timestamp() "
+            "WHERE job_id = %s AND job_contract_version = 2 "
+            "AND job_kind = 'round' AND state = 'READY' AND stage = 'admission' "
+            "AND generation = 0 AND lease_owner IS NULL "
+            "RETURNING job_id",
+            (reason_code, _truncate(message), job_id),
+        ).fetchone()
+        if updated is None:
+            return False
+        _audit(
+            connection,
+            job_id,
+            "blocked",
+            stage="blocked",
+            reason_code=reason_code,
+            detail={"message": _truncate(message), "generation": 0},
         )
         return True
 
@@ -5883,6 +6142,16 @@ def _family_archive_disposition(
         ledger is not None
         and ledger["remaining_total_seconds"] <= 0
     ):
+        return ("archive",)
+    if (
+        ledger is not None
+        and ledger["max_fuzz_seconds"] > 0
+        and ledger["remaining_fuzz_seconds"] < 1
+    ):
+        # 改9: the runtime derives no further round once either budget is
+        # below one second, so a guided family whose fuzz sub-budget is gone
+        # has concluded. A fixed family (max_fuzz_seconds=0) never fuzzes and
+        # is not affected.
         return ("archive",)
     campaigns = [
         child for child in children if child["job_kind"] == "campaign"

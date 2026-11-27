@@ -683,6 +683,194 @@ def build_graph(
     return builder.compile(checkpointer=checkpointer)
 
 
+# §10 dispositions for a denied derived round. A denial blocks only that round
+# and keeps its reason code. The normal path never reaches admission with an
+# exhausted budget: ``derive_and_admit_round`` gates budget and max_rounds
+# before creating the child (改9). Only in an extreme race (the ledger moved
+# between that gate and the admission predicate) can the predicate still deny
+# with BUDGET_EXHAUSTED; that is not a BLOCKED reason, so the already-created
+# round is closed as ADMISSION_DENIED with the precise sub_reason on the
+# round_admission_denied audit. A failed or crashed admission also fails
+# closed as ADMISSION_DENIED: no admission was granted.
+_DENIED_ROUND_BLOCK_REASONS = frozenset(
+    {"ADMISSION_DENIED", "ENVELOPE_VIOLATION", "HARNESS_REJECTED"}
+)
+
+
+def _block_derived_round(
+    dsn: str,
+    job_id: UUID,
+    *,
+    reason_code: str,
+    message: str,
+    run_root: str | None,
+) -> None:
+    if state_store.block_round_child(
+        dsn, job_id, reason_code=reason_code, message=message
+    ):
+        execution.record_blocked(
+            dsn,
+            job_id,
+            reason_code=reason_code,
+            message=message,
+            generation=0,
+            run_root=run_root,
+        )
+
+
+def _admit_derived_round(
+    dsn: str,
+    *,
+    job_id: UUID,
+    family_id: UUID | str,
+    round_no: int,
+    admission_inputs: Any,
+    run_root: str | None,
+) -> dict[str, Any]:
+    """Run ``record_admission`` for a derived READY round; fail closed otherwise."""
+    try:
+        if not isinstance(admission_inputs, dict):
+            raise state_store.StateError(
+                "the derived round has no persisted admission inputs"
+            )
+        budget_snapshot = state_store.family_budget_summary(dsn, family_id)
+        outcome = state_store.record_admission(
+            dsn,
+            family_id=family_id,
+            job_id=job_id,
+            round_no=round_no,
+            envelope=admission_inputs["envelope"],
+            seed_digest=admission_inputs["seed_digest"],
+            budget_snapshot=budget_snapshot,
+            experiment=admission_inputs.get("experiment"),
+            recomputable=admission_inputs.get("recomputable", True),
+            campaign_bundle_digest=admission_inputs.get("campaign_bundle_digest"),
+        )
+    except (state_store.StateError, psycopg.Error, KeyError, TypeError) as error:
+        message = f"round {round_no} admission failed: {error}"
+        _block_derived_round(
+            dsn,
+            job_id,
+            reason_code="ADMISSION_DENIED",
+            message=message,
+            run_root=run_root,
+        )
+        current = state_store.load_job(dsn, job_id)
+        return {
+            "job_id": str(job_id),
+            "derived": True,
+            "state": current["state"] if current else None,
+            "admitted": False,
+            "reason_code": "ADMISSION_DENIED",
+            "sub_reason": None,
+            "error": str(error),
+        }
+    if outcome.admitted or outcome.status == "already_admitted":
+        return {
+            "job_id": str(job_id),
+            "derived": True,
+            "state": "READY",
+            "admitted": True,
+            "reason_code": None,
+            "sub_reason": None,
+            "admission": outcome.admission,
+        }
+    reason_code = (
+        outcome.reason_code
+        if outcome.reason_code in _DENIED_ROUND_BLOCK_REASONS
+        else "ADMISSION_DENIED"
+    )
+    message = (
+        f"round {round_no} admission denied: {outcome.reason_code}"
+        + (f" ({outcome.sub_reason})" if outcome.sub_reason else "")
+    )
+    _block_derived_round(
+        dsn, job_id, reason_code=reason_code, message=message, run_root=run_root
+    )
+    current = state_store.load_job(dsn, job_id)
+    return {
+        "job_id": str(job_id),
+        "derived": True,
+        "state": current["state"] if current else None,
+        "admitted": False,
+        "reason_code": reason_code,
+        "sub_reason": outcome.sub_reason,
+    }
+
+
+def derive_and_admit_round(
+    dsn: str,
+    *,
+    family_id: UUID | str,
+    round_no: int,
+    plan: dict[str, Any],
+    envelope: dict[str, Any],
+    seed_digest: str,
+    experiment: dict[str, Any] | None = None,
+    recomputable: bool = True,
+    campaign_bundle_digest: str | None = None,
+    run_root: str | None = None,
+) -> dict[str, Any]:
+    """Family-level transition #23/#26: gate, derive the next round, admit it.
+
+    Order (改9): ``state.check_round_derivation`` first (serial children,
+    ``max_rounds``, total and — for guided — fuzz budget); a refused
+    transition creates nothing and the family archives through
+    ``converge_families``. Only then is the ``job_kind=round`` child created
+    with its frozen plan and persisted admission inputs, and
+    ``state.record_admission`` runs before anything executes. An admitted
+    round stays ``READY`` and becomes claimable through the v2 claim gate; a
+    denied or failed admission blocks and archives the round, so it never
+    starts a container. The human-approved first plan never comes through
+    here.
+    """
+    gate = state_store.check_round_derivation(
+        dsn, family_id=family_id, round_no=round_no
+    )
+    if not gate.allowed:
+        return {
+            "job_id": None,
+            "derived": False,
+            "state": None,
+            "admitted": False,
+            "reason_code": gate.reason_code,
+            "sub_reason": gate.sub_reason,
+        }
+    admission_inputs = {
+        "envelope": envelope,
+        "seed_digest": seed_digest,
+        "experiment": experiment,
+        "recomputable": recomputable,
+        "campaign_bundle_digest": campaign_bundle_digest,
+    }
+    child = state_store.create_round_child(
+        dsn,
+        family_id=family_id,
+        round_no=round_no,
+        plan=plan,
+        admission_inputs=admission_inputs,
+    )
+    job_id = UUID(child["job_id"])
+    if child["state"] != "READY":
+        # Re-entry after the round already left the admission phase.
+        return {
+            "job_id": child["job_id"],
+            "derived": True,
+            "state": child["state"],
+            "admitted": None,
+            "reason_code": None,
+            "sub_reason": None,
+        }
+    return _admit_derived_round(
+        dsn,
+        job_id=job_id,
+        family_id=family_id,
+        round_no=round_no,
+        admission_inputs=admission_inputs,
+        run_root=run_root,
+    )
+
+
 def _worker_id() -> str:
     return os.getenv("DATACON_WORKER_ID") or f"{socket.gethostname()}:{os.getpid()}"
 

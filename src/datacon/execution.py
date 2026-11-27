@@ -19,6 +19,7 @@ import re
 import shutil
 import stat
 import sys
+import time
 import unicodedata
 import uuid
 from typing import Any, Callable, Mapping, Sequence
@@ -137,6 +138,10 @@ class ExecutionContext:
     envelope: dict[str, Any] | None = None
     budget_summary: dict[str, int] = field(default_factory=dict)
     admission: dict[str, Any] | None = None
+    # T12 runtime budget (interface-contract-delta §7): the hard-timeout
+    # ceiling granted by ``state.budget_gate`` for the container step that is
+    # currently running, or None outside a budgeted step.
+    step_ceiling_seconds: float | None = None
 
     @property
     def job_id_text(self) -> str:
@@ -2798,6 +2803,101 @@ def _journal_hmac(payload: Mapping[str, Any], secret: bytes) -> str:
     return hmac.new(secret, encoded, hashlib.sha256).hexdigest()
 
 
+# Injectable step clock. The budget charge measures the wall time of the
+# container step (including timeouts and failures) with this monotonic clock;
+# tests replace it with a fake clock instead of sleeping.
+STEP_CLOCK: Callable[[], float] = time.monotonic
+
+
+def _budget_family_id(context: ExecutionContext) -> str | None:
+    """Return the family whose ledger pays for this job's container steps.
+
+    Only v2 campaign/round children spend the family budget (§7); v1 jobs and
+    any other shape keep the v0.1 deadline-only behaviour.
+    """
+    job = context.job
+    if job.get("job_contract_version") != 2:
+        return None
+    if job.get("job_kind") not in ("campaign", "round"):
+        return None
+    family_id = job.get("family_id")
+    return None if family_id is None else str(family_id)
+
+
+def _gate_step_budget(
+    dsn: str, context: ExecutionContext, *, step_key: str, charge_kind: str
+) -> float | None:
+    """Check the family ledger before a container starts (§7 step 1).
+
+    Returns the hard-timeout ceiling: the total balance for a ``general``
+    step, ``min(remaining_total_seconds, remaining_fuzz_seconds)`` for a
+    ``fuzz`` step. Less than one second raises ``BUDGET_EXHAUSTED`` before any
+    container exists. Returns None for jobs without a family ledger.
+    """
+    family_id = _budget_family_id(context)
+    if family_id is None:
+        return None
+    try:
+        ledger = state.load_budget_ledger(dsn, family_id)
+    except state.StateError as error:
+        raise ExecutionBlocked(
+            "MATERIAL_MISSING",
+            f"the family budget ledger is unavailable: {error}",
+        ) from error
+    if ledger is None:
+        raise ExecutionBlocked(
+            "MATERIAL_MISSING", "the family budget ledger is unavailable"
+        )
+    decision = state.budget_gate(ledger, fuzz=charge_kind == "fuzz")
+    if not decision.allowed:
+        raise ExecutionFailed(
+            state.BUDGET_EXHAUSTED,
+            f"the family {charge_kind} budget is exhausted before {step_key}",
+        )
+    return float(decision.hard_timeout_seconds)
+
+
+def _charge_step_budget(
+    dsn: str,
+    context: ExecutionContext,
+    *,
+    step_key: str,
+    attempt_no: int,
+    charge_kind: str,
+    elapsed_seconds: float,
+) -> state.BudgetChargeOutcome:
+    """Charge one finished container step in its own short transaction (§7 step 2).
+
+    Fuzz steps charge the same span against the fuzz sub-budget as well, so
+    both balances move together. The idempotency key is
+    ``(job_id, step_key, attempt_no)``.
+    """
+    family_id = _budget_family_id(context)
+    assert family_id is not None
+    elapsed = max(0.0, float(elapsed_seconds))
+    return state.charge_step_budget(
+        dsn,
+        family_id=family_id,
+        job_id=context.job_id,
+        step_key=step_key,
+        attempt_no=attempt_no,
+        charge_kind=charge_kind,
+        elapsed_seconds=elapsed,
+        elapsed_fuzz_seconds=elapsed if charge_kind == "fuzz" else 0,
+        generation=context.generation,
+    )
+
+
+def _cap_to_step_budget(context: ExecutionContext, seconds: float) -> float:
+    """Bound a container hard timeout by the ceiling the budget gate granted."""
+    # Contexts built outside run_execution (unit doubles) may predate the
+    # field; they have no budgeted step and keep the plain timeout.
+    ceiling = getattr(context, "step_ceiling_seconds", None)
+    if ceiling is None:
+        return seconds
+    return max(1.0, min(float(seconds), ceiling))
+
+
 def _run_step(
     dsn: str,
     context: ExecutionContext,
@@ -2806,6 +2906,7 @@ def _run_step(
     input_digest: str | None,
     action: Callable[[int, str], Any],
     reusable: Callable[[Mapping[str, Any]], bool] | None = None,
+    charge_kind: str = "general",
 ) -> tuple[Any, bool]:
     """Execute one logical step with generation fencing and crash recovery.
 
@@ -2890,6 +2991,11 @@ def _run_step(
     # Attempt numbers are unique per generation; max(all)+1 keeps the journal
     # tree ordered without colliding with an adopted result.
     attempt_no = next_attempt_no
+    # T12 §7: the budget gate runs before the attempt row and before any
+    # container, so an exhausted family never starts the step.
+    ceiling = _gate_step_budget(
+        dsn, context, step_key=step_key, charge_kind=charge_kind
+    )
     token = uuid.uuid4().hex
     stored = state.record_attempt(
         dsn,
@@ -2904,7 +3010,19 @@ def _run_step(
     )
     if not stored:
         raise state.StaleGeneration("the worker lease was lost before the step")
-    result = action(attempt_no, token)
+    if ceiling is None:
+        result = action(attempt_no, token)
+    else:
+        result = _run_budgeted_action(
+            dsn,
+            context,
+            step_key=step_key,
+            attempt_no=attempt_no,
+            token=token,
+            charge_kind=charge_kind,
+            ceiling=ceiling,
+            action=action,
+        )
     if os.getenv(FAULT_ENV):
         prefixes = [item.strip() for item in os.getenv(FAULT_ENV, "").split(",") if item.strip()]
         if any(step_key.startswith(prefix) for prefix in prefixes):
@@ -2925,6 +3043,64 @@ def _run_step(
     if not recorded:
         raise state.StaleGeneration("the worker lease was lost before the result")
     return result, False
+
+
+def _run_budgeted_action(
+    dsn: str,
+    context: ExecutionContext,
+    *,
+    step_key: str,
+    attempt_no: int,
+    token: str,
+    charge_kind: str,
+    ceiling: float,
+    action: Callable[[int, str], Any],
+) -> Any:
+    """Run one container step under its budget ceiling and always charge it.
+
+    The ceiling is visible to the step through ``context.step_ceiling_seconds``
+    and caps its container hard timeout. After the container exits, whether
+    the step completed, timed out, hit a limit or raised, the elapsed time is
+    charged in an independent short transaction. A charge failure never masks
+    the step's own exception.
+    """
+    context.step_ceiling_seconds = ceiling
+    started = STEP_CLOCK()
+    failure: BaseException | None = None
+    try:
+        return action(attempt_no, token)
+    except BaseException as error:
+        failure = error
+        raise
+    finally:
+        context.step_ceiling_seconds = None
+        elapsed = STEP_CLOCK() - started
+        try:
+            _charge_step_budget(
+                dsn,
+                context,
+                step_key=step_key,
+                attempt_no=attempt_no,
+                charge_kind=charge_kind,
+                elapsed_seconds=elapsed,
+            )
+            # The archived budget snapshot and report.budget must describe
+            # the ledger after this charge, rebuilt from the family charges.
+            family_id = _budget_family_id(context)
+            assert family_id is not None
+            context.budget_summary = state.family_budget_summary(
+                dsn, family_id
+            )
+        except state.StaleGeneration:
+            if failure is None:
+                raise
+        except state.StateError as charge_error:
+            if failure is None:
+                raise ExecutionFailed(
+                    "RUN_INCOMPLETE",
+                    f"the {step_key} budget charge could not be recorded: "
+                    f"{charge_error}",
+                ) from charge_error
 
 
 def _journal_path(
@@ -5677,7 +5853,11 @@ def _reusable_replay(run_root: Path, payload: Mapping[str, Any]) -> bool:
 
 def _do_probe(context: ExecutionContext, sandbox: Any) -> dict[str, Any]:
     try:
-        report: ProbeReport = sandbox.probe(deadline_seconds=min(PROBE_TIMEOUT, _remaining(context)))
+        report: ProbeReport = sandbox.probe(
+            deadline_seconds=_cap_to_step_budget(
+                context, min(PROBE_TIMEOUT, _remaining(context))
+            )
+        )
     except SandboxPolicyError:
         raise
     except SandboxUnavailable:
@@ -5730,7 +5910,10 @@ def _do_build(
     attempt_no: int,
     token: str,
 ) -> dict[str, Any]:
-    deadline = max(1.0, min(BUILD_TIMEOUT, _remaining(context) - context.reserve_seconds))
+    deadline = _cap_to_step_budget(
+        context,
+        max(1.0, min(BUILD_TIMEOUT, _remaining(context) - context.reserve_seconds)),
+    )
     # Hash the exact tree that will be mounted immediately before the
     # container is created. A replaced recipe/source aborts the step.
     _verify_materialized_tree(materials_dir, material_digests)
@@ -5801,6 +5984,7 @@ def _do_replay(
     attempt_no: int,
     token: str,
 ) -> dict[str, Any]:
+    timeout_seconds = _cap_to_step_budget(context, timeout_seconds)
     files = build.get("files") if isinstance(build.get("files"), Mapping) else {}
     relative = files.get("artifact") if isinstance(files, Mapping) else None
     artifact_path = _run_root_path(
@@ -6117,6 +6301,11 @@ def _finish_failed(
         "RUN_INCOMPLETE",
         "NOT_COMPARABLE",
         "TIMEOUT",
+    ) or (
+        # §10: an exhausted budget is INCONCLUSIVE once replays exist and
+        # FAILED before any replay; no new reason code is introduced.
+        error.reason_code == state.BUDGET_EXHAUSTED
+        and bool(runs)
     )
     terminal = "INCONCLUSIVE" if incomplete else "FAILED"
     report, markdown = _build_report(

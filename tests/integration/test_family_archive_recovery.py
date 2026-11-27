@@ -1543,3 +1543,58 @@ def test_archive_family_retries_after_envelope_is_approved(
     document = json.loads(path.read_bytes())
     assert document["family_approval_digest"] == new_approval_digest
     assert _family_row(isolated_database, family_id)[5] == _digest(path)
+
+
+def test_guided_family_converges_when_fuzz_sub_budget_is_exhausted(
+    isolated_database, tmp_path, monkeypatch
+):
+    """改9: a guided family whose fuzz sub-budget fell below one second archives.
+
+    The runtime refuses to derive another round when either budget is below
+    one second (DefaultIterationGate / derive_and_admit_round), so a family
+    that still has total budget but no fuzz budget must not wait forever. A
+    fixed family (``max_fuzz_seconds=0``) is unaffected.
+    """
+    evidence_root = tmp_path / "evidence"
+    monkeypatch.setenv("DATACON_EVIDENCE_ROOT", str(evidence_root))
+    family_id, campaign_id, round_ids = _archived_family(
+        isolated_database, tmp_path,
+        max_rounds=8,
+        rounds=[(1, "INCONCLUSIVE", "INCONCLUSIVE", "EVIDENCE_INCOMPLETE")],
+    )
+    isolated_database.connection.execute(
+        "UPDATE budget_ledger SET remaining_total_seconds = 600, "
+        "remaining_fuzz_seconds = 0 WHERE family_id = %s",
+        (family_id,),
+    )
+    _insert_charge(
+        isolated_database,
+        family_id,
+        campaign_id,
+        step_key="fuzz:campaign",
+        kind="fuzz",
+        seconds=300,
+        fuzz=300,
+    )
+
+    # A fixed family before its first round finishes: max_fuzz_seconds=0 and
+    # remaining_fuzz_seconds=0 must not be read as an exhausted fuzz budget.
+    fixed_family = _insert_family(isolated_database, request=_fixed_request())
+    _insert_approval(isolated_database, fixed_family, "sha256:" + "5f" * 32)
+    _insert_ledger(
+        isolated_database,
+        fixed_family,
+        max_total=900,
+        max_fuzz=0,
+        remaining_total=900,
+        remaining_fuzz=0,
+    )
+
+    result = workflow.run_worker(isolated_database.dsn, once=True, execute=False)
+
+    assert _family_row(isolated_database, family_id)[0] == "COMPLETED", (
+        "guided family with an exhausted fuzz sub-budget stayed AGGREGATING"
+    )
+    assert result["families_converged"] == 1
+    assert (evidence_root / str(family_id) / "family.json").is_file()
+    assert _family_row(isolated_database, fixed_family)[0] == "AGGREGATING"
