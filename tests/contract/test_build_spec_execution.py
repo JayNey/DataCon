@@ -597,6 +597,19 @@ class _InMemoryState:
         return True
 
     def finish_execution(self, dsn: str, job_id: UUID, **kwargs: Any) -> bool:
+        evidence_status = kwargs.get("evidence_status")
+        if evidence_status != "archived":
+            if evidence_status not in (None, "failed"):
+                raise execution.state.StateError(
+                    "evidence_status must be archived or failed"
+                )
+            if (
+                kwargs.get("verdict") is not None
+                or kwargs.get("verdict_reason") is not None
+            ):
+                raise execution.state.StateError(
+                    "a verdict requires archived evidence"
+                )
         self.finished_calls.append(dict(kwargs))
         self.job["state"] = kwargs.get("state", self.job["state"])
         return True
@@ -2417,14 +2430,10 @@ def test_v2_archive_only_recovery_never_downgrades_provenance_failure(
     )
     assert result.reason_code == build_provenance.BUILD_PROVENANCE_MISSING
     assert result.verdict is None
-    # B-6: publish only if the full offline verifier accepts the archive.
-    if result.evidence_path is not None:
-        evidence.verify_bundle(result.evidence_path)
-    else:
-        finished = mem_state.finished_calls[-1]
-        assert finished["state"] == "FAILED"
-        assert finished["reason_code"] == build_provenance.BUILD_PROVENANCE_MISSING
-        assert "BLOCKED_ON_T13A" in finished["evidence_error"]
+    assert result.evidence_path is not None
+    verified = evidence.verify_bundle(result.evidence_path)
+    assert verified.manifest["verdict"] == "FAILED"
+    assert verified.manifest["reason_code"] == build_provenance.BUILD_PROVENANCE_MISSING
 
 
 # ---------------------------------------------------------------------------
@@ -5114,6 +5123,112 @@ def test_nb4_merge_cc_shim_log_rejects_symlink_fragment(tmp_path: Path):
     with pytest.raises(SandboxPolicyError, match="symlink"):
         merge_cc_shim_log(log_path)
     assert not log_path.exists()
+
+
+def test_d3_complete_inconclusive_verify_failure_lands_failed_never_stale(
+    tmp_path: Path, monkeypatch
+):
+    """D3: when archive verify_bundle fails on a complete INCONCLUSIVE, land FAILED without StateError/STALE."""
+    run_root, _ = _configure_isolated_roots(tmp_path, monkeypatch)
+    spec = _cmake_spec()
+    face = _cmake_compile_commands_bytes(
+        flags=["-fsanitize=address", "-g", "-O1", "-I../include", "-D_GNU_SOURCE"]
+    )
+    job, plan, plan_digest, review = _setup_fixture_plan_and_job(
+        version=2, build_spec=spec
+    )
+    mem_state = _InMemoryState(job, plan, plan_digest, review)
+    mem_state.install(monkeypatch)
+    fake_sandbox = _FakeSandbox(
+        image_digest=plan["image_digest"],
+        build_recipe_digest=plan["build_recipe_digest"],
+        faces={"vulnerable": face, "fixed": face},
+        face_name="compile_commands.json",
+    )
+
+    def _fail_verify(_target):
+        raise evidence.BundleError("INVALID_MANIFEST", "simulated verification failure")
+
+    monkeypatch.setattr(execution, "verify_bundle", _fail_verify)
+    result = execution.run_execution(
+        "dsn",
+        job["job_id"],
+        1,
+        case_root=str(FIXTURE_CASES),
+        run_root=run_root,
+        sandbox=fake_sandbox,
+    )
+    assert result.state == "FAILED", result
+    assert result.reason_code == "EVIDENCE_WRITE_FAILED"
+    assert result.verdict is None
+    finished = mem_state.finished_calls[-1]
+    assert finished["state"] == "FAILED"
+    assert finished["reason_code"] == "EVIDENCE_WRITE_FAILED"
+    assert finished["verdict"] is None
+    assert finished["verdict_reason"] is None
+    assert finished["evidence_status"] == "failed"
+    assert "simulated verification failure" in str(finished.get("evidence_error", ""))
+
+
+def test_d3_nb2_partial_failed_and_pre_rule_inconclusive_archive_cleanly(
+    tmp_path: Path, monkeypatch
+):
+    """D3/NB2: legitimate partial FAILED and pre-rule INCONCLUSIVE bundles archive via verify_bundle."""
+    for kind, build_err, expected_state, expected_reason, expected_verdict in (
+        (
+            "failed-provenance",
+            SandboxError(
+                "missing provenance face",
+                reason_code=build_provenance.BUILD_PROVENANCE_MISSING,
+            ),
+            "FAILED",
+            build_provenance.BUILD_PROVENANCE_MISSING,
+            None,
+        ),
+        (
+            "pre-rule-timeout",
+            SandboxError("build container timed out", reason_code="TIMEOUT"),
+            "INCONCLUSIVE",
+            "TIMEOUT",
+            "INCONCLUSIVE",
+        ),
+    ):
+        case_tmp = tmp_path / kind
+        case_tmp.mkdir()
+        run_root, _ = _configure_isolated_roots(case_tmp, monkeypatch)
+        spec = _cmake_spec()
+        face = _cmake_compile_commands_bytes(
+            flags=["-fsanitize=address", "-g", "-O1", "-I../include", "-D_GNU_SOURCE"]
+        )
+        job, plan, plan_digest, review = _setup_fixture_plan_and_job(
+            version=2, build_spec=spec
+        )
+        mem_state = _InMemoryState(job, plan, plan_digest, review)
+        mem_state.install(monkeypatch)
+        fake_sandbox = _FakeSandbox(
+            image_digest=plan["image_digest"],
+            build_recipe_digest=plan["build_recipe_digest"],
+            faces={"vulnerable": face, "fixed": None},
+            face_name="compile_commands.json",
+            build_error_by_version={"fixed": build_err},
+        )
+        result = execution.run_execution(
+            "dsn",
+            job["job_id"],
+            1,
+            case_root=str(FIXTURE_CASES),
+            run_root=run_root,
+            sandbox=fake_sandbox,
+        )
+        assert result.state == expected_state, (kind, result)
+        assert result.reason_code == expected_reason
+        assert result.verdict == expected_verdict
+        assert result.evidence_path is not None
+        verified = evidence.verify_bundle(result.evidence_path)
+        assert verified.manifest["verdict"] == expected_state
+        assert verified.manifest["reason_code"] == expected_reason
+        finished = mem_state.finished_calls[-1]
+        assert finished["evidence_status"] == "archived"
 
 
 def test_policy_round_blocked_mid_execution_archives_blocked_bundle(
