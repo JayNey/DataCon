@@ -6,6 +6,7 @@ from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 import hashlib
 import math
+import os
 from pathlib import Path, PurePosixPath
 import re
 import threading
@@ -19,6 +20,7 @@ from psycopg.types.json import Jsonb
 
 from datacon import cases as case_registry
 from datacon import contracts
+from datacon import evidence
 from datacon import jsonutil
 
 REVIEW_WINDOW_HOURS = 24
@@ -5631,6 +5633,493 @@ def expire_pending_envelopes(dsn: str) -> int:
     return expired
 
 
+_TERMINAL_FAMILY_CHILD_STATES = frozenset(
+    {
+        "COMPLETED",
+        "REPRODUCED",
+        "NOT_REPRODUCED",
+        "INCONCLUSIVE",
+        "BLOCKED",
+        "FAILED",
+    }
+)
+
+
+def _family_children(connection, family_id: UUID) -> list[dict[str, Any]]:
+    return connection.execute(
+        "SELECT j.job_id, j.job_kind, j.round_no, j.state, j.verdict, "
+        "j.reason_code, j.evidence_status, j.evidence_path, j.evidence_digest, "
+        "j.workflow_synced, p.plan_digest "
+        "FROM jobs j LEFT JOIN plans p ON p.job_id = j.job_id "
+        "WHERE j.parent_job_id = %s "
+        "ORDER BY j.round_no NULLS FIRST, j.submitted_at, j.job_id",
+        (family_id,),
+    ).fetchall()
+
+
+def _family_review_plan(connection, family_id: UUID) -> str | None:
+    review = connection.execute(
+        "SELECT plan_digest FROM reviews WHERE job_id = %s", (family_id,)
+    ).fetchone()
+    return review["plan_digest"] if review is not None else None
+
+
+def _family_admitted_job_ids(connection, family_id: UUID) -> set[str]:
+    rows = connection.execute(
+        "SELECT job_id FROM admissions WHERE parent_job_id = %s", (family_id,)
+    ).fetchall()
+    return {str(row["job_id"]) for row in rows}
+
+
+def _family_status_budget(connection, family_id: UUID) -> dict[str, int] | None:
+    ledger = connection.execute(
+        "SELECT " + _BUDGET_LEDGER_COLUMNS +
+        " FROM budget_ledger WHERE family_id = %s",
+        (family_id,),
+    ).fetchone()
+    if ledger is None:
+        return None
+    charges = connection.execute(
+        "SELECT seconds, fuzz_seconds FROM budget_charges WHERE family_id = %s",
+        (family_id,),
+    ).fetchall()
+    return budget_summary(ledger, charges)
+
+
+def _family_child_view(
+    child: Mapping[str, Any],
+    *,
+    review_plan: str | None,
+    admitted_job_ids: set[str],
+) -> dict[str, Any]:
+    job_id = str(child["job_id"])
+    plan_digest = child["plan_digest"]
+    if plan_digest is not None and plan_digest == review_plan:
+        admission_kind = "human"
+    elif job_id in admitted_job_ids:
+        admission_kind = "policy"
+    else:
+        admission_kind = None
+    return {
+        "round_no": child["round_no"],
+        "job_id": job_id,
+        "state": child["state"],
+        "plan_digest": plan_digest,
+        "admission_kind": admission_kind,
+        "verdict": child["verdict"],
+        "evidence_status": child["evidence_status"],
+        "reason_code": child["reason_code"],
+    }
+
+
+def _family_evidence_view(row: Mapping[str, Any]) -> dict[str, Any] | None:
+    if (
+        row["evidence_status"] is None
+        and row["evidence_digest"] is None
+        and row["evidence_path"] is None
+        and row["verdict"] is None
+    ):
+        return None
+    return {
+        "available": row["evidence_status"] == "archived"
+        and row["evidence_path"] is not None
+        and row["evidence_digest"] is not None,
+        "status": row["evidence_status"],
+        "digest": row["evidence_digest"],
+        "path": row["evidence_path"],
+        "error": row["evidence_error"],
+    }
+
+
+def _family_status(connection, row: Mapping[str, Any]) -> dict[str, Any]:
+    family_id = row["job_id"]
+    children = _family_children(connection, family_id)
+    review_plan = _family_review_plan(connection, family_id)
+    admitted_job_ids = _family_admitted_job_ids(connection, family_id)
+    budget = _family_status_budget(connection, family_id)
+
+    rounds: list[dict[str, Any]] = []
+    campaign: dict[str, Any] | None = None
+    for child in children:
+        view = _family_child_view(
+            child,
+            review_plan=review_plan,
+            admitted_job_ids=admitted_job_ids,
+        )
+        if child["job_kind"] == "round":
+            rounds.append(view)
+        elif child["job_kind"] == "campaign":
+            campaign = view
+    rounds.sort(key=lambda entry: entry["round_no"])
+
+    request = row["request"] if isinstance(row["request"], Mapping) else {}
+    exploration = request.get("exploration")
+    exploration = exploration if isinstance(exploration, Mapping) else {}
+    max_rounds = exploration.get("max_rounds", 1)
+    if type(max_rounds) is not int or max_rounds < 1:
+        max_rounds = 1
+    payload = {
+        "job_id": str(family_id),
+        "state": row["state"],
+        "stage": row["stage"],
+        "reason_code": row["reason_code"],
+        "family": {
+            "family_id": str(row["family_id"]),
+            "max_rounds": max_rounds,
+            "rounds_used": max(
+                (entry["round_no"] for entry in rounds), default=0
+            ),
+        },
+        "campaign": campaign,
+        "rounds": rounds,
+        "budget": budget,
+    }
+    evidence_view = _family_evidence_view(row)
+    if evidence_view is not None:
+        payload["evidence"] = evidence_view
+    return payload
+
+
+def _family_archive_root(evidence_root: Path | str | None) -> Path:
+    raw = (
+        os.getenv("DATACON_EVIDENCE_ROOT", ".datacon/evidence")
+        if evidence_root is None
+        else str(evidence_root)
+    )
+    return Path(raw).expanduser().resolve()
+
+
+def _family_archive_timestamp(now: Any, db_now: Any) -> str:
+    """Render the archive time from the injected clock or the database clock.
+
+    The default is the transaction's ``clock_timestamp()``; a test may inject
+    either an aware timestamp object or an RFC 3339 string. ``created_at`` is
+    never read from a Python wall clock in production.
+    """
+    if now is None:
+        return jsonutil.timestamp(db_now)
+    if isinstance(now, str):
+        try:
+            return jsonutil.require_rfc3339(now, "family archive time")
+        except ValueError as error:
+            raise StateError(str(error)) from error
+    try:
+        return jsonutil.timestamp(now)
+    except ValueError as error:
+        raise StateError(str(error)) from error
+
+
+def archive_family(
+    dsn: str,
+    family_id: UUID,
+    *,
+    evidence_root: Path | str | None = None,
+    now: Any = None,
+) -> dict[str, Any]:
+    """Write the D43 family index and converge the family without a lease.
+
+    The whole read snapshot (family row, children, approval chain, ledger and
+    charges) is taken in one repeatable-read transaction. ``family.json`` is
+    then written atomically outside that transaction; only after its bytes are
+    validated and hashed does the no-lease ``complete_family`` pointer write
+    run. A crash between the file write and ``complete_family`` is recoverable:
+    the next scan reuses the same bytes and retries only the pointer write.
+    """
+    try:
+        family_id = UUID(str(family_id))
+    except (TypeError, ValueError) as error:
+        raise StateError("family_id must be a UUID") from error
+    with _connect(dsn) as connection:
+        with connection.transaction():
+            connection.execute(
+                "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"
+            )
+            job = connection.execute(
+                "SELECT job_id, state, job_kind, job_contract_version, "
+                "evidence_path, evidence_digest, evidence_status, request "
+                "FROM jobs WHERE job_id = %s",
+                (family_id,),
+            ).fetchone()
+            if job is None:
+                raise StateError("family job does not exist")
+            if job["job_kind"] != "family" or job["job_contract_version"] != 2:
+                raise StateError("job is not a v2 family")
+            if job["state"] == "COMPLETED":
+                evidence_path = job["evidence_path"]
+                evidence_digest = job["evidence_digest"]
+                if not evidence_path or not evidence_digest:
+                    raise StateError(
+                        "family is COMPLETED without an evidence pointer"
+                    )
+                info = evidence.load_family_index(evidence_path)
+                if info.digest != evidence_digest:
+                    raise StateError(
+                        "family evidence digest does not match the archived index"
+                    )
+                if info.document["family_id"] != str(family_id):
+                    raise StateError("family index belongs to another family")
+                return {
+                    "family_id": str(family_id),
+                    "state": "COMPLETED",
+                    "evidence_path": evidence_path,
+                    "evidence_digest": evidence_digest,
+                    "archived": False,
+                }
+            if job["state"] != "AGGREGATING":
+                raise StateError(
+                    f"cannot archive a family while it is {job['state']}"
+                )
+            children = _family_children(connection, family_id)
+            if not children:
+                raise StateError("family has no children")
+            approval = _family_approval_chain_tail(connection, family_id)
+            ledger = connection.execute(
+                "SELECT " + _BUDGET_LEDGER_COLUMNS +
+                " FROM budget_ledger WHERE family_id = %s",
+                (family_id,),
+            ).fetchone()
+            if ledger is None:
+                raise StateError("budget ledger does not exist")
+            charges = connection.execute(
+                "SELECT seconds, fuzz_seconds FROM budget_charges "
+                "WHERE family_id = %s",
+                (family_id,),
+            ).fetchall()
+            db_now = connection.execute(
+                "SELECT clock_timestamp() AS db_now"
+            ).fetchone()["db_now"]
+
+    rounds: list[dict[str, Any]] = []
+    campaign: dict[str, Any] | None = None
+    for child in children:
+        child_state = child["state"]
+        if child_state not in _TERMINAL_FAMILY_CHILD_STATES or (
+            child_state == "BLOCKED" and not child["workflow_synced"]
+        ):
+            raise StateError("family has non-terminal children")
+        if child["job_kind"] == "campaign":
+            if campaign is not None:
+                raise StateError("family has more than one campaign")
+            if (
+                child["evidence_status"] != "archived"
+                or not child["evidence_digest"]
+            ):
+                raise StateError("campaign evidence is not archived")
+            if child["plan_digest"] is None:
+                raise StateError("campaign plan is missing")
+            campaign = {
+                "job_id": str(child["job_id"]),
+                "bundle_digest": child["evidence_digest"],
+            }
+        elif child["job_kind"] == "round":
+            if child["round_no"] is None:
+                raise StateError("family round is missing round_no")
+            if (
+                child["evidence_status"] != "archived"
+                or not child["evidence_digest"]
+            ):
+                raise StateError(
+                    f"round {child['round_no']} evidence is not archived"
+                )
+            if child["plan_digest"] is None:
+                raise StateError(
+                    f"round {child['round_no']} plan digest is missing"
+                )
+            rounds.append(
+                {
+                    "round_no": child["round_no"],
+                    "job_id": str(child["job_id"]),
+                    "plan_digest": child["plan_digest"],
+                    "state": child_state,
+                    "evidence_digest": child["evidence_digest"],
+                }
+            )
+        else:
+            raise StateError("family has an unknown child kind")
+    if approval is None:
+        raise StateError("family has no approval chain")
+
+    document = evidence.build_family_index(
+        family_id=family_id,
+        created_at=_family_archive_timestamp(now, db_now),
+        family_approval_digest=approval[0],
+        rounds=rounds,
+        campaign=campaign,
+        budget=budget_summary(ledger, charges),
+    )
+    path = (
+        _family_archive_root(evidence_root)
+        / str(family_id)
+        / evidence.FAMILY_INDEX_FILENAME
+    )
+    completed: dict[str, bool] = {}
+
+    def _complete(evidence_path: str, evidence_digest: str) -> None:
+        completed["value"] = complete_family(
+            dsn, family_id, evidence_path, evidence_digest
+        )
+
+    info = evidence.finalize_family_index(path, document, complete=_complete)
+    return {
+        "family_id": str(family_id),
+        "state": "COMPLETED",
+        "evidence_path": str(path),
+        "evidence_digest": info.digest,
+        "archived": bool(completed.get("value", False)),
+    }
+
+
+def record_family_archive_failure(
+    dsn: str, family_id: UUID, message: str
+) -> None:
+    """Persist one retryable family-archive failure without crashing the worker.
+
+    Identical messages are written once, so a worker that keeps scanning the
+    same unfixable family does not grow the audit log without bound. The family
+    remains AGGREGATING and the next scan retries.
+    """
+    try:
+        with _connect(dsn) as connection:
+            connection.execute(
+                "INSERT INTO audit_events "
+                "(job_id, stage, attempt_no, event_type, reason_code, detail, "
+                "created_at) "
+                "SELECT %s, 'archive', NULL, 'family_archive_failed', NULL, %s, "
+                "clock_timestamp() "
+                "WHERE NOT EXISTS ("
+                "SELECT 1 FROM audit_events WHERE job_id = %s "
+                "AND event_type = 'family_archive_failed' "
+                "AND detail ->> 'message' = %s)",
+                (
+                    family_id,
+                    Jsonb({"message": message}),
+                    family_id,
+                    message,
+                ),
+            )
+    except (StateError, psycopg.Error):
+        # A failure record must never turn a retryable archive failure into a
+        # worker crash.
+        return
+
+
+def converge_families(
+    dsn: str,
+    *,
+    evidence_root: Path | str | None = None,
+    now: Any = None,
+) -> list[str]:
+    """Idempotently archive every AGGREGATING family whose children are done.
+
+    This is the worker crash-recovery sweep. It selects only families that have
+    at least one child, no pending envelope and no non-terminal (or unsynced
+    BLOCKED) child, then retries the atomic ``family.json`` write and the
+    no-lease ``complete_family`` convergence. Archive failures are recorded and
+    left retryable; a later sweep picks the same family up again.
+    """
+    with _connect(dsn) as connection:
+        family_ids = [
+            row["job_id"]
+            for row in connection.execute(
+                "SELECT f.job_id FROM jobs f "
+                "WHERE f.job_contract_version = 2 AND f.job_kind = 'family' "
+                "AND f.state = 'AGGREGATING' "
+                "AND EXISTS (SELECT 1 FROM jobs c WHERE c.parent_job_id = f.job_id) "
+                "AND NOT EXISTS ("
+                "SELECT 1 FROM jobs c WHERE c.parent_job_id = f.job_id AND ("
+                "c.state NOT IN ('COMPLETED', 'REPRODUCED', 'NOT_REPRODUCED', "
+                "'INCONCLUSIVE', 'BLOCKED', 'FAILED') "
+                "OR (c.state = 'BLOCKED' AND c.workflow_synced = false))) "
+                "AND NOT EXISTS ("
+                "SELECT 1 FROM family_envelopes e WHERE e.family_id = f.job_id "
+                "AND e.status = 'pending') "
+                "ORDER BY f.submitted_at, f.job_id"
+            ).fetchall()
+        ]
+    converged: list[str] = []
+    for family_id in family_ids:
+        try:
+            archive_family(
+                dsn, family_id, evidence_root=evidence_root, now=now
+            )
+        except (StateError, evidence.BundleError, OSError) as error:
+            record_family_archive_failure(
+                dsn, family_id, f"{type(error).__name__}: {error}"
+            )
+            continue
+        converged.append(str(family_id))
+    return converged
+
+
+def family_export_sources(dsn: str, family_id: UUID) -> dict[str, Any]:
+    """Return the archived family index plus every child bundle to export.
+
+    Each round and the campaign keep their own archived manifest digest; the
+    aggregate export copies those directories instead of rebuilding anything.
+    """
+    try:
+        family_id = UUID(str(family_id))
+    except (TypeError, ValueError) as error:
+        raise StateError("family_id must be a UUID") from error
+    with _connect(dsn) as connection:
+        job = connection.execute(
+            "SELECT job_kind, job_contract_version, evidence_path, "
+            "evidence_digest, evidence_status FROM jobs WHERE job_id = %s",
+            (family_id,),
+        ).fetchone()
+        if job is None:
+            raise StateError("family job does not exist")
+        if job["job_kind"] != "family" or job["job_contract_version"] != 2:
+            raise StateError("job is not a v2 family")
+        if (
+            job["evidence_status"] != "archived"
+            or not job["evidence_path"]
+            or not job["evidence_digest"]
+        ):
+            raise StateError("family evidence is not archived")
+        children = _family_children(connection, family_id)
+
+    campaign: dict[str, Any] | None = None
+    rounds: list[dict[str, Any]] = []
+    for child in children:
+        if child["job_kind"] == "campaign":
+            if campaign is not None:
+                raise StateError("family has more than one campaign")
+            if (
+                child["evidence_status"] != "archived"
+                or not child["evidence_path"]
+                or not child["evidence_digest"]
+            ):
+                raise StateError("campaign evidence is not archived")
+            campaign = {
+                "source": child["evidence_path"],
+                "digest": child["evidence_digest"],
+            }
+        elif child["job_kind"] == "round":
+            if (
+                child["evidence_status"] != "archived"
+                or not child["evidence_path"]
+                or not child["evidence_digest"]
+            ):
+                raise StateError(
+                    f"round {child['round_no']} evidence is not archived"
+                )
+            rounds.append(
+                {
+                    "round_no": child["round_no"],
+                    "source": child["evidence_path"],
+                    "digest": child["evidence_digest"],
+                }
+            )
+    rounds.sort(key=lambda entry: entry["round_no"])
+    return {
+        "family_path": job["evidence_path"],
+        "family_digest": job["evidence_digest"],
+        "campaign": campaign,
+        "rounds": rounds,
+    }
+
+
 def status(dsn: str, job_id: UUID) -> dict[str, Any] | None:
     with _connect(dsn) as connection:
         row = connection.execute(
@@ -5638,6 +6127,7 @@ def status(dsn: str, job_id: UUID) -> dict[str, Any] | None:
             SELECT j.job_id, j.state, j.stage, j.reason_code, j.last_error,
                    j.verdict, j.verdict_reason, j.evidence_digest, j.evidence_path,
                    j.evidence_status, j.evidence_error,
+                   j.job_kind, j.family_id, j.request,
                    p.plan_digest, p.summary, p.plan, p.created_at AS plan_created_at,
                    r.decision, r.reviewer_id, r.plan_digest AS review_plan_digest,
                    r.decided_at
@@ -5648,8 +6138,10 @@ def status(dsn: str, job_id: UUID) -> dict[str, Any] | None:
             """,
             (job_id,),
         ).fetchone()
-    if row is None:
-        return None
+        if row is None:
+            return None
+        if row["job_kind"] == "family":
+            return _family_status(connection, row)
 
     pending_plan = None
     evidence_refs: list[str] = []

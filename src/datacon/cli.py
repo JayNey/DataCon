@@ -85,7 +85,13 @@ def _parser() -> argparse.ArgumentParser:
     )
 
     export = commands.add_parser("export", help="export the archived evidence bundle")
-    export.add_argument("job_id")
+    export.add_argument("job_id", nargs="?", default=None)
+    export.add_argument(
+        "--family",
+        dest="family_id",
+        default=None,
+        help="aggregate-export one family (mutually exclusive with JOB_ID)",
+    )
     export.add_argument("--out", required=True, type=Path)
 
     verify = commands.add_parser(
@@ -295,7 +301,82 @@ def _worker(args) -> int:
     return 0
 
 
+def _export_family(args) -> int:
+    family_id = _parse_job_id(args.family_id)
+    if family_id is None:
+        return _error(2, "INVALID_REQUEST", "family_id must be a UUID")
+    dsn = _database_url()
+    if not dsn:
+        return _error(1, "DATABASE_NOT_CONFIGURED", "set DATACON_DATABASE_URL")
+    try:
+        job = state.load_job(dsn, family_id)
+    except psycopg.Error as error:
+        return _error(1, "DATABASE_ERROR", _database_error_message(error))
+    if job is None:
+        return _error(3, "JOB_NOT_FOUND", "family does not exist")
+    if job.get("job_kind") != "family":
+        return _error(2, "INVALID_REQUEST", "job is not a family")
+    if (
+        job.get("evidence_status") != "archived"
+        or not job.get("evidence_path")
+        or not job.get("evidence_digest")
+    ):
+        return _error(
+            3,
+            "EVIDENCE_NOT_AVAILABLE",
+            "no archived family index is available for this family",
+        )
+    try:
+        sources = state.family_export_sources(dsn, family_id)
+    except state.StateError as error:
+        return _error(3, "EVIDENCE_NOT_AVAILABLE", str(error))
+    except psycopg.Error as error:
+        return _error(1, "DATABASE_ERROR", _database_error_message(error))
+    campaign = sources["campaign"]
+    try:
+        exported = evidence.export_family(
+            sources["family_path"],
+            args.out,
+            campaign_source=None if campaign is None else campaign["source"],
+            rounds=[
+                (entry["round_no"], entry["source"])
+                for entry in sources["rounds"]
+            ],
+            expected_family_digest=sources["family_digest"],
+        )
+    except evidence.BundleError as error:
+        return _error(3, error.reason_code, error.message)
+    except OSError as error:
+        return _error(3, "EVIDENCE_NOT_AVAILABLE", str(error))
+    print(
+        json.dumps(
+            {
+                "family_id": str(family_id),
+                "out": str(exported.root),
+                "family_digest": exported.family_digest,
+                "rounds": exported.round_digests,
+                "campaign_digest": exported.campaign_digest,
+            },
+            ensure_ascii=False,
+            default=str,
+        )
+    )
+    return 0
+
+
 def _export(args) -> int:
+    if args.family_id is not None:
+        if args.job_id is not None:
+            return _error(
+                2,
+                "INVALID_REQUEST",
+                "JOB_ID and --family are mutually exclusive",
+            )
+        return _export_family(args)
+    if args.job_id is None:
+        return _error(
+            2, "INVALID_REQUEST", "export requires JOB_ID or --family FAMILY_ID"
+        )
     job_id = _parse_job_id(args.job_id)
     if job_id is None:
         return _error(2, "INVALID_REQUEST", "job_id must be a UUID")
