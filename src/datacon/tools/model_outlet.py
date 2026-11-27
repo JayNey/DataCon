@@ -786,6 +786,107 @@ def build_model_audit(
     }
 
 
+# The closed six-field report.model_audit summary of model/audit.json
+# (interface contract delta 8).
+MODEL_AUDIT_SUMMARY_FIELDS = (
+    "provider",
+    "model_version",
+    "prompt_version",
+    "allowed_fields_digest",
+    "redaction_version",
+    "outcome",
+)
+
+
+def model_audit_summary(record: Mapping[str, Any]) -> dict[str, Any]:
+    """Return the ``report.model_audit`` summary of one ``model_audit`` record."""
+    return {field: record[field] for field in MODEL_AUDIT_SUMMARY_FIELDS}
+
+
+def validate_model_audit_document(value: Any) -> dict[str, Any]:
+    """Validate one archived ``model/audit.json`` offline; returns it normalized.
+
+    The record the outlet writes and the document the bundle archives are
+    the same closed eleven fields, so the same rules apply - with one
+    exception the archive forces: the document carries
+    ``allowed_fields_digest``, never the field names, so there is nothing to
+    recompute the digest from and it is checked as the digest it is.
+    Anything a compliant document cannot carry is refused with
+    ``AUDIT_INVALID``.
+    """
+    if not isinstance(value, Mapping):
+        raise OutletError(
+            "model/audit.json must be a JSON object", sub_reason="AUDIT_INVALID"
+        )
+    keys = set(value)
+    missing = [field for field in MODEL_AUDIT_FIELDS if field not in keys]
+    unknown = sorted(str(key) for key in keys - set(MODEL_AUDIT_FIELDS))
+    if missing:
+        raise OutletError(
+            "model/audit.json is missing field(s): " + ", ".join(missing),
+            sub_reason="AUDIT_INVALID",
+        )
+    if unknown:
+        raise OutletError(
+            "model/audit.json has unknown field(s): " + ", ".join(unknown),
+            sub_reason="AUDIT_INVALID",
+        )
+    allowed_fields_digest = value["allowed_fields_digest"]
+    if not jsonutil.is_digest(allowed_fields_digest):
+        raise OutletError(
+            "model_audit.allowed_fields_digest must be a sha256 digest",
+            sub_reason="AUDIT_INVALID",
+        )
+    try:
+        record = build_model_audit(
+            job_id=value["job_id"],
+            stage=value["stage"],
+            provider=value["provider"],
+            model_version=value["model_version"],
+            prompt_version=value["prompt_version"],
+            redaction_version=value["redaction_version"],
+            request_digest=value["request_digest"],
+            response_digest=value["response_digest"],
+            duration_seconds=value["duration_seconds"],
+            outcome=value["outcome"],
+        )
+    except OutletError as error:
+        if error.sub_reason == "PROVIDER_MISSING":
+            # The outlet's admission token stays with the writer; an
+            # archived document that cannot have been written compliantly
+            # is a shape fault of the archive.
+            raise OutletError(str(error), sub_reason="AUDIT_INVALID") from error
+        raise
+    return {**record, "allowed_fields_digest": allowed_fields_digest}
+
+
+def verify_model_audit_document(
+    value: Any, *, job_id: str, report_model_audit: Any
+) -> dict[str, Any]:
+    """Validate an archived ``model/audit.json`` and bind it to its bundle.
+
+    Called for ``execution`` and ``campaign`` bundles; ``blocked`` bundles
+    carry no audit and never call this. The audit was produced by the child
+    job the bundle belongs to (``job_id``, required: a caller that cannot
+    name the job has no anchor to verify against), and
+    ``report.model_audit`` is exactly its six-field summary - a report may
+    not describe another provider, version or outcome than the audit it
+    archives. Returns the normalized record.
+    """
+    record = validate_model_audit_document(value)
+    if record["job_id"] != job_id:
+        raise OutletError(
+            "model/audit.json was produced by another job",
+            sub_reason="AUDIT_INVALID",
+        )
+    if report_model_audit != model_audit_summary(record):
+        raise OutletError(
+            "report.model_audit is not the summary of model/audit.json",
+            sub_reason="AUDIT_INVALID",
+        )
+    return record
+
+
 class ModelOutlet:
     """The single outbound gate for external analysis models (REQ-13).
 

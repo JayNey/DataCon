@@ -825,6 +825,49 @@ v2 角色表由“v0.1 完整角色集 + v0.2 新增角色集”组成，不是�
 
 v2 `execution` 恰好包含 `review` 或 `admission` 之一，不得两者都缺，也不得用两者互相代替；`campaign` 与 fixed 人批轮次的 `review.json` 是 family 人批决议的副本，路径仍在包根目录，校验以 `plan_digest` 绑定，不以包内 `job_id` 绑定。文件角色只扩展，不改变 v1 已有角色语义；v1 角色集合仍由冻结分支维护。
 
+### `intel/snapshot.json` 与 `intel/license.json`（`intel_snapshot` / `license_record` 完整 schema）
+
+两个情报文档的形状由 T15 提出并经规范 owner 评审认可（PR #60）。快照文档承载注册身份、采集事实与快照原字节；许可文档承载同一注册身份与授予。两份文档的键集均封闭。
+
+```json
+// intel/snapshot.json（role: intel_snapshot）
+{
+  "case_id": "cve-2099-0001",
+  "source_id": "advisory-primary",
+  "snapshot_digest": "sha256:…",          // 恰好对 body 的原字节求值
+  "source_url": "https://advisory.example.com/cve-2099-0001.txt",
+  "license": "CC-BY-4.0",                 // 未登记时为 null，缺口保持可见
+  "fetched_at": "2026-11-26T00:00:00Z",   // 以下四项：没有采集记录时 redirect 与三者同为 null
+  "http_status": 200,
+  "redirect_chain_digest": "sha256:…",    // 未跟随重定向或无采集记录时为 null
+  "tool_version": "datacon.intel_fetch/0.1.0",
+  "body_base64": "…"                      // 正文原字节的规范 base64
+}
+
+// intel/license.json（role: license_record）
+{
+  "case_id": "cve-2099-0001",
+  "source_id": "advisory-primary",
+  "source_url": "https://advisory.example.com/cve-2099-0001.txt",
+  "snapshot_digest": "sha256:…",          // 这份许可覆盖的那个快照
+  "license": "CC-BY-4.0",
+  "permitted_uses": ["research", "reproduction"]
+}
+```
+
+| 字段 | 规则 |
+| --- | --- |
+| `case_id` / `source_id` | 非空文本。`case_id` 必须与所在包的 plan/report 一致（`SOURCE_CONFLICT`/`SOURCE_CASE_MISMATCH`）；`source_id` 无离线锚点，仅供展示，待注册摘要随 plan 归档后再绑定 |
+| `snapshot_digest` | sha256 摘要，恰好描述 `body_base64` 解码后的字节 |
+| `source_url` | 去凭据后的 https 源（`public_source_url` 规则）；无法归因 → `POLICY_DENIED`/`SOURCE_URL_INVALID` |
+| `license` | 许可标识或 null（缺口可见，由许可判定拒绝） |
+| `fetched_at` / `http_status` / `tool_version` | 采集事实，三者同有同无；`http_status` 为 100–599 的整数 |
+| `redirect_chain_digest` | 摘要或 null；没有采集记录时必须为 null |
+| `body_base64` | 正文原字节的规范 base64 拼写；解码后不得超过采集上限（32 MiB，文档最坏约 43 MiB，仍在包读取的 128 MiB 单文件上限内）；离线案例与 `materials/advisory` 的字节重复是自校验包的已知代价 |
+| `permitted_uses` | 互异用途名组成的 JSON 数组；空数组是「什么都没授予」的合规记录 |
+
+验包绑定（`execution`/`campaign` 调用，`blocked` 不携带这两份文档）：两份文档的五个共享字段一致；`report.intel` 是封闭三字段摘要且与快照文档一致；`plan.intel` 按 `contracts` 的封闭规则校验（四字段、`sources` 非空且全 https、无未知键）后绑定 `content_digest` 与 `collected_at`，且 `sources`（本次分析采信的来源）必须包含快照的 `source_url`（两侧去凭据后比较；plan 生成侧负责把线上抓取的来源加进 `sources`，而不是放宽验包）。最后仅凭归档的许可授予离线重推许可判定：不覆盖系统用途 → `POLICY_DENIED`/`LICENSE_REJECTED`。验包可出现的细因记号：`SNAPSHOT_DOCUMENT_INVALID`、`LICENSE_DOCUMENT_INVALID`、`INTEL_REGISTRATION_INVALID`、`INTEL_BINDING_MISMATCH`、`SOURCE_URL_MISMATCH`、`LICENSE_MISMATCH`（后两者为构造时记录与注册矛盾的细因）；`SOURCE_CASE_MISMATCH` 沿用 §10 既有记号。
+
 ### report
 
 ```json
