@@ -3904,6 +3904,7 @@ def _evidence_artifacts(
     runs: Sequence[Mapping[str, Any]],
     probe: Mapping[str, Any] | None,
     execution_metadata: Mapping[str, Any],
+    blocked: bool = False,
 ) -> dict[str, tuple[str, bytes | Path]]:
     is_v2 = _is_v2_context(context)
     context_admission = getattr(context, "admission", None)
@@ -3923,7 +3924,12 @@ def _evidence_artifacts(
             + b"\n",
         ),
     }
-    if context_admission is not None:
+    if context_admission is not None and not blocked:
+        # The bundle contract (evidence.py) forbids admission.json on a
+        # blocked bundle: an admission only ever documents permission for a
+        # round that was going to run, not the blocked outcome itself. A
+        # blocked policy round therefore archives without its admission
+        # document; review.json below stays allowed on every bundle kind.
         artifacts["admission.json"] = (
             "admission",
             jsonutil.canonical_bytes(dict(context_admission)) + b"\n",
@@ -6025,6 +6031,11 @@ def _finish_blocked(
                 runs=runs or [],
                 probe=probe,
                 execution_metadata={},
+                # The report above is a blocked bundle for v2 contexts; the
+                # verifier rejects a blocked bundle that still carries the
+                # policy admission, so the writer must drop it here (v1 has
+                # no admission row and is unchanged).
+                blocked=_is_v2_context(context),
             ),
             verdict="BLOCKED",
         )

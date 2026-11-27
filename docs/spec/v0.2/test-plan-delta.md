@@ -163,6 +163,8 @@ T11 只验证图结构与节点幂等；policy 准入、轮次与预算容量的
 | `tests/integration/test_toolchain_image.py::test_oniguruma_case_uses_existing_toolchain_image`（双标 `postgres`+`docker`） | 已有 cmake/make/autoconf/automake/libFuzzer 的案例不要求镜像 v2 | `AssertionError: Oniguruma-like case required toolchain image v2` |
 | `tests/integration/test_toolchain_image.py::test_missing_tool_requires_toolchain_image_v2` | 需要 pkg-config/libtool/ninja/git 的案例被路由到新镜像或阻断 | `AssertionError: missing tool assumed present` |
 | `tests/contract/test_release.py::test_release_manifest_keeps_contract_version_one` | release smoke/B03 仍按 `contract_version=1` 校验，v2 smoke 不混入 | `AssertionError: release manifest contract_version changed` |
+| `tests/contract/test_build_spec_execution.py::test_policy_round_blocked_mid_execution_archives_blocked_bundle` | policy 轮次执行中途被阻断时归档 blocked 包且不携带 `admission.json`，终态为 `BLOCKED`（真实阻断原因）而非 `FAILED(EVIDENCE_WRITE_FAILED)` 无证据包 | `AssertionError: ExecutionResult(state='FAILED', verdict=None, verdict_reason=None, evidence_digest=None, evidence_path=None, reason_code='EVIDENCE_WRITE_FAILED')` |
+| `tests/contract/test_build_spec_execution.py::test_human_review_round_blocked_still_archives` | 对照：人批轮次执行中途被阻断（审核被改写 → `PLAN_MISMATCH`）仍归档 blocked 包（携带 `review.json`），门控不得改坏这条正路 | 未触发 RED（既有行为对照） |
 
 ### T14 模型出口与 ExperimentSpec
 
