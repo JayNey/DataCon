@@ -1084,6 +1084,36 @@ def test_v2_blocked_build_metadata_rejects_arbitrary_path(tmp_path):
         verify_bundle(root)
 
 
+@pytest.mark.parametrize("bundle_kind", ["execution", "campaign"])
+def test_v2_execution_and_campaign_reject_arbitrary_build_path(
+    tmp_path, bundle_kind
+):
+    """D39 stays enforced after the build layout for non-blocked bundles."""
+    files = _base_files(
+        execution=bundle_kind == "execution",
+        campaign=bundle_kind == "campaign",
+    )
+    files["evil/metadata.json"] = (
+        "build_metadata",
+        json.dumps(
+            {"version": "vulnerable", "staged_materials": {}}
+        ).encode()
+        + b"\n",
+    )
+    root = _write_v2_bundle(
+        tmp_path,
+        _manifest(
+            bundle_kind,
+            verdict=None if bundle_kind == "campaign" else "INCONCLUSIVE",
+            reason=None if bundle_kind == "campaign" else "EVIDENCE_INCOMPLETE",
+        ),
+        files,
+        name=f"{bundle_kind}-arbitrary-build-path",
+    )
+    with pytest.raises(BundleError, match="fixed build path"):
+        verify_bundle(root)
+
+
 def test_v2_build_record_with_material_only_is_accepted(tmp_path):
     """D4 only rejects the two aliases, not ordinary build materials."""
     files = _base_files(execution=True, campaign=False)
