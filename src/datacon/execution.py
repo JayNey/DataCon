@@ -1172,6 +1172,17 @@ def _load_context(
                     "PLAN_MISMATCH",
                     "the policy admission envelope differs from the frozen plan",
                 )
+            expected_parent_approval = plan.get("parent_approval_digest")
+            if (
+                not isinstance(expected_parent_approval, str)
+                or not expected_parent_approval
+                or admission.get("parent_approval_digest")
+                != expected_parent_approval
+            ):
+                raise ExecutionBlocked(
+                    "PLAN_MISMATCH",
+                    "the policy admission parent approval differs from the frozen plan",
+                )
             if (
                 admission.get("parent_job_id") != str(job.get("parent_job_id"))
                 or admission.get("round_no") != plan.get("round_no")
@@ -1590,11 +1601,16 @@ def _assert_context_unchanged(
             raise ExecutionBlocked(
                 "MATERIAL_MISSING", f"the policy admission changed: {error}"
             ) from error
+        expected_parent_approval = context.plan.get("parent_approval_digest")
         if (
             admission is None
             or admission.get("approval_kind") != "policy"
             or admission.get("envelope_digest")
             != context.plan.get("envelope_digest")
+            or not isinstance(expected_parent_approval, str)
+            or not expected_parent_approval
+            or admission.get("parent_approval_digest")
+            != expected_parent_approval
         ):
             raise ExecutionBlocked("PLAN_MISMATCH", "the policy admission changed")
     elif (
@@ -4717,7 +4733,10 @@ def _archive_only(dsn: str, context: ExecutionContext) -> ExecutionResult:
             rejected.append(f"build:{version} input does not match the plan")
             continue
         if _reusable_build(
-            build_root, result, check_provenance_face=not is_v2_spec
+            build_root,
+            result,
+            check_provenance_face=not is_v2_spec,
+            artifact_suffix=_primary_artifact_suffix(context, result),
         ):
             builds[version] = result
     runs: list[dict[str, Any]] = []
@@ -5226,7 +5245,11 @@ def run_execution(
                     attempt_no,
                     token,
                 ),
-                reusable=lambda payload: _reusable_build(build_root, payload),
+                reusable=lambda payload: _reusable_build(
+                    build_root,
+                    payload,
+                    artifact_suffix=_primary_artifact_suffix(context, payload),
+                ),
             )
             builds[version] = result
             if result.get("status") != "completed":
@@ -5576,11 +5599,60 @@ def _to_observation(payload: Mapping[str, Any], run_root: Path) -> RunObservatio
     )
 
 
+def _primary_artifact_suffix(
+    context: ExecutionContext,
+    payload: Mapping[str, Any] | None = None,
+) -> str:
+    """Return the trusted run-root suffix for the primary build artifact."""
+    files = payload.get("files") if isinstance(payload, Mapping) else None
+    has_outputs = (
+        isinstance(files, Mapping)
+        and isinstance(files.get("outputs"), Mapping)
+        and bool(files.get("outputs"))
+    )
+    if not has_outputs:
+        return "/parser"
+    build_spec = _build_spec_from_context(context) if _is_v2_context(context) else None
+    if not isinstance(build_spec, Mapping):
+        return "/parser"
+    raw_outputs = build_spec.get("outputs")
+    if (
+        not isinstance(raw_outputs, Sequence)
+        or isinstance(raw_outputs, (str, bytes))
+        or not raw_outputs
+    ):
+        return "/parser"
+    normalized_outputs: list[str] = []
+    for index, raw_output in enumerate(raw_outputs):
+        if not isinstance(raw_output, str):
+            return "/parser"
+        try:
+            norm_rel, _ = build_provenance.validate_build_spec_output_path(
+                raw_output, index
+            )
+        except ValueError:
+            return "/parser"
+        normalized_outputs.append(norm_rel)
+    if "parser" in normalized_outputs:
+        primary = "parser"
+    else:
+        primary = next(
+            (
+                item
+                for item in normalized_outputs
+                if PurePosixPath(item).name == "parser"
+            ),
+            normalized_outputs[0],
+        )
+    return f"/{primary}"
+
+
 def _reusable_build(
     run_root: Path,
     payload: Mapping[str, Any],
     *,
     check_provenance_face: bool = True,
+    artifact_suffix: str = "/parser",
 ) -> bool:
     if payload.get("status") != "completed":
         return False
@@ -5588,7 +5660,7 @@ def _reusable_build(
     digests = payload.get("file_digests")
     if not isinstance(files, Mapping) or not isinstance(digests, Mapping):
         return False
-    for key, suffix in (("artifact", "/parser"), ("log", "/build.log")):
+    for key, suffix in (("artifact", artifact_suffix), ("log", "/build.log")):
         relative = files.get(key)
         path = _run_root_path(run_root, relative, suffix)
         if path is None:
@@ -5755,7 +5827,11 @@ def _do_replay(
 ) -> dict[str, Any]:
     files = build.get("files") if isinstance(build.get("files"), Mapping) else {}
     relative = files.get("artifact") if isinstance(files, Mapping) else None
-    artifact_path = _run_root_path(_work_root(context), relative, "/parser")
+    artifact_path = _run_root_path(
+        _work_root(context),
+        relative,
+        _primary_artifact_suffix(context, build),
+    )
     if artifact_path is None:
         raise ExecutionBlocked(
             "PLAN_MISMATCH", "the build result has no trusted parser path"

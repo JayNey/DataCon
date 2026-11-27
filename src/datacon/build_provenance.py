@@ -10,6 +10,7 @@ from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass
+import fnmatch
 import hashlib
 from pathlib import Path, PurePosixPath
 import posixpath
@@ -52,10 +53,6 @@ _WS_RE: Final[re.Pattern[str]] = re.compile(r"\s+")
 _SHELL_META_RE: Final[re.Pattern[str]] = re.compile(r"[\s;&|`$<>\"'\\()]")
 _CONTROL_RE: Final[re.Pattern[str]] = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 _ENV_KEY_RE: Final[re.Pattern[str]] = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-_CMAKE_EXPORT_RE: Final[re.Pattern[str]] = re.compile(
-    r"^CMAKE_EXPORT_COMPILE_COMMANDS(?::[A-Za-z0-9_]+)?=(.*)$",
-    re.IGNORECASE,
-)
 _CMAKE_FALSE_VALUES: Final[frozenset[str]] = frozenset(
     {"", "0", "off", "false", "no", "n", "ignore", "notfound"}
 )
@@ -1091,7 +1088,8 @@ def _iter_cmake_var_operations(
             index += 1
             continue
         if operation == "D":
-            name, separator, value = expression.partition("=")
+            raw_name, separator, value = expression.partition("=")
+            name = raw_name.split(":", 1)[0]
             operations.append(("D", name, value if separator else ""))
         else:
             operations.append(("U", expression, None))
@@ -1103,14 +1101,20 @@ def cmake_export_compile_commands_state(
 ) -> tuple[str, str | None] | None:
     """Return the final ``(-D|-U, value)`` operation for the export variable.
 
-    ``-D`` and ``-U`` are applied in configure order. ``None`` means the
-    variable was never touched. A trailing ``-U`` (or a falsey final ``-D``)
-    means compile_commands.json is disabled for the effective configuration.
+    ``-D`` and ``-U`` are applied in configure order. ``-D<VAR>:<TYPE>=<VAL>``
+    strips ``:<TYPE>`` before matching, and ``-U<PATTERN>`` applies CMake
+    glob matching (``fnmatchcase``). ``None`` means the variable was never
+    touched. A trailing ``-U`` (or a falsey final ``-D``) means
+    compile_commands.json is disabled for the effective configuration.
     """
     state: tuple[str, str | None] | None = None
     for operation, name, value in _iter_cmake_var_operations(configure):
-        if name == "CMAKE_EXPORT_COMPILE_COMMANDS":
-            state = (operation, value)
+        if operation == "D" and name.upper() == "CMAKE_EXPORT_COMPILE_COMMANDS":
+            state = ("D", value)
+        elif operation == "U" and fnmatch.fnmatchcase(
+            "CMAKE_EXPORT_COMPILE_COMMANDS", name
+        ):
+            state = ("U", None)
     return state
 
 
@@ -1118,31 +1122,22 @@ def iter_cmake_export_compile_commands_values(
     configure: Sequence[str],
 ) -> list[str]:
     """Return all ``CMAKE_EXPORT_COMPILE_COMMANDS`` values in ``configure`` (quote-aware)."""
-    values: list[str] = []
-    i = 0
-    total = len(configure)
-    while i < total:
-        tok = _clean_token(configure[i])
-        define_expr: str | None = None
-        if tok == "-D" and i + 1 < total:
-            define_expr = _clean_token(configure[i + 1])
-            i += 2
-        elif tok.startswith("-D") and len(tok) > 2:
-            define_expr = _clean_token(tok[2:])
-            i += 1
-        else:
-            i += 1
-            continue
-
-        match = _CMAKE_EXPORT_RE.fullmatch(define_expr)
-        if match is not None:
-            values.append(match.group(1))
-    return values
+    return [
+        value
+        for operation, name, value in _iter_cmake_var_operations(configure)
+        if operation == "D"
+        and name.upper() == "CMAKE_EXPORT_COMPILE_COMMANDS"
+        and value is not None
+    ]
 
 
 def cmake_has_export_compile_commands(configure: Sequence[str]) -> bool:
-    """Return True if ``configure`` explicitly defines ``CMAKE_EXPORT_COMPILE_COMMANDS``."""
-    return bool(iter_cmake_export_compile_commands_values(configure))
+    """Return True if ``configure`` leaves ``CMAKE_EXPORT_COMPILE_COMMANDS`` enabled."""
+    state = cmake_export_compile_commands_state(configure)
+    if state is None:
+        return False
+    operation, value = state
+    return operation == "D" and value is not None and not _is_cmake_false_value(value)
 
 
 def cmake_disables_compile_commands(configure: Sequence[str]) -> bool:
@@ -1270,6 +1265,14 @@ def validate_build_spec_output_path(raw_output: str, index: int) -> tuple[str, s
         or has_shell_metachars(norm_rel)
     ):
         raise ValueError(f"unsafe build_spec.outputs[{index}]: {raw_output!r}")
+    if (
+        norm_rel in ("metadata.json", "build.log", "build_provenance")
+        or norm_rel.startswith("build_provenance/")
+    ):
+        raise ValueError(
+            f"build_spec.outputs[{index}] conflicts with reserved D39 build "
+            f"artifact path: {raw_output!r}"
+        )
     return norm_rel, f"/work/{norm_rel}"
 
 
@@ -1528,11 +1531,24 @@ def _validate_cmake_command_paths(
             value = tok[2:]
             label = "configure -B"
             index += 1
+        elif tok == "--install-prefix":
+            if index + 1 >= total:
+                return (
+                    "build_spec.configure (cmake) --install-prefix requires a directory"
+                )
+            value = configure[index + 1]
+            label = "configure --install-prefix"
+            index += 2
+        elif tok.startswith("--install-prefix="):
+            value = tok.split("=", 1)[1]
+            label = "configure --install-prefix"
+            index += 1
         elif tok in ("-D", "-U") and index + 1 < total:
-            expression = configure[index + 1]
+            expression = _clean_token(configure[index + 1])
             index += 2
             if tok == "-D":
-                name, _separator, raw_value = expression.partition("=")
+                raw_name, _separator, raw_value = expression.partition("=")
+                name = raw_name.split(":", 1)[0]
                 if name in _CMAKE_OUTPUT_PATH_VARS:
                     try:
                         validate_work_path_arg(
@@ -1542,10 +1558,11 @@ def _validate_cmake_command_paths(
                         return str(error)
             continue
         elif (tok.startswith("-D") or tok.startswith("-U")) and len(tok) > 2:
-            expression = tok[2:]
+            expression = _clean_token(tok[2:])
             index += 1
             if tok.startswith("-D"):
-                name, _separator, raw_value = expression.partition("=")
+                raw_name, _separator, raw_value = expression.partition("=")
+                name = raw_name.split(":", 1)[0]
                 if name in _CMAKE_OUTPUT_PATH_VARS:
                     try:
                         validate_work_path_arg(
