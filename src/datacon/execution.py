@@ -3006,6 +3006,14 @@ def _run_step(
         generation=context.generation,
         input_digest=input_digest,
         status="started",
+        # The started row carries what a crash-recovery charge needs
+        # (state.recover_uncharged_attempts): the charge kind and the
+        # hard-timeout ceiling granted before the container started.
+        result=(
+            None
+            if ceiling is None
+            else {"budget": {"charge_kind": charge_kind, "ceiling_seconds": ceiling}}
+        ),
         attempt_token=token,
     )
     if not stored:

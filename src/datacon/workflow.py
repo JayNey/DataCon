@@ -822,7 +822,8 @@ def derive_and_admit_round(
     round stays ``READY`` and becomes claimable through the v2 claim gate; a
     denied or failed admission blocks and archives the round, so it never
     starts a container. The human-approved first plan never comes through
-    here.
+    here. A crash between child creation and admission is recovered by
+    ``recover_unadmitted_rounds``.
     """
     gate = state_store.check_round_derivation(
         dsn, family_id=family_id, round_no=round_no
@@ -871,6 +872,37 @@ def derive_and_admit_round(
     )
 
 
+def recover_unadmitted_rounds(
+    dsn: str,
+    *,
+    grace_seconds: int = state_store.ROUND_ADMISSION_RECOVERY_GRACE_SECONDS,
+    run_root: str | None = None,
+) -> int:
+    """Worker scan: finish rounds a crash left between creation and admission.
+
+    Each stuck ``READY``/``stage='admission'`` round older than the grace
+    window is admitted again from the inputs persisted with its plan
+    (``record_admission`` is idempotent); a denial or a failure blocks and
+    archives it. Returns the number of rounds handled.
+    """
+    handled = 0
+    for row in state_store.unadmitted_round_children(
+        dsn, grace_seconds=grace_seconds
+    ):
+        raw_summary = row.get("summary")
+        summary: dict[str, Any] = raw_summary if isinstance(raw_summary, dict) else {}
+        _admit_derived_round(
+            dsn,
+            job_id=row["job_id"],
+            family_id=row["family_id"],
+            round_no=row["round_no"],
+            admission_inputs=summary.get("admission_inputs"),
+            run_root=run_root,
+        )
+        handled += 1
+    return handled
+
+
 def _worker_id() -> str:
     return os.getenv("DATACON_WORKER_ID") or f"{socket.gethostname()}:{os.getpid()}"
 
@@ -902,6 +934,11 @@ def run_worker(
             # forever. The sweep is idempotent (the existing family.json bytes
             # win) and only touches families with terminal children.
             converged_families = state_store.converge_families(dsn)
+            # T12 改9 crash recovery: a derived round left without admission
+            # is admitted again or blocked, and a container step that died
+            # before its budget charge is charged once its lease expired.
+            recovered_rounds = recover_unadmitted_rounds(dsn, run_root=run_root)
+            recovered_charges = state_store.recover_uncharged_attempts(dsn)
             claimed = state_store.claim_next(
                 dsn, worker, lease_seconds=lease_seconds, execute=execute
             )
@@ -911,6 +948,8 @@ def run_worker(
                         "processed": 0,
                         "expired_envelopes": expired_envelopes,
                         "families_converged": len(converged_families),
+                        "rounds_recovered": recovered_rounds,
+                        "charges_recovered": recovered_charges,
                     }
                 time.sleep(poll_seconds)
                 continue
@@ -924,6 +963,8 @@ def run_worker(
             )
             result["expired_envelopes"] = expired_envelopes
             result["families_converged"] = len(converged_families)
+            result["rounds_recovered"] = recovered_rounds
+            result["charges_recovered"] = recovered_charges
             if once:
                 return result
 

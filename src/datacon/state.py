@@ -1010,6 +1010,9 @@ def create_round_child(
         }
 
 
+ROUND_ADMISSION_RECOVERY_GRACE_SECONDS = 300
+
+
 def check_round_derivation(
     dsn: str, *, family_id: UUID | str, round_no: int
 ) -> BudgetDecision:
@@ -1072,6 +1075,199 @@ def check_round_derivation(
             False, BUDGET_EXHAUSTED, 0, sub_reason=BUDGET_EXHAUSTED
         )
     return BudgetDecision(True, None, gate.hard_timeout_seconds, round_no)
+
+
+def unadmitted_round_children(
+    dsn: str, *, grace_seconds: int = ROUND_ADMISSION_RECOVERY_GRACE_SECONDS
+) -> list[dict[str, Any]]:
+    """List derived rounds stuck before admission (crash recovery, 改9).
+
+    A derived round is ``READY``/``stage='admission'``, never claimed, and
+    has no admission row. Rows younger than ``grace_seconds`` (database clock)
+    belong to a derivation that may still be in flight and are skipped.
+    """
+    if type(grace_seconds) is not int or grace_seconds < 0:
+        raise StateError("grace_seconds must be a non-negative integer")
+    with _connect(dsn) as connection:
+        rows = connection.execute(
+            "SELECT j.job_id, j.family_id, j.round_no, p.plan, p.summary "
+            "FROM jobs j JOIN plans p ON p.job_id = j.job_id "
+            "WHERE j.job_contract_version = 2 AND j.job_kind = 'round' "
+            "AND j.state = 'READY' AND j.stage = 'admission' "
+            "AND j.generation = 0 AND j.lease_owner IS NULL "
+            "AND j.updated_at <= clock_timestamp() - make_interval(secs => %s) "
+            "AND NOT EXISTS (SELECT 1 FROM admissions a WHERE a.job_id = j.job_id) "
+            "ORDER BY j.updated_at",
+            (grace_seconds,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def recover_uncharged_attempts(dsn: str) -> int:
+    """Charge container steps that crashed before their budget charge (改9).
+
+    A budgeted step writes its ``started`` attempt row (with the charge kind
+    and the hard-timeout ceiling the gate granted) before the container, and
+    charges after the container exits. If the process died in between, the
+    row stays ``started`` with no ``budget_charges`` row. Once the job's lease
+    has expired (or a newer generation owns it) this scan charges the step
+    conservatively: ``min(ceil(now - started_at), ceiling)``, then the normal
+    §7 formula clamps it to the remaining balance. The charge uses the same
+    idempotency key ``(job_id, step_key, attempt_no)``, so it runs at most
+    once and never races a live worker. Returns the number of charges written.
+    """
+    with _connect(dsn) as connection:
+        candidates = connection.execute(
+            "SELECT a.job_id, a.step_key, a.attempt_no, a.generation "
+            "FROM attempts a JOIN jobs j ON j.job_id = a.job_id "
+            "WHERE j.job_contract_version = 2 "
+            "AND j.job_kind IN ('campaign', 'round') "
+            "AND a.stage = 'execute' AND a.status = 'started' "
+            "AND a.result ? 'budget' "
+            "AND (j.generation <> a.generation OR j.lease_expires_at IS NULL "
+            "OR j.lease_expires_at <= clock_timestamp()) "
+            "AND NOT EXISTS (SELECT 1 FROM budget_charges c "
+            "WHERE c.job_id = a.job_id AND c.step_key = a.step_key "
+            "AND c.attempt_no = a.attempt_no) "
+            "ORDER BY a.started_at",
+        ).fetchall()
+    charged = 0
+    for candidate in candidates:
+        if _recover_uncharged_attempt(dsn, candidate):
+            charged += 1
+    return charged
+
+
+def _recover_uncharged_attempt(dsn: str, candidate: Mapping[str, Any]) -> bool:
+    with _connect(dsn) as connection:
+        with connection.transaction():
+            job = connection.execute(
+                "SELECT job_id, family_id, generation, lease_expires_at, "
+                "clock_timestamp() AS db_now FROM jobs WHERE job_id = %s",
+                (candidate["job_id"],),
+            ).fetchone()
+            if job is None:
+                return False
+            # Lock order jobs(family) -> jobs(child) -> budget_ledger.
+            connection.execute(
+                "SELECT 1 FROM jobs WHERE job_id = %s FOR KEY SHARE",
+                (job["family_id"],),
+            ).fetchone()
+            job = connection.execute(
+                "SELECT job_id, family_id, generation, lease_expires_at "
+                "FROM jobs WHERE job_id = %s FOR KEY SHARE",
+                (candidate["job_id"],),
+            ).fetchone()
+            ledger = connection.execute(
+                "SELECT " + _BUDGET_LEDGER_COLUMNS +
+                " FROM budget_ledger WHERE family_id = %s FOR UPDATE",
+                (job["family_id"],),
+            ).fetchone()
+            if ledger is None:
+                return False
+            attempt = connection.execute(
+                "SELECT status, result, started_at, clock_timestamp() AS db_now "
+                "FROM attempts WHERE job_id = %s AND stage = 'execute' "
+                "AND step_key = %s AND attempt_no = %s AND generation = %s",
+                (
+                    candidate["job_id"],
+                    candidate["step_key"],
+                    candidate["attempt_no"],
+                    candidate["generation"],
+                ),
+            ).fetchone()
+            if attempt is None or attempt["status"] != "started":
+                return False
+            live = (
+                job["generation"] == candidate["generation"]
+                and job["lease_expires_at"] is not None
+                and job["lease_expires_at"] > attempt["db_now"]
+            )
+            if live:
+                return False
+            existing = connection.execute(
+                "SELECT 1 FROM budget_charges WHERE job_id = %s "
+                "AND step_key = %s AND attempt_no = %s",
+                (
+                    candidate["job_id"],
+                    candidate["step_key"],
+                    candidate["attempt_no"],
+                ),
+            ).fetchone()
+            if existing is not None:
+                return False
+            budget = (attempt["result"] or {}).get("budget")
+            if not isinstance(budget, Mapping):
+                return False
+            charge_kind = budget.get("charge_kind")
+            ceiling = budget.get("ceiling_seconds")
+            if charge_kind not in ("general", "fuzz") or not isinstance(
+                ceiling, (int, float)
+            ) or isinstance(ceiling, bool) or ceiling < 0:
+                return False
+            elapsed = max(
+                0.0,
+                (attempt["db_now"] - attempt["started_at"]).total_seconds(),
+            )
+            elapsed = min(float(math.ceil(elapsed)), float(ceiling))
+            charged_seconds, charged_fuzz = compute_budget_charge(
+                ledger,
+                charge_kind=charge_kind,
+                elapsed_seconds=elapsed,
+                elapsed_fuzz_seconds=elapsed if charge_kind == "fuzz" else 0,
+            )
+            if charge_kind == "fuzz" and charged_fuzz < 1:
+                # Nothing left to charge on the fuzz sub-budget; a fuzz charge
+                # row must carry fuzz_seconds >= 1, so record none.
+                return False
+            updated = connection.execute(
+                "UPDATE budget_ledger SET "
+                "remaining_total_seconds = remaining_total_seconds - %s, "
+                "remaining_fuzz_seconds = remaining_fuzz_seconds - %s, "
+                "updated_at = clock_timestamp() "
+                "WHERE family_id = %s AND remaining_total_seconds >= %s "
+                "AND remaining_fuzz_seconds >= %s RETURNING family_id",
+                (
+                    charged_seconds,
+                    charged_fuzz,
+                    job["family_id"],
+                    charged_seconds,
+                    charged_fuzz,
+                ),
+            ).fetchone()
+            if updated is None:
+                return False
+            connection.execute(
+                "INSERT INTO budget_charges "
+                "(charge_id, family_id, job_id, step_key, attempt_no, "
+                "charge_kind, seconds, fuzz_seconds) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+                (
+                    uuid.uuid4(),
+                    job["family_id"],
+                    candidate["job_id"],
+                    candidate["step_key"],
+                    candidate["attempt_no"],
+                    charge_kind,
+                    charged_seconds,
+                    charged_fuzz,
+                ),
+            )
+            _audit(
+                connection,
+                candidate["job_id"],
+                "budget_charge_recovered",
+                stage="execute",
+                detail={
+                    "step_key": candidate["step_key"],
+                    "attempt_no": candidate["attempt_no"],
+                    "generation": candidate["generation"],
+                    "charge_kind": charge_kind,
+                    "seconds": charged_seconds,
+                    "fuzz_seconds": charged_fuzz,
+                },
+            )
+            return True
 
 
 def block_round_child(

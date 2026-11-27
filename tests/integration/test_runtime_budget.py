@@ -657,3 +657,119 @@ def test_admission_failure_after_child_creation_fails_closed(
     assert state.claim_next(
         isolated_database.dsn, "worker-t12", job_contract_version=2
     ) is None
+
+
+def _age_round(database, job_id, seconds: int) -> None:
+    database.connection.execute(
+        "UPDATE jobs SET updated_at = clock_timestamp() - make_interval(secs => %s) "
+        "WHERE job_id = %s",
+        (seconds, job_id),
+    )
+
+
+def test_unadmitted_round_after_crash_is_recovered_by_the_worker_scan(
+    isolated_database, tmp_path, monkeypatch
+):
+    monkeypatch.setenv("DATACON_EVIDENCE_ROOT", str(tmp_path / "evidence"))
+    family_id, envelope = _seed_family(isolated_database)
+
+    def crash(*args, **kwargs):
+        raise KeyboardInterrupt("process died between child and admission")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(state, "record_admission", crash)
+        with pytest.raises(KeyboardInterrupt):
+            _derive(isolated_database, family_id, envelope, round_no=1)
+    (job_id, _round_no, job_state, _reason), = _round_jobs(
+        isolated_database, family_id
+    )
+    assert job_state == "READY"
+
+    # Within the grace window the scan leaves an in-flight derivation alone.
+    assert workflow.recover_unadmitted_rounds(isolated_database.dsn) == 0
+    assert _count(
+        isolated_database, "SELECT count(*) FROM admissions WHERE job_id = %s", (job_id,)
+    ) == 0
+
+    # After the grace window the scan retries the persisted admission inputs.
+    _age_round(isolated_database, job_id, 3600)
+    assert workflow.recover_unadmitted_rounds(isolated_database.dsn) == 1
+    assert _count(
+        isolated_database, "SELECT count(*) FROM admissions WHERE job_id = %s", (job_id,)
+    ) == 1, "a round left READY without admission after a crash was never recovered"
+    assert workflow.recover_unadmitted_rounds(isolated_database.dsn) == 0
+    claimed = state.claim_next(
+        isolated_database.dsn, "worker-t12", job_contract_version=2
+    )
+    assert claimed is not None and claimed["job_id"] == job_id
+
+    # A retried admission that is denied fails closed: BLOCKED and archived.
+    family_id, envelope = _seed_family(isolated_database)
+    outside = deepcopy(DEFAULT_EXPERIMENT)
+    outside["input_family"] = "format_string"
+    with monkeypatch.context() as patch:
+        patch.setattr(state, "record_admission", crash)
+        with pytest.raises(KeyboardInterrupt):
+            _derive(
+                isolated_database, family_id, envelope, round_no=1,
+                experiment=outside,
+            )
+    (job_id, _round_no, _state, _reason), = _round_jobs(
+        isolated_database, family_id
+    )
+    _age_round(isolated_database, job_id, 3600)
+    assert workflow.recover_unadmitted_rounds(isolated_database.dsn) == 1
+    assert _round_jobs(isolated_database, family_id)[0][2:] == (
+        "BLOCKED",
+        "ENVELOPE_VIOLATION",
+    )
+    assert state.load_job(isolated_database.dsn, job_id)["evidence_status"] == "archived"
+
+
+def test_crash_before_charge_is_recovered_by_the_worker_scan(
+    isolated_database, step_clock, monkeypatch
+):
+    family_id, envelope = _seed_family(
+        isolated_database, ledger_total=40, ledger_fuzz=25
+    )
+    context = _running_round(isolated_database, family_id, envelope)
+
+    def crash(*args, **kwargs):
+        raise KeyboardInterrupt("process died before the charge committed")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(execution, "_charge_step_budget", crash)
+        with pytest.raises(KeyboardInterrupt):
+            _step(
+                isolated_database,
+                context,
+                "fuzz:search",
+                RecordingContainer(context, step_clock, runtime=3.0),
+                charge_kind="fuzz",
+            )
+    assert _charges(isolated_database, context.job_id) == []
+
+    # The lease is still live: a running worker owns the attempt.
+    assert state.recover_uncharged_attempts(isolated_database.dsn) == 0
+
+    # Lease expired and the attempt started long ago: the scan charges the
+    # step conservatively, capped by the ceiling the gate granted (25s).
+    isolated_database.connection.execute(
+        "UPDATE jobs SET lease_expires_at = clock_timestamp() - interval '1 second' "
+        "WHERE job_id = %s",
+        (context.job_id,),
+    )
+    isolated_database.connection.execute(
+        "UPDATE attempts SET started_at = clock_timestamp() - interval '10 hours' "
+        "WHERE job_id = %s AND step_key = 'fuzz:search'",
+        (context.job_id,),
+    )
+    assert state.recover_uncharged_attempts(isolated_database.dsn) == 1
+    assert _charges(isolated_database, context.job_id) == [
+        ("fuzz:search", 1, "fuzz", 25, 25)
+    ], "a step that crashed before its charge was never charged"
+    ledger = _ledger(isolated_database, family_id)
+    assert (ledger["remaining_total_seconds"], ledger["remaining_fuzz_seconds"]) == (15, 0)
+    # Idempotent: a second scan charges nothing.
+    assert state.recover_uncharged_attempts(isolated_database.dsn) == 0
+    assert len(_charges(isolated_database, context.job_id)) == 1
