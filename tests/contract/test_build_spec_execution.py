@@ -5229,3 +5229,283 @@ def test_d3_nb2_partial_failed_and_pre_rule_inconclusive_archive_cleanly(
         assert verified.manifest["reason_code"] == expected_reason
         finished = mem_state.finished_calls[-1]
         assert finished["evidence_status"] == "archived"
+
+
+def test_policy_round_blocked_mid_execution_archives_blocked_bundle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Issue #63: a policy round blocked mid-execution still archives.
+
+    The policy round's approval document is admission.json, but the blocked
+    bundle contract forbids admission.json. The writer must drop it so the
+    real block reason (POLICY_DENIED) reaches BLOCKED with an evidence
+    bundle, instead of degrading to FAILED(EVIDENCE_WRITE_FAILED) with no
+    evidence after the verifier rejects the bundle.
+    """
+    run_root, _ = _configure_isolated_roots(tmp_path, monkeypatch)
+    spec = _cmake_spec()
+    face = _cmake_compile_commands_bytes(
+        flags=["-fsanitize=address", "-g", "-O1", "-I../include", "-D_GNU_SOURCE"]
+    )
+    parent_approval = "sha256:" + "e" * 64
+    job, plan, plan_digest, review = _setup_fixture_plan_and_job(
+        version=2, build_spec=spec
+    )
+    plan["parent_approval_digest"] = parent_approval
+    plan_digest = contracts.plan_digest(plan)
+    mem_state = _InMemoryState(job, plan, plan_digest, review)
+    mem_state.install(monkeypatch)
+    # The family's human review is bound to the first plan, not this later
+    # round: the round is admitted by policy only.
+    mem_state.review = {
+        "reviewer_id": "family-reviewer",
+        "decision": "approve",
+        "plan_digest": "sha256:" + "9" * 64,
+        "decided_at": review["decided_at"],
+    }
+    mem_state.admission = {
+        "admission_id": str(uuid4()),
+        "job_id": str(job["job_id"]),
+        "parent_job_id": str(job["parent_job_id"]),
+        "round_no": plan["round_no"],
+        "approval_kind": "policy",
+        "envelope_digest": plan["envelope_digest"],
+        "parent_approval_digest": parent_approval,
+        "seed_digest": plan["inputs"]["candidate"],
+        "predicate_version": "admission-v1",
+        "recomputable": True,
+        "supporting_bundle_digest": None,
+        "decided_at": "2099-01-01T00:00:00Z",
+    }
+    fake_sandbox = _FakeSandbox(
+        image_digest=plan["image_digest"],
+        build_recipe_digest=plan["build_recipe_digest"],
+        faces={"vulnerable": face, "fixed": face},
+        face_name="compile_commands.json",
+    )
+    original_build = fake_sandbox.build
+
+    def build(version: str, **kwargs: Any):
+        if version == "fixed":
+            raise SandboxPolicyError("seccomp profile mismatch")
+        return original_build(version, **kwargs)
+
+    fake_sandbox.build = build
+    result = execution.run_execution(
+        "dsn",
+        job["job_id"],
+        1,
+        case_root=str(FIXTURE_CASES),
+        run_root=run_root,
+        sandbox=fake_sandbox,
+    )
+    assert result.state == "BLOCKED", result
+    assert result.reason_code == "POLICY_DENIED"
+    assert result.evidence_path, "blocked policy round archived no evidence"
+    finished = mem_state.finished_calls[-1]
+    assert finished["state"] == "BLOCKED"
+    assert finished["reason_code"] == "POLICY_DENIED"
+    assert finished.get("evidence_error") is None
+    assert finished["evidence_path"] == result.evidence_path
+    verified = evidence.verify_bundle(result.evidence_path)
+    assert "admission.json" not in verified.file_data
+    # A blocked policy round carries neither approval document: not its
+    # admission (forbidden on blocked bundles) and not the family's
+    # first-plan review (a policy round is never human-reviewed).
+    assert "review.json" not in verified.file_data
+    report = json.loads(verified.file_data["report.json"])
+    assert report["bundle_kind"] == "blocked"
+    assert report["reason_code"] == "POLICY_DENIED"
+    assert report["review"] is None
+
+
+
+def test_policy_round_failed_partial_bundle_keeps_admission_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """SF-3 contrast for #63: a policy round that FAILS (not blocked).
+
+    The partial FAILED bundle is an execution bundle, which must carry
+    exactly one approval document: this round's admission.json, never the
+    family's review.json. If a future change wrongly passes blocked= to
+    this path too, the admission would vanish and the verifier would
+    reject the bundle.
+    """
+    run_root, _ = _configure_isolated_roots(tmp_path, monkeypatch)
+    spec = _cmake_spec()
+    face = _cmake_compile_commands_bytes(
+        flags=["-fsanitize=address", "-g", "-O1", "-I../include", "-D_GNU_SOURCE"]
+    )
+    parent_approval = "sha256:" + "e" * 64
+    job, plan, plan_digest, review = _setup_fixture_plan_and_job(
+        version=2, build_spec=spec
+    )
+    plan["parent_approval_digest"] = parent_approval
+    plan_digest = contracts.plan_digest(plan)
+    mem_state = _InMemoryState(job, plan, plan_digest, review)
+    mem_state.install(monkeypatch)
+    mem_state.review = {
+        "reviewer_id": "family-reviewer",
+        "decision": "approve",
+        "plan_digest": "sha256:" + "9" * 64,
+        "decided_at": review["decided_at"],
+    }
+    mem_state.admission = {
+        "admission_id": str(uuid4()),
+        "job_id": str(job["job_id"]),
+        "parent_job_id": str(job["parent_job_id"]),
+        "round_no": plan["round_no"],
+        "approval_kind": "policy",
+        "envelope_digest": plan["envelope_digest"],
+        "parent_approval_digest": parent_approval,
+        "seed_digest": plan["inputs"]["candidate"],
+        "predicate_version": "admission-v1",
+        "recomputable": True,
+        "supporting_bundle_digest": None,
+        "decided_at": "2099-01-01T00:00:00Z",
+    }
+    build_error = SandboxError(
+        "missing provenance face",
+        reason_code=build_provenance.BUILD_PROVENANCE_MISSING,
+    )
+    fake_sandbox = _FakeSandbox(
+        image_digest=plan["image_digest"],
+        build_recipe_digest=plan["build_recipe_digest"],
+        faces={"vulnerable": face, "fixed": None},
+        face_name="compile_commands.json",
+        build_error_by_version={"fixed": build_error},
+    )
+    result = execution.run_execution(
+        "dsn",
+        job["job_id"],
+        1,
+        case_root=str(FIXTURE_CASES),
+        run_root=run_root,
+        sandbox=fake_sandbox,
+    )
+    assert result.state == "FAILED", result
+    assert result.reason_code == build_provenance.BUILD_PROVENANCE_MISSING
+    assert result.evidence_path, "failed policy round archived no evidence"
+    verified = evidence.verify_bundle(result.evidence_path)
+    assert "admission.json" in verified.file_data
+    assert "review.json" not in verified.file_data
+
+def test_human_review_round_blocked_still_archives(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Contrast for issue #63: a human-review round blocked mid-execution.
+
+    The round is approved by a review bound to this plan; flipping the
+    decision to reject between the two builds trips the pre-container
+    recheck (PLAN_MISMATCH) and the blocked bundle carries review.json,
+    which the blocked contract allows. The admission gate on blocked
+    bundles must not disturb this path.
+    """
+    run_root, _ = _configure_isolated_roots(tmp_path, monkeypatch)
+    spec = _cmake_spec()
+    face = _cmake_compile_commands_bytes(
+        flags=["-fsanitize=address", "-g", "-O1", "-I../include", "-D_GNU_SOURCE"]
+    )
+    job, plan, plan_digest, review = _setup_fixture_plan_and_job(
+        version=2, build_spec=spec
+    )
+    mem_state = _InMemoryState(job, plan, plan_digest, review)
+    mem_state.install(monkeypatch)
+    fake_sandbox = _FakeSandbox(
+        image_digest=plan["image_digest"],
+        build_recipe_digest=plan["build_recipe_digest"],
+        faces={"vulnerable": face, "fixed": face},
+        face_name="compile_commands.json",
+    )
+    original_build = fake_sandbox.build
+
+    def build(version: str, **kwargs: Any):
+        result = original_build(version, **kwargs)
+        if version == "vulnerable":
+            mem_state.review = {**mem_state.review, "decision": "reject"}
+        return result
+
+    fake_sandbox.build = build
+    result = execution.run_execution(
+        "dsn",
+        job["job_id"],
+        1,
+        case_root=str(FIXTURE_CASES),
+        run_root=run_root,
+        sandbox=fake_sandbox,
+    )
+    assert result.state == "BLOCKED", result
+    assert result.reason_code == "PLAN_MISMATCH"
+    assert result.evidence_path, "blocked review round archived no evidence"
+    finished = mem_state.finished_calls[-1]
+    assert finished["state"] == "BLOCKED"
+    assert finished["reason_code"] == "PLAN_MISMATCH"
+    assert finished.get("evidence_error") is None
+    verified = evidence.verify_bundle(result.evidence_path)
+    assert "review.json" in verified.file_data
+    assert "admission.json" not in verified.file_data
+
+
+def test_evidence_artifacts_policy_blocked_never_falls_back_to_review(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """SF-1 pin for #63: the elif must not fire for a policy round.
+
+    The production path clears ``context.review`` when it adopts an
+    admission, so the end-to-end test cannot see this; this coordinate
+    simulates the unguarded state - a context that carries both the
+    admission and the family review - and requires the blocked write to
+    carry neither approval document.
+    """
+    run_root, _ = _configure_isolated_roots(tmp_path, monkeypatch)
+    spec = _cmake_spec()
+    parent_approval = "sha256:" + "e" * 64
+    job, plan, plan_digest, review = _setup_fixture_plan_and_job(
+        version=2, build_spec=spec
+    )
+    plan["parent_approval_digest"] = parent_approval
+    plan_digest = contracts.plan_digest(plan)
+    mem_state = _InMemoryState(job, plan, plan_digest, review)
+    mem_state.install(monkeypatch)
+    mem_state.review = {
+        "reviewer_id": "family-reviewer",
+        "decision": "approve",
+        "plan_digest": "sha256:" + "9" * 64,
+        "decided_at": review["decided_at"],
+    }
+    mem_state.admission = {
+        "admission_id": str(uuid4()),
+        "job_id": str(job["job_id"]),
+        "parent_job_id": str(job["parent_job_id"]),
+        "round_no": plan["round_no"],
+        "approval_kind": "policy",
+        "envelope_digest": plan["envelope_digest"],
+        "parent_approval_digest": parent_approval,
+        "seed_digest": plan["inputs"]["candidate"],
+        "predicate_version": "admission-v1",
+        "recomputable": True,
+        "supporting_bundle_digest": None,
+        "decided_at": "2099-01-01T00:00:00Z",
+    }
+    context = execution._load_context(
+        "dsn",
+        job["job_id"],
+        1,
+        case_root=str(FIXTURE_CASES),
+        run_root=run_root,
+    )
+    # The unguarded precondition: both approval documents on one context.
+    context.review = review
+
+    artifacts = execution._evidence_artifacts(
+        context,
+        run_root / "run",
+        builds={},
+        runs=[],
+        probe=None,
+        execution_metadata={},
+        blocked=True,
+    )
+
+    assert "admission.json" not in artifacts
+    assert "review.json" not in artifacts
