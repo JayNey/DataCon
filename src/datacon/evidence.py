@@ -206,6 +206,33 @@ _V2_REQUIRED_PATHS = {
         "budget/snapshot.json": "budget_snapshot",
     },
 }
+# A FAILED or pre-rule INCONCLUSIVE execution bundle is allowed to archive
+# only the evidence that was actually produced. It still carries the fixed
+# documents needed to interpret the partial run, but build/replay roles are
+# required only when their paths exist (and are always validated when they do).
+# This is deliberately narrower than the full execution role table: a complete
+# REPRODUCED/NOT_REPRODUCED/rule-backed INCONCLUSIVE bundle keeps the strict
+# table, and empty replay/build files never satisfy the partial layout.
+_V2_PARTIAL_EXECUTION_REQUIRED_ROLES = frozenset(
+    {
+        "report_json",
+        "report_markdown",
+        "plan",
+        "envelope",
+        "budget_snapshot",
+        "execution_metadata",
+        "case_config",
+    }
+)
+_V2_PARTIAL_EXECUTION_REQUIRED_PATHS = {
+    "report.json": "report_json",
+    "report.md": "report_markdown",
+    "plan.json": "plan",
+    "envelope.json": "envelope",
+    "budget/snapshot.json": "budget_snapshot",
+    "metadata/execution.json": "execution_metadata",
+    "metadata/case.json": "case_config",
+}
 _ENTRY_FIELDS = frozenset({"path", "role", "size_bytes", "sha256"})
 # Closed top-level key set for Manifest v2 (§8 / §12.5). Blocked bundles may
 # omit nullable identity keys (§12.2), but unknown top-level keys are always
@@ -671,9 +698,19 @@ def write_bundle(
         entries.sort(key=lambda item: item["path"])
 
         roles = {entry["role"] for entry in entries}
+        partial_execution = False
         if schema_version == contracts.SCHEMA_VERSION_V2:
-            required_roles = _V2_REQUIRED_ROLES[bundle_kind]
+            payload_verdict = (
+                verdict if isinstance(verdict, str) else report.get("verdict")
+            )
+            partial_execution = _is_partial_execution(
+                bundle_kind, payload_verdict, report
+            )
+            required_roles, required_paths = _v2_required_roles_and_paths(
+                bundle_kind, partial_execution
+            )
         else:
+            required_paths = _REQUIRED_PATHS
             required_roles = (
                 _REQUIRED_ROLES
                 if bundle_kind == "execution"
@@ -694,8 +731,12 @@ def write_bundle(
                     payloads, plan_digest=plan_digest, report=report
                 )
             else:
-                _require_required_paths(listed, _V2_REQUIRED_PATHS[bundle_kind])
-                _verify_v2_layout(listed, bundle_kind)
+                _require_required_paths(listed, required_paths)
+                _verify_v2_layout(
+                    listed,
+                    bundle_kind,
+                    partial_execution=partial_execution,
+                )
         elif bundle_kind == "execution":
             _require_required_paths(listed, _REQUIRED_PATHS)
         else:
@@ -3576,12 +3617,44 @@ def _v2_required_role_paths(
         )
 
 
-def _verify_v2_build_layout(listed: Mapping[str, Mapping[str, Any]]) -> None:
+def _verify_v2_build_layout(
+    listed: Mapping[str, Mapping[str, Any]], *, partial_execution: bool = False
+) -> None:
     for version in _REPLAY_VERSIONS:
         prefix = f"build/{version}/"
         group = {
             path: entry for path, entry in listed.items() if path.startswith(prefix)
         }
+        if partial_execution:
+            # A partial execution bundle may have no build directory at all (a
+            # pre-build block), or only the produce/build evidence that exists.
+            # If a version group exists, its core log/metadata must be present;
+            # a build_artifact is optional because a failed build may have no
+            # verified artifact. Every present entry is still role/path checked.
+            if group:
+                _v2_required_role_paths(
+                    listed, prefix + "metadata.json", "build_metadata"
+                )
+                _v2_required_role_paths(
+                    listed, prefix + "build.log", "build_log"
+                )
+            for path, entry in group.items():
+                relative = path[len(prefix) :]
+                if relative in ("metadata.json", "build.log"):
+                    continue
+                if relative.startswith("build_provenance/"):
+                    if entry["role"] != "build_provenance":
+                        raise BundleError(
+                            "INVALID_MANIFEST",
+                            f"evidence {path} must carry the build_provenance role",
+                        )
+                    continue
+                if entry["role"] != "build_artifact":
+                    raise BundleError(
+                        "INVALID_MANIFEST",
+                        f"evidence {path} must carry the build_artifact role",
+                    )
+            continue
         if not group:
             raise BundleError(
                 "INVALID_MANIFEST", f"manifest is missing build/{version}/ evidence"
@@ -3622,10 +3695,13 @@ def _verify_v2_build_layout(listed: Mapping[str, Mapping[str, Any]]) -> None:
 
 
 def _verify_v2_replay_layout(
-    listed: Mapping[str, Mapping[str, Any]], bundle_kind: str
+    listed: Mapping[str, Mapping[str, Any]],
+    bundle_kind: str,
+    *,
+    require_complete: bool = True,
 ) -> None:
     expected = _v2_replay_expected_paths()
-    if bundle_kind == "execution":
+    if bundle_kind == "execution" and require_complete:
         for path, role in expected.items():
             _v2_required_role_paths(listed, path, role)
     for path, entry in listed.items():
@@ -3648,8 +3724,39 @@ def _verify_v2_replay_layout(
                 )
 
 
+def _is_partial_execution(
+    bundle_kind: str,
+    verdict: Any,
+    report: Mapping[str, Any],
+) -> bool:
+    """Return True for a FAILED or rule-less INCONCLUSIVE execution bundle."""
+    if bundle_kind != "execution":
+        return False
+    if verdict == "FAILED":
+        return True
+    if verdict != "INCONCLUSIVE":
+        return False
+    return report.get("rule") is None
+
+
+def _v2_required_roles_and_paths(
+    bundle_kind: str, partial_execution: bool
+) -> tuple[frozenset[str], Mapping[str, str]]:
+    if bundle_kind == "blocked":
+        return _BLOCKED_REQUIRED_ROLES, {}
+    if partial_execution:
+        return (
+            _V2_PARTIAL_EXECUTION_REQUIRED_ROLES,
+            _V2_PARTIAL_EXECUTION_REQUIRED_PATHS,
+        )
+    return _V2_REQUIRED_ROLES[bundle_kind], _V2_REQUIRED_PATHS[bundle_kind]
+
+
 def _verify_v2_layout(
-    listed: Mapping[str, Mapping[str, Any]], bundle_kind: str
+    listed: Mapping[str, Mapping[str, Any]],
+    bundle_kind: str,
+    *,
+    partial_execution: bool = False,
 ) -> None:
     for path, role in _V2_FIXED_PATH_ROLES.items():
         entry = listed.get(path)
@@ -3676,14 +3783,22 @@ def _verify_v2_layout(
             )
 
     if bundle_kind in ("execution", "campaign"):
-        for path, role in (
+        fixed_metadata = [
             ("metadata/execution.json", "execution_metadata"),
-            ("metadata/probe.json", "probe"),
             ("metadata/case.json", "case_config"),
-        ):
+        ]
+        if not partial_execution:
+            fixed_metadata.insert(1, ("metadata/probe.json", "probe"))
+        for path, role in fixed_metadata:
             _v2_required_role_paths(listed, path, role)
-        _verify_v2_build_layout(listed)
-        _verify_v2_replay_layout(listed, bundle_kind)
+        _verify_v2_build_layout(
+            listed, partial_execution=partial_execution
+        )
+        _verify_v2_replay_layout(
+            listed,
+            bundle_kind,
+            require_complete=not partial_execution,
+        )
 
     has_review = "review.json" in listed
     has_admission = "admission.json" in listed
@@ -3827,6 +3942,13 @@ def _verify_bundle_v2(
     the later evidence-v2 tasks (T13/T14). The generic inventory walk and
     digest checks are shared with v1 so path traversal, symlinks, extra/missing
     files and digest tampering keep the same guarantees.
+
+    T13a adds one narrow partial-execution layout: a ``FAILED`` execution or an
+    ``INCONCLUSIVE`` execution whose report has no rule trace may archive only
+    the evidence that was actually produced. The fixed documents (report, plan,
+    envelope, budget, execution/case metadata) are still mandatory; build and
+    replay roles are validated whenever present, but an absent build artifact
+    or replay file is not fabricated to satisfy the full role table.
     """
     (
         job_id,
@@ -3840,8 +3962,22 @@ def _verify_bundle_v2(
     seen: set[str] = set()
     for entry in files:
         entries.append(_validate_entry(entry, seen, _V2_ROLE_NAMES))
+    listed = {entry["path"]: entry for entry in entries}
     roles = {entry["role"] for entry in entries}
-    required_roles = _V2_REQUIRED_ROLES[bundle_kind]
+    data: dict[str, bytes] | None = None
+    partial_execution = False
+    if bundle_kind == "execution" and verdict in ("FAILED", "INCONCLUSIVE"):
+        # The partial decision depends on report.rule, so read the listed files
+        # once here and reuse the verified bytes below. A malformed/missing
+        # report still fails closed before any layout is accepted.
+        data = _read_listed_files(root_path, listed)
+        report = _parse_json_file(data, "report.json")
+        partial_execution = _is_partial_execution(
+            bundle_kind, verdict, report
+        )
+    required_roles, required_paths = _v2_required_roles_and_paths(
+        bundle_kind, partial_execution
+    )
     if not required_roles <= roles:
         missing = sorted(required_roles - roles)
         raise BundleError(
@@ -3849,13 +3985,15 @@ def _verify_bundle_v2(
             "manifest is missing required roles: " + ", ".join(missing),
         )
 
-    listed = {entry["path"]: entry for entry in entries}
     if bundle_kind == "blocked":
         _require_blocked_paths(listed)
     else:
-        _require_required_paths(listed, _V2_REQUIRED_PATHS[bundle_kind])
-    _verify_v2_layout(listed, bundle_kind)
-    data = _read_listed_files(root_path, listed)
+        _require_required_paths(listed, required_paths)
+    _verify_v2_layout(
+        listed, bundle_kind, partial_execution=partial_execution
+    )
+    if data is None:
+        data = _read_listed_files(root_path, listed)
     if bundle_kind == "blocked":
         _verify_v2_blocked_semantics(
             job_id=job_id,
