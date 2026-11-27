@@ -2,7 +2,7 @@
 
 **版本** v0.2  
 **日期** 2026-11-21  
-**状态** 已批准，改8 修订（T09 门禁改动保留；改7 的 T12 准入持久化、信封绑定、预算快照与审批账本初始化坐标保留；改8 增补 T12 无候选 seed 的 family 转移决策坐标）  
+**状态** 已批准，改8 修订（T09 门禁改动保留；改7 的 T12 准入持久化、信封绑定、预算快照与审批账本初始化坐标保留；改8 增补 T12 family 转移决策入口与坐标）  
 **适用范围** 多轮探索、计划身份、自动准入、构建溯源与证据 v2
 
 ## 1. 版本声明
@@ -150,13 +150,13 @@ flowchart TD
 | 21 | `build_diagnose → verify` | fixed 模式或复用 validation | 进入六次回放 |
 | 22 | `build_diagnose → archive` | 重试耗尽或溯源失败 | 归档 `BUILD_FAILED` 或 `BUILD_PROVENANCE_MISSING` |
 | 23 | `campaign → hypothesis_aggregator` | guided 模式产生下一轮候选 seed | family 级逻辑转移：派生新的 `job_kind=round` child；当前 campaign child 自己完成 `archive`，不得原地继续跑 verify |
-| 24 | `campaign → archive` | campaign 搜索结束或到达 fuzz 预算 | 保存 campaign bundle，供 family 审计；campaign 完成且无候选 seed 时，runtime 记录 `no_next_round` 决策（`family_transition_decided` 审计事件）后 family 归档，无决策则保持 `AGGREGATING`（改8） |
+| 24 | `campaign → archive` | campaign 搜索结束或到达 fuzz 预算 | 保存 campaign bundle，供 family 审计；campaign 完成且无候选 seed 时，runtime 在 campaign 决策点（`after_round_no=0`）记录 `no_next_round`（`NO_CANDIDATE_SEED`）后 family 归档，无决策则保持 `AGGREGATING`（改8） |
 | 25 | `verify → archive` | 结论为 `REPRODUCED`、`NOT_REPRODUCED`，或到达终止条件 | 终态不可回退 |
-| 26 | `verify → hypothesis_aggregator` | 六次回放未形成结论，且仍有 `max_rounds` 与预算余额 | family 级逻辑转移：派生下一轮 child；受 `max_rounds`、`max_total_seconds`、`max_fuzz_seconds` 与账本约束，耗尽归档 `BUDGET_EXHAUSTED` |
+| 26 | `verify → hypothesis_aggregator` | 六次回放未形成结论，且仍有 `max_rounds` 与预算余额 | family 级逻辑转移：派生下一轮 child；受 `max_rounds`、`max_total_seconds`、`max_fuzz_seconds` 与账本约束，耗尽归档 `BUDGET_EXHAUSTED`；仍有轮次与预算但 seed 已用尽时，runtime 在第 k 轮决策点（`after_round_no=k`）记录 `no_next_round`（`NO_REMAINING_SEEDS`）后 family 归档（改8） |
 
 两条 family 级转移（#23、#26）不是同一 job 内的继续执行：当前 child 必须先自行 `archive`，再由 family 创建下一轮 child。family 的多个 child 串行执行，同一时刻只有一个执行槽位。
 
-**无候选 seed 的 family 收敛（改8）**。campaign 完成且无候选 seed 时，runtime 记录 `no_next_round` 决策后 family 归档；无决策保持 `AGGREGATING`。决策只以 family 的 `family_transition_decided` 审计事件为准（`stage=transition`，`detail` 含 `campaign_job_id`、`decision`、`candidate_seed_count`、`next_round_no`、`reason_code`）；`next_round` 决策不触发归档，family 仍按 #23 等待下一轮 child。
+**family 转移决策（改8）**。campaign 完成且无候选 seed 时，runtime 记录 `no_next_round` 决策后 family 归档；无决策保持 `AGGREGATING`。决策按决策点记录：`after_round_no=0` 是 campaign 归档后的决策点（边 #23/#24），`after_round_no=k`（k ≥ 1）是第 k 轮以 `INCONCLUSIVE` 归档后的决策点（边 #26），因此“有 seed 但跑完 k 轮后 seed 用尽”的 family 同样可以收敛。归档判定只采纳当前 campaign 在当前决策点（`after_round_no` 等于已用轮次）的 `no_next_round`；`next_round`、历史决策点或不匹配的决策都不触发归档。决策只以 family 的 `family_transition_decided` 审计事件为准，入口与字段见[接口 §9.2](interface-contract-delta.md)。
 
 **终态说明（D40）**。campaign child 在搜索结束或 fuzz 预算耗尽并完成归档后，job `state=COMPLETED`；family 在聚合期间保持不可领取的 `AGGREGATING`，聚合归档后同样 `state=COMPLETED`。`COMPLETED` 是 v2 新增终态：`verdict`/`reason_code` 为 null，`evidence_status='archived'`，`claim_next` 不领取，回滚排空集合不包含它。campaign 不再用 `INCONCLUSIVE` 表示“搜索完成”；`INCONCLUSIVE` 只表示复现判定未形成结论。archive 节点对 campaign 与 family 的归档动作不变，变的只是归档后的 job 终态。
 
@@ -245,6 +245,6 @@ T09 门禁在改8 后仍应满足：
 - `tests/contract/test_ci_gates.py` 43 项全绿，其中包含四条路径作用域用例。
 - 改6 只改本目录的 Markdown，不触及业务代码、工作流、迁移、`scripts/`、`examples/`、根 README 或 v0.1 文档；`git status --short` 只出现未跟踪的 `docs/spec/v0.2/`（默认折叠；使用 `-uall` 时列出本目录 12 个文件）与两个保留的 T09 门禁改动 `src/datacon/ci_gates.py`、`tests/contract/test_ci_gates.py`（均显示为 `M`，不新增其他改动）。
 - 改7 只登记 T12 准入持久化坐标、预算快照幂等冲突坐标、审批/计划信封绑定坐标、审批初始化预算账本坐标与三路径语义，不改变 REQ/TC、§10 原因码或行为契约。
-- 改8 仅增补无 seed family 决策坐标（T12 的两条 `postgres` 坐标与边 #24 的说明），不改变 REQ/TC 与 §10 原因码；`NO_CANDIDATE_SEED` 只出现在决策审计的 `detail.reason_code`，不进入 `jobs.reason_code` 或审计 `reason_code` 列。
+- 改8 增补 family 转移决策入口与坐标（`record_family_transition_decision`、T12 的 `postgres` 坐标与边 #24/#26 的说明），不改变 REQ/TC 与 §10 原因码；决策子码 `NO_CANDIDATE_SEED`/`NO_REMAINING_SEEDS` 只出现在决策审计的 `detail.reason_code`，不进入 `jobs.reason_code`、审计 `reason_code` 列或 §10 终态封闭集。
 - 本目录所有相对链接可解析，REQ/TC 引用落在允许集合内；六份 ADR 文件总行数（含空行）60–120 行，含标题、Status、Date 与 6 个二级节。
 - 不新增 `xfail`、`skip` 或业务代码；T09 不新增 T10–T15 的测试代码，仅新增四条门禁作用域用例；各任务开工时再按坐标创建测试。
