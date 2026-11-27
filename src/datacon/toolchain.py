@@ -10,6 +10,7 @@ import re
 import subprocess
 from types import MappingProxyType
 from typing import Any, Literal, NoReturn
+import uuid
 
 from datacon import release, verdict
 from datacon.tools import sandbox
@@ -58,7 +59,9 @@ _IMAGE_REPO_RE = re.compile(
     f"^(?:{_REGISTRY_PREFIX_RE})?{_REPO_PATH_RE}{_IMAGE_TAG_RE}$"
 )
 _TOOL_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._+-]{0,63}$")
+_CONTAINER_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,62}$")
 _PROBE_LINE_RE = re.compile(r"^TOOL\s+(\S+)\s+(present|absent)$")
+_PROBE_CLEANUP_TIMEOUT_SECONDS: float = 15.0
 
 
 class ToolchainBoundaryError(ValueError):
@@ -409,6 +412,7 @@ def build_toolchain_probe_command(
     image: str = PINNED_TOOLCHAIN_IMAGE,
     seccomp_path: Path | str | None = None,
     docker_bin: str = "docker",
+    container_name: str | None = None,
 ) -> list[str]:
     """Construct an isolated one-shot ``docker run`` command to probe the image."""
     validated_image, _ = validate_pinned_image_ref(
@@ -425,6 +429,15 @@ def build_toolchain_probe_command(
         raise ToolchainBoundaryError(
             "docker_bin must be a non-empty executable name or path without "
             "leading/trailing whitespace or control characters",
+            sub_reason=SUB_REASON_TOOLCHAIN_PROBE_FAILED,
+        )
+    if container_name is not None and (
+        not isinstance(container_name, str)
+        or not _CONTAINER_NAME_RE.fullmatch(container_name)
+    ):
+        raise ToolchainBoundaryError(
+            f"container_name must match {_CONTAINER_NAME_RE.pattern}, "
+            f"got {container_name!r}",
             sub_reason=SUB_REASON_TOOLCHAIN_PROBE_FAILED,
         )
     if seccomp_path is None:
@@ -477,41 +490,44 @@ def build_toolchain_probe_command(
             sub_reason=SUB_REASON_TOOLCHAIN_PROBE_FAILED,
         )
 
-    return [
-        docker_bin,
-        "run",
-        "--rm",
-        "--platform",
-        "linux/amd64",
-        "--pull",
-        "never",
-        "--network=none",
-        "--read-only",
-        "--cap-drop=ALL",
-        "--security-opt=no-new-privileges:true",
-        f"--security-opt=seccomp={seccomp_file}",
-        "--user=65534:65534",
-        "--pids-limit=128",
-        "--memory=1024m",
-        "--memory-swap=1024m",
-        "--cpus=2",
-        "--ipc=private",
-        "--log-driver=none",
-        "--tmpfs",
-        "/work:rw,noexec,nosuid,nodev,size=128m,mode=1777",
-        "--tmpfs",
-        "/tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777",
-        "-w",
-        "/work",
-        "-e",
-        "TMPDIR=/tmp",
-        "-e",
-        "HOME=/work",
-        validated_image,
-        "/bin/sh",
-        "-c",
-        render_toolchain_probe_script(),
-    ]
+    cmd = [docker_bin, "run", "--rm"]
+    if container_name is not None:
+        cmd.extend(["--name", container_name])
+    cmd.extend(
+        [
+            "--platform",
+            "linux/amd64",
+            "--pull",
+            "never",
+            "--network=none",
+            "--read-only",
+            "--cap-drop=ALL",
+            "--security-opt=no-new-privileges:true",
+            f"--security-opt=seccomp={seccomp_file}",
+            "--user=65534:65534",
+            "--pids-limit=128",
+            "--memory=1024m",
+            "--memory-swap=1024m",
+            "--cpus=2",
+            "--ipc=private",
+            "--log-driver=none",
+            "--tmpfs",
+            "/work:rw,noexec,nosuid,nodev,size=128m,mode=1777",
+            "--tmpfs",
+            "/tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777",
+            "-w",
+            "/work",
+            "-e",
+            "TMPDIR=/tmp",
+            "-e",
+            "HOME=/work",
+            validated_image,
+            "/bin/sh",
+            "-c",
+            render_toolchain_probe_script(),
+        ]
+    )
+    return cmd
 
 
 def verify_pinned_image_tool_boundary(
@@ -531,10 +547,12 @@ def verify_pinned_image_tool_boundary(
             f"timeout_seconds must be a positive finite number, got {timeout_seconds!r}",
             sub_reason=SUB_REASON_TOOLCHAIN_PROBE_FAILED,
         )
+    container_name = f"datacon-toolchain-probe-{uuid.uuid4().hex[:16]}"
     cmd = build_toolchain_probe_command(
         image=image,
         seccomp_path=None,
         docker_bin=docker_bin,
+        container_name=container_name,
     )
     try:
         completed = subprocess.run(
@@ -544,8 +562,17 @@ def verify_pinned_image_tool_boundary(
             check=False,
         )
     except subprocess.TimeoutExpired as error:
+        try:
+            subprocess.run(
+                [docker_bin, "rm", "-f", container_name],
+                capture_output=True,
+                timeout=_PROBE_CLEANUP_TIMEOUT_SECONDS,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            pass
         raise ToolchainBoundaryError(
-            f"toolchain probe container timed out after {timeout_seconds}s",
+            f"toolchain probe container {container_name} timed out after {timeout_seconds}s",
             sub_reason=SUB_REASON_TOOLCHAIN_PROBE_FAILED,
         ) from error
     except OSError as error:

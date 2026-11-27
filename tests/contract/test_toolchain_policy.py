@@ -549,18 +549,87 @@ def test_verify_pinned_image_rejects_invalid_timeout_offline(
     )
 
 
+def test_probe_command_container_name_validation():
+    default_cmd = toolchain.build_toolchain_probe_command()
+    assert "--name" not in default_cmd
+
+    named_cmd = toolchain.build_toolchain_probe_command(
+        container_name="datacon-toolchain-probe-0123456789abcdef"
+    )
+    assert named_cmd[:5] == [
+        "docker",
+        "run",
+        "--rm",
+        "--name",
+        "datacon-toolchain-probe-0123456789abcdef",
+    ]
+
+    for bad_name in ("", "   ", "--privileged", "BadName", "probe\x00name", 123):
+        with pytest.raises(toolchain.ToolchainBoundaryError) as caught:
+            toolchain.build_toolchain_probe_command(container_name=bad_name)  # type: ignore[arg-type]
+        _assert_blocked_policy_error(
+            caught.value, toolchain.SUB_REASON_TOOLCHAIN_PROBE_FAILED
+        )
+
+
 def test_verify_pinned_image_handles_timeout_expired_offline(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    def _raise_timeout(*args: Any, **kwargs: Any) -> Any:
-        raise subprocess.TimeoutExpired(cmd=args[0], timeout=kwargs["timeout"])
+    calls: list[tuple[list[str], dict[str, Any]]] = []
 
-    monkeypatch.setattr(subprocess, "run", _raise_timeout)
+    def _fake_run(cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess[bytes]:
+        calls.append((cmd, kwargs))
+        if len(calls) == 1:
+            raise subprocess.TimeoutExpired(cmd=cmd, timeout=kwargs["timeout"])
+        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(subprocess, "run", _fake_run)
     with pytest.raises(toolchain.ToolchainBoundaryError, match="timed out") as caught:
-        toolchain.verify_pinned_image_tool_boundary(timeout_seconds=12.5)
+        toolchain.verify_pinned_image_tool_boundary(
+            docker_bin="/usr/bin/docker", timeout_seconds=12.5
+        )
     _assert_blocked_policy_error(
         caught.value, toolchain.SUB_REASON_TOOLCHAIN_PROBE_FAILED
     )
+    assert len(calls) == 2
+    run_cmd, _ = calls[0]
+    assert "--name" in run_cmd
+    container_name = run_cmd[run_cmd.index("--name") + 1]
+    assert container_name.startswith("datacon-toolchain-probe-")
+    cleanup_cmd, cleanup_kwargs = calls[1]
+    assert cleanup_cmd == ["/usr/bin/docker", "rm", "-f", container_name]
+    assert cleanup_kwargs.get("capture_output") is True
+    assert cleanup_kwargs.get("check") is False
+    assert 0 < cleanup_kwargs.get("timeout", 0) <= 30
+
+
+@pytest.mark.parametrize(
+    "cleanup_error",
+    [
+        OSError("docker daemon gone"),
+        subprocess.TimeoutExpired(cmd=["docker", "rm", "-f", "x"], timeout=15.0),
+    ],
+)
+def test_verify_pinned_image_timeout_swallows_cleanup_errors_offline(
+    monkeypatch: pytest.MonkeyPatch,
+    cleanup_error: Exception,
+):
+    calls: list[list[str]] = []
+
+    def _fake_run(cmd: list[str], **kwargs: Any) -> Any:
+        calls.append(cmd)
+        if len(calls) == 1:
+            raise subprocess.TimeoutExpired(cmd=cmd, timeout=kwargs["timeout"])
+        raise cleanup_error
+
+    monkeypatch.setattr(subprocess, "run", _fake_run)
+    with pytest.raises(toolchain.ToolchainBoundaryError, match="timed out") as caught:
+        toolchain.verify_pinned_image_tool_boundary(timeout_seconds=5.0)
+    _assert_blocked_policy_error(
+        caught.value, toolchain.SUB_REASON_TOOLCHAIN_PROBE_FAILED
+    )
+    assert len(calls) == 2
+    assert calls[1][:3] == ["docker", "rm", "-f"]
 
 
 def test_verify_pinned_image_handles_oserror_offline(
@@ -626,10 +695,14 @@ def test_verify_pinned_image_success_offline_checks_subprocess_kwargs(
         docker_bin="/usr/bin/docker",
         timeout_seconds=45.0,
     )
+    assert "--name" in captured["cmd"]
+    container_name = captured["cmd"][captured["cmd"].index("--name") + 1]
+    assert container_name.startswith("datacon-toolchain-probe-")
     assert captured["cmd"] == toolchain.build_toolchain_probe_command(
         image=release.TOOLCHAIN_IMAGE,
         seccomp_path=None,
         docker_bin="/usr/bin/docker",
+        container_name=container_name,
     )
     kwargs = captured["kwargs"]
     assert kwargs.get("capture_output") is True
