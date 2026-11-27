@@ -8,7 +8,6 @@ from __future__ import annotations
 
 from copy import deepcopy
 import hashlib
-import importlib
 import json
 from pathlib import Path
 from typing import Any
@@ -17,7 +16,7 @@ from uuid import uuid4
 import pytest
 from test_plan import PLAN as BASE_PLAN_V1
 
-from datacon import contracts, evidence, jsonutil
+from datacon import build_provenance as provenance, contracts, evidence, jsonutil
 
 PROVENANCE_FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "provenance"
 REPO_ROOT = "/work/repo"
@@ -39,10 +38,6 @@ def _fixture_bytes(name: str) -> bytes:
 
 def _sha256_hex(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
-
-
-def _import_build_provenance():
-    return importlib.import_module("datacon.build_provenance")
 
 
 def _make_build_spec(
@@ -375,7 +370,6 @@ def _write_v2_bundle(
 
 
 def test_declared_flags_must_be_subset_of_effective_flags():
-    provenance = _import_build_provenance()
     vulnerable_face = _fixture_bytes("cmake_comparable_vulnerable.compile_commands.json")
     missing_declared_face = _fixture_bytes(
         "cmake_missing_declared_flag.compile_commands.json"
@@ -428,7 +422,6 @@ def test_declared_flags_must_be_subset_of_effective_flags():
 
 
 def test_two_versions_must_have_equal_effective_flags():
-    provenance = _import_build_provenance()
     vuln_cmake = _fixture_bytes("cmake_comparable_vulnerable.compile_commands.json")
     unequal_fixed_cmake = _fixture_bytes(
         "cmake_unequal_effective_fixed.compile_commands.json"
@@ -483,7 +476,6 @@ def test_two_versions_must_have_equal_effective_flags():
 
 
 def test_include_order_is_significant():
-    provenance = _import_build_provenance()
 
     ab_norm = provenance.normalize_compile_flags(
         ["-fsanitize=address", "-g", "-O1", "-I", "a", "-I", "b"],
@@ -586,7 +578,6 @@ def test_include_order_is_significant():
 
 
 def test_connected_and_split_flag_forms_are_equivalent():
-    provenance = _import_build_provenance()
 
     split_tokens = [
         "-fsanitize=address",
@@ -678,7 +669,6 @@ def test_connected_and_split_flag_forms_are_equivalent():
 
 
 def test_declared_flags_are_normalized_before_compare():
-    provenance = _import_build_provenance()
     connected_face = _fixture_bytes("cmake_flags_connected.compile_commands.json")
 
     declared_split_and_quoted = [
@@ -728,7 +718,6 @@ def test_declared_flags_are_normalized_before_compare():
 
 
 def test_cmake_and_make_success_faces_are_captured():
-    provenance = _import_build_provenance()
 
     cmake_vuln = _fixture_bytes("cmake_comparable_vulnerable.compile_commands.json")
     cmake_fixed = _fixture_bytes("cmake_comparable_fixed.compile_commands.json")
@@ -998,9 +987,39 @@ def test_build_provenance_rules_version_is_bound_in_plan(tmp_path: Path):
     with pytest.raises(evidence.BundleError, match="build_provenance_rules_version"):
         evidence.verify_bundle(drifted_report_bundle)
 
+    # plan.json drift relative to manifest/report must also fail closed.
+    drifted_plan_bundle = _write_v2_bundle(
+        tmp_path / "rules-plan-drifted",
+        bundle_kind="execution",
+        provenance_versions=("vulnerable", "fixed"),
+    )
+    plan_path = drifted_plan_bundle / "plan.json"
+    plan_doc = json.loads(plan_path.read_text(encoding="utf-8"))
+    plan_doc["build_provenance_rules_version"] = "build-provenance-v2"
+    plan_bytes = (json.dumps(plan_doc, sort_keys=True) + "\n").encode("utf-8")
+    plan_path.write_bytes(plan_bytes)
+    manifest_path = drifted_plan_bundle / "manifest.json"
+    manifest_doc = json.loads(manifest_path.read_text(encoding="utf-8"))
+    for entry in manifest_doc["files"]:
+        if entry["path"] == "plan.json":
+            entry["size_bytes"] = len(plan_bytes)
+            entry["sha256"] = _sha256_hex(plan_bytes)
+    manifest_path.write_text(json.dumps(manifest_doc, sort_keys=True) + "\n", encoding="utf-8")
+    with pytest.raises(evidence.BundleError, match="build_provenance_rules_version"):
+        evidence.verify_bundle(drifted_plan_bundle)
+
+    # Campaign bundles enforce the same build_provenance_rules_version binding.
+    drifted_campaign_bundle = _write_v2_bundle(
+        tmp_path / "rules-campaign-report-drifted",
+        bundle_kind="campaign",
+        provenance_versions=("vulnerable", "fixed"),
+        report_rules_version="build-provenance-v2",
+    )
+    with pytest.raises(evidence.BundleError, match="build_provenance_rules_version"):
+        evidence.verify_bundle(drifted_campaign_bundle)
+
 
 def test_missing_face_blocks_plan_freeze():
-    provenance = _import_build_provenance()
 
     # §3 L132-160 canonical CMake BuildSpec (without explicit -DCMAKE_EXPORT_COMPILE_COMMANDS=ON;
     # the fixed executor template injects export flags) and §5 Make BuildSpec with CC shim must freeze.
@@ -1076,10 +1095,13 @@ def test_missing_face_blocks_plan_freeze():
     assert make_env_decision.ok is False, (
         "deprecated make_env field in BuildSpec must be rejected at freeze"
     )
+    assert make_env_decision.reason_code == "BUILD_PROVENANCE_MISSING", (
+        "expected BUILD_PROVENANCE_MISSING for deprecated make_env, "
+        f"got {make_env_decision.reason_code!r}"
+    )
 
 
 def test_shell_recipe_requires_separate_face_review():
-    provenance = _import_build_provenance()
     baseline_log = _fixture_bytes("shell_face_baseline.shell-face.log")
     same_norm_log = _fixture_bytes("shell_face_same_normalized.shell-face.log")
     drifted_log = _fixture_bytes("shell_face_drifted.shell-face.log")

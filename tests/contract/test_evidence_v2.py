@@ -1978,3 +1978,244 @@ def test_v2_build_layout_rejects_multiple_provenance_faces_per_version(
         )
         with pytest.raises(BundleError, match="at most one build_provenance face"):
             verify_bundle(partial_root)
+
+
+def test_campaign_crash_seed_enforcement_covers_int_crashes_alt_paths_and_corrupt_json(
+    tmp_path,
+):
+    """PR #62 B-1: int crashes, invalid types, non-default fuzz_provenance paths, and corrupt JSON."""
+    # 1. Integer "crashes": 2 in fuzz/provenance.json or report.json requires crash_seed.
+    for target in ("fuzz/provenance.json", "report.json"):
+        files = _base_files(execution=False, campaign=True)
+        payload = (
+            {
+                "schema_version": 2,
+                "bundle_kind": "campaign",
+                "build_provenance_rules_version": "build-provenance-v1",
+                "crashes": 2,
+            }
+            if target == "report.json"
+            else {"crashes": 2}
+        )
+        role = "report_json" if target == "report.json" else "fuzz_provenance"
+        files[target] = (role, json.dumps(payload).encode("utf-8") + b"\n")
+        root = _write_v2_bundle(
+            tmp_path,
+            _manifest("campaign", verdict=None, reason=None),
+            files,
+            name="campaign-int-crashes-" + target.replace("/", "-"),
+        )
+        with pytest.raises(BundleError, match="crash_seed"):
+            verify_bundle(root)
+
+    # 2. Negative integer / invalid types fail closed as INVALID_MANIFEST.
+    for label, bad_doc in (
+        ("neg-crashes", {"crashes": -1}),
+        ("bool-crashes", {"crashes": True}),
+        ("str-crashes", {"crashes": "2"}),
+        ("neg-crash-count", {"crash_count": -1}),
+        ("bad-candidate-seeds", {"candidate_seeds": "not-a-list"}),
+    ):
+        files = _base_files(execution=False, campaign=True)
+        files["fuzz/provenance.json"] = (
+            "fuzz_provenance",
+            json.dumps(bad_doc).encode("utf-8") + b"\n",
+        )
+        root = _write_v2_bundle(
+            tmp_path,
+            _manifest("campaign", verdict=None, reason=None),
+            files,
+            name=f"campaign-invalid-{label}",
+        )
+        with pytest.raises(BundleError) as raised:
+            verify_bundle(root)
+        assert raised.value.reason_code == "INVALID_MANIFEST", label
+
+    # 3. fuzz_provenance at a non-default path is still inspected.
+    alt_files = _base_files(execution=False, campaign=True)
+    del alt_files["fuzz/provenance.json"]
+    alt_files["fuzz/campaign_provenance.json"] = (
+        "fuzz_provenance",
+        b'{"crashes": 1}\n',
+    )
+    alt_root = _write_v2_bundle(
+        tmp_path,
+        _manifest("campaign", verdict=None, reason=None),
+        alt_files,
+        name="campaign-alt-fuzz-provenance",
+    )
+    with pytest.raises(BundleError, match="crash_seed"):
+        verify_bundle(alt_root)
+
+    # 4. Corrupt JSON in fuzz_provenance is never skipped even when report already lists seeds.
+    corrupt_files = _base_files(execution=False, campaign=True)
+    corrupt_files["report.json"] = (
+        "report_json",
+        json.dumps(
+            {
+                "schema_version": 2,
+                "bundle_kind": "campaign",
+                "build_provenance_rules_version": "build-provenance-v1",
+                "candidate_seeds": [DIGEST],
+            }
+        ).encode("utf-8")
+        + b"\n",
+    )
+    corrupt_files["fuzz/crashes/seed-001.bin"] = ("crash_seed", b"CRASH\n")
+    corrupt_files["fuzz/provenance.json"] = ("fuzz_provenance", b"{corrupt json")
+    corrupt_root = _write_v2_bundle(
+        tmp_path,
+        _manifest("campaign", verdict=None, reason=None),
+        corrupt_files,
+        name="campaign-corrupt-fuzz-provenance",
+    )
+    with pytest.raises(BundleError):
+        verify_bundle(corrupt_root)
+
+
+def test_nb2_hollow_shell_and_campaign_reject_non_build_or_replay_roles_under_reserved_dirs(
+    tmp_path,
+):
+    """PR #62 B-2: non-build/non-replay roles under build/ or replay/ cannot spoof runtime evidence."""
+    base_hollow = {
+        path: item
+        for path, item in _partial_execution_files().items()
+        if not path.startswith("build/")
+    }
+    base_hollow["report.json"] = (
+        "report_json",
+        b'{"rule":null,"build_provenance_rules_version":"build-provenance-v1"}\n',
+    )
+
+    for label, spoof_path, spoof_role in (
+        ("build-dummy-symbolizer", "build/dummy.txt", "symbolizer_log"),
+        ("replay-dummy-symbolizer", "replay/dummy.txt", "symbolizer_log"),
+        (
+            "replay-fixed-path-wrong-role",
+            "replay/vulnerable/normal/stdout.log",
+            "symbolizer_log",
+        ),
+        ("probe-wrong-role", "metadata/probe.json", "symbolizer_log"),
+    ):
+        files = dict(base_hollow)
+        files[spoof_path] = (spoof_role, b"spoof\n")
+        root = _write_v2_bundle(
+            tmp_path,
+            _manifest("execution", verdict="INCONCLUSIVE", reason="TIMEOUT"),
+            files,
+            name=f"nb2-spoof-{label}",
+        )
+        with pytest.raises(BundleError) as raised:
+            verify_bundle(root)
+        assert raised.value.reason_code == "INVALID_MANIFEST", label
+
+    # Campaign carrying a non-replay role under replay/ is also rejected.
+    camp_files = _base_files(execution=False, campaign=True)
+    camp_files["replay/dummy.txt"] = ("symbolizer_log", b"spoof\n")
+    camp_root = _write_v2_bundle(
+        tmp_path,
+        _manifest("campaign", verdict=None, reason=None),
+        camp_files,
+        name="campaign-spoof-replay-dir",
+    )
+    with pytest.raises(BundleError, match="replay"):
+        verify_bundle(camp_root)
+
+
+def test_v2_defensive_face_consistency_blocked_cap_and_partial_report_contradictions(
+    tmp_path,
+):
+    """PR #62 non-blocking hardening: face consistency, build_spec.kind match, blocked cap, report checks."""
+    # 1. Cross-version mismatched face names (compile_commands.json vs cc-shim.log) rejected.
+    mismatch_files = _base_files(execution=True, campaign=False)
+    del mismatch_files["build/fixed/build_provenance/compile_commands.json"]
+    mismatch_files["build/fixed/build_provenance/cc-shim.log"] = (
+        "build_provenance",
+        b'{"argv":["clang","-c","a.c"]}\n',
+    )
+    mismatch_root = _write_v2_bundle(
+        tmp_path,
+        _manifest("execution"),
+        mismatch_files,
+        name="cross-version-face-mismatch",
+    )
+    with pytest.raises(BundleError, match="face filenames must match"):
+        verify_bundle(mismatch_root)
+
+    # 2. Face filename must match plan.build_spec.kind when build_spec.kind is present.
+    kind_files = _base_files(execution=True, campaign=False)
+    kind_files["plan.json"] = (
+        "plan",
+        json.dumps(
+            {
+                "schema_version": 2,
+                "build_provenance_rules_version": "build-provenance-v1",
+                "build_spec": {"kind": "make"},
+            }
+        ).encode("utf-8")
+        + b"\n",
+    )
+    kind_root = _write_v2_bundle(
+        tmp_path,
+        _manifest("execution"),
+        kind_files,
+        name="face-kind-mismatch",
+    )
+    with pytest.raises(BundleError, match="build_spec.kind"):
+        verify_bundle(kind_root)
+
+    # 3. Blocked bundle carrying 2 build_provenance faces in one version is rejected.
+    blocked_manifest = _manifest("blocked")
+    blocked_files = _blocked_files(blocked_manifest)
+    blocked_files["build/vulnerable/build_provenance/compile_commands.json"] = (
+        "build_provenance",
+        b"[]\n",
+    )
+    blocked_files["build/vulnerable/build_provenance/cc-shim.log"] = (
+        "build_provenance",
+        b'{"argv":["clang","-c","a.c"]}\n',
+    )
+    blocked_root = _write_v2_bundle(
+        tmp_path,
+        blocked_manifest,
+        blocked_files,
+        name="blocked-two-faces",
+    )
+    with pytest.raises(BundleError, match="at most one build_provenance face"):
+        verify_bundle(blocked_root)
+
+    # 4. Contradictory report.verdict or evidence_complete=True on partial bundle rejected.
+    for label, report_doc in (
+        (
+            "verdict-contradiction",
+            {
+                "verdict": "REPRODUCED",
+                "rule": None,
+                "missing": ["build:fixed"],
+                "build_provenance_rules_version": "build-provenance-v1",
+            },
+        ),
+        (
+            "evidence-complete-true",
+            {
+                "verdict": "INCONCLUSIVE",
+                "rule": None,
+                "missing": ["build:fixed"],
+                "evidence_complete": True,
+                "build_provenance_rules_version": "build-provenance-v1",
+            },
+        ),
+    ):
+        partial_files = _partial_execution_files()
+        partial_files["report.json"] = (
+            "report_json",
+            json.dumps(report_doc).encode("utf-8") + b"\n",
+        )
+        root = _write_v2_bundle(
+            tmp_path,
+            _manifest("execution", verdict="INCONCLUSIVE", reason="TIMEOUT"),
+            partial_files,
+            name=f"partial-contradiction-{label}",
+        )
+        with pytest.raises(BundleError, match="missing required roles"):
+            verify_bundle(root)

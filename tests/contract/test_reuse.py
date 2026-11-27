@@ -19,6 +19,7 @@ import pytest
 from test_evidence_v2 import _base_files, _manifest, _write_v2_bundle
 from test_plan_family import ROUND_PLAN_V2
 
+from datacon import jsonutil
 from datacon.contracts import plan_digest
 from datacon.evidence import BundleError, _verify_v2_reuse_artifacts, verify_bundle
 
@@ -74,16 +75,7 @@ def _reuse_origin(
 def _with_build_spec_outputs(plan: dict, outputs: list[str]) -> dict:
     updated = deepcopy(plan)
     updated["build_spec"]["outputs"] = list(outputs)
-    updated["build_recipe_digest"] = (
-        "sha256:"
-        + hashlib.sha256(
-            json.dumps(
-                updated["build_spec"],
-                sort_keys=True,
-                separators=(",", ":"),
-            ).encode("utf-8")
-        ).hexdigest()
-    )
+    updated["build_recipe_digest"] = jsonutil.digest_json(updated["build_spec"])
     return updated
 
 
