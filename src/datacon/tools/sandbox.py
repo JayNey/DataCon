@@ -8,11 +8,12 @@ every container is labelled and removed after use.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from pathlib import Path
+from dataclasses import dataclass, field, replace
+from pathlib import Path, PurePosixPath
 import hashlib
 import json
 import os
+import posixpath
 import re
 import shlex
 import shutil
@@ -23,7 +24,7 @@ import time
 import uuid
 from typing import Any, Mapping, Sequence
 
-from datacon import fileio
+from datacon import build_provenance, fileio, jsonutil
 from datacon.asan import ASanSignature, parse_asan
 from datacon.cases import MAX_MATERIAL_BYTES
 
@@ -32,10 +33,16 @@ MIB = 1024 * 1024
 # attached container stream (log driver "none"), so there is no on-disk Docker
 # log to rotate and no host log-directory access.
 MAX_LOG_BYTES = 16 * 1024 * 1024
+MAX_PROVENANCE_FACE_BYTES = MAX_LOG_BYTES
 CAPTURE_CHUNK_BYTES = 64 * 1024
 MAX_ARTIFACT_BYTES = 128 * 1024 * 1024
 MAX_PREVIEW_BYTES = 512
 STREAM_ROLES = ("stdout", "stderr")
+DEFAULT_CC_SHIM_LOG_PATH = "/work/.datacon-cc-shim.log"
+DEFAULT_CC_SHIM_COMPILER = "clang"
+DEFAULT_CXX_SHIM_COMPILER = "clang++"
+_UNSAFE_WORK_PATH_CHARS = " \t\r\n'\"`$;\x00"
+_SAFE_SYSTEM_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 _IMAGE_DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
 _SAFE_NAME = re.compile(r"[^a-z0-9_.-]+")
@@ -209,6 +216,8 @@ class BuildResult:
     metadata: dict[str, Any]
     capture_error: str | None = None
     truncated_roles: tuple[str, ...] = ()
+    provenance_face: bytes | None = None
+    provenance_face_name: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
         payload = {
@@ -228,7 +237,38 @@ class BuildResult:
         }
         payload["capture_error"] = self.capture_error
         payload["truncated_roles"] = list(self.truncated_roles)
+        # Never expose raw provenance_face bytes in JSON metadata.
+        payload.pop("provenance_face", None)
+        if self.provenance_face_name is not None:
+            payload["provenance_face_name"] = self.provenance_face_name
+        if self.provenance_face is not None:
+            payload["provenance_face_size"] = len(self.provenance_face)
+            if not isinstance(payload.get("provenance_face_sha256"), str):
+                payload["provenance_face_sha256"] = (
+                    "sha256:" + hashlib.sha256(self.provenance_face).hexdigest()
+                )
         return payload
+
+
+@dataclass(frozen=True)
+class BuildSpecExecutionPlan:
+    """Validated, fixed-template execution plan for a v2 ``BuildSpec``."""
+
+    kind: str
+    configure: tuple[str, ...]
+    build: tuple[str, ...]
+    install: tuple[str, ...]
+    env: dict[str, str]
+    outputs: tuple[str, ...]
+    primary_output: str
+    primary_output_container_path: str
+    output_container_paths: tuple[tuple[str, str], ...]
+    provenance_face_name: str
+    provenance_face_container_path: str | None
+    cc_shim_destination: str | None = None
+    cxx_shim_destination: str | None = None
+    cmake_build_dir: str | None = None
+    container_command: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -787,6 +827,711 @@ def _extract_compile_args(recipe: bytes) -> tuple[str, ...]:
     return ()
 
 
+def _validate_work_container_path(path: str, *, label: str) -> str:
+    if (
+        not isinstance(path, str)
+        or not path.startswith("/work/")
+        or any(character in path for character in _UNSAFE_WORK_PATH_CHARS)
+        or ".." in PurePosixPath(path).parts
+    ):
+        raise SandboxPolicyError(f"unsafe {label}: {path!r}")
+    normalized = posixpath.normpath(path)
+    if not normalized.startswith("/work/"):
+        raise SandboxPolicyError(f"unsafe {label}: {path!r}")
+    return normalized
+
+
+def _validate_build_spec_output(raw_output: str, index: int) -> tuple[str, str]:
+    try:
+        return build_provenance.validate_build_spec_output_path(raw_output, index)
+    except ValueError as error:
+        raise SandboxError(
+            str(error), reason_code=build_provenance.BUILD_PROVENANCE_MISSING
+        ) from error
+
+
+def _select_primary_output(outputs: Sequence[str]) -> str:
+    if "parser" in outputs:
+        return "parser"
+    for item in outputs:
+        if PurePosixPath(item).name == "parser":
+            return item
+    return outputs[0]
+
+
+def _validate_shim_destination(
+    destination: Any,
+    *,
+    allowed_basenames: Sequence[str] | frozenset[str],
+    label: str,
+) -> str:
+    if not build_provenance.is_controlled_shim_path(
+        destination, allowed_basenames=allowed_basenames
+    ):
+        raise SandboxError(
+            f"unsafe {label} mount destination: {destination!r}",
+            reason_code=build_provenance.BUILD_PROVENANCE_MISSING,
+        )
+    return posixpath.normpath(str(destination))
+
+
+def _ensure_safe_dir_component(
+    parent_fd: int,
+    name: str,
+    *,
+    mode: int,
+    exclusive: bool,
+    label: str,
+) -> int:
+    dir_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    if exclusive:
+        try:
+            os.mkdir(name, mode, dir_fd=parent_fd)
+        except FileExistsError as error:
+            raise SandboxPolicyError(
+                f"the one-shot {label} directory already exists"
+            ) from error
+        except OSError as error:
+            raise SandboxPolicyError(
+                f"cannot create {label} directory safely: {error}"
+            ) from error
+        try:
+            fd = os.open(name, dir_flags, dir_fd=parent_fd)
+        except OSError as error:
+            raise SandboxPolicyError(
+                f"cannot open {label} directory without following a symlink: {error}"
+            ) from error
+    else:
+        try:
+            fd = os.open(name, dir_flags, dir_fd=parent_fd)
+        except FileNotFoundError:
+            try:
+                os.mkdir(name, mode, dir_fd=parent_fd)
+            except FileExistsError:
+                pass
+            except OSError as error:
+                raise SandboxPolicyError(
+                    f"cannot create {label} directory safely: {error}"
+                ) from error
+            try:
+                fd = os.open(name, dir_flags, dir_fd=parent_fd)
+            except OSError as error:
+                raise SandboxPolicyError(
+                    f"cannot open {label} directory without following a symlink: {error}"
+                ) from error
+        except OSError as error:
+            raise SandboxPolicyError(
+                f"cannot open {label} directory without following a symlink: {error}"
+            ) from error
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISDIR(info.st_mode):
+            raise SandboxPolicyError(f"{label} is not a real directory")
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def _create_safe_build_work_dir(
+    run_root: Path, version: str
+) -> tuple[int, Path, str, tuple[int, int]]:
+    """Create a one-shot build staging dir under ``run_root`` without following symlinks."""
+    try:
+        root_lstat = os.lstat(run_root)
+    except FileNotFoundError:
+        try:
+            run_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        except OSError as error:
+            raise SandboxPolicyError(
+                f"sandbox run_root cannot be created safely: {error}"
+            ) from error
+    except OSError as error:
+        raise SandboxPolicyError(
+            f"sandbox run_root cannot be inspected: {error}"
+        ) from error
+    else:
+        if stat.S_ISLNK(root_lstat.st_mode) or not stat.S_ISDIR(root_lstat.st_mode):
+            raise SandboxPolicyError(
+                "sandbox run_root must be a real directory, not a symlink"
+            )
+
+    dir_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        root_fd = os.open(run_root, dir_flags)
+    except OSError as error:
+        raise SandboxPolicyError(
+            f"sandbox run_root cannot be opened without following a symlink: {error}"
+        ) from error
+
+    build_fd: int | None = None
+    version_fd: int | None = None
+    work_fd: int | None = None
+    try:
+        build_fd = _ensure_safe_dir_component(
+            root_fd, "build", mode=0o755, exclusive=False, label="build root"
+        )
+        version_fd = _ensure_safe_dir_component(
+            build_fd,
+            version,
+            mode=0o755,
+            exclusive=False,
+            label=f"build/{version}",
+        )
+        leaf = uuid.uuid4().hex
+        work_fd = _ensure_safe_dir_component(
+            version_fd,
+            leaf,
+            mode=0o755,
+            exclusive=True,
+            label="build work",
+        )
+        os.fchmod(work_fd, 0o755)
+        work = run_root / "build" / version / leaf
+        by_fd = os.fstat(work_fd)
+        by_path = os.lstat(work)
+        if stat.S_ISLNK(by_path.st_mode) or not stat.S_ISDIR(by_path.st_mode):
+            raise SandboxPolicyError("build work directory is not a real directory")
+        if (by_fd.st_dev, by_fd.st_ino) != (by_path.st_dev, by_path.st_ino):
+            raise SandboxPolicyError(
+                "build work directory identity changed after creation"
+            )
+        result_fd = work_fd
+        work_fd = None
+        return result_fd, work, leaf, (by_fd.st_dev, by_fd.st_ino)
+    except SandboxPolicyError:
+        raise
+    except OSError as error:
+        raise SandboxPolicyError(
+            f"cannot prepare build work directory safely: {error}"
+        ) from error
+    finally:
+        if work_fd is not None:
+            os.close(work_fd)
+        if version_fd is not None:
+            os.close(version_fd)
+        if build_fd is not None:
+            os.close(build_fd)
+        os.close(root_fd)
+
+
+def _verify_bound_shim_file(
+    work_fd: int, work: Path, shim_name: str, *, label: str
+) -> Path:
+    shim_path = work / shim_name
+    try:
+        by_dir_fd = os.lstat(shim_name, dir_fd=work_fd)
+        by_path = os.lstat(shim_path)
+    except OSError as error:
+        raise SandboxPolicyError(
+            f"cannot verify {label} before mounting: {error}"
+        ) from error
+    if (
+        stat.S_ISLNK(by_dir_fd.st_mode)
+        or not stat.S_ISREG(by_dir_fd.st_mode)
+        or stat.S_ISLNK(by_path.st_mode)
+        or not stat.S_ISREG(by_path.st_mode)
+        or (by_dir_fd.st_dev, by_dir_fd.st_ino) != (by_path.st_dev, by_path.st_ino)
+    ):
+        raise SandboxPolicyError(
+            f"{label} failed symlink/inode boundary verification before mounting"
+        )
+    return shim_path
+
+
+def _cleanup_safe_build_work_dir(
+    run_root: Path,
+    version: str,
+    leaf: str,
+    work_identity: tuple[int, int],
+    shim_names: Sequence[str],
+) -> None:
+    """Remove staged shim files and the per-build temp dir without following symlinks."""
+    dir_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    root_fd: int | None = None
+    build_fd: int | None = None
+    version_fd: int | None = None
+    work_fd: int | None = None
+    try:
+        root_fd = os.open(run_root, dir_flags)
+        build_fd = os.open("build", dir_flags, dir_fd=root_fd)
+        version_fd = os.open(version, dir_flags, dir_fd=build_fd)
+        work_fd = os.open(leaf, dir_flags, dir_fd=version_fd)
+        info = os.fstat(work_fd)
+        if (info.st_dev, info.st_ino) != work_identity:
+            return
+        for shim_name in shim_names:
+            try:
+                os.unlink(shim_name, dir_fd=work_fd)
+            except OSError:
+                pass
+        os.close(work_fd)
+        work_fd = None
+        try:
+            os.rmdir(leaf, dir_fd=version_fd)
+        except OSError:
+            pass
+    except OSError:
+        pass
+    finally:
+        if work_fd is not None:
+            os.close(work_fd)
+        if version_fd is not None:
+            os.close(version_fd)
+        if build_fd is not None:
+            os.close(build_fd)
+        if root_fd is not None:
+            os.close(root_fd)
+
+
+def render_cc_shim_script(
+    *,
+    real_compiler: str = DEFAULT_CC_SHIM_COMPILER,
+    log_path: str = DEFAULT_CC_SHIM_LOG_PATH,
+) -> str:
+    """Render a POSIX ``/bin/sh`` + ``awk`` cc-shim wrapper script.
+
+    Each invocation atomically appends one strict JSONL line
+    ``{"cwd": ..., "compiler": ..., "argv": [...]}`` to ``log_path`` with full
+    RFC 8259 string escaping (quotes, backslashes, control characters, spaces)
+    under ``LC_ALL=C`` serialized via ``flock`` (or a bounded POSIX ``mkdir``
+    lock fallback when ``flock`` is unavailable), then ``exec``s
+    ``real_compiler`` with exact verbatim ``"$@"`` and exit code.
+    """
+    if (
+        not isinstance(real_compiler, str)
+        or not real_compiler.strip()
+        or build_provenance.has_control_chars(real_compiler)
+    ):
+        raise SandboxPolicyError("real_compiler must be a non-empty string without control chars")
+    if (
+        not isinstance(log_path, str)
+        or not log_path.strip()
+        or build_provenance.has_control_chars(log_path)
+    ):
+        raise SandboxPolicyError("log_path must be a non-empty string without control chars")
+
+    quoted_compiler = shlex.quote(real_compiler)
+    quoted_log_path = shlex.quote(log_path)
+    awk_program = (
+        "function emit_json_str(s,    i, n, ch) {\n"
+        '  printf "%s", "\\""\n'
+        "  n = length(s)\n"
+        "  for (i = 1; i <= n; i++) {\n"
+        "    ch = substr(s, i, 1)\n"
+        '    if (ch == "\\\\") printf "%s", "\\\\\\\\"\n'
+        '    else if (ch == "\\"") printf "%s", "\\\\\\""\n'
+        '    else if (ch == "\\b") printf "%s", "\\\\b"\n'
+        '    else if (ch == "\\f") printf "%s", "\\\\f"\n'
+        '    else if (ch == "\\n") printf "%s", "\\\\n"\n'
+        '    else if (ch == "\\r") printf "%s", "\\\\r"\n'
+        '    else if (ch == "\\t") printf "%s", "\\\\t"\n'
+        '    else if (ch in ctrl) printf "%s", ctrl[ch]\n'
+        '    else printf "%s", ch\n'
+        "  }\n"
+        '  printf "%s", "\\""\n'
+        "}\n"
+        "BEGIN {\n"
+        "  for (c = 1; c < 32; c++) {\n"
+        '    ctrl[sprintf("%c", c)] = sprintf("\\\\u%04x", c)\n'
+        "  }\n"
+        '  printf "%s", "{\\"cwd\\":"\n'
+        "  emit_json_str(ARGV[1])\n"
+        '  printf "%s", ",\\"compiler\\":"\n'
+        "  emit_json_str(ARGV[2])\n"
+        '  printf "%s", ",\\"argv\\":["\n'
+        "  emit_json_str(ARGV[2])\n"
+        "  for (i = 3; i < ARGC; i++) {\n"
+        '    printf "%s", ","\n'
+        "    emit_json_str(ARGV[i])\n"
+        "  }\n"
+        '  printf "]}\\n"\n'
+        "  exit 0\n"
+        "}\n"
+    )
+    return (
+        "#!/bin/sh\n"
+        "set -e\n"
+        f'PATH="{_SAFE_SYSTEM_PATH}${{PATH:+:$PATH}}"\n'
+        "export PATH\n"
+        f"_datacon_real_compiler={quoted_compiler}\n"
+        f"_datacon_log_path={quoted_log_path}\n"
+        '_datacon_lock_path="${_datacon_log_path}.lock"\n'
+        'if [ -L "$_datacon_log_path" ] || [ -L "$_datacon_lock_path" ]; then\n'
+        "  exit 1\n"
+        "fi\n"
+        "_datacon_cwd=$(pwd -P)\n"
+        "_datacon_emit_log() {\n"
+        f"  LC_ALL=C awk -- '{awk_program}' "
+        '"$_datacon_cwd" "$_datacon_real_compiler" "$@"\n'
+        "}\n"
+        "if command -v flock >/dev/null 2>&1; then\n"
+        "  (\n"
+        "    flock -x 9 || exit 1\n"
+        '    if [ -L "$_datacon_log_path" ]; then exit 1; fi\n'
+        '    _datacon_emit_log "$@" >> "$_datacon_log_path"\n'
+        '  ) 9>"$_datacon_lock_path" || exit 1\n'
+        "else\n"
+        "  (\n"
+        "    _datacon_tries=0\n"
+        '    while ! mkdir "$_datacon_lock_path" 2>/dev/null; do\n'
+        "      _datacon_tries=$((_datacon_tries + 1))\n"
+        '      if [ "$_datacon_tries" -ge 600 ]; then\n'
+        "        exit 1\n"
+        "      fi\n"
+        "      sleep 0.05 2>/dev/null || sleep 1\n"
+        "    done\n"
+        "    trap 'rmdir \"$_datacon_lock_path\" 2>/dev/null || true' EXIT INT TERM HUP\n"
+        '    if [ -L "$_datacon_log_path" ]; then exit 1; fi\n'
+        '    _datacon_emit_log "$@" >> "$_datacon_log_path"\n'
+        "  ) || exit 1\n"
+        "fi\n"
+        'exec "$_datacon_real_compiler" "$@"\n'
+    )
+
+
+def render_build_runner_script(
+    *,
+    stage_fixture: bool = True,
+    emit_result_marker: bool = True,
+    wait_for_release: bool = True,
+) -> str:
+    """Return the fixed POSIX ``/bin/sh`` runner template for ``BuildSpec`` argv arrays.
+
+    Zero user arguments are ever interpolated into this script: ``primary_output``,
+    pre-build cleanup targets, and the length-prefixed ``configure`` / ``build`` /
+    ``install`` argv vectors are passed exclusively via positional parameters
+    (``$1..$N``) and dispatched in isolated subshells via ``(exec "$@")`` with
+    ``set -f`` (no ``eval``, no shell word-splitting, no runner state mutation).
+    """
+    lines = [
+        "set -f",
+        "_datacon_out=$1",
+        "shift",
+        "",
+        "_datacon_has_symlink_in_work() {",
+        "  _p=$1",
+        '  case "$_p" in',
+        "    /work/*)",
+        "      (",
+        "        set -f",
+        "        IFS=/",
+        "        _cur=/work",
+        "        for _seg in ${_p#/work/}; do",
+        '          [ -n "$_seg" ] || continue',
+        '          _cur="$_cur/$_seg"',
+        '          if [ -L "$_cur" ]; then',
+        "            exit 0",
+        "          fi",
+        "        done",
+        "        exit 1",
+        "      )",
+        "      ;;",
+        "    *)",
+        '      [ -L "$_p" ]',
+        "      ;;",
+        "  esac",
+        "}",
+        "",
+        "_datacon_clean_path() {",
+        "  _p=$1",
+        '  case "$_p" in',
+        "    /work/*)",
+        "      (",
+        "        set -f",
+        "        IFS=/",
+        "        _cur=/work",
+        "        for _seg in ${_p#/work/}; do",
+        '          [ -n "$_seg" ] || continue',
+        '          _cur="$_cur/$_seg"',
+        '          if [ -L "$_cur" ]; then',
+        '            rm -f -- "$_cur" 2>/dev/null || true',
+        "            exit 0",
+        "          fi",
+        "        done",
+        '        rm -f -- "$_p" 2>/dev/null || true',
+        '        rmdir -- "$_p" 2>/dev/null || true',
+        "      )",
+        "      ;;",
+        "    *)",
+        '      rm -f -- "$_p" 2>/dev/null || true',
+        "      ;;",
+        "  esac",
+        "}",
+        "",
+        "_datacon_run_first_n() {",
+        "  _n=$1",
+        "  shift",
+        "  _total=$#",
+        "  _i=0",
+        '  while [ "$_i" -lt "$_n" ]; do',
+        "    _arg=$1",
+        "    shift",
+        '    if [ "$#" -eq 0 ]; then',
+        '      set -- "$_arg"',
+        "    else",
+        '      set -- "$@" "$_arg"',
+        "    fi",
+        "    _i=$((_i + 1))",
+        "  done",
+        "  _drop=$((_total - _n))",
+        '  while [ "$_drop" -gt 0 ]; do',
+        "    shift",
+        "    _drop=$((_drop - 1))",
+        "  done",
+        '  (case "$1" in -*) exit 126 ;; esac; exec "$@")',
+        "}",
+    ]
+    if stage_fixture:
+        lines.extend(
+            [
+                f'PATH="{_SAFE_SYSTEM_PATH}${{PATH:+:$PATH}}"',
+                "export PATH",
+                "if [ -d /fixture ]; then",
+                "  cp -RP /fixture/. /work/ 2>/dev/null || true",
+                "  chmod -R u+w /work 2>/dev/null || true",
+                "fi",
+            ]
+        )
+    lines.extend(
+        [
+            "_n_clean=$1",
+            "shift",
+            "_i_clean=0",
+            'while [ "$_i_clean" -lt "$_n_clean" ]; do',
+            '  _datacon_clean_path "$1"',
+            "  shift",
+            "  _i_clean=$((_i_clean + 1))",
+            "done",
+            "_datacon_code=0",
+            "_n_cfg=$1",
+            "shift",
+            'if [ "$_n_cfg" -gt 0 ]; then',
+            '  _datacon_run_first_n "$_n_cfg" "$@"',
+            "  _datacon_code=$?",
+            '  shift "$_n_cfg"',
+            "fi",
+            "_n_bld=$1",
+            "shift",
+            'if [ "$_datacon_code" -eq 0 ] && [ "$_n_bld" -gt 0 ]; then',
+            '  _datacon_run_first_n "$_n_bld" "$@"',
+            "  _datacon_code=$?",
+            "fi",
+            'if [ "$_n_bld" -gt 0 ]; then',
+            '  shift "$_n_bld"',
+            "fi",
+            "_n_inst=$1",
+            "shift",
+            'if [ "$_datacon_code" -eq 0 ] && [ "$_n_inst" -gt 0 ]; then',
+            '  _datacon_run_first_n "$_n_inst" "$@"',
+            "  _datacon_code=$?",
+            "fi",
+        ]
+    )
+    if emit_result_marker:
+        lines.extend(
+            [
+                'if ! _datacon_has_symlink_in_work "$_datacon_out" && [ ! -L "$_datacon_out" ] && [ -f "$_datacon_out" ]; then',
+                '  _datacon_size=$(wc -c < "$_datacon_out" 2>/dev/null | tr -d " ")',
+                '  [ -n "$_datacon_size" ] || _datacon_size=0',
+                '  _datacon_digest=$(sha256sum -- "$_datacon_out" 2>/dev/null | cut -d" " -f1)',
+                '  [ -n "$_datacon_digest" ] || _datacon_digest=missing',
+                "else",
+                "  _datacon_size=-1",
+                "  _datacon_digest=missing",
+                "fi",
+                r"printf '\nDATACON_BUILD_RESULT code=%s size=%s digest=%s\n' "
+                '"$_datacon_code" "$_datacon_size" "$_datacon_digest" >&2',
+                "cat /sys/fs/cgroup/pids.events > /work/pids.events 2>/dev/null || true",
+                "cat /sys/fs/cgroup/memory.events > /work/memory.events 2>/dev/null || true",
+            ]
+        )
+    if wait_for_release:
+        lines.extend(
+            [
+                "touch /work/done",
+                "while [ ! -e /work/release ]; do sleep 0.1; done",
+            ]
+        )
+    lines.append('exit "$_datacon_code"')
+    return "\n".join(lines) + "\n"
+
+
+def build_runner_command(
+    plan: BuildSpecExecutionPlan,
+    *,
+    stage_fixture: bool = True,
+    emit_result_marker: bool = True,
+    wait_for_release: bool = True,
+) -> list[str]:
+    """Assemble the exact argv command vector for executing ``plan`` without shell splicing."""
+    clean_paths: list[str] = []
+    seen_clean: set[str] = set()
+    for _rel, container_path in plan.output_container_paths:
+        if container_path not in seen_clean:
+            clean_paths.append(container_path)
+            seen_clean.add(container_path)
+    if (
+        plan.provenance_face_container_path is not None
+        and plan.provenance_face_container_path not in seen_clean
+    ):
+        clean_paths.append(plan.provenance_face_container_path)
+        seen_clean.add(plan.provenance_face_container_path)
+        if plan.kind == "make":
+            lock_path = f"{plan.provenance_face_container_path}.lock"
+            if lock_path not in seen_clean:
+                clean_paths.append(lock_path)
+                seen_clean.add(lock_path)
+    return [
+        "/bin/sh",
+        "-c",
+        render_build_runner_script(
+            stage_fixture=stage_fixture,
+            emit_result_marker=emit_result_marker,
+            wait_for_release=wait_for_release,
+        ),
+        "datacon-build-runner",
+        plan.primary_output_container_path,
+        str(len(clean_paths)),
+        *clean_paths,
+        str(len(plan.configure)),
+        *plan.configure,
+        str(len(plan.build)),
+        *plan.build,
+        str(len(plan.install)),
+        *plan.install,
+    ]
+
+
+def prepare_build_spec_execution(
+    build_spec: Mapping[str, Any],
+    *,
+    cc_shim_log_path: str = DEFAULT_CC_SHIM_LOG_PATH,
+) -> BuildSpecExecutionPlan:
+    """Validate a v2 ``BuildSpec`` fail-closed and build a fixed-template execution plan.
+
+    Raises ``SandboxError(..., reason_code="BUILD_PROVENANCE_MISSING")`` before
+    any container is created whenever freeze validation or path safety fails.
+    """
+    decision = build_provenance.validate_build_spec_for_freeze(build_spec)
+    if not decision.ok:
+        raise SandboxError(
+            decision.error_detail or "build_spec failed provenance freeze validation",
+            reason_code=build_provenance.BUILD_PROVENANCE_MISSING,
+        )
+
+    kind = str(build_spec["kind"])
+    face_name = build_provenance.FACE_FILENAMES[kind]
+    raw_outputs = build_spec["outputs"]
+    output_pairs = tuple(
+        _validate_build_spec_output(item, index)
+        for index, item in enumerate(raw_outputs)
+    )
+    outputs = tuple(rel for rel, _container in output_pairs)
+    primary_output = _select_primary_output(outputs)
+    primary_output_container_path = f"/work/{primary_output}"
+
+    build_argv = tuple(build_spec["build"])
+    install_argv = tuple(build_spec.get("install") or ())
+    env = dict(build_spec["env"])
+    env_err = build_provenance.validate_build_spec_env(env)
+    if env_err is not None:
+        raise SandboxError(
+            env_err, reason_code=build_provenance.BUILD_PROVENANCE_MISSING
+        )
+
+    configure_argv: tuple[str, ...] = ()
+    cmake_build_dir: str | None = None
+    provenance_face_container_path: str | None = None
+    cc_shim_destination: str | None = None
+    cxx_shim_destination: str | None = None
+
+    if kind == "cmake":
+        raw_configure = list(build_spec["configure"])
+        cmd_err = build_provenance.validate_build_spec_commands(
+            kind, configure=raw_configure, build=build_argv, install=install_argv
+        )
+        if cmd_err is not None:
+            raise SandboxError(
+                cmd_err, reason_code=build_provenance.BUILD_PROVENANCE_MISSING
+            )
+        try:
+            cmake_build_dir, provenance_face_container_path = (
+                build_provenance.extract_cmake_build_dir(raw_configure)
+            )
+        except ValueError as error:
+            raise SandboxError(
+                str(error), reason_code=build_provenance.BUILD_PROVENANCE_MISSING
+            ) from error
+        if not build_provenance.cmake_has_export_compile_commands(raw_configure):
+            raw_configure.append("-DCMAKE_EXPORT_COMPILE_COMMANDS=ON")
+        configure_argv = tuple(raw_configure)
+    elif kind == "make":
+        cmd_err = build_provenance.validate_build_spec_commands(
+            kind, build=build_argv, install=install_argv
+        )
+        if cmd_err is not None:
+            raise SandboxError(
+                cmd_err, reason_code=build_provenance.BUILD_PROVENANCE_MISSING
+            )
+        provenance_face_container_path = _validate_work_container_path(
+            cc_shim_log_path, label="cc-shim log path"
+        )
+        cc_shim_destination = _validate_shim_destination(
+            env["CC"],
+            allowed_basenames=build_provenance.CC_SHIM_BASENAMES,
+            label="cc-shim",
+        )
+        if "CXX" in env:
+            cxx_dest = _validate_shim_destination(
+                env["CXX"],
+                allowed_basenames=build_provenance.CXX_SHIM_BASENAMES,
+                label="cxx-shim",
+            )
+            if cxx_dest != cc_shim_destination:
+                cxx_shim_destination = cxx_dest
+    elif kind == "shell":
+        cmd_err = build_provenance.validate_build_spec_commands(
+            kind, build=build_argv, install=install_argv
+        )
+        if cmd_err is not None:
+            raise SandboxError(
+                cmd_err, reason_code=build_provenance.BUILD_PROVENANCE_MISSING
+            )
+        provenance_face_container_path = None
+
+    base_plan = BuildSpecExecutionPlan(
+        kind=kind,
+        configure=configure_argv,
+        build=build_argv,
+        install=install_argv,
+        env=env,
+        outputs=outputs,
+        primary_output=primary_output,
+        primary_output_container_path=primary_output_container_path,
+        output_container_paths=output_pairs,
+        provenance_face_name=face_name,
+        provenance_face_container_path=provenance_face_container_path,
+        cc_shim_destination=cc_shim_destination,
+        cxx_shim_destination=cxx_shim_destination,
+        cmake_build_dir=cmake_build_dir,
+    )
+    command = tuple(build_runner_command(base_plan))
+    return replace(base_plan, container_command=command)
+
+
 def _quota_events(files: Mapping[str, bytes]) -> list[str]:
     hits: list[str] = []
     pids = files.get("/work/pids.events", b"").decode("utf-8", "replace")
@@ -1165,24 +1910,55 @@ class DockerSandbox:
     def _copy_work_path(
         self, name: str, relative: str, limit: int
     ) -> tuple[bytes, int, bool]:
-        """Read one bounded tmpfs file while the container is still alive."""
-        if not relative.startswith("/work/") or any(
-            character in relative for character in " \t\r\n'\"`$;"
-        ):
-            raise SandboxPolicyError("unsafe sandbox stream path")
+        """Read one bounded regular tmpfs file while refusing symlinks under ``/work``."""
+        safe_path = _validate_work_container_path(
+            relative, label="sandbox stream path"
+        )
+        safe_check = (
+            'set -f; '
+            'case "$_p" in /work/*) ;; *) exit 1 ;; esac; '
+            'IFS=/; _cur=/work; '
+            'for _seg in ${_p#/work/}; do '
+            '[ -n "$_seg" ] || continue; '
+            '_cur="$_cur/$_seg"; '
+            'if [ -L "$_cur" ]; then exit 1; fi; '
+            'done; '
+            'if [ -L "$_p" ] || [ ! -f "$_p" ]; then exit 1; fi; '
+        )
         size_result = self._docker(
-            ["exec", name, "sh", "-c", f"wc -c < {relative} 2>/dev/null || echo 0"],
+            [
+                "exec",
+                name,
+                "sh",
+                "-c",
+                '_p=$1; ' + safe_check + 'wc -c < "$_p" 2>/dev/null',
+                "datacon-copy-size",
+                safe_path,
+            ],
             timeout=30,
         )
+        if size_result.returncode != 0:
+            return b"", 0, False
         try:
             size = int(size_result.stdout.decode("ascii", "replace").strip())
         except ValueError:
-            size = 0
+            return b"", 0, False
         data_result = self._docker(
-            ["exec", name, "sh", "-c", f"head -c {limit + 1} -- {relative}"],
+            [
+                "exec",
+                name,
+                "sh",
+                "-c",
+                '_lim=$1; _p=$2; ' + safe_check + 'head -c "$_lim" -- "$_p"',
+                "datacon-copy-data",
+                str(limit + 1),
+                safe_path,
+            ],
             timeout=60,
         )
-        data = data_result.stdout if data_result.returncode == 0 else b""
+        if data_result.returncode != 0:
+            return b"", 0, False
+        data = data_result.stdout
         return data[:limit], size, size > limit or len(data) > limit
 
     def _start_attached(self, name: str) -> subprocess.Popen:
@@ -1222,6 +1998,7 @@ class DockerSandbox:
         *,
         deadline_seconds: float,
         artifact: bool = False,
+        extra_copy_paths: Sequence[tuple[str, int]] = (),
     ) -> tuple[
         bytes,
         bytes,
@@ -1309,11 +2086,20 @@ class DockerSandbox:
                 # the container is removed, so copy it while the container may
                 # still be alive. The wrapper's post-exit digest decides later
                 # whether these bytes are the completed artifact.
-                for relative, limit in (
+                copy_targets: list[tuple[str, int]] = [
                     ("/work/parser", MAX_ARTIFACT_BYTES),
                     ("/work/pids.events", MAX_LOG_BYTES),
                     ("/work/memory.events", MAX_LOG_BYTES),
-                ):
+                ]
+                seen_targets = {item[0] for item in copy_targets}
+                for extra_path, extra_limit in extra_copy_paths:
+                    safe_extra = _validate_work_container_path(
+                        extra_path, label="sandbox copy path"
+                    )
+                    if safe_extra not in seen_targets:
+                        copy_targets.append((safe_extra, extra_limit))
+                        seen_targets.add(safe_extra)
+                for relative, limit in copy_targets:
                     data, _size, was_truncated = self._copy_work_path(
                         name, relative, limit
                     )
@@ -1702,9 +2488,14 @@ printf 'uid=%s\nseccomp=%s\nseccomp_filters=%s\nno_new_privs=%s\ncap_eff=%s\ncgr
         compile_args: Sequence[str] = (),
         deadline_seconds: float = 300.0,
         expected_materials: Mapping[str, str] | None = None,
+        build_spec: Mapping[str, Any] | None = None,
     ) -> BuildResult:
         if version not in ("vulnerable", "fixed"):
             raise SandboxError("build version is invalid")
+        plan: BuildSpecExecutionPlan | None = None
+        if build_spec is not None:
+            # Fail closed BEFORE creating or starting any Docker container.
+            plan = prepare_build_spec_execution(build_spec)
         materials = Path(materials_dir)
         if materials.is_symlink() or not materials.is_dir():
             raise SandboxError(
@@ -1730,6 +2521,16 @@ printf 'uid=%s\nseccomp=%s\nseccomp_filters=%s\nno_new_privs=%s\ncap_eff=%s\ncgr
                     f"reviewed material changed before build: {relative}",
                     reason_code="PLAN_MISMATCH",
                 )
+        if plan is not None:
+            assert build_spec is not None
+            return self._build_with_spec(
+                version=version,
+                materials=materials,
+                build_spec=build_spec,
+                plan=plan,
+                compile_args=compile_args,
+                deadline_seconds=deadline_seconds,
+            )
         if not (materials / "build.sh").is_file():
             raise SandboxError("reviewed build recipe is missing")
         work = self.run_root / "build" / version / uuid.uuid4().hex
@@ -1877,6 +2678,314 @@ printf 'uid=%s\nseccomp=%s\nseccomp_filters=%s\nno_new_privs=%s\ncap_eff=%s\ncgr
             # the error is carried in metadata/log_truncated above. A container
             # left behind is reported through self.cleanup_errors.
             pass
+
+    def _stage_shim(
+        self,
+        *,
+        work_fd: int,
+        work: Path,
+        shim_name: str,
+        real_compiler: str,
+        log_path: str,
+        destination: str,
+        mounts: list[tuple[str, str, bool]],
+        shim_names: list[str],
+    ) -> None:
+        script = render_cc_shim_script(
+            real_compiler=real_compiler,
+            log_path=log_path,
+        )
+        try:
+            fileio.write_regular_file(
+                shim_name,
+                script.encode("utf-8"),
+                mode=0o555,
+                dir_fd=work_fd,
+                parent_path=work,
+            )
+        except fileio.UnsafeFileError as error:
+            raise SandboxPolicyError(
+                f"cannot write {shim_name} script safely: {error.message}"
+            ) from error
+        shim_names.append(shim_name)
+        shim_path = _verify_bound_shim_file(
+            work_fd, work, shim_name, label=shim_name
+        )
+        mounts.append((str(shim_path), destination, True))
+
+    def _build_with_spec(
+        self,
+        *,
+        version: str,
+        materials: Path,
+        build_spec: Mapping[str, Any],
+        plan: BuildSpecExecutionPlan,
+        compile_args: Sequence[str],
+        deadline_seconds: float,
+    ) -> BuildResult:
+        work_fd, work, work_leaf, work_identity = _create_safe_build_work_dir(
+            self.run_root, version
+        )
+        mounts: list[tuple[str, str, bool]] = [(str(materials), "/fixture", True)]
+        shim_names: list[str] = []
+        started = time.monotonic()
+        name: str | None = None
+        try:
+            try:
+                if plan.kind == "make":
+                    assert plan.cc_shim_destination is not None
+                    assert plan.provenance_face_container_path is not None
+                    self._stage_shim(
+                        work_fd=work_fd,
+                        work=work,
+                        shim_name="cc-shim",
+                        real_compiler=DEFAULT_CC_SHIM_COMPILER,
+                        log_path=plan.provenance_face_container_path,
+                        destination=plan.cc_shim_destination,
+                        mounts=mounts,
+                        shim_names=shim_names,
+                    )
+                    if plan.cxx_shim_destination is not None:
+                        self._stage_shim(
+                            work_fd=work_fd,
+                            work=work,
+                            shim_name="cxx-shim",
+                            real_compiler=DEFAULT_CXX_SHIM_COMPILER,
+                            log_path=plan.provenance_face_container_path,
+                            destination=plan.cxx_shim_destination,
+                            mounts=mounts,
+                            shim_names=shim_names,
+                        )
+            finally:
+                os.close(work_fd)
+                work_fd = -1
+
+            container_env: dict[str, str] = {
+                "TMPDIR": "/work",
+                "HOME": "/work",
+                "ASAN_OPTIONS": "detect_leaks=0",
+            }
+            container_env.update(plan.env)
+
+            extra_copy_paths: list[tuple[str, int]] = []
+            seen_copy_paths: set[str] = {
+                "/work/parser",
+                "/work/pids.events",
+                "/work/memory.events",
+            }
+            for _rel, container_path in plan.output_container_paths:
+                if container_path not in seen_copy_paths:
+                    extra_copy_paths.append((container_path, MAX_ARTIFACT_BYTES))
+                    seen_copy_paths.add(container_path)
+            if (
+                plan.provenance_face_container_path is not None
+                and plan.provenance_face_container_path not in seen_copy_paths
+            ):
+                extra_copy_paths.append(
+                    (plan.provenance_face_container_path, MAX_PROVENANCE_FACE_BYTES)
+                )
+                seen_copy_paths.add(plan.provenance_face_container_path)
+
+            name, _ = self._create(
+                suffix=f"build-{version}",
+                command=list(plan.container_command),
+                mounts=mounts,
+                env=container_env,
+            )
+            (
+                stdout,
+                stderr,
+                files,
+                truncated_streams,
+                state,
+                timed_out,
+                exit_code,
+                cleanup_error,
+            ) = self._start_and_wait(
+                name,
+                deadline_seconds=deadline_seconds,
+                artifact=True,
+                extra_copy_paths=extra_copy_paths,
+            )
+            duration = time.monotonic() - started
+            report_match = None
+            for match in re.finditer(
+                rb"DATACON_BUILD_RESULT code=(-?\d+) size=(-?\d+) digest=([0-9a-f]{64}|missing)",
+                stderr,
+            ):
+                report_match = match
+            reported_code = reported_size = reported_digest = None
+            if report_match is not None:
+                reported_code = int(report_match.group(1))
+                reported_size = int(report_match.group(2))
+                reported_digest = report_match.group(3).decode("ascii")
+            log_bytes = re.sub(
+                rb"\n?DATACON_BUILD_RESULT code=-?\d+ size=-?\d+ digest=(?:[0-9a-f]{64}|missing)\n?",
+                b"",
+                stdout + stderr,
+            )
+            capture_error = state.pop("_capture_error", None)
+            log, log_truncated = _truncate_log(log_bytes)
+            declared_copy_paths: set[str] = {
+                container_path for _rel, container_path in plan.output_container_paths
+            }
+            if plan.provenance_face_container_path is not None:
+                declared_copy_paths.add(plan.provenance_face_container_path)
+            relevant_truncated_streams = {
+                item
+                for item in truncated_streams
+                if item != "/work/parser" or "/work/parser" in declared_copy_paths
+            }
+            truncated = log_truncated or bool(relevant_truncated_streams)
+            truncated_roles = tuple(
+                role for role in STREAM_ROLES if role in truncated_streams
+            )
+            artifact = files.get(plan.primary_output_container_path)
+            if (
+                plan.primary_output_container_path in truncated_streams
+                or (artifact is not None and len(artifact) > MAX_ARTIFACT_BYTES)
+            ):
+                artifact = None
+                truncated = True
+            if capture_error is not None:
+                artifact = None
+                truncated = True
+            artifact_digest = (
+                "sha256:" + hashlib.sha256(artifact).hexdigest()
+                if artifact is not None
+                else None
+            )
+            if artifact is not None and reported_digest is not None:
+                if (
+                    reported_digest == "missing"
+                    or reported_size != len(artifact)
+                    or artifact_digest is None
+                    or reported_digest != artifact_digest.split(":", 1)[1]
+                    or reported_code != exit_code
+                ):
+                    artifact = None
+                    artifact_digest = None
+                    truncated = True
+            elif artifact is not None:
+                artifact = None
+                artifact_digest = None
+                truncated = True
+
+            provenance_face_name = plan.provenance_face_name
+            provenance_face: bytes | None = None
+            provenance_face_truncated = False
+            if plan.kind == "shell":
+                provenance_face_truncated = log_truncated or bool(
+                    truncated_streams & set(STREAM_ROLES)
+                )
+                if capture_error is None and not provenance_face_truncated:
+                    provenance_face = log
+            else:
+                face_path = plan.provenance_face_container_path
+                assert face_path is not None
+                if face_path in truncated_streams:
+                    provenance_face_truncated = True
+                    truncated = True
+                if capture_error is None and not provenance_face_truncated:
+                    raw_face = files.get(face_path)
+                    if (
+                        raw_face is not None
+                        and len(raw_face) > MAX_PROVENANCE_FACE_BYTES
+                    ):
+                        provenance_face_truncated = True
+                        truncated = True
+                    else:
+                        provenance_face = raw_face
+
+            quota_hits = _quota_events(files)
+            status = (
+                "completed"
+                if exit_code == 0 and artifact is not None and capture_error is None
+                else "build_failed"
+            )
+            if timed_out:
+                status = "timeout"
+            elif capture_error is not None:
+                status = "infra_error"
+            elif state.get("OOMKilled") or quota_hits:
+                status = "resource_limited"
+
+            outputs_meta: dict[str, Any] = {}
+            for rel_out, c_path in plan.output_container_paths:
+                out_bytes = (
+                    artifact
+                    if c_path == plan.primary_output_container_path
+                    else files.get(c_path)
+                )
+                if (
+                    out_bytes is not None
+                    and c_path not in truncated_streams
+                    and len(out_bytes) <= MAX_ARTIFACT_BYTES
+                ):
+                    outputs_meta[rel_out] = {
+                        "size_bytes": len(out_bytes),
+                        "sha256": "sha256:" + hashlib.sha256(out_bytes).hexdigest(),
+                    }
+                else:
+                    outputs_meta[rel_out] = None
+
+            metadata: dict[str, Any] = {
+                "build_spec_kind": plan.kind,
+                "build_command": list(plan.build),
+                "build_recipe_digest": jsonutil.digest_json(dict(build_spec)),
+                "outputs": outputs_meta,
+                "primary_output": plan.primary_output,
+                "provenance_face_name": provenance_face_name,
+                "provenance_face_truncated": provenance_face_truncated,
+                "exit_code": exit_code,
+                "timed_out": timed_out,
+                "oom_killed": bool(state.get("OOMKilled")),
+                "limits_hit": quota_hits,
+                "truncated_roles": list(truncated_roles),
+            }
+            if plan.configure:
+                metadata["configure_command"] = list(plan.configure)
+            if plan.install:
+                metadata["install_command"] = list(plan.install)
+            if provenance_face is not None:
+                metadata["provenance_face_size"] = len(provenance_face)
+                metadata["provenance_face_sha256"] = (
+                    "sha256:" + hashlib.sha256(provenance_face).hexdigest()
+                )
+            if capture_error is not None:
+                metadata["capture_error"] = capture_error
+            if cleanup_error is not None:
+                metadata["cleanup_errors"] = [cleanup_error]
+
+            resolved_compile_args = (
+                tuple(compile_args)
+                if compile_args
+                else tuple(build_spec["declared_compile_flags"])
+            )
+            return BuildResult(
+                version=version,
+                status=status,
+                exit_code=exit_code,
+                duration_seconds=duration,
+                container_id=name,
+                image_digest=self.image_digest,
+                compile_args=resolved_compile_args,
+                artifact_digest=artifact_digest,
+                log=log,
+                log_truncated=truncated or log_truncated,
+                artifact=artifact,
+                metadata=metadata,
+                capture_error=capture_error,
+                truncated_roles=truncated_roles,
+                provenance_face=provenance_face,
+                provenance_face_name=provenance_face_name,
+            )
+        finally:
+            if work_fd >= 0:
+                os.close(work_fd)
+            _cleanup_safe_build_work_dir(
+                self.run_root, version, work_leaf, work_identity, shim_names
+            )
 
     def replay(
         self,
