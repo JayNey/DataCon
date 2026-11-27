@@ -562,7 +562,7 @@ CREATE TABLE IF NOT EXISTS budget_charges (
 **v2 终态 `COMPLETED` 与无租约收敛（D40）**。campaign child 搜索结束/预算耗尽并归档后、family 聚合归档后，`jobs.state=COMPLETED`。它是 v2 新增终态：`verdict` 与 `reason_code` 为 null，`evidence_status='archived'`（因此仍满足归档指针 CHECK 与“无 verdict 的失败行”检查，不需要为它放宽 v1 约束）。两条收敛接口职责分离：
 - `finish_execution`：**仅用于持有有效 worker lease 且状态为 `RUNNING`/`ARCHIVING` 的 child job**（含 `campaign` child 落 `COMPLETED`）；其终态白名单从 `REPRODUCED`/`NOT_REPRODUCED`/`INCONCLUSIVE`/`BLOCKED`/`FAILED` 扩展为包含 `COMPLETED`，archived 分支要求 `evidence_path` 与 `evidence_digest` 同时非空。
 - `complete_family(family_id, evidence_path, evidence_digest)`：**无执行租约的 family 终态收敛接口**。在锁住 `job_kind='family'` 行后，将状态从 `AGGREGATING` 迁移至 `COMPLETED`，设置 `evidence_status='archived'`、非空 `evidence_path` 与 `evidence_digest`、`verdict=NULL`、`reason_code=NULL`，无需执行租约，仍受 007 `jobs_archived_evidence_check` 约束；若 family 已为 `COMPLETED` 且指针一致则幂等返回，状态非法则拒绝。
-- **崩溃恢复路径**：若末轮 child 已归档终态，但进程在 `family.json` 落盘或 `complete_family` 提交前崩溃，worker 恢复扫描检测到“全部 child 已终态（或已满足预算/轮次/结论终止条件）且 family 仍为 `AGGREGATING`”时，幂等补落盘 `family.json` 并调用 `complete_family` 收敛，不让 family 永久滞留 `AGGREGATING` 阻塞回滚。
+- **崩溃恢复路径**：若末轮 child 已归档终态，但进程在 `family.json` 落盘或 `complete_family` 提交前崩溃，worker 恢复扫描检测到“全部 child 已终态（或已满足预算/轮次/结论终止条件，或存在与当前轮次匹配的 `no_next_round` 决策，见 §9.2）且 family 仍为 `AGGREGATING`”时，幂等补落盘 `family.json` 并调用 `complete_family` 收敛，不让 family 永久滞留 `AGGREGATING` 阻塞回滚。
 
 `claim_next` 不领取 `COMPLETED`；回滚排空集合不包含它。campaign 不再用 `INCONCLUSIVE` 表示搜索完成；`INCONCLUSIVE` 仍只表示复现判定未形成结论。v1 终态枚举不变。迁移 007 允许的 `state='INCONCLUSIVE'`、`verdict=NULL`、`evidence_status='archived'` 组合继续有效；新增 `COMPLETED` 的行为属于 T10 的迁移与实现，不在 007 中回改。
 
@@ -1134,6 +1134,39 @@ campaign 的 job `state` 在搜索结束/预算耗尽并归档后固定为 `COMP
 
 `export --family` 的输出目录结构固定为 `family.json`、`campaign/` 与 `rounds/<round_no>/`；`family.json` 记录轮次索引、预算与摘要，不改写任何单轮 manifest。
 
+### 9.2 family 转移决策（改8）
+
+campaign 完成且无候选 seed 时，runtime 记录 `no_next_round` 决策后 family 归档；无决策保持 `AGGREGATING`。该决策由 P1 的 state 入口承载，P2 的 runtime 调用：
+
+```python
+record_family_transition_decision(
+    dsn, family_id, *,
+    campaign_job_id, after_round_no, decision,
+    reason_code=None, candidate_seed_count=None, next_round_no=None,
+) -> dict
+```
+
+**决策点 `after_round_no`**（必填，非负整数，布尔值不算整数）：
+- `0`：campaign child 归档 `COMPLETED` 后（边 #23/#24）。前置条件：family 尚无任何 `round` child。
+- `k ≥ 1`：第 k 轮 round 归档后（边 #26）。前置条件：family 当前最大 `round_no` 恰为 k，round k 为 `INCONCLUSIVE`，不存在 `round_no > k` 的 child。
+
+调用时机：campaign 归档后调用一次（`after_round_no=0`）；之后每轮 round 以 `INCONCLUSIVE` 归档、且 runtime 判定不再继续时调用一次（`after_round_no=k`）。轮次或预算耗尽、末轮形成结论时 family 按既有规则归档，不需要决策。
+
+**参数值域（fail-closed）**：
+
+| `decision` | `reason_code` | `candidate_seed_count` | `next_round_no` |
+| --- | --- | --- | --- |
+| `no_next_round` | 必填；`after_round_no=0` 只允许 `NO_CANDIDATE_SEED`，`after_round_no≥1` 只允许 `NO_REMAINING_SEEDS` | 必填且为 `0` | 必须为空 |
+| `next_round` | 必须为空 | 必填且 `≥ 1` | 必填，等于 `after_round_no + 1`，且不超过锁内按审批链尾解析出的有效 `max_rounds` |
+
+决策子码的封闭集合 `FAMILY_TRANSITION_REASON_CODES = {NO_CANDIDATE_SEED, NO_REMAINING_SEEDS}`；其余组合、类型（布尔值、浮点数、负数）一律拒绝，不写事件。
+
+**锁与校验顺序**：只锁 family 行（与 §9.1“换信封重批只锁 family”一致）。① family 必须是 v2 `job_kind='family'`；② 按幂等键 `(campaign_job_id, after_round_no)` 查既有决策：`detail` 完全相同则返回既有记录（family 已终态时同样返回，这不代表之后还会归档），不同则以 `StateError` 拒绝；③ family 为 `AGGREGATING`；④ `campaign_job_id` 是本 family 的 `job_kind='campaign'` child 且为 `COMPLETED`；⑤ 无 `pending` 信封；⑥ 决策点前置条件；⑦ `next_round` 的 `max_rounds` 上限。不同决策点的决策可以共存。
+
+**写入形态**：一条 `audit_events`，`job_id=family_id`、`stage='transition'`、`event_type='family_transition_decided'`、审计 `reason_code` 列为 NULL、`detail={campaign_job_id, after_round_no, decision, candidate_seed_count, next_round_no, reason_code}`；事件时间取数据库 `clock_timestamp()`，返回值的 `created_at` 为 UTC RFC 3339 字符串。入口不创建 child、不写 `family.json`、不改预算。
+
+**归档采纳规则**：family 归档门禁保留 unindexable/terminal/verdict/`max_rounds`/预算规则；在判定等待前，只采纳 `campaign_job_id` 等于当前 campaign 且 `after_round_no` 等于已用轮次的那条决策，其为 `no_next_round` 时归档。`next_round`、其他决策点或缺少 `after_round_no` 的事件一律忽略。决策以 `audit_events` 为唯一来源，不读证据文件。
+
 ## 10. 新增原因码
 
 | 原因码 | 触发条件 | 终态或去向 |
@@ -1152,6 +1185,8 @@ campaign 的 job `state` 在搜索结束/预算耗尽并归档后固定为 `COMP
 - 抓取路径的成帧与状态失败同归 `MATERIAL_MISSING`（`BLOCKED`）：正文截断 `CONTENT_TRUNCATED`、缺少或自相矛盾的 `Content-Length` `RESPONSE_UNFRAMED`、空正文 `EMPTY_CONTENT`、最终状态不在 2xx `HTTP_STATUS_REJECTED`、响应头超过 64 KiB `RESPONSE_HEAD_TOO_LARGE`；
 - 固定快照（离线案例）沿用 v0.1 的归类：内容摘要与登记值不符属材料无法校验，归 `MATERIAL_MISSING`（`detail.sub_reason=DIGEST_MISMATCH`）；读不到、读取出错、登记摘要格式非法分别为 `SNAPSHOT_MISSING` / `SNAPSHOT_UNREADABLE` / `SNAPSHOT_DIGEST_INVALID`，为空或超过线上上限分别为 `EMPTY_CONTENT` / `SIZE_LIMIT_EXCEEDED`。来源登记给了别的案例属 `SOURCE_CONFLICT`（`detail.sub_reason=SOURCE_CASE_MISMATCH`，该快照不被打开）；来源 URL 缺失或无法解析属 `POLICY_DENIED`（`detail.sub_reason=SOURCE_URL_INVALID`）；
 - 域名不在白名单、私网/回环/CGNAT/元数据/IPv4-mapped IPv6 被拒、缺许可或许可用途不符：归属 `POLICY_DENIED`（`BLOCKED`），其中许可拒绝的 `detail.sub_reason` 记录 `LICENSE_REJECTED`。
+
+family 转移决策子码 `NO_CANDIDATE_SEED`、`NO_REMAINING_SEEDS`（见 §9.2）不是本节原因码：它们只出现在 `family_transition_decided` 审计事件的 `detail.reason_code`，不进入 `jobs.reason_code`、审计 `reason_code` 列或任何终态封闭集合。
 
 这些原因码与 v0.1 原因码并集使用。T10 起应把新码加入对应终态的封闭集合（`ENVELOPE_VIOLATION`、`ADMISSION_DENIED`、`REUSE_MISMATCH`、`HARNESS_REJECTED` 按阻断或失败归属，`BUDGET_EXHAUSTED` 与 `BUILD_PROVENANCE_MISSING` 按上表归属）；`REVIEW_ENVELOPE_MISMATCH` 是审核调用的拒绝码，不进入 job 终态，也不新增 `reviews` 行。T09 不修改判定实现。
 
