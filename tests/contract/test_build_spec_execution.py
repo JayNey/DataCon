@@ -415,6 +415,8 @@ class _InMemoryState:
         self.attempts: list[dict[str, Any]] = []
         self.finished_calls: list[dict[str, Any]] = []
         self.budget_charges: list[dict[str, int]] = []
+        self.admission: dict[str, Any] | None = None
+        self.family_envelope: dict[str, Any] | None = None
 
     def install(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(execution.state, "load_job", self.load_job)
@@ -447,6 +449,29 @@ class _InMemoryState:
             "family_budget_summary",
             self.family_budget_summary,
         )
+        monkeypatch.setattr(
+            execution.state, "get_family_envelope", self.get_family_envelope
+        )
+        monkeypatch.setattr(
+            execution.state, "get_admission", self.get_admission
+        )
+
+    def get_family_envelope(
+        self, dsn: str, family_id: UUID | str, envelope_digest: str
+    ) -> dict[str, Any] | None:
+        envelope = self.family_envelope
+        if envelope is None:
+            envelope = self.job.get("envelope")
+        if isinstance(envelope, dict) and (
+            contracts.envelope_digest(envelope) == envelope_digest
+        ):
+            return deepcopy(envelope)
+        return None
+
+    def get_admission(
+        self, dsn: str, job_id: UUID | str
+    ) -> dict[str, Any] | None:
+        return deepcopy(self.admission) if self.admission is not None else None
 
     def family_budget_summary(
         self, dsn: str, family_id: UUID | str
@@ -1567,17 +1592,31 @@ def test_v2_provenance_failure_fails_closed_without_replay_or_inconclusive_downg
     assert len(fake_sandbox.replay_calls) == 0, (
         f"{scenario}: must NEVER enter 6-replay phase (got {len(fake_sandbox.replay_calls)} calls)"
     )
-    # B-6: a partial FAILED execution bundle fails verify_bundle, so with no
-    # T13a handoff it is not published. The terminal row still records the
-    # real reason and an explicit BLOCKED_ON_T13A evidence error.
-    assert result.evidence_path is None, (
-        f"{scenario}: an unverifiable partial bundle must not be published"
+    # B-6: the T13a partial layout accepts this bundle, so the produced
+    # build evidence is preserved and the archive passes offline verification.
+    assert result.evidence_path is not None, (
+        f"{scenario}: partial FAILED evidence must now be archived"
     )
-    finished = mem_state.finished_calls[-1]
-    assert finished["state"] == "FAILED"
-    assert finished["reason_code"] == build_provenance.BUILD_PROVENANCE_MISSING
-    assert finished["evidence_status"] == "failed"
-    assert "BLOCKED_ON_T13A" in finished["evidence_error"]
+    verified = evidence.verify_bundle(result.evidence_path)
+    manifest = verified.manifest
+    report = json.loads(verified.file_data["report.json"])
+    assert manifest["verdict"] == "FAILED"
+    assert manifest["reason_code"] == build_provenance.BUILD_PROVENANCE_MISSING
+    assert report["state"] == "FAILED"
+    assert report["verdict"] == "FAILED"
+    assert report["reason_code"] == build_provenance.BUILD_PROVENANCE_MISSING
+    assert report["replays"] == []
+    assert "envelope.json" in verified.file_data
+    assert "budget/snapshot.json" in verified.file_data
+    for version, raw_face in faces.items():
+        if raw_face is None:
+            continue
+        log_rel = f"build/{version}/build.log"
+        assert log_rel in verified.file_data
+        assert verified.file_data[log_rel] == fake_sandbox.build_logs[version]
+        face_rel = f"build/{version}/build_provenance/{face_name}"
+        assert face_rel in verified.file_data
+        assert verified.file_data[face_rel] == raw_face
 
 
 # ---------------------------------------------------------------------------
@@ -2145,10 +2184,13 @@ def test_v2_compile_flags_vs_declared_compile_flags_mismatch_fails_closed(
     assert result.verdict is None
     assert len(fake_sandbox.build_calls) == 0, f"{label}: must not build on mismatch"
     assert len(fake_sandbox.replay_calls) == 0, f"{label}: must run 0 replays"
-    assert result.evidence_path is None
-    finished = mem_state.finished_calls[-1]
-    assert finished["state"] == "FAILED"
-    assert "BLOCKED_ON_T13A" in finished["evidence_error"]
+    assert result.evidence_path is not None
+    verified = evidence.verify_bundle(result.evidence_path)
+    report = json.loads(verified.file_data["report.json"])
+    assert verified.manifest["verdict"] == "FAILED"
+    assert report["reason_code"] == build_provenance.BUILD_PROVENANCE_MISSING
+    assert report["build_provenance"]["comparable"] is False
+    assert "plan.compile_flags" in str(report["error"])
 
 
 # ---------------------------------------------------------------------------
@@ -2439,16 +2481,21 @@ def test_b1_v2_partial_inconclusive_build_timeout_and_sandbox_error_preserve_evi
     assert result.verdict == "INCONCLUSIVE"
     assert result.verdict_reason == expected_reason
     assert result.reason_code == expected_reason
-    assert result.evidence_path is None
+    assert result.evidence_path is not None
     assert len(fake_sandbox.replay_calls) == 0
-    # The partial build evidence is still recorded honestly in the run tree,
-    # but it is not published as an execution bundle until T13a can verify a
-    # partial role layout.
-    finished = mem_state.finished_calls[-1]
-    assert finished["state"] == "INCONCLUSIVE"
-    assert finished["reason_code"] == expected_reason
-    assert finished["evidence_status"] == "failed"
-    assert "BLOCKED_ON_T13A" in finished["evidence_error"]
+    verified = evidence.verify_bundle(result.evidence_path)
+    report = json.loads(verified.file_data["report.json"])
+    assert verified.manifest["verdict"] == "INCONCLUSIVE"
+    assert verified.manifest["reason_code"] == expected_reason
+    assert report["verdict"] == "INCONCLUSIVE"
+    assert report["reason_code"] == expected_reason
+    assert report["rule"] is None
+    assert report["replays"] == []
+    assert "build/vulnerable/build.log" in verified.file_data
+    assert (
+        "build/vulnerable/build_provenance/compile_commands.json"
+        in verified.file_data
+    )
 
 
 @pytest.mark.parametrize(
@@ -4105,7 +4152,9 @@ def test_b7_missing_envelope_body_fails_closed_without_fake_evidence(
     assert result.evidence_path is None
     assert fake_sandbox.build_calls == []
     finished = mem_state.finished_calls[-1]
-    assert "BLOCKED_ON_T12" in str(finished.get("evidence_error"))
+    assert "approved envelope body is not available" in str(
+        finished.get("evidence_error")
+    )
 
 
 def _real_sandbox(tmp_path: Path) -> DockerSandbox:
@@ -4247,6 +4296,99 @@ def test_s7_real_docker_make_face_has_per_file_flags(tmp_path):
     assert {"src/a.c", "src/b.c"} <= set(parsed.units)
     assert "-DFEATURE_A" in parsed.units["src/a.c"]
     assert "-DFEATURE_B" in parsed.units["src/b.c"]
+
+
+def test_b7_policy_round_writes_admission_not_review(tmp_path, monkeypatch):
+    """B-7: a policy-admitted round archives admission.json and no review."""
+    run_root, _ = _configure_isolated_roots(tmp_path, monkeypatch)
+    spec = _cmake_spec()
+    face = _cmake_compile_commands_bytes(
+        flags=["-fsanitize=address", "-g", "-O1", "-I../include", "-D_GNU_SOURCE"]
+    )
+    job, plan, plan_digest, review = _setup_fixture_plan_and_job(
+        version=2, build_spec=spec
+    )
+    mem_state = _InMemoryState(job, plan, plan_digest, review)
+    mem_state.install(monkeypatch)
+    # A guided family's human review is bound to the first plan, not this
+    # later round. It must not be reused as the round's approval.
+    mem_state.review = {
+        "reviewer_id": "family-reviewer",
+        "decision": "approve",
+        "plan_digest": "sha256:" + "9" * 64,
+        "decided_at": review["decided_at"],
+    }
+    mem_state.admission = {
+        "admission_id": str(uuid4()),
+        "job_id": str(job["job_id"]),
+        "parent_job_id": str(job["parent_job_id"]),
+        "round_no": plan["round_no"],
+        "approval_kind": "policy",
+        "envelope_digest": plan["envelope_digest"],
+        "parent_approval_digest": "sha256:" + "e" * 64,
+        "seed_digest": plan["inputs"]["candidate"],
+        "predicate_version": "admission-v1",
+        "recomputable": True,
+        "supporting_bundle_digest": None,
+        "decided_at": "2099-01-01T00:00:00Z",
+    }
+    fake_sandbox = _FakeSandbox(
+        image_digest=plan["image_digest"],
+        build_recipe_digest=plan["build_recipe_digest"],
+        faces={"vulnerable": face, "fixed": face},
+        face_name="compile_commands.json",
+    )
+    result = execution.run_execution(
+        "dsn",
+        job["job_id"],
+        1,
+        case_root=str(FIXTURE_CASES),
+        run_root=run_root,
+        sandbox=fake_sandbox,
+    )
+    assert result.state == "REPRODUCED", result
+    verified = evidence.verify_bundle(result.evidence_path)
+    assert "admission.json" in verified.file_data
+    assert "review.json" not in verified.file_data
+    report = json.loads(verified.file_data["report.json"])
+    assert report["review"] is None
+    assert json.loads(verified.file_data["admission.json"])[
+        "approval_kind"
+    ] == "policy"
+
+
+def test_b7_approved_envelope_is_read_from_the_family_store(tmp_path, monkeypatch):
+    """B-7: execution reads the approved envelope through the T12 getter."""
+    run_root, _ = _configure_isolated_roots(tmp_path, monkeypatch)
+    spec = _cmake_spec()
+    face = _cmake_compile_commands_bytes(
+        flags=["-fsanitize=address", "-g", "-O1", "-I../include", "-D_GNU_SOURCE"]
+    )
+    job, plan, plan_digest, review = _setup_fixture_plan_and_job(
+        version=2, build_spec=spec
+    )
+    approved_envelope = job.pop("envelope")
+    mem_state = _InMemoryState(job, plan, plan_digest, review)
+    mem_state.family_envelope = approved_envelope
+    mem_state.install(monkeypatch)
+    fake_sandbox = _FakeSandbox(
+        image_digest=plan["image_digest"],
+        build_recipe_digest=plan["build_recipe_digest"],
+        faces={"vulnerable": face, "fixed": face},
+        face_name="compile_commands.json",
+    )
+    result = execution.run_execution(
+        "dsn",
+        job["job_id"],
+        1,
+        case_root=str(FIXTURE_CASES),
+        run_root=run_root,
+        sandbox=fake_sandbox,
+    )
+    assert result.state == "REPRODUCED", result
+    verified = evidence.verify_bundle(result.evidence_path)
+    envelope = json.loads(verified.file_data["envelope.json"])
+    assert contracts.envelope_digest(envelope) == plan["envelope_digest"]
 
 
 def _reviewed_shell_spec(build: list[str]) -> dict[str, Any]:

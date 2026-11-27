@@ -2193,3 +2193,46 @@ def test_fixed_first_round_runs_without_admission_row(
     )
     assert _job_state(isolated_database, child_id) == "RUNNING"
     assert _admissions(isolated_database, family_id, 1) == []
+
+
+def test_get_family_envelope_returns_only_the_approved_bound_body(isolated_database):
+    family_id, _child_id, envelope = _seed_family(isolated_database)
+    digest = contracts.envelope_digest(envelope)
+    isolated_database.connection.execute(
+        "INSERT INTO family_envelopes "
+        "(envelope_id, family_id, envelope_digest, envelope_json, status, "
+        "review_deadline_at, reviewer_id, decided_at, created_at) "
+        "VALUES (%s, %s, %s, %s, 'approved', "
+        "clock_timestamp() + interval '1 day', %s, clock_timestamp(), "
+        "clock_timestamp())",
+        (uuid4(), family_id, digest, Jsonb(envelope), REVIEWER_ID),
+    )
+    got = state.get_family_envelope(isolated_database.dsn, family_id, digest)
+    assert got == envelope
+    assert state.get_family_envelope(
+        isolated_database.dsn, family_id, _digest("0")
+    ) is None
+
+    isolated_database.connection.execute(
+        "UPDATE family_envelopes SET status = 'pending' "
+        "WHERE family_id = %s AND envelope_digest = %s",
+        (family_id, digest),
+    )
+    assert state.get_family_envelope(
+        isolated_database.dsn, family_id, digest
+    ) is None
+
+
+def test_get_admission_exposes_the_policy_row_only(isolated_database):
+    seed = _seed_family(isolated_database)
+    _family_id, child_id, _envelope = seed
+    outcome = _admit(isolated_database, seed)
+    assert outcome.admitted
+
+    admission = state.get_admission(isolated_database.dsn, child_id)
+    assert admission is not None
+    assert admission["job_id"] == str(child_id)
+    assert admission["approval_kind"] == "policy"
+    assert admission["round_no"] == 2
+    assert admission["decided_at"]
+    assert state.get_admission(isolated_database.dsn, uuid4()) is None

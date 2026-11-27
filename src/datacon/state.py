@@ -4567,6 +4567,68 @@ def family_budget_summary(dsn: str, family_id: UUID | str) -> dict[str, int]:
     return budget_summary(ledger, charges)
 
 
+def get_family_envelope(
+    dsn: str,
+    family_id: UUID | str,
+    envelope_digest: str,
+) -> dict[str, Any] | None:
+    """Return the approved normal envelope body, or None when unavailable.
+
+    This is the read half of ``propose_envelope``/``record_review``: execution
+    may archive only the exact body the human approved for this family and
+    digest. A pending, rejected, expired or otherwise mismatched row returns
+    None; malformed stored JSON is a StateError, never a silently normalized
+    substitute.
+    """
+    try:
+        family_uuid = uuid.UUID(str(family_id))
+        digest = jsonutil.require_digest(envelope_digest, "envelope_digest")
+    except (TypeError, ValueError) as error:
+        raise StateError(str(error)) from error
+    with _connect(dsn) as connection:
+        row = connection.execute(
+            "SELECT envelope_json, envelope_digest, status "
+            "FROM family_envelopes WHERE family_id = %s AND envelope_digest = %s",
+            (family_uuid, digest),
+        ).fetchone()
+    if row is None or row["status"] != "approved":
+        return None
+    try:
+        normalized = contracts.normalize_envelope(row["envelope_json"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise StateError(f"stored family envelope is invalid: {error}") from error
+    actual = contracts.envelope_digest(normalized)
+    if actual != digest or row["envelope_digest"] != digest:
+        raise StateError("stored family envelope digest does not match its row")
+    return normalized
+
+
+def get_admission(dsn: str, job_id: UUID | str) -> dict[str, Any] | None:
+    """Return the policy admission row bound to ``job_id``, or None.
+
+    Only the closed ``admissions`` row shape is exposed. Execution uses this to
+    prove that a policy round was admitted without inventing a human review.
+    """
+    try:
+        job_uuid = uuid.UUID(str(job_id))
+    except (TypeError, ValueError) as error:
+        raise StateError("job_id must be a UUID") from error
+    with _connect(dsn) as connection:
+        row = connection.execute(
+            "SELECT admission_id, job_id, parent_job_id, round_no, "
+            "approval_kind, envelope_digest, parent_approval_digest, "
+            "seed_digest, predicate_version, recomputable, "
+            "supporting_bundle_digest, decided_at "
+            "FROM admissions WHERE job_id = %s",
+            (job_uuid,),
+        ).fetchone()
+    if row is None:
+        return None
+    if row["approval_kind"] != "policy":
+        raise StateError("admission approval_kind must be policy")
+    return _admission_record(row)
+
+
 # A decided family envelope maps back to the review decision it recorded. The
 # idempotency key is (family_id, first_plan_digest, envelope_digest, decision,
 # reviewer_id); the first_plan_digest is validated before the lookup, so the

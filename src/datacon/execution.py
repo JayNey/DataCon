@@ -117,7 +117,7 @@ class ExecutionContext:
     job: dict[str, Any]
     plan: dict[str, Any]
     plan_digest: str
-    review: dict[str, Any]
+    review: dict[str, Any] | None
     case: CaseDefinition
     case_root: Path
     manifest_case: dict[str, Any]
@@ -136,6 +136,7 @@ class ExecutionContext:
     cleanup_errors: list[str] = field(default_factory=list)
     envelope: dict[str, Any] | None = None
     budget_summary: dict[str, int] = field(default_factory=dict)
+    admission: dict[str, Any] | None = None
 
     @property
     def job_id_text(self) -> str:
@@ -1144,14 +1145,60 @@ def _load_context(
         raise ExecutionBlocked(
             "PLAN_MISMATCH", "frozen plan digest does not match its content"
         )
-    if review is None or review["decision"] != "approve":
-        raise ExecutionBlocked(
-            "PLAN_MISMATCH", "an approved review bound to the plan is required"
-        )
-    if review["plan_digest"] != plan_row["plan_digest"]:
-        raise ExecutionBlocked(
-            "PLAN_MISMATCH", "the approval is bound to a different plan"
-        )
+    admission: dict[str, Any] | None = None
+    review_binds_plan = (
+        review is not None
+        and review.get("decision") == "approve"
+        and review.get("plan_digest") == plan_row["plan_digest"]
+    )
+    if not review_binds_plan and is_v2 and job.get("job_kind") == "round":
+        # A family-scoped human review approves the first plan, not every
+        # later round. If it does not bind this frozen plan, the round must
+        # carry its own policy admission; the family review must never be
+        # silently reused for a later round.
+        try:
+            admission = state.get_admission(dsn, job_id)
+        except state.StateError as error:
+            raise ExecutionBlocked(
+                "MATERIAL_MISSING", f"the policy admission is unavailable: {error}"
+            ) from error
+        if admission is not None:
+            if admission.get("approval_kind") != "policy":
+                raise ExecutionBlocked(
+                    "PLAN_MISMATCH", "the admission is not a policy admission"
+                )
+            if admission.get("envelope_digest") != plan.get("envelope_digest"):
+                raise ExecutionBlocked(
+                    "PLAN_MISMATCH",
+                    "the policy admission envelope differs from the frozen plan",
+                )
+            if (
+                admission.get("parent_job_id") != str(job.get("parent_job_id"))
+                or admission.get("round_no") != plan.get("round_no")
+            ):
+                raise ExecutionBlocked(
+                    "PLAN_MISMATCH",
+                    "the policy admission is bound to a different family round",
+                )
+            plan_inputs = plan.get("inputs")
+            if (
+                isinstance(plan_inputs, Mapping)
+                and admission.get("seed_digest") != plan_inputs.get("candidate")
+            ):
+                raise ExecutionBlocked(
+                    "PLAN_MISMATCH",
+                    "the policy admission seed differs from the frozen plan",
+                )
+            review = None
+    if admission is None:
+        if review is None or review["decision"] != "approve":
+            raise ExecutionBlocked(
+                "PLAN_MISMATCH", "an approved review bound to the plan is required"
+            )
+        if review["plan_digest"] != plan_row["plan_digest"]:
+            raise ExecutionBlocked(
+                "PLAN_MISMATCH", "the approval is bound to a different plan"
+            )
 
     request = job["request"]
     if request.get("limits") != plan["limits"]:
@@ -1420,6 +1467,18 @@ def _load_context(
                     f"the family budget ledger is unavailable: {error}",
                 ) from error
         raw_envelope = job.get("envelope")
+        if not isinstance(raw_envelope, Mapping):
+            family_id = job.get("family_id")
+            if family_id is not None:
+                try:
+                    raw_envelope = state.get_family_envelope(
+                        dsn, family_id, plan["envelope_digest"]
+                    )
+                except state.StateError as error:
+                    raise ExecutionBlocked(
+                        "MATERIAL_MISSING",
+                        f"the approved family envelope is unavailable: {error}",
+                    ) from error
         if isinstance(raw_envelope, Mapping):
             try:
                 normalized_envelope = contracts.normalize_envelope(raw_envelope)
@@ -1437,14 +1496,9 @@ def _load_context(
                 )
             envelope_doc = normalized_envelope
         elif job.get("job_kind") in ("round", "campaign"):
-            # T12 owns the public reader for family_envelopes. Until that
-            # handoff exists the executor cannot recover the approved body from
-            # load_job; failing here is better than writing a two-key
-            # placeholder that contracts.normalize_envelope rejects.
             raise ExecutionBlocked(
                 "MATERIAL_MISSING",
-                "BLOCKED_ON_T12: the approved envelope body is not available "
-                "to the executor",
+                "the approved envelope body is not available to the executor",
             )
     context = ExecutionContext(
         job_id=job_id,
@@ -1453,6 +1507,7 @@ def _load_context(
         plan=plan,
         plan_digest=plan_row["plan_digest"],
         review=review,
+        admission=admission,
         case=case,
         case_root=registry.root,
         manifest_case=manifest_case,
@@ -1528,7 +1583,25 @@ def _assert_context_unchanged(
             )
     except ValueError as error:
         raise ExecutionBlocked("PLAN_MISMATCH", f"the frozen plan is invalid: {error}") from error
-    if review is None or review["decision"] != "approve" or review["plan_digest"] != context.plan_digest:
+    if getattr(context, "admission", None) is not None:
+        try:
+            admission = state.get_admission(dsn, context.job_id)
+        except state.StateError as error:
+            raise ExecutionBlocked(
+                "MATERIAL_MISSING", f"the policy admission changed: {error}"
+            ) from error
+        if (
+            admission is None
+            or admission.get("approval_kind") != "policy"
+            or admission.get("envelope_digest")
+            != context.plan.get("envelope_digest")
+        ):
+            raise ExecutionBlocked("PLAN_MISMATCH", "the policy admission changed")
+    elif (
+        review is None
+        or review["decision"] != "approve"
+        or review["plan_digest"] != context.plan_digest
+    ):
         raise ExecutionBlocked("PLAN_MISMATCH", "the approved review changed")
     # ``material_root`` is the directory containing case materials, not the
     # registry root. Reload from the registry root captured when the context
@@ -3372,6 +3445,7 @@ def _build_report(
     bundle_kind: str = "execution",
 ) -> tuple[dict[str, Any], str]:
     is_v2 = _is_v2_context(context)
+    context_review = getattr(context, "review", None)
     plan_inputs = context.plan.get("inputs")
     report_inputs: dict[str, Any] | None
     if isinstance(plan_inputs, Mapping):
@@ -3411,12 +3485,16 @@ def _build_report(
             else context.plan["limits"]
         ),
         "inputs": report_inputs,
-        "review": {
-            "reviewer_id": context.review["reviewer_id"],
-            "decision": context.review["decision"],
-            "decided_at": jsonutil.timestamp(context.review["decided_at"]),
-            "plan_digest": context.review["plan_digest"],
-        },
+        "review": (
+            {
+                "reviewer_id": context_review["reviewer_id"],
+                "decision": context_review["decision"],
+                "decided_at": jsonutil.timestamp(context_review["decided_at"]),
+                "plan_digest": context_review["plan_digest"],
+            }
+            if context_review is not None
+            else None
+        ),
         "signature": context.plan["asan_signature"],
         "builds": [dict(item) for item in builds.values()],
         "replays": [dict(item) for item in runs],
@@ -3818,21 +3896,11 @@ def _evidence_artifacts(
     execution_metadata: Mapping[str, Any],
 ) -> dict[str, tuple[str, bytes | Path]]:
     is_v2 = _is_v2_context(context)
+    context_admission = getattr(context, "admission", None)
+    context_review = getattr(context, "review", None)
     build_spec = _build_spec_from_context(context)
     artifacts: dict[str, tuple[str, bytes | Path]] = {
         "plan.json": ("plan", jsonutil.canonical_bytes(context.plan) + b"\n"),
-        "review.json": (
-            "review",
-            jsonutil.canonical_bytes(
-                {
-                    "reviewer_id": context.review["reviewer_id"],
-                    "decision": context.review["decision"],
-                    "plan_digest": context.review["plan_digest"],
-                    "decided_at": jsonutil.timestamp(context.review["decided_at"]),
-                }
-            )
-            + b"\n",
-        ),
         "metadata/execution.json": (
             "execution_metadata",
             jsonutil.canonical_bytes(execution_metadata) + b"\n",
@@ -3845,12 +3913,30 @@ def _evidence_artifacts(
             + b"\n",
         ),
     }
+    if context_admission is not None:
+        artifacts["admission.json"] = (
+            "admission",
+            jsonutil.canonical_bytes(dict(context_admission)) + b"\n",
+        )
+    elif context_review is not None:
+        artifacts["review.json"] = (
+            "review",
+            jsonutil.canonical_bytes(
+                {
+                    "reviewer_id": context_review["reviewer_id"],
+                    "decision": context_review["decision"],
+                    "plan_digest": context_review["plan_digest"],
+                    "decided_at": jsonutil.timestamp(context_review["decided_at"]),
+                }
+            )
+            + b"\n",
+        )
     if is_v2:
         if context.envelope is None:
             raise BundleError(
                 "EVIDENCE_INCOMPLETE",
-                "BLOCKED_ON_T12: the approved envelope body is not available to "
-                "the executor; refusing to write a placeholder envelope.json",
+                "the approved envelope body is not available to the executor; "
+                "refusing to write a placeholder envelope.json",
             )
         artifacts["envelope.json"] = (
             "envelope",
@@ -3859,8 +3945,8 @@ def _evidence_artifacts(
         if not context.budget_summary:
             raise BundleError(
                 "EVIDENCE_INCOMPLETE",
-                "BLOCKED_ON_T12: the family budget ledger summary is not available; "
-                "refusing to write a placeholder budget/snapshot.json",
+                "the family budget ledger summary is not available; refusing to "
+                "write a placeholder budget/snapshot.json",
             )
         artifacts["budget/snapshot.json"] = (
             "budget_snapshot",
@@ -4437,13 +4523,10 @@ def _write_v2_bundle_dir(
         evidence._apply_bundle_modes(target, dir_mode=dir_mode, file_mode=file_mode)
 
         # Every bundle that is published must pass the full offline v2
-        # verifier. A FAILED or partial INCONCLUSIVE execution bundle can omit
-        # replay/build roles (for example a fixed build that never ran), and
-        # publishing it as bundle_kind=execution would make the archive fail
-        # verification offline after it left the job. T13a owns a partial
-        # layout in the verifier; until that handoff exists this path fails
-        # closed with an explicit BLOCKED_ON_T13A marker instead of skipping
-        # verification or fabricating empty replay files.
+        # verifier. T13a's partial layout accepts FAILED / pre-rule
+        # INCONCLUSIVE bundles without fabricated replay files. If a bundle
+        # still fails verification, this path fails closed with an explicit
+        # BLOCKED_ON_T13A marker rather than skipping verification.
         partial_execution = bundle_kind == "execution" and effective_verdict in (
             "FAILED",
             "INCONCLUSIVE",
