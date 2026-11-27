@@ -4532,27 +4532,9 @@ def _write_v2_bundle_dir(
         (target / "manifest.json").chmod(file_mode)
         evidence._apply_bundle_modes(target, dir_mode=dir_mode, file_mode=file_mode)
 
-        # Every bundle that is published must pass the full offline v2
-        # verifier. T13a's partial layout accepts FAILED / pre-rule
-        # INCONCLUSIVE bundles without fabricated replay files. If a bundle
-        # still fails verification, this path fails closed with an explicit
-        # BLOCKED_ON_T13A marker rather than skipping verification.
-        partial_execution = bundle_kind == "execution" and effective_verdict in (
-            "FAILED",
-            "INCONCLUSIVE",
-        )
-        try:
-            verify_bundle(target)
-        except BundleError as verifier_error:
-            if partial_execution:
-                raise BundleError(
-                    "EVIDENCE_INCOMPLETE",
-                    "BLOCKED_ON_T13A: partial execution evidence cannot be "
-                    "published as bundle_kind=execution because it fails "
-                    f"offline verification ({verifier_error.reason_code}: "
-                    f"{verifier_error.message})",
-                ) from verifier_error
-            raise
+        # Every published v2 bundle (full execution, partial FAILED / pre-rule
+        # INCONCLUSIVE, blocked, or campaign) must pass the offline verifier.
+        verify_bundle(target)
         return evidence.BundleInfo(
             root=target,
             manifest=manifest,
@@ -4967,27 +4949,18 @@ def _archive_only(dsn: str, context: ExecutionContext) -> ExecutionResult:
     except (state.StateError, state.StaleGeneration):
         return ExecutionResult("STALE")
     if archive_error is not None:
-        blocked_on_t13a = "BLOCKED_ON_T13A" in archive_error
-        finished_state = decision.verdict if blocked_on_t13a else "FAILED"
-        finished_reason = (
-            decision.reason_code if blocked_on_t13a else "EVIDENCE_WRITE_FAILED"
-        )
         try:
             finished = state.finish_execution(
                 dsn,
                 context.job_id,
                 generation=context.generation,
-                state=finished_state,
-                reason_code=finished_reason,
-                verdict=decision.verdict if blocked_on_t13a else None,
-                verdict_reason=decision.reason_code if blocked_on_t13a else None,
+                state="FAILED",
+                reason_code="EVIDENCE_WRITE_FAILED",
+                verdict=None,
+                verdict_reason=None,
                 evidence_status="failed",
                 evidence_error=archive_error,
-                last_error=(
-                    "partial evidence is not publishable until T13a"
-                    if blocked_on_t13a
-                    else "evidence bundle could not be written during archive recovery"
-                ),
+                last_error="evidence bundle could not be written during archive recovery",
                 stage="failed",
             )
         except (state.StateError, state.StaleGeneration):
@@ -4995,10 +4968,10 @@ def _archive_only(dsn: str, context: ExecutionContext) -> ExecutionResult:
         if not finished:
             return ExecutionResult("STALE")
         return ExecutionResult(
-            finished_state,
-            verdict=decision.verdict if blocked_on_t13a else None,
-            verdict_reason=decision.reason_code if blocked_on_t13a else None,
-            reason_code=finished_reason,
+            "FAILED",
+            verdict=None,
+            verdict_reason=None,
+            reason_code="EVIDENCE_WRITE_FAILED",
         )
     final_state = decision.verdict
     reason_code = (
@@ -6172,30 +6145,18 @@ def _finish_failed(
         digest = path = None
         archive_error = str(archive_failure)
     if archive_error is not None:
-        blocked_on_t13a = "BLOCKED_ON_T13A" in archive_error
-        finished_state = terminal if blocked_on_t13a else "FAILED"
-        finished_reason = (
-            error.reason_code if blocked_on_t13a else "EVIDENCE_WRITE_FAILED"
-        )
         try:
             finished = state.finish_execution(
                 dsn,
                 job_id,
                 generation=generation,
-                state=finished_state,
-                reason_code=finished_reason,
-                verdict=terminal if (incomplete and blocked_on_t13a) else None,
-                verdict_reason=(
-                    error.reason_code if (incomplete and blocked_on_t13a) else None
-                ),
+                state="FAILED",
+                reason_code="EVIDENCE_WRITE_FAILED",
+                verdict=None,
+                verdict_reason=None,
                 evidence_status="failed",
                 evidence_error=archive_error,
-                last_error=(
-                    f"{error.message}; partial evidence is not publishable "
-                    "until T13a"
-                    if blocked_on_t13a
-                    else error.message
-                ),
+                last_error=error.message,
                 stage="failed",
             )
         except (state.StateError, state.StaleGeneration):
@@ -6203,12 +6164,10 @@ def _finish_failed(
         if not finished:
             return ExecutionResult("STALE")
         return ExecutionResult(
-            finished_state,
-            verdict=terminal if (incomplete and blocked_on_t13a) else None,
-            verdict_reason=(
-                error.reason_code if (incomplete and blocked_on_t13a) else None
-            ),
-            reason_code=finished_reason,
+            "FAILED",
+            verdict=None,
+            verdict_reason=None,
+            reason_code="EVIDENCE_WRITE_FAILED",
         )
     try:
         finished = state.finish_execution(

@@ -1,0 +1,17 @@
+[
+  {
+    "directory": "/work/repo/build",
+    "command": "clang -fsanitize=address -g -O1 -I b -I a -c /work/repo/src/lexer.c -o /work/repo/build/lexer.o",
+    "file": "/work/repo/src/lexer.c"
+  },
+  {
+    "directory": "/work/repo/build",
+    "command": "clang -fsanitize=address -g -O1 -I b -I a -c /work/repo/src/parser.c -o /work/repo/build/parser.o",
+    "file": "/work/repo/src/parser.c"
+  },
+  {
+    "directory": "/work/repo/build",
+    "command": "clang -fsanitize=address /work/repo/build/lexer.o /work/repo/build/parser.o -o /work/repo/build/parser",
+    "file": "/work/repo/build/parser"
+  }
+]
