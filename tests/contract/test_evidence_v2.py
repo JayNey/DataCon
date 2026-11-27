@@ -1678,12 +1678,7 @@ def test_verify_v2_partial_bundle_rejects_wrong_build_role(tmp_path):
         files,
         name="bad-build-role",
     )
-    # D39 narrows build roles to their fixed paths before the role layout
-    # check runs, so this wrong-role carrier is rejected as a misplaced build
-    # log. It is still rejected before any partial evidence is accepted.
-    with pytest.raises(
-        BundleError, match="must live at build/<version>/build.log"
-    ):
+    with pytest.raises(BundleError, match="must carry the build_artifact role"):
         verify_bundle(root)
 
 

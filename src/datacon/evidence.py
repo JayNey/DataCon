@@ -4042,7 +4042,10 @@ def _verify_v2_layout(
     *,
     partial_execution: bool = False,
 ) -> None:
-    _verify_v2_build_role_paths(listed)
+    if bundle_kind not in ("execution", "campaign"):
+        # Blocked bundles do not run the build layout; keep D39's role/path
+        # guard first so a build role cannot hide at an arbitrary path.
+        _verify_v2_build_role_paths(listed)
     for path, role in _V2_FIXED_PATH_ROLES.items():
         entry = listed.get(path)
         if entry is not None and entry["role"] != role:
@@ -4079,6 +4082,9 @@ def _verify_v2_layout(
         _verify_v2_build_layout(
             listed, partial_execution=partial_execution
         )
+        # T13a's partial-build role errors keep precedence; D39 still rejects
+        # any build role left at a non-fixed path after the layout check.
+        _verify_v2_build_role_paths(listed)
         _verify_v2_replay_layout(
             listed,
             bundle_kind,
