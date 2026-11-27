@@ -1,0 +1,5 @@
+2099-01-01T00:00:01Z [build] cwd=/work/run-0001/repo
+2099-01-01T00:00:02Z clang -fsanitize=address -g -O1 -I/work/run-0001/repo/include -c /work/run-0001/repo/src/parser.c -o /work/run-0001/repo/out/parser.o
+2099-01-01T00:00:03Z clang -fsanitize=address -g -O1 -I/work/run-0001/repo/include -c /work/run-0001/repo/src/lexer.c -o /work/run-0001/repo/out/lexer.o
+2099-01-01T00:00:04Z clang -fsanitize=address /work/run-0001/repo/out/parser.o /work/run-0001/repo/out/lexer.o -o /work/run-0001/repo/out/parser
+2099-01-01T00:00:05Z [build] done artifact=/work/run-0001/repo/out/parser
