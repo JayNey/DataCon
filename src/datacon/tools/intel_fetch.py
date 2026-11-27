@@ -629,6 +629,65 @@ def strip_url_credentials(url: str) -> str:
     )
 
 
+SOURCE_URL_INVALID = "SOURCE_URL_INVALID"
+
+
+def public_source_url(url: Any) -> str:
+    """Return ``url`` as it may appear in evidence, or refuse it.
+
+    A source URL is report and evidence material: it is returned without
+    any ``user:password@`` part, and it must name an https origin. A
+    missing or blank value, embedded whitespace or a control character,
+    another scheme, a hostless authority, an unparseable port or
+    credentials that survive the stripping each name no trustworthy origin
+    and are refused with ``SOURCE_URL_INVALID``: material that cannot be
+    attributed to a source is policy, not content. The message never
+    repeats the URL, which may still carry credentials.
+    """
+    if not isinstance(url, str) or not url.strip():
+        raise IntelFetchError(SOURCE_URL_INVALID, "no source URL is registered")
+    if any(character.isspace() or ord(character) < 0x20 for character in url):
+        raise IntelFetchError(
+            SOURCE_URL_INVALID,
+            "the source URL carries whitespace or a control character",
+        )
+    try:
+        stripped = strip_url_credentials(url)
+        parts = urlsplit(stripped)
+        # Reading ``port`` is what turns an unparseable port into a
+        # ValueError; username/password cannot survive the stripping.
+        _ = parts.port
+        if parts.scheme != "https" or not parts.hostname:
+            raise ValueError("the URL names no https origin")
+        if parts.username is not None or parts.password is not None:
+            raise ValueError("credentials survived the stripping")
+    except ValueError as error:
+        raise IntelFetchError(
+            SOURCE_URL_INVALID, f"the source URL cannot be parsed: {error}"
+        ) from error
+    return stripped
+
+
+def license_rejection(license_id: Any, permitted_uses: Any) -> str | None:
+    """Return why a registered license is refused, or ``None`` when it passes.
+
+    One rule for every reader of a license grant - the snapshot provider at
+    admission and the evidence verifier offline: a grant passes only when a
+    license is registered and the permitted uses name the system use, and
+    only a list, tuple, set or frozenset names permissions at all. ``in`` on
+    a text value is a substring test and on bytes a ``TypeError`` that would
+    read as unreadable material; a malformed record grants nothing either
+    way, exactly like the registry gate in ``check_license``.
+    """
+    if not isinstance(license_id, str) or not license_id.strip():
+        return "no license is registered"
+    if not isinstance(permitted_uses, (list, tuple, set, frozenset)):
+        return "its permitted uses are not registered as a list"
+    if SYSTEM_USE not in permitted_uses:
+        return f"its license does not permit {SYSTEM_USE!r}"
+    return None
+
+
 def build_snapshot(
     fetch_result: FetchResult, license_info: str | None
 ) -> Mapping[str, Any]:
