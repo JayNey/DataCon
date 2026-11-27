@@ -4714,6 +4714,73 @@ def test_nonblocking_cmake_configure_attached_and_separate_P_rejected(
                 "--install-prefix=/etc",
             ],
         ),
+        (
+            "lowercase-on-cannot-override-off",
+            [
+                "cmake",
+                "-S",
+                ".",
+                "-B",
+                "build",
+                "-DCMAKE_EXPORT_COMPILE_COMMANDS=OFF",
+                "-Dcmake_export_compile_commands=ON",
+            ],
+        ),
+        (
+            "per-config-runtime-output-escape",
+            [
+                "cmake",
+                "-S",
+                ".",
+                "-B",
+                "build",
+                "-DCMAKE_RUNTIME_OUTPUT_DIRECTORY_RELEASE=/etc",
+            ],
+        ),
+        (
+            "per-config-archive-output-typed-escape",
+            [
+                "cmake",
+                "-S",
+                ".",
+                "-B",
+                "build",
+                "-DCMAKE_ARCHIVE_OUTPUT_DIRECTORY_DEBUG:PATH=/etc",
+            ],
+        ),
+        (
+            "per-config-library-output-escape",
+            [
+                "cmake",
+                "-S",
+                ".",
+                "-B",
+                "build",
+                "-DCMAKE_LIBRARY_OUTPUT_DIRECTORY_MINSIZEREL=/etc",
+            ],
+        ),
+        (
+            "quoted-install-prefix-double",
+            [
+                "cmake",
+                "-S",
+                ".",
+                "-B",
+                "build",
+                '-DCMAKE_INSTALL_PREFIX="/etc"',
+            ],
+        ),
+        (
+            "quoted-install-prefix-single",
+            [
+                "cmake",
+                "-S",
+                ".",
+                "-B",
+                "build",
+                "-DCMAKE_INSTALL_PREFIX='/etc'",
+            ],
+        ),
     ],
 )
 def test_d1_cmake_typed_vars_wildcard_unset_and_install_prefix_fail_closed(
@@ -4754,6 +4821,20 @@ def test_d1_cmake_has_export_and_disables_share_typed_and_unset_semantics():
     ]
     assert build_provenance.cmake_disables_compile_commands(wildcard_unset) is True
     assert build_provenance.cmake_has_export_compile_commands(wildcard_unset) is False
+
+    # Lowercase variable does NOT enable CMake's case-sensitive export; auto-inject =ON.
+    lowercase_only = [
+        "cmake",
+        "-S",
+        ".",
+        "-B",
+        "build",
+        "-Dcmake_export_compile_commands=ON",
+    ]
+    assert build_provenance.cmake_disables_compile_commands(lowercase_only) is False
+    assert build_provenance.cmake_has_export_compile_commands(lowercase_only) is False
+    lower_plan = prepare_build_spec_execution(_cmake_spec(configure=lowercase_only))
+    assert "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON" in lower_plan.configure
 
     # Valid typed =ON and valid --install-prefix inside /work remain allowed.
     valid_typed = [
@@ -4863,7 +4944,9 @@ def test_d2_make_runner_merges_cc_shim_fragments_with_and_without_install(
     "reserved_output",
     [
         "metadata.json",
+        "metadata.json/sub",
         "build.log",
+        "build.log/sub",
         "build_provenance",
         "build_provenance/compile_commands.json",
         "build_provenance/nested/file.log",
@@ -4996,16 +5079,27 @@ def test_nb3_policy_admission_parent_approval_digest_mismatch_blocked(
     assert result.reason_code == "PLAN_MISMATCH"
     assert fake_sandbox.probe_calls == 0
 
-    # Also verify pre-execution recheck (_assert_context_unchanged) rejects drift.
+    # Also verify pre-execution recheck (_assert_context_unchanged) rejects drift
+    # on parent_approval_digest, parent_job_id, round_no, and seed_digest.
     mem_state.job["state"] = "RUNNING"
     mem_state.admission["parent_approval_digest"] = plan_parent_approval
     context = execution._load_context(
         "dsn", job["job_id"], 1, case_root=str(FIXTURE_CASES), run_root=run_root
     )
-    mem_state.admission["parent_approval_digest"] = wrong_parent_approval
-    with pytest.raises(execution.ExecutionBlocked) as exc_info:
-        execution._assert_context_unchanged("dsn", context)
-    assert exc_info.value.reason_code == "PLAN_MISMATCH"
+    for field, bad_value in (
+        ("parent_approval_digest", wrong_parent_approval),
+        ("parent_job_id", str(uuid4())),
+        ("round_no", (plan["round_no"] or 1) + 99),
+        ("seed_digest", "sha256:" + "0" * 64),
+    ):
+        original = mem_state.admission[field]
+        mem_state.admission[field] = bad_value
+        try:
+            with pytest.raises(execution.ExecutionBlocked) as exc_info:
+                execution._assert_context_unchanged("dsn", context)
+            assert exc_info.value.reason_code == "PLAN_MISMATCH", field
+        finally:
+            mem_state.admission[field] = original
 
 
 def test_nb4_merge_cc_shim_log_rejects_symlink_fragment(tmp_path: Path):

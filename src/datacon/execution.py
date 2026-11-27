@@ -1105,6 +1105,38 @@ def _assert_budget(context: ExecutionContext, *, purpose: str) -> float:
     return remaining
 
 
+def _validate_policy_admission(
+    admission: Mapping[str, Any],
+    *,
+    job: Mapping[str, Any],
+    plan: Mapping[str, Any],
+) -> str | None:
+    """Return a mismatch reason if a policy admission does not bind ``(job, plan)``."""
+    if admission.get("approval_kind") != "policy":
+        return "the admission is not a policy admission"
+    if admission.get("envelope_digest") != plan.get("envelope_digest"):
+        return "the policy admission envelope differs from the frozen plan"
+    expected_parent_approval = plan.get("parent_approval_digest")
+    if (
+        not isinstance(expected_parent_approval, str)
+        or not expected_parent_approval
+        or admission.get("parent_approval_digest") != expected_parent_approval
+    ):
+        return "the policy admission parent approval differs from the frozen plan"
+    if (
+        admission.get("parent_job_id") != str(job.get("parent_job_id"))
+        or admission.get("round_no") != plan.get("round_no")
+    ):
+        return "the policy admission is bound to a different family round"
+    plan_inputs = plan.get("inputs")
+    if (
+        isinstance(plan_inputs, Mapping)
+        and admission.get("seed_digest") != plan_inputs.get("candidate")
+    ):
+        return "the policy admission seed differs from the frozen plan"
+    return None
+
+
 def _load_context(
     dsn: str,
     job_id: UUID,
@@ -1163,43 +1195,9 @@ def _load_context(
                 "MATERIAL_MISSING", f"the policy admission is unavailable: {error}"
             ) from error
         if admission is not None:
-            if admission.get("approval_kind") != "policy":
-                raise ExecutionBlocked(
-                    "PLAN_MISMATCH", "the admission is not a policy admission"
-                )
-            if admission.get("envelope_digest") != plan.get("envelope_digest"):
-                raise ExecutionBlocked(
-                    "PLAN_MISMATCH",
-                    "the policy admission envelope differs from the frozen plan",
-                )
-            expected_parent_approval = plan.get("parent_approval_digest")
-            if (
-                not isinstance(expected_parent_approval, str)
-                or not expected_parent_approval
-                or admission.get("parent_approval_digest")
-                != expected_parent_approval
-            ):
-                raise ExecutionBlocked(
-                    "PLAN_MISMATCH",
-                    "the policy admission parent approval differs from the frozen plan",
-                )
-            if (
-                admission.get("parent_job_id") != str(job.get("parent_job_id"))
-                or admission.get("round_no") != plan.get("round_no")
-            ):
-                raise ExecutionBlocked(
-                    "PLAN_MISMATCH",
-                    "the policy admission is bound to a different family round",
-                )
-            plan_inputs = plan.get("inputs")
-            if (
-                isinstance(plan_inputs, Mapping)
-                and admission.get("seed_digest") != plan_inputs.get("candidate")
-            ):
-                raise ExecutionBlocked(
-                    "PLAN_MISMATCH",
-                    "the policy admission seed differs from the frozen plan",
-                )
+            mismatch = _validate_policy_admission(admission, job=job, plan=plan)
+            if mismatch is not None:
+                raise ExecutionBlocked("PLAN_MISMATCH", mismatch)
             review = None
     if admission is None:
         if review is None or review["decision"] != "approve":
@@ -1601,16 +1599,12 @@ def _assert_context_unchanged(
             raise ExecutionBlocked(
                 "MATERIAL_MISSING", f"the policy admission changed: {error}"
             ) from error
-        expected_parent_approval = context.plan.get("parent_approval_digest")
         if (
             admission is None
-            or admission.get("approval_kind") != "policy"
-            or admission.get("envelope_digest")
-            != context.plan.get("envelope_digest")
-            or not isinstance(expected_parent_approval, str)
-            or not expected_parent_approval
-            or admission.get("parent_approval_digest")
-            != expected_parent_approval
+            or _validate_policy_admission(
+                admission, job=job, plan=context.plan
+            )
+            is not None
         ):
             raise ExecutionBlocked("PLAN_MISMATCH", "the policy admission changed")
     elif (
