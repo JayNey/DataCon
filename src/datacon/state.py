@@ -5780,26 +5780,50 @@ def _family_terminal_state(child: Mapping[str, Any]) -> tuple[str, str]:
 
 FAMILY_TRANSITION_DECISIONS = frozenset({"next_round", "no_next_round"})
 FAMILY_TRANSITION_EVENT = "family_transition_decided"
-_TRANSITION_REASON_CODE = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
+# Closed set of family transition sub-codes. They live only in the decision
+# audit ``detail.reason_code``: never in ``jobs.reason_code``, the audit
+# ``reason_code`` column or the §10 terminal reason set. The campaign point
+# (``after_round_no=0``) only admits ``NO_CANDIDATE_SEED``; a round point
+# (``after_round_no>=1``) only admits ``NO_REMAINING_SEEDS``, the code the
+# orchestration iteration gate already uses for exhausted seeds.
+FAMILY_TRANSITION_REASON_CODES = frozenset(
+    {"NO_CANDIDATE_SEED", "NO_REMAINING_SEEDS"}
+)
 
 
-def _latest_family_transition_decision(
-    connection, family_id: UUID
+def _family_transition_reason_code(after_round_no: int) -> str:
+    """Return the only sub-code allowed at one decision point."""
+    return "NO_CANDIDATE_SEED" if after_round_no == 0 else "NO_REMAINING_SEEDS"
+
+
+def _family_transition_decision_at(
+    connection, family_id: UUID, campaign_job_id: Any, after_round_no: int
 ) -> dict[str, Any] | None:
-    """Return the newest ``family_transition_decided`` detail, if any.
+    """Return the decision recorded at one ``(campaign, after_round_no)`` point.
 
     ``audit_events`` is the only source of the family-level decision: no
     evidence file is read, so the archive gate stays a pure database query.
+    The match is exact (JSON containment on both keys), so a decision made at
+    an earlier point is never adopted later. An event without
+    ``after_round_no`` never matches: this entry shipped together with that
+    field, so no production row lacks it and such a row is simply invalid.
+    The family row lock serializes writers, so a point holds at most one row.
     """
-    row = connection.execute(
-        "SELECT detail FROM audit_events "
-        "WHERE job_id = %s AND event_type = %s "
-        "ORDER BY created_at DESC, event_id DESC LIMIT 1",
-        (family_id, FAMILY_TRANSITION_EVENT),
+    return connection.execute(
+        "SELECT event_id, detail, created_at FROM audit_events "
+        "WHERE job_id = %s AND event_type = %s AND detail @> %s "
+        "ORDER BY event_id LIMIT 1",
+        (
+            family_id,
+            FAMILY_TRANSITION_EVENT,
+            Jsonb(
+                {
+                    "campaign_job_id": str(campaign_job_id),
+                    "after_round_no": after_round_no,
+                }
+            ),
+        ),
     ).fetchone()
-    if row is None or not isinstance(row["detail"], Mapping):
-        return None
-    return dict(row["detail"])
 
 
 def _family_archive_disposition(
@@ -5816,9 +5840,10 @@ def _family_archive_disposition(
     ``terminal`` fires when a child can never enter ``family.json`` (failed or
     plan-less blocked evidence) or when the last round is itself BLOCKED/FAILED
     without a conclusion. ``wait`` keeps the family AGGREGATING. Before
-    waiting, the latest ``family_transition_decided`` event is consulted: a
-    ``no_next_round`` decision (campaign finished without a candidate seed)
-    archives the family; ``next_round`` or no decision keeps it waiting.
+    waiting, the transition decision recorded for the current campaign at the
+    current point (``after_round_no == rounds_used``) is consulted: only a
+    matching ``no_next_round`` archives the family. ``next_round``, a decision
+    at another point, or no decision keeps it waiting.
     """
     rounds = sorted(
         (
@@ -5859,9 +5884,18 @@ def _family_archive_disposition(
         and ledger["remaining_total_seconds"] <= 0
     ):
         return ("archive",)
-    decision = _latest_family_transition_decision(connection, family_id)
-    if decision is not None and decision.get("decision") == "no_next_round":
-        return ("archive",)
+    campaigns = [
+        child for child in children if child["job_kind"] == "campaign"
+    ]
+    if len(campaigns) == 1:
+        decision = _family_transition_decision_at(
+            connection, family_id, campaigns[0]["job_id"], rounds_used
+        )
+        if (
+            decision is not None
+            and decision["detail"].get("decision") == "no_next_round"
+        ):
+            return ("archive",)
     return ("wait",)
 
 
@@ -6436,21 +6470,23 @@ def converge_families(
 
 def _transition_decision_detail(
     campaign_job_id: UUID,
+    after_round_no: Any,
     decision: Any,
     reason_code: Any,
     candidate_seed_count: Any,
     next_round_no: Any,
 ) -> dict[str, Any]:
-    """Validate a family transition decision and build its audit detail."""
+    """Validate a transition decision fail-closed and build its audit detail.
+
+    Every field is checked for exact type and range; any combination not
+    listed in the contract is refused before the database is touched.
+    """
+    if type(after_round_no) is not int or after_round_no < 0:
+        raise StateError("after_round_no must be a non-negative integer")
     if decision not in FAMILY_TRANSITION_DECISIONS:
         raise StateError(
             "decision must be 'next_round' or 'no_next_round'"
         )
-    if reason_code is not None and (
-        not isinstance(reason_code, str)
-        or not _TRANSITION_REASON_CODE.fullmatch(reason_code)
-    ):
-        raise StateError("reason_code must be an upper-case code")
     if candidate_seed_count is not None and (
         type(candidate_seed_count) is not int or candidate_seed_count < 0
     ):
@@ -6460,16 +6496,30 @@ def _transition_decision_detail(
     ):
         raise StateError("next_round_no must be a positive integer")
     if decision == "no_next_round":
-        if reason_code is None:
-            raise StateError("no_next_round requires reason_code")
-        if candidate_seed_count is None:
-            raise StateError("no_next_round requires candidate_seed_count")
+        expected = _family_transition_reason_code(after_round_no)
+        if reason_code not in FAMILY_TRANSITION_REASON_CODES:
+            raise StateError(
+                "no_next_round requires a reason_code from "
+                + ", ".join(sorted(FAMILY_TRANSITION_REASON_CODES))
+            )
+        if reason_code != expected:
+            raise StateError(
+                f"after_round_no={after_round_no} only admits {expected}"
+            )
+        if candidate_seed_count != 0:
+            raise StateError("no_next_round requires candidate_seed_count=0")
         if next_round_no is not None:
             raise StateError("no_next_round must not carry next_round_no")
-    elif next_round_no is None:
-        raise StateError("next_round requires next_round_no")
+    else:
+        if reason_code is not None:
+            raise StateError("next_round must not carry reason_code")
+        if candidate_seed_count is None or candidate_seed_count < 1:
+            raise StateError("next_round requires candidate_seed_count >= 1")
+        if next_round_no != after_round_no + 1:
+            raise StateError("next_round requires next_round_no = after_round_no + 1")
     return {
         "campaign_job_id": str(campaign_job_id),
+        "after_round_no": after_round_no,
         "decision": decision,
         "candidate_seed_count": candidate_seed_count,
         "next_round_no": next_round_no,
@@ -6485,9 +6535,10 @@ def _transition_decision_record(
         "family_id": str(family_id),
         "event_id": row["event_id"],
         "event_type": FAMILY_TRANSITION_EVENT,
-        "created_at": row["created_at"],
+        "created_at": jsonutil.timestamp(row["created_at"]),
         **{key: detail.get(key) for key in (
             "campaign_job_id",
+            "after_round_no",
             "decision",
             "candidate_seed_count",
             "next_round_no",
@@ -6496,36 +6547,78 @@ def _transition_decision_record(
     }
 
 
+def _check_transition_point(
+    connection, family_id: UUID, after_round_no: int
+) -> None:
+    """Require the family to stand exactly at the requested decision point.
+
+    ``after_round_no=0`` is the campaign point: no round child exists yet.
+    ``after_round_no=k`` is the point after round k: the highest round is k
+    and it ended ``INCONCLUSIVE`` (no conclusion); no later round exists.
+    """
+    rounds = connection.execute(
+        "SELECT round_no, state FROM jobs "
+        "WHERE parent_job_id = %s AND job_kind = 'round' "
+        "ORDER BY round_no DESC NULLS FIRST",
+        (family_id,),
+    ).fetchall()
+    if after_round_no == 0:
+        if rounds:
+            raise StateError(
+                "the campaign decision point has passed: the family "
+                "already has a round"
+            )
+        return
+    if not rounds or rounds[0]["round_no"] != after_round_no:
+        raise StateError(
+            f"after_round_no={after_round_no} is not the family's latest round"
+        )
+    if rounds[0]["state"] != "INCONCLUSIVE":
+        raise StateError(
+            f"round {after_round_no} must be INCONCLUSIVE before the family "
+            "decides"
+        )
+
+
 def record_family_transition_decision(
     dsn: str,
     family_id: UUID,
     *,
     campaign_job_id: UUID,
+    after_round_no: int,
     decision: str,
     reason_code: str | None = None,
     candidate_seed_count: int | None = None,
     next_round_no: int | None = None,
-    now: Any = None,
 ) -> dict[str, Any]:
-    """Record the family-level transition after its campaign completed.
+    """Record one family-level transition decision at one decision point.
 
-    P2's campaign runtime calls this once the campaign child is ``COMPLETED``
-    to say whether the family derives another round (``next_round``, with a
-    positive ``next_round_no``) or ends without one (``no_next_round``, with a
-    ``reason_code`` such as ``NO_CANDIDATE_SEED`` and a non-negative
-    ``candidate_seed_count``; 0 is legal). Exactly one
-    ``family_transition_decided`` audit event is written under the family row
-    lock with ``job_id=family_id`` and ``stage='transition'``. The decision's
-    ``reason_code`` lives only in ``detail``; the audit column stays null so
-    no §10 reason code is introduced.
+    P2's runtime calls this once per decision point of a guided family:
 
-    Idempotent per campaign: an identical decision returns the existing
-    record without writing; any different decision or detail for the same
-    campaign raises ``StateError``. It never creates a child, writes
-    ``family.json`` or touches the budget. ``now`` is accepted for parity with
-    ``archive_family``; the event time is the database clock.
+    * after the campaign child archived (``after_round_no=0``, edge #23/#24);
+    * after round ``k`` archived ``INCONCLUSIVE`` and the family does not
+      simply continue by budget/round rules (``after_round_no=k``, edge #26).
+
+    ``no_next_round`` requires ``candidate_seed_count=0`` and the point's
+    sub-code (``NO_CANDIDATE_SEED`` at 0, ``NO_REMAINING_SEEDS`` at k>=1) and
+    forbids ``next_round_no``. ``next_round`` forbids ``reason_code`` and
+    requires ``candidate_seed_count>=1`` and ``next_round_no=after_round_no+1``
+    within the effective ``max_rounds``.
+
+    Only the family row is locked. Exactly one ``family_transition_decided``
+    audit event is written with ``job_id=family_id``, ``stage='transition'``,
+    a NULL audit ``reason_code`` column and ``detail={campaign_job_id,
+    after_round_no, decision, candidate_seed_count, next_round_no,
+    reason_code}``. The event time is the database ``clock_timestamp()``;
+    ``created_at`` is returned as an RFC 3339 UTC string.
+
+    Idempotency is checked first, keyed by ``(campaign_job_id,
+    after_round_no)``: an identical detail returns the original record without
+    writing, even after the family reached a terminal state (that answer says
+    nothing about whether it will archive again); any other detail at the same
+    point raises ``StateError``. Decisions at different points coexist. It
+    never creates a child, writes ``family.json`` or touches the budget.
     """
-    del now
     try:
         family_id = UUID(str(family_id))
         campaign_job_id = UUID(str(campaign_job_id))
@@ -6535,6 +6628,7 @@ def record_family_transition_decision(
         ) from error
     detail = _transition_decision_detail(
         campaign_job_id,
+        after_round_no,
         decision,
         reason_code,
         candidate_seed_count,
@@ -6543,8 +6637,8 @@ def record_family_transition_decision(
     with _connect(dsn) as connection:
         with connection.transaction():
             family = connection.execute(
-                "SELECT state, job_kind, job_contract_version FROM jobs "
-                "WHERE job_id = %s FOR UPDATE",
+                "SELECT state, job_kind, job_contract_version, request "
+                "FROM jobs WHERE job_id = %s FOR UPDATE",
                 (family_id,),
             ).fetchone()
             if family is None:
@@ -6554,21 +6648,16 @@ def record_family_transition_decision(
                 or family["job_contract_version"] != 2
             ):
                 raise StateError("job is not a v2 family")
-            existing = connection.execute(
-                "SELECT event_id, detail, created_at FROM audit_events "
-                "WHERE job_id = %s AND event_type = %s "
-                "AND detail->>'campaign_job_id' = %s "
-                "ORDER BY event_id",
-                (family_id, FAMILY_TRANSITION_EVENT, str(campaign_job_id)),
-            ).fetchall()
-            for row in existing:
-                if row["detail"] != detail:
+            existing = _family_transition_decision_at(
+                connection, family_id, campaign_job_id, after_round_no
+            )
+            if existing is not None:
+                if existing["detail"] != detail:
                     raise StateError(
                         "a different transition decision was already "
-                        "recorded for this campaign"
+                        f"recorded at after_round_no={after_round_no}"
                     )
-            if existing:
-                return _transition_decision_record(family_id, existing[0])
+                return _transition_decision_record(family_id, existing)
             if family["state"] != "AGGREGATING":
                 raise StateError(
                     "cannot record a transition decision while the family "
@@ -6594,6 +6683,16 @@ def record_family_transition_decision(
             ).fetchone()
             if pending_envelope is not None:
                 raise StateError("family has a pending envelope")
+            _check_transition_point(connection, family_id, after_round_no)
+            if decision == "next_round":
+                max_rounds = _effective_family_max_rounds(
+                    connection, family_id, family["request"]
+                )
+                if next_round_no is None or next_round_no > max_rounds:
+                    raise StateError(
+                        f"next_round_no={next_round_no} exceeds the effective "
+                        f"max_rounds={max_rounds}"
+                    )
             row = connection.execute(
                 "INSERT INTO audit_events "
                 "(job_id, stage, attempt_no, event_type, reason_code, detail, "

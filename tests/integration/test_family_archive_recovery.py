@@ -125,7 +125,7 @@ def _insert_plan(database, job_id, digest):
     )
 
 
-def _insert_approval(database, family_id):
+def _insert_approval(database, family_id, approval_digest=APPROVAL_DIGEST):
     database.connection.execute(
         "INSERT INTO family_approvals (approval_id, family_id, "
         "approval_digest, envelope_digest, first_plan_digest, reviewer_id, "
@@ -134,7 +134,7 @@ def _insert_approval(database, family_id):
         (
             uuid4(),
             family_id,
-            APPROVAL_DIGEST,
+            approval_digest,
             "sha256:" + "b" * 64,
             CAMPAIGN_PLAN,
         ),
@@ -414,7 +414,9 @@ def test_family_archive_recovery_records_failure_and_retries(
 # ---------------------------------------------------------------------------
 
 
-def _archived_family(database, tmp_path, *, max_rounds, rounds):
+def _archived_family(
+    database, tmp_path, *, max_rounds, rounds, approval_digest=APPROVAL_DIGEST
+):
     """Build the common guided family rows and return their identifiers."""
     family_id = _insert_family(
         database, request=_guided_request(max_rounds=max_rounds)
@@ -448,7 +450,7 @@ def _archived_family(database, tmp_path, *, max_rounds, rounds):
             ROUND1_PLAN if round_no == 1 else ROUND2_PLAN,
         )
         round_ids.append(round_id)
-    _insert_approval(database, family_id)
+    _insert_approval(database, family_id, approval_digest)
     _insert_ledger(database, family_id)
     return family_id, campaign_id, round_ids
 
@@ -525,65 +527,174 @@ def _decision_events(database, family_id):
     ).fetchall()
 
 
+def _approval_digest(tag):
+    return "sha256:" + hashlib.sha256(tag.encode()).hexdigest()
+
+
+NO_SEED_AT_CAMPAIGN = dict(
+    after_round_no=0,
+    decision="no_next_round",
+    reason_code="NO_CANDIDATE_SEED",
+    candidate_seed_count=0,
+)
+NEXT_AFTER_CAMPAIGN = dict(
+    after_round_no=0,
+    decision="next_round",
+    candidate_seed_count=1,
+    next_round_no=1,
+)
+NO_SEED_AFTER_ROUND1 = dict(
+    after_round_no=1,
+    decision="no_next_round",
+    reason_code="NO_REMAINING_SEEDS",
+    candidate_seed_count=0,
+)
+
+
+def _decide(database, family_id, campaign_id, **kwargs):
+    return state.record_family_transition_decision(
+        database.dsn, family_id, campaign_job_id=campaign_id, **kwargs
+    )
+
+
+def _assert_rejected_without_event(database, family_id, campaign_id, **kwargs):
+    before = len(_decision_events(database, family_id))
+    try:
+        _decide(database, family_id, campaign_id, **kwargs)
+    except (state.StateError, TypeError):
+        pass
+    else:
+        pytest.fail(f"ineligible decision was accepted: {kwargs}")
+    assert len(_decision_events(database, family_id)) == before, (
+        f"rejected decision wrote an event: {kwargs}"
+    )
+
+
+# Fail-closed argument combinations at the campaign decision point (B-2).
+# Each must be refused before any event is written.
+_REJECTED_CAMPAIGN_POINT_CALLS = [
+    dict(after_round_no=0, decision="stop", reason_code="NO_CANDIDATE_SEED",
+         candidate_seed_count=0),
+    dict(after_round_no=0, decision="no_next_round", candidate_seed_count=0),
+    dict(after_round_no=0, decision="no_next_round",
+         reason_code="NO_CANDIDATE_SEED"),
+    dict(after_round_no=0, decision="no_next_round",
+         reason_code="NO_CANDIDATE_SEED", candidate_seed_count=-1),
+    dict(after_round_no=0, decision="no_next_round",
+         reason_code="NO_CANDIDATE_SEED", candidate_seed_count=5),
+    dict(after_round_no=0, decision="no_next_round",
+         reason_code="NO_CANDIDATE_SEED", candidate_seed_count=False),
+    dict(after_round_no=0, decision="no_next_round",
+         reason_code="REPRODUCED", candidate_seed_count=0),
+    dict(after_round_no=0, decision="no_next_round",
+         reason_code="FOO", candidate_seed_count=0),
+    # NO_REMAINING_SEEDS belongs to the round decision points only.
+    dict(after_round_no=0, decision="no_next_round",
+         reason_code="NO_REMAINING_SEEDS", candidate_seed_count=0),
+    dict(after_round_no=0, decision="no_next_round",
+         reason_code="NO_CANDIDATE_SEED", candidate_seed_count=0,
+         next_round_no=1),
+    dict(after_round_no=0, decision="next_round"),
+    dict(after_round_no=0, decision="next_round", next_round_no=1),
+    dict(after_round_no=0, decision="next_round", next_round_no=1,
+         candidate_seed_count=0),
+    dict(after_round_no=0, decision="next_round", next_round_no=1,
+         reason_code="NO_CANDIDATE_SEED", candidate_seed_count=0),
+    dict(after_round_no=0, decision="next_round", next_round_no=1,
+         reason_code="NO_CANDIDATE_SEED", candidate_seed_count=1),
+    dict(after_round_no=0, decision="next_round", next_round_no=0,
+         candidate_seed_count=1),
+    dict(after_round_no=0, decision="next_round", next_round_no=True,
+         candidate_seed_count=1),
+    dict(after_round_no=0, decision="next_round", next_round_no=1.0,
+         candidate_seed_count=1),
+    dict(after_round_no=0, decision="next_round", next_round_no=2,
+         candidate_seed_count=1),
+    dict(after_round_no=0, decision="next_round", next_round_no=99,
+         candidate_seed_count=1),
+    # A round decision point with no round child yet.
+    dict(after_round_no=1, decision="no_next_round",
+         reason_code="NO_REMAINING_SEEDS", candidate_seed_count=0),
+    dict(after_round_no=-1, decision="no_next_round",
+         reason_code="NO_CANDIDATE_SEED", candidate_seed_count=0),
+    dict(after_round_no=True, decision="no_next_round",
+         reason_code="NO_CANDIDATE_SEED", candidate_seed_count=0),
+    # after_round_no is a required keyword (P2 must name its decision point).
+    dict(decision="no_next_round", reason_code="NO_CANDIDATE_SEED",
+         candidate_seed_count=0),
+    # ``now`` was removed (S-3): the event time is the database clock.
+    dict(NO_SEED_AT_CAMPAIGN, now="2099-01-01T00:00:00Z"),
+]
+
+
 def _assert_decision_rejected(isolated_database, tmp_path, family_id, campaign_id):
     """Every malformed or ineligible call is refused and writes nothing."""
-    dsn = isolated_database.dsn
-    bad_calls = [
-        dict(decision="stop", reason_code="NO_CANDIDATE_SEED",
-             candidate_seed_count=0),
-        dict(decision="no_next_round", candidate_seed_count=0),
-        dict(decision="no_next_round", reason_code="NO_CANDIDATE_SEED"),
-        dict(decision="no_next_round", reason_code="NO_CANDIDATE_SEED",
-             candidate_seed_count=-1),
-        dict(decision="no_next_round", reason_code="NO_CANDIDATE_SEED",
-             candidate_seed_count=0, next_round_no=1),
-        dict(decision="next_round"),
-        dict(decision="next_round", next_round_no=0),
-        dict(decision="next_round", next_round_no=True),
-    ]
-    for kwargs in bad_calls:
-        with pytest.raises(state.StateError):
-            state.record_family_transition_decision(
-                dsn, family_id, campaign_job_id=campaign_id, **kwargs
-            )
-    no_seed = dict(
-        decision="no_next_round",
-        reason_code="NO_CANDIDATE_SEED",
-        candidate_seed_count=0,
+    database = isolated_database
+    for kwargs in _REJECTED_CAMPAIGN_POINT_CALLS:
+        _assert_rejected_without_event(database, family_id, campaign_id, **kwargs)
+    with pytest.raises(TypeError):
+        _decide(database, family_id, campaign_id, now=None, **NO_SEED_AT_CAMPAIGN)
+
+    # The campaign must be this family's own COMPLETED campaign child: a
+    # real COMPLETED campaign of another family is refused, as is an unknown id.
+    other_family, other_campaign, _ = _archived_family(
+        database, tmp_path / "other", max_rounds=8, rounds=[],
+        approval_digest=_approval_digest(f"other-{family_id}"),
     )
-    # The campaign must be this family's own COMPLETED campaign child.
-    with pytest.raises(state.StateError):
-        state.record_family_transition_decision(
-            dsn, family_id, campaign_job_id=uuid4(), **no_seed
-        )
-    isolated_database.connection.execute(
+    _assert_rejected_without_event(
+        database, family_id, other_campaign, **NO_SEED_AT_CAMPAIGN
+    )
+    _assert_rejected_without_event(
+        database, family_id, uuid4(), **NO_SEED_AT_CAMPAIGN
+    )
+    # A non-family job or a v1 job is not a family.
+    _assert_rejected_without_event(
+        database, campaign_id, campaign_id, **NO_SEED_AT_CAMPAIGN
+    )
+    v1_job = uuid4()
+    database.connection.execute(
+        "INSERT INTO jobs (job_id, request, state, stage, submitted_at) "
+        "VALUES (%s, %s, 'QUEUED', 'queued', clock_timestamp())",
+        (v1_job, Jsonb({"cve_id": "CVE-2099-0001"})),
+    )
+    _assert_rejected_without_event(
+        database, v1_job, campaign_id, **NO_SEED_AT_CAMPAIGN
+    )
+    database.connection.execute("DELETE FROM jobs WHERE job_id = %s", (v1_job,))
+
+    database.connection.execute(
         "UPDATE jobs SET state = 'RUNNING', evidence_status = NULL, "
         "evidence_path = NULL, evidence_digest = NULL WHERE job_id = %s",
         (campaign_id,),
     )
-    with pytest.raises(state.StateError):
-        state.record_family_transition_decision(
-            dsn, family_id, campaign_job_id=campaign_id, **no_seed
-        )
-    isolated_database.connection.execute(
+    _assert_rejected_without_event(
+        database, family_id, campaign_id, **NO_SEED_AT_CAMPAIGN
+    )
+    database.connection.execute(
         "UPDATE jobs SET state = 'COMPLETED', evidence_status = 'archived', "
         "evidence_path = %s, evidence_digest = %s WHERE job_id = %s",
         (str(tmp_path / "campaign-bundle"), CAMPAIGN_DIGEST, campaign_id),
     )
-    isolated_database.connection.execute(
+    database.connection.execute(
         "INSERT INTO family_envelopes (envelope_id, family_id, "
         "envelope_digest, envelope_json, status) "
         "VALUES (%s, %s, %s, %s, 'pending')",
         (uuid4(), family_id, "sha256:" + "c" * 64, Jsonb({})),
     )
-    with pytest.raises(state.StateError):
-        state.record_family_transition_decision(
-            dsn, family_id, campaign_job_id=campaign_id, **no_seed
-        )
-    assert _decision_events(isolated_database, family_id) == []
-    isolated_database.connection.execute(
+    _assert_rejected_without_event(
+        database, family_id, campaign_id, **NO_SEED_AT_CAMPAIGN
+    )
+    database.connection.execute(
         "DELETE FROM family_envelopes WHERE family_id = %s", (family_id,)
     )
+    assert _decision_events(database, family_id) == []
+    assert _decision_events(database, other_family) == []
+
+    # Nothing was recorded, so neither family may archive.
+    workflow.run_worker(database.dsn, once=True, execute=False)
+    assert _family_row(database, family_id)[0] == "AGGREGATING"
+    assert _family_row(database, other_family)[0] == "AGGREGATING"
+    return other_family, other_campaign
 
 
 def test_campaign_only_guided_family_archives_after_no_seed_decision(
@@ -595,16 +706,14 @@ def test_campaign_only_guided_family_archives_after_no_seed_decision(
         isolated_database, tmp_path, max_rounds=8, rounds=[]
     )
 
-    decision = state.record_family_transition_decision(
-        isolated_database.dsn,
-        family_id,
-        campaign_job_id=campaign_id,
-        decision="no_next_round",
-        reason_code="NO_CANDIDATE_SEED",
-        candidate_seed_count=0,
+    decision = _decide(
+        isolated_database, family_id, campaign_id, **NO_SEED_AT_CAMPAIGN
     )
     assert decision["decision"] == "no_next_round"
+    assert decision["after_round_no"] == 0
     assert decision["candidate_seed_count"] == 0
+    assert isinstance(decision["created_at"], str)
+    assert decision["created_at"].endswith("Z")
 
     result = workflow.run_worker(
         isolated_database.dsn, once=True, execute=False
@@ -637,25 +746,17 @@ def test_family_transition_decision_is_idempotent_and_rejects_conflict(
     family_id, campaign_id, _ = _archived_family(
         isolated_database, tmp_path, max_rounds=8, rounds=[]
     )
-    _assert_decision_rejected(
+    other_family, other_campaign = _assert_decision_rejected(
         isolated_database, tmp_path, family_id, campaign_id
     )
 
-    first = state.record_family_transition_decision(
-        isolated_database.dsn,
-        family_id,
-        campaign_job_id=campaign_id,
-        decision="next_round",
-        candidate_seed_count=2,
-        next_round_no=1,
+    first = _decide(
+        isolated_database, family_id, campaign_id,
+        **dict(NEXT_AFTER_CAMPAIGN, candidate_seed_count=2),
     )
-    second = state.record_family_transition_decision(
-        isolated_database.dsn,
-        family_id,
-        campaign_job_id=campaign_id,
-        decision="next_round",
-        candidate_seed_count=2,
-        next_round_no=1,
+    second = _decide(
+        isolated_database, family_id, campaign_id,
+        **dict(NEXT_AFTER_CAMPAIGN, candidate_seed_count=2),
     )
     assert first == second
     events = _decision_events(isolated_database, family_id)
@@ -665,20 +766,23 @@ def test_family_transition_decision_is_idempotent_and_rejects_conflict(
     assert reason_code is None
     assert detail == {
         "campaign_job_id": str(campaign_id),
+        "after_round_no": 0,
         "decision": "next_round",
         "candidate_seed_count": 2,
         "next_round_no": 1,
         "reason_code": None,
     }
 
-    with pytest.raises(state.StateError):
-        state.record_family_transition_decision(
-            isolated_database.dsn,
-            family_id,
-            campaign_job_id=campaign_id,
-            decision="no_next_round",
-            reason_code="NO_CANDIDATE_SEED",
-            candidate_seed_count=0,
+    # Same decision point, different decision or detail: a conflict.
+    for kwargs in (
+        NO_SEED_AT_CAMPAIGN,
+        dict(NEXT_AFTER_CAMPAIGN, candidate_seed_count=3),
+        dict(NEXT_AFTER_CAMPAIGN, candidate_seed_count=2, next_round_no=2),
+        dict(NEXT_AFTER_CAMPAIGN, candidate_seed_count=2,
+             reason_code="NO_CANDIDATE_SEED"),
+    ):
+        _assert_rejected_without_event(
+            isolated_database, family_id, campaign_id, **kwargs
         )
     assert len(_decision_events(isolated_database, family_id)) == 1
 
@@ -694,6 +798,237 @@ def test_family_transition_decision_is_idempotent_and_rejects_conflict(
     assert (
         _audit_count(isolated_database, family_id, "family_archive_failed") == 0
     )
+
+    # A family that already COMPLETED still answers an identical retry with
+    # the original record (idempotency is checked first) and refuses a
+    # different one; neither writes an event.
+    recorded = _decide(
+        isolated_database, other_family, other_campaign, **NO_SEED_AT_CAMPAIGN
+    )
+    workflow.run_worker(isolated_database.dsn, once=True, execute=False)
+    assert _family_row(isolated_database, other_family)[0] == "COMPLETED"
+    again = _decide(
+        isolated_database, other_family, other_campaign, **NO_SEED_AT_CAMPAIGN
+    )
+    assert again == recorded
+    _assert_rejected_without_event(
+        isolated_database, other_family, other_campaign, **NEXT_AFTER_CAMPAIGN
+    )
+    assert len(_decision_events(isolated_database, other_family)) == 1
+
+
+def test_family_archives_after_seeds_exhausted_mid_family(
+    isolated_database, tmp_path, monkeypatch
+):
+    evidence_root = tmp_path / "evidence"
+    monkeypatch.setenv("DATACON_EVIDENCE_ROOT", str(evidence_root))
+    family_id, campaign_id, _ = _archived_family(
+        isolated_database, tmp_path, max_rounds=8, rounds=[]
+    )
+    _decide(isolated_database, family_id, campaign_id, **NEXT_AFTER_CAMPAIGN)
+
+    # Round 1 still running: no decision after round 1 yet.
+    round1_id = _insert_child(
+        isolated_database,
+        family_id,
+        job_kind="round",
+        round_no=1,
+        state_name="RUNNING",
+        evidence_status=None,
+    )
+    _insert_plan(isolated_database, round1_id, ROUND1_PLAN)
+    _assert_rejected_without_event(
+        isolated_database, family_id, campaign_id, **NO_SEED_AFTER_ROUND1
+    )
+    isolated_database.connection.execute(
+        "UPDATE jobs SET state = 'INCONCLUSIVE', verdict = 'INCONCLUSIVE', "
+        "reason_code = 'EVIDENCE_INCOMPLETE', evidence_status = 'archived', "
+        "evidence_path = %s, evidence_digest = %s WHERE job_id = %s",
+        (str(tmp_path / "round-1-bundle"), ROUND1_DIGEST, round1_id),
+    )
+
+    # Ineligible decision points and payloads are refused without an event.
+    for kwargs in (
+        dict(NO_SEED_AFTER_ROUND1, after_round_no=2),
+        dict(NO_SEED_AFTER_ROUND1, reason_code="NO_CANDIDATE_SEED"),
+        dict(NO_SEED_AFTER_ROUND1, candidate_seed_count=1),
+        dict(after_round_no=1, decision="next_round", candidate_seed_count=1,
+             next_round_no=1),
+        dict(after_round_no=1, decision="next_round", candidate_seed_count=1,
+             next_round_no=9),
+    ):
+        _assert_rejected_without_event(
+            isolated_database, family_id, campaign_id, **kwargs
+        )
+    # The family's own round child is not its campaign.
+    _assert_rejected_without_event(
+        isolated_database, family_id, round1_id, **NO_SEED_AFTER_ROUND1
+    )
+
+    # Only next_round@0 exists: the family keeps waiting.
+    for _ in range(2):
+        result = workflow.run_worker(
+            isolated_database.dsn, once=True, execute=False
+        )
+        assert result["families_converged"] == 0
+    assert _family_row(isolated_database, family_id)[0] == "AGGREGATING"
+
+    _decide(isolated_database, family_id, campaign_id, **NO_SEED_AFTER_ROUND1)
+    assert len(_decision_events(isolated_database, family_id)) == 2
+
+    result = workflow.run_worker(
+        isolated_database.dsn, once=True, execute=False
+    )
+    path = evidence_root / str(family_id) / "family.json"
+    row = _family_row(isolated_database, family_id)
+    assert row[0] == "COMPLETED", (
+        "no_next_round after round 1 did not archive the family"
+    )
+    assert result["families_converged"] == 1
+    assert row[5] == _digest(path)
+    document = json.loads(path.read_bytes())
+    assert [entry["round_no"] for entry in document["rounds"]] == [1]
+    assert document["rounds"][0]["job_id"] == str(round1_id)
+    assert _audit_count(isolated_database, family_id, "family_completed") == 1
+
+
+def test_campaign_decision_cannot_archive_a_family_with_rounds(
+    isolated_database, tmp_path, monkeypatch
+):
+    evidence_root = tmp_path / "evidence"
+    monkeypatch.setenv("DATACON_EVIDENCE_ROOT", str(evidence_root))
+    family_id, campaign_id, round_ids = _archived_family(
+        isolated_database, tmp_path,
+        max_rounds=8,
+        rounds=[(1, "INCONCLUSIVE", "INCONCLUSIVE", "EVIDENCE_INCOMPLETE")],
+    )
+    # Round 1 already exists, so the campaign decision point has passed.
+    _assert_rejected_without_event(
+        isolated_database, family_id, campaign_id, **NO_SEED_AT_CAMPAIGN
+    )
+    _assert_rejected_without_event(
+        isolated_database, family_id, campaign_id, **NEXT_AFTER_CAMPAIGN
+    )
+    # next_round beyond the effective max_rounds is refused.
+    capped_family, capped_campaign, _ = _archived_family(
+        isolated_database, tmp_path / "capped",
+        max_rounds=1,
+        rounds=[(1, "INCONCLUSIVE", "INCONCLUSIVE", "EVIDENCE_INCOMPLETE")],
+        approval_digest=_approval_digest(f"capped-{family_id}"),
+    )
+    _assert_rejected_without_event(
+        isolated_database, capped_family, capped_campaign,
+        after_round_no=1, decision="next_round", candidate_seed_count=1,
+        next_round_no=2,
+    )
+
+    # A no_next_round event at a stale decision point must not archive: plant
+    # one directly (bypassing the entry) and the gate still waits.
+    isolated_database.connection.execute(
+        "INSERT INTO audit_events (job_id, stage, event_type, detail) "
+        "VALUES (%s, 'transition', 'family_transition_decided', %s)",
+        (
+            family_id,
+            Jsonb({
+                "campaign_job_id": str(campaign_id),
+                "after_round_no": 0,
+                "decision": "no_next_round",
+                "candidate_seed_count": 0,
+                "next_round_no": None,
+                "reason_code": "NO_CANDIDATE_SEED",
+            }),
+        ),
+    )
+    # A legacy event without after_round_no is never adopted either.
+    isolated_database.connection.execute(
+        "INSERT INTO audit_events (job_id, stage, event_type, detail) "
+        "VALUES (%s, 'transition', 'family_transition_decided', %s)",
+        (
+            family_id,
+            Jsonb({
+                "campaign_job_id": str(campaign_id),
+                "decision": "no_next_round",
+                "candidate_seed_count": 0,
+                "next_round_no": None,
+                "reason_code": "NO_CANDIDATE_SEED",
+            }),
+        ),
+    )
+    result = workflow.run_worker(
+        isolated_database.dsn, once=True, execute=False
+    )
+    assert _family_row(isolated_database, family_id)[0] == "AGGREGATING", (
+        "a campaign-point no_next_round archived a family with rounds"
+    )
+    assert not (evidence_root / str(family_id) / "family.json").exists()
+    # The capped family archives on max_rounds, not on any decision.
+    assert _family_row(isolated_database, capped_family)[0] == "COMPLETED"
+    assert result["families_converged"] == 1
+    assert round_ids
+
+
+def test_family_transition_decision_is_serialized_under_concurrency(
+    isolated_database, tmp_path
+):
+    family_id, campaign_id, _ = _archived_family(
+        isolated_database, tmp_path, max_rounds=8, rounds=[]
+    )
+    workers = 4
+
+    def race(calls):
+        barrier = threading.Barrier(len(calls))
+        outcomes = [None] * len(calls)
+
+        def run(index, target_family, target_campaign, kwargs):
+            barrier.wait()
+            try:
+                outcomes[index] = (
+                    "ok",
+                    state.record_family_transition_decision(
+                        isolated_database.dsn,
+                        target_family,
+                        campaign_job_id=target_campaign,
+                        **kwargs,
+                    ),
+                )
+            except Exception as error:  # noqa: BLE001 - reported below
+                outcomes[index] = ("error", f"{type(error).__name__}: {error}")
+
+        threads = [
+            threading.Thread(target=run, args=(index, *call))
+            for index, call in enumerate(calls)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=30)
+        return outcomes
+
+    same = race(
+        [(family_id, campaign_id, NO_SEED_AT_CAMPAIGN)] * workers
+    )
+    assert [kind for kind, _ in same] == ["ok"] * workers
+    records = [record for _, record in same]
+    assert all(record == records[0] for record in records)
+    assert len(_decision_events(isolated_database, family_id)) == 1
+
+    other_family, other_campaign, _ = _archived_family(
+        isolated_database, tmp_path / "race", max_rounds=8, rounds=[],
+        approval_digest=_approval_digest(f"race-{family_id}"),
+    )
+    mixed = race(
+        [
+            (other_family, other_campaign, NO_SEED_AT_CAMPAIGN),
+            (other_family, other_campaign, NEXT_AFTER_CAMPAIGN),
+        ]
+        * 2
+    )
+    winners = {
+        record["decision"] for kind, record in mixed if kind == "ok"
+    }
+    assert len(winners) == 1, f"conflicting decisions both won: {mixed}"
+    assert sum(kind == "ok" for kind, _ in mixed) == 2
+    assert len(_decision_events(isolated_database, other_family)) == 1
 
 
 def test_family_converges_when_budget_is_exhausted(
