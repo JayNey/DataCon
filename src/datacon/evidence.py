@@ -4004,6 +4004,7 @@ def _verify_v2_provenance_rules_version(
     data: Mapping[str, bytes],
     listed: Mapping[str, Mapping[str, Any]],
     *,
+    bundle_kind: str,
     partial_execution: bool = False,
 ) -> None:
     """Bind ``build_provenance_rules_version``, ``report.build_provenance`` and ``build_spec.kind``."""
@@ -4052,26 +4053,32 @@ def _verify_v2_provenance_rules_version(
                 "INVALID_MANIFEST",
                 "plan.json build_spec must be a JSON object",
             )
-        if "kind" in plan_build_spec:
-            kind = plan_build_spec.get("kind")
-            expected_kind_face = (
-                build_provenance.FACE_FILENAMES.get(kind)
-                if isinstance(kind, str)
-                else None
+        if "kind" not in plan_build_spec:
+            # S-1: imported bundles never went through plan freeze, so a
+            # build_spec without kind must not silently skip the face binding.
+            raise BundleError(
+                "INVALID_MANIFEST",
+                "plan.json build_spec is missing kind",
             )
-            if expected_kind_face is None:
+        kind = plan_build_spec.get("kind")
+        expected_kind_face = (
+            build_provenance.FACE_FILENAMES.get(kind)
+            if isinstance(kind, str)
+            else None
+        )
+        if expected_kind_face is None:
+            raise BundleError(
+                "INVALID_MANIFEST",
+                f"plan.json build_spec.kind is not a supported provenance kind: {kind!r}",
+            )
+        for version, face in archived_faces.items():
+            if face != expected_kind_face:
                 raise BundleError(
                     "INVALID_MANIFEST",
-                    f"plan.json build_spec.kind is not a supported provenance kind: {kind!r}",
+                    f"build provenance face build/{version}/build_provenance/{face} "
+                    f"does not match plan build_spec.kind {kind!r} "
+                    f"(expected {expected_kind_face})",
                 )
-            for version, face in archived_faces.items():
-                if face != expected_kind_face:
-                    raise BundleError(
-                        "INVALID_MANIFEST",
-                        f"build provenance face build/{version}/build_provenance/{face} "
-                        f"does not match plan build_spec.kind {kind!r} "
-                        f"(expected {expected_kind_face})",
-                    )
 
     # B-2 (§8): report.json["build_provenance"] is a closed 3-key object
     # ({vulnerable, fixed, comparable}) bound to archived faces and build_spec.kind.
@@ -4092,6 +4099,17 @@ def _verify_v2_provenance_rules_version(
         raise BundleError(
             "INVALID_MANIFEST",
             "report.json build_provenance.comparable must be a boolean",
+        )
+    if not partial_execution and not comparable:
+        # B-2 (§8, D4/D39): a non-comparable build ends as FAILED /
+        # BUILD_PROVENANCE_MISSING at the build stage, before any replay or
+        # fuzzing. A complete execution bundle (rule-backed verdict) therefore
+        # always records comparable=true, and a campaign bundle, whose verdict
+        # is null and so cannot express FAILED, has no non-comparable shape.
+        raise BundleError(
+            "INVALID_MANIFEST",
+            "report.json build_provenance.comparable must be true for a "
+            f"complete {bundle_kind} bundle",
         )
     if comparable and len(archived_faces) != 2:
         raise BundleError(
@@ -4798,7 +4816,11 @@ def _verify_bundle_v2(
     _verify_v2_build_records(listed, data)
     if bundle_kind in ("execution", "campaign"):
         _verify_v2_provenance_rules_version(
-            manifest, data, listed, partial_execution=partial_execution
+            manifest,
+            data,
+            listed,
+            bundle_kind=bundle_kind,
+            partial_execution=partial_execution,
         )
     if bundle_kind == "execution":
         if manifest.get("reuse_origin") is not None:

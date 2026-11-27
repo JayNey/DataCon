@@ -369,6 +369,22 @@ def _write_v2_bundle(
     return root
 
 
+def _rewrite_bundle_json(root: Path, relative: str, mutate) -> None:
+    """Rewrite one JSON file of a written bundle and re-seal its manifest entry."""
+    path = root / relative
+    document = json.loads(path.read_text(encoding="utf-8"))
+    mutate(document)
+    payload = jsonutil.canonical_bytes(document) + b"\n"
+    path.write_bytes(payload)
+    manifest_path = root / "manifest.json"
+    manifest_doc = json.loads(manifest_path.read_text(encoding="utf-8"))
+    for entry in manifest_doc["files"]:
+        if entry["path"] == relative:
+            entry["size_bytes"] = len(payload)
+            entry["sha256"] = _sha256_hex(payload)
+    manifest_path.write_bytes(jsonutil.canonical_bytes(manifest_doc) + b"\n")
+
+
 def test_declared_flags_must_be_subset_of_effective_flags():
     vulnerable_face = _fixture_bytes("cmake_comparable_vulnerable.compile_commands.json")
     missing_declared_face = _fixture_bytes(
@@ -937,6 +953,63 @@ def test_validation_bundle_requires_build_provenance(tmp_path: Path):
     with pytest.raises(evidence.BundleError, match="build_provenance"):
         evidence.verify_bundle(missing_campaign)
 
+    # Campaign with only one archived face (nit: the per-version face is
+    # required for campaign bundles exactly as for execution bundles).
+    single_missing_campaign = _write_v2_bundle(
+        tmp_path / "campaign-single-missing-provenance",
+        bundle_kind="campaign",
+        provenance_versions=("fixed",),
+    )
+    with pytest.raises(evidence.BundleError, match="build_provenance"):
+        evidence.verify_bundle(single_missing_campaign)
+
+    # B-2 (§8, D4/D39): a complete execution only reaches a rule-backed
+    # verdict after provenance compared, so the production writer always
+    # records comparable=true there. comparable=false on a complete bundle
+    # is a contradiction and must fail closed.
+    for verdict, reason in (
+        ("INCONCLUSIVE", "EVIDENCE_INCOMPLETE"),
+        ("REPRODUCED", None),
+        ("NOT_REPRODUCED", None),
+    ):
+        bundle = _write_v2_bundle(
+            tmp_path / f"exec-not-comparable-{verdict.lower()}",
+            bundle_kind="execution",
+            provenance_versions=("vulnerable", "fixed"),
+        )
+
+        def _not_comparable(report, verdict=verdict, reason=reason):
+            report["verdict"] = verdict
+            report["state"] = verdict
+            report["reason_code"] = reason
+            report["build_provenance"]["comparable"] = False
+
+        _rewrite_bundle_json(bundle, "report.json", _not_comparable)
+
+        def _manifest_verdict(manifest, verdict=verdict, reason=reason):
+            manifest["verdict"] = verdict
+            manifest["reason_code"] = reason
+
+        manifest_path = bundle / "manifest.json"
+        manifest_doc = json.loads(manifest_path.read_text(encoding="utf-8"))
+        _manifest_verdict(manifest_doc)
+        manifest_path.write_bytes(jsonutil.canonical_bytes(manifest_doc) + b"\n")
+        with pytest.raises(evidence.BundleError, match="comparable"):
+            evidence.verify_bundle(bundle)
+
+    campaign_not_comparable = _write_v2_bundle(
+        tmp_path / "campaign-not-comparable",
+        bundle_kind="campaign",
+        provenance_versions=("vulnerable", "fixed"),
+    )
+    _rewrite_bundle_json(
+        campaign_not_comparable,
+        "report.json",
+        lambda report: report["build_provenance"].__setitem__("comparable", False),
+    )
+    with pytest.raises(evidence.BundleError, match="comparable"):
+        evidence.verify_bundle(campaign_not_comparable)
+
 
 def test_build_provenance_rules_version_is_bound_in_plan(tmp_path: Path):
     plan_v1_rules = _make_plan_v2(rules_version="build-provenance-v1")
@@ -1017,6 +1090,49 @@ def test_build_provenance_rules_version_is_bound_in_plan(tmp_path: Path):
     )
     with pytest.raises(evidence.BundleError, match="build_provenance_rules_version"):
         evidence.verify_bundle(drifted_campaign_bundle)
+
+    # S-1: an archived plan's build_spec is checked independently of plan
+    # freeze (imported bundles never went through contracts): a non-object
+    # build_spec or one without ``kind`` fails closed instead of skipping the
+    # build_spec.kind face binding.
+    for label, build_spec in (
+        ("not-object", "not-an-object"),
+        ("no-kind", {"build": ["make"]}),
+    ):
+        bundle = _write_v2_bundle(
+            tmp_path / f"rules-build-spec-{label}",
+            bundle_kind="execution",
+            provenance_versions=("vulnerable", "fixed"),
+        )
+
+        def _bad_build_spec(plan, build_spec=build_spec):
+            plan["build_spec"] = build_spec
+
+        _rewrite_bundle_json(bundle, "plan.json", _bad_build_spec)
+        with pytest.raises(evidence.BundleError, match="build_spec"):
+            evidence.verify_bundle(bundle)
+
+    # S-1: a rules version with surrounding whitespace is not the same version.
+    padded = _write_v2_bundle(
+        tmp_path / "rules-padded",
+        bundle_kind="execution",
+        provenance_versions=("vulnerable", "fixed"),
+        report_rules_version="  build-provenance-v1  ",
+    )
+    for relative in ("plan.json",):
+        _rewrite_bundle_json(
+            padded,
+            relative,
+            lambda doc: doc.__setitem__(
+                "build_provenance_rules_version", "  build-provenance-v1  "
+            ),
+        )
+    manifest_path = padded / "manifest.json"
+    manifest_doc = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest_doc["build_provenance_rules_version"] = "  build-provenance-v1  "
+    manifest_path.write_bytes(jsonutil.canonical_bytes(manifest_doc) + b"\n")
+    with pytest.raises(evidence.BundleError, match="build_provenance_rules_version"):
+        evidence.verify_bundle(padded)
 
 
 def test_missing_face_blocks_plan_freeze():
