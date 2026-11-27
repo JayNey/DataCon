@@ -1204,20 +1204,26 @@ def test_campaign_report_must_not_carry_verdict_fields(tmp_path, field):
 
 
 def test_v2_build_provenance_faces_are_fixed(tmp_path):
-    """D39 allows only the three reviewed provenance face names."""
-    allowed = _base_files(execution=True, campaign=False)
-    allowed["build/vulnerable/build_provenance/cc-shim.log"] = (
-        "build_provenance",
-        b"cc-shim\n",
-    )
-    allowed["build/fixed/build_provenance/shell-face.log"] = (
-        "build_provenance",
-        b"shell-face\n",
-    )
-    root = _write_v2_bundle(
-        tmp_path, _manifest("execution"), allowed, name="provenance-faces"
-    )
-    assert verify_bundle(root).manifest["bundle_kind"] == "execution"
+    """D39 allows only the three reviewed provenance face names (one per version)."""
+    for face_name, payload in (
+        ("compile_commands.json", b"[]\n"),
+        ("cc-shim.log", b"cc-shim\n"),
+        ("shell-face.log", b"shell-face\n"),
+    ):
+        allowed = _base_files(execution=True, campaign=False)
+        for version in ("vulnerable", "fixed"):
+            allowed.pop(f"build/{version}/build_provenance/compile_commands.json")
+            allowed[f"build/{version}/build_provenance/{face_name}"] = (
+                "build_provenance",
+                payload,
+            )
+        root = _write_v2_bundle(
+            tmp_path,
+            _manifest("execution"),
+            allowed,
+            name="provenance-face-" + face_name.replace(".", "-"),
+        )
+        assert verify_bundle(root).manifest["bundle_kind"] == "execution"
 
     for bad_face in ("evil.txt", "nested/compile_commands.json"):
         files = _base_files(execution=True, campaign=False)
@@ -1924,3 +1930,51 @@ def test_campaign_bundle_with_candidate_seeds_requires_crash_seed_role(tmp_path)
     )
     verified = verify_bundle(ok_seed_root)
     assert "crash_seed" in {entry["role"] for entry in verified.manifest["files"]}
+
+
+@pytest.mark.parametrize("bundle_kind", ["execution", "campaign"])
+def test_v2_build_layout_rejects_multiple_provenance_faces_per_version(
+    tmp_path, bundle_kind
+):
+    """§8 requires exactly one build_provenance face per version (and at most one in partial)."""
+    files = _base_files(
+        execution=bundle_kind == "execution",
+        campaign=bundle_kind == "campaign",
+    )
+    files["build/vulnerable/build_provenance/cc-shim.log"] = (
+        "build_provenance",
+        b'{"argv":["clang","-c","a.c"]}\n',
+    )
+    root = _write_v2_bundle(
+        tmp_path,
+        _manifest(
+            bundle_kind,
+            verdict=None if bundle_kind == "campaign" else "INCONCLUSIVE",
+            reason=None if bundle_kind == "campaign" else "EVIDENCE_INCOMPLETE",
+        ),
+        files,
+        name=f"{bundle_kind}-two-faces-one-version",
+    )
+    with pytest.raises(BundleError, match="exactly one build_provenance face"):
+        verify_bundle(root)
+
+    if bundle_kind == "execution":
+        partial = _partial_execution_files()
+        partial["build/vulnerable/build_provenance/compile_commands.json"] = (
+            "build_provenance",
+            b"[]\n",
+        )
+        partial["build/vulnerable/build_provenance/cc-shim.log"] = (
+            "build_provenance",
+            b'{"argv":["clang","-c","a.c"]}\n',
+        )
+        partial_root = _write_v2_bundle(
+            tmp_path,
+            _manifest(
+                "execution", verdict="FAILED", reason="BUILD_PROVENANCE_MISSING"
+            ),
+            partial,
+            name="partial-two-faces-one-version",
+        )
+        with pytest.raises(BundleError, match="at most one build_provenance face"):
+            verify_bundle(partial_root)

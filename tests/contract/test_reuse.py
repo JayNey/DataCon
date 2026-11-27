@@ -20,7 +20,7 @@ from test_evidence_v2 import _base_files, _manifest, _write_v2_bundle
 from test_plan_family import ROUND_PLAN_V2
 
 from datacon.contracts import plan_digest
-from datacon.evidence import BundleError, verify_bundle
+from datacon.evidence import BundleError, _verify_v2_reuse_artifacts, verify_bundle
 
 DIGEST = "sha256:" + "a" * 64
 OTHER_DIGEST = "sha256:" + "b" * 64
@@ -71,8 +71,24 @@ def _reuse_origin(
     }
 
 
+def _with_build_spec_outputs(plan: dict, outputs: list[str]) -> dict:
+    updated = deepcopy(plan)
+    updated["build_spec"]["outputs"] = list(outputs)
+    updated["build_recipe_digest"] = (
+        "sha256:"
+        + hashlib.sha256(
+            json.dumps(
+                updated["build_spec"],
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+    )
+    return updated
+
+
 def _validation_plan(build_ref: dict) -> dict:
-    plan = deepcopy(ROUND_PLAN_V2)
+    plan = _with_build_spec_outputs(ROUND_PLAN_V2, ["parser"])
     plan["build_ref"] = deepcopy(build_ref)
     return plan
 
@@ -374,17 +390,8 @@ def test_validation_rejects_non_default_build_artifact_layout(tmp_path):
 def test_validation_supports_custom_build_spec_single_output_reuse(tmp_path):
     """T13a: reuse byte binding honors a single custom BuildSpec.outputs[0] path."""
     build_ref = _campaign_build_ref()
-    custom_plan = _validation_plan(build_ref)
-    custom_plan["build_spec"]["outputs"] = ["bin/custom_target"]
-    custom_plan["build_recipe_digest"] = (
-        "sha256:"
-        + hashlib.sha256(
-            json.dumps(
-                custom_plan["build_spec"],
-                sort_keys=True,
-                separators=(",", ":"),
-            ).encode("utf-8")
-        ).hexdigest()
+    custom_plan = _with_build_spec_outputs(
+        _validation_plan(build_ref), ["bin/custom_target"]
     )
     root = _write_validation(
         tmp_path,
@@ -410,3 +417,75 @@ def test_validation_supports_custom_build_spec_single_output_reuse(tmp_path):
     with pytest.raises(BundleError) as raised:
         verify_bundle(root)
     assert raised.value.reason_code == "REUSE_MISMATCH"
+
+
+def test_validation_rejects_parser_fallback_for_custom_or_multi_output_build_spec(
+    tmp_path,
+):
+    """T13a: non-null build_spec never falls back to default parser for custom/multi outputs."""
+    build_ref = _campaign_build_ref()
+
+    # (a) Plan declares custom outputs=['bin/custom_target'], but bundle only ships parser.
+    custom_plan = _with_build_spec_outputs(
+        _validation_plan(build_ref), ["bin/custom_target"]
+    )
+    custom_root = _write_validation(
+        tmp_path,
+        "reuse-custom-decl-but-parser-shipped",
+        build_ref=build_ref,
+        plan=custom_plan,
+        plan_digest_override=plan_digest(custom_plan),
+    )
+    with pytest.raises(BundleError) as raised:
+        verify_bundle(custom_root)
+    assert raised.value.reason_code == "INVALID_MANIFEST"
+
+    # (b) Plan declares multi-output outputs=['bin/a', 'bin/b']: fail closed even if
+    # bundle ships default parser, one declared path, or both declared paths.
+    multi_plan = _with_build_spec_outputs(
+        _validation_plan(build_ref), ["bin/a", "bin/b"]
+    )
+    multi_parser_root = _write_validation(
+        tmp_path,
+        "reuse-multi-decl-parser-shipped",
+        build_ref=build_ref,
+        plan=multi_plan,
+        plan_digest_override=plan_digest(multi_plan),
+    )
+    with pytest.raises(BundleError) as raised:
+        verify_bundle(multi_parser_root)
+    assert raised.value.reason_code == "INVALID_MANIFEST"
+
+    for version in VERSIONS:
+        _rename_manifested_file(
+            multi_parser_root,
+            f"build/{version}/parser",
+            f"build/{version}/bin/a",
+        )
+        _add_manifested_file(
+            multi_parser_root,
+            f"build/{version}/bin/b",
+            BUILD_ARTIFACT,
+        )
+    with pytest.raises(BundleError) as raised:
+        verify_bundle(multi_parser_root)
+    assert raised.value.reason_code == "INVALID_MANIFEST"
+
+    # Only plan_build_spec=None falls back to default parser.
+    default_data = {
+        "build/vulnerable/build.log": BUILD_LOG,
+        "build/vulnerable/parser": BUILD_ARTIFACT,
+        "build/fixed/build.log": BUILD_LOG,
+        "build/fixed/parser": BUILD_ARTIFACT,
+    }
+    _verify_v2_reuse_artifacts(build_ref, default_data, plan_build_spec=None)
+    with pytest.raises(BundleError) as raised:
+        _verify_v2_reuse_artifacts(
+            build_ref,
+            {
+                **default_data,
+                "build/fixed/bin/custom_target": BUILD_ARTIFACT,
+            },
+            plan_build_spec=None,
+        )
+    assert raised.value.reason_code == "INVALID_MANIFEST"

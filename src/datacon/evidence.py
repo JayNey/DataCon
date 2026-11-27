@@ -3761,11 +3761,24 @@ def _verify_v2_reuse_artifacts(
 
     A validation bundle is self-contained only when its own ``build.log`` and
     primary artifact bytes hash to the same digests declared in the plan's
-    authoritative ``build_ref``. Supports the default ``parser`` layout as well
-    as a single custom primary output declared in ``plan.build_spec.outputs``.
-    Undeclared, extra, or missing artifacts fail closed.
+    authoritative ``build_ref``. When ``plan_build_spec`` is provided, it must
+    declare exactly one valid output path and the bundle must ship that exact
+    path; multi-output or invalid ``build_spec.outputs`` fail closed. Only when
+    ``plan_build_spec`` is ``None`` does verification fall back to the default
+    ``parser`` path.
     """
-    declared_outputs = _declared_build_outputs(plan_build_spec)
+    if plan_build_spec is None:
+        expected_rel = "parser"
+    else:
+        declared_outputs = _declared_build_outputs(plan_build_spec)
+        if len(declared_outputs) != 1:
+            raise BundleError(
+                "INVALID_MANIFEST",
+                "reusable build_spec.outputs must declare exactly one valid "
+                "output path (default parser or single custom output); "
+                "multi-artifact reuse is not supported yet",
+            )
+        expected_rel = declared_outputs[0]
     artifacts = plan_build_ref["artifacts"]
     for version in _REPLAY_VERSIONS:
         prefix = f"build/{version}/"
@@ -3777,18 +3790,12 @@ def _verify_v2_reuse_artifacts(
             not in (prefix + "metadata.json", prefix + "build.log")
             and not path.startswith(prefix + "build_provenance/")
         )
-        default_artifact = prefix + "parser"
-        allowed_single_paths = {default_artifact}
-        if len(declared_outputs) == 1:
-            allowed_single_paths.add(prefix + declared_outputs[0])
-        if (
-            len(shipped_artifacts) != 1
-            or shipped_artifacts[0] not in allowed_single_paths
-        ):
+        expected_artifact = prefix + expected_rel
+        if shipped_artifacts != [expected_artifact]:
             raise BundleError(
                 "INVALID_MANIFEST",
-                f"{version} build artifact layout does not match the default "
-                "parser or declared build_spec.outputs[0]",
+                f"{version} build artifact layout does not match expected "
+                f"{expected_artifact} (default parser / build_spec.outputs[0])",
             )
         bound_artifact = shipped_artifacts[0]
         expected = artifacts[version]
@@ -4026,6 +4033,7 @@ def _verify_v2_build_layout(
                 _v2_required_role_paths(
                     listed, prefix + "build.log", "build_log"
                 )
+            provenance_faces = 0
             for path, entry in group.items():
                 relative = path[len(prefix) :]
                 if relative in ("metadata.json", "build.log"):
@@ -4042,12 +4050,18 @@ def _verify_v2_build_layout(
                             "INVALID_MANIFEST",
                             f"build provenance face {path} is not at a fixed face path",
                         )
+                    provenance_faces += 1
                     continue
                 if entry["role"] != "build_artifact":
                     raise BundleError(
                         "INVALID_MANIFEST",
                         f"evidence {path} must carry the build_artifact role",
                     )
+            if provenance_faces > 1:
+                raise BundleError(
+                    "INVALID_MANIFEST",
+                    f"manifest must carry at most one build_provenance face for build/{version}/",
+                )
             continue
         if not group:
             raise BundleError(
@@ -4090,6 +4104,11 @@ def _verify_v2_build_layout(
             raise BundleError(
                 "INVALID_MANIFEST",
                 f"manifest is missing a build_provenance face for build/{version}/",
+            )
+        if provenance_faces > 1:
+            raise BundleError(
+                "INVALID_MANIFEST",
+                f"manifest must carry exactly one build_provenance face for build/{version}/",
             )
     for path, entry in listed.items():
         if entry["role"] in _V2_BUILD_ROLES and not (
