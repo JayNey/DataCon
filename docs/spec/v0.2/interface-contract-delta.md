@@ -1044,6 +1044,7 @@ v2 `execution` 恰好包含 `review` 或 `admission` 之一，不得两者都缺
 | `experiments` | ExperimentSpec 摘要与结果引用（含对应 `evidence_refs`） |
 | `budget` | family 预算汇总，必须含 `max_total_seconds`、`max_fuzz_seconds`、`spent_seconds`、`spent_fuzz_seconds`、`remaining_seconds`（对应 DB 列 `remaining_total_seconds`）、`remaining_fuzz_seconds`，并能由 `budget_charges` 重建 |
 | `reuse_origin` | 复用型 validation 指向 campaign；fixed/normal execution 为 null；campaign 为 null |
+| `fuzz` | 改9 增补：只出现在 campaign report，execution/blocked 不带；封闭对象 `{engine, status, rng_seed, fuzz_log_digest, crash_count, crash_seeds}`，`engine` 固定 `libfuzzer`，`status` 为 fuzz 搜索状态（`COMPLETED` campaign 恒为 `completed`），`rng_seed` 为确定性 libFuzzer `-seed`，`fuzz_log_digest` 为 `fuzz/fuzz.log` 的 SHA-256，`crash_seeds` 每项 `{path, sha256}`；与 `fuzz/provenance.json` 同口径，`crash_count` 等于 `crash_seeds` 项数，每项与一个 `crash_seed` 文件及 provenance 中同 `path`/`sha256` 的记录一一对应；只是搜索观测，不产 verdict |
 | `evidence_refs` | 位于 `report` 发现项或 `experiments[]` 内的可解析构建、回放、fuzz 引用（语法见第 11 节）；越界、日志缺失或摘要不符视为不可解析并失败 |
 
 `replays` 在完整 validation 报告中必须恰好覆盖两版的 `normal`、`candidate_1`、`candidate_2` 六项。campaign report 的 `verdict` 与 `reason_code` 为 null，不要求六次回放，但必须记录搜索观测、候选 seed 与 provenance。`spent_seconds` 与 `spent_fuzz_seconds` 必须等于 `budget_charges` 中 `seconds` 与 `fuzz_seconds` 的 family 汇总；不一致即证据不可对账。

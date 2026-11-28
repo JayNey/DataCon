@@ -413,6 +413,39 @@ def test_zero_crash_campaign_completes_without_crash_seed(tmp_path, monkeypatch)
     assert provenance["crash_count"] == 0 and provenance["crash_seeds"] == []
     assert provenance["harness_digest"]["fuzz_shim"] == fuzz.FUZZ_SHIM_REVIEWED_DIGEST
 
+    # P2 SF-3: the campaign bundle carries the writer-segment documents too
+    # (#67 model audit, #72 intel), bound to report and plan like execution.
+    from datacon.tools.intel_evidence import verify_intel_documents
+    from datacon.tools.model_outlet import (
+        MODEL_AUDIT_SUMMARY_FIELDS,
+        verify_model_audit_document,
+    )
+
+    roles = {entry["path"]: entry["role"] for entry in verified.manifest["files"]}
+    report = json.loads(verified.file_data["report.json"])
+    assert roles["model/audit.json"] == "model_audit"
+    audit = json.loads(verified.file_data["model/audit.json"])
+    assert report["model_audit"] == {
+        field: audit[field] for field in MODEL_AUDIT_SUMMARY_FIELDS
+    }
+    verify_model_audit_document(
+        audit,
+        job_id=str(setup["job"]["job_id"]),
+        report_model_audit=report["model_audit"],
+    )
+    assert roles["intel/snapshot.json"] == "intel_snapshot"
+    assert roles["intel/license.json"] == "license_record"
+    snapshot_doc = json.loads(verified.file_data["intel/snapshot.json"])
+    license_doc = json.loads(verified.file_data["intel/license.json"])
+    assert report["intel"]["snapshot_digest"] == snapshot_doc["snapshot_digest"]
+    verify_intel_documents(
+        snapshot_doc,
+        license_doc,
+        case_id=setup["plan"]["case_id"],
+        report_intel=report["intel"],
+        plan_intel=setup["plan"]["intel"],
+    )
+
 
 @pytest.mark.parametrize(
     ("ceiling", "value", "sub_reason"),

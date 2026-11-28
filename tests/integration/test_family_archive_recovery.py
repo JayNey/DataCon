@@ -2104,6 +2104,12 @@ def test_worker_runs_guided_validation_round_reusing_campaign_build(
             path = f"build/{version}/{output}"
             assert verified.file_data[path] == campaign_bundle.file_data[path]
     assert sum(1 for path in verified.file_data if path.startswith("replay/")) == 18
+    # The reuse validation bundle carries the writer-segment documents too.
+    roles = {entry["path"]: entry["role"] for entry in manifest["files"]}
+    assert roles["model/audit.json"] == "model_audit"
+    assert roles["intel/snapshot.json"] == "intel_snapshot"
+    assert roles["intel/license.json"] == "license_record"
+    assert json.loads(verified.file_data["report.json"])["intel"] is not None
     seed_bytes = verified.file_data["materials/inputs/candidate.txt"]
     assert "sha256:" + hashlib.sha256(seed_bytes).hexdigest() == seed_digest
     # Reused builds cost nothing; only the probe and the replays were charged.
