@@ -3537,7 +3537,10 @@ def test_nonblocking_6_persist_build_oversize_face_and_campaign_inputs_none_and_
         sandbox=camp_sandbox,
     )
     assert camp_result.state == "BLOCKED"
-    assert camp_result.reason_code == "MATERIAL_MISSING"
+    # T12 B: a campaign now runs its own preflight; a campaign frozen under a
+    # fixed (non-guided) envelope is refused before any container as an
+    # envelope violation instead of falling into the six-replay input check.
+    assert camp_result.reason_code == "ENVELOPE_VIOLATION"
     assert camp_sandbox.probe_calls == 0
     assert len(camp_sandbox.build_calls) == 0
     assert len(camp_sandbox.replay_calls) == 0
