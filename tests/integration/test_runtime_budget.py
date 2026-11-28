@@ -145,6 +145,7 @@ def _seed_family(
     max_rounds: int = 8,
     ledger_total: int | None = None,
     ledger_fuzz: int | None = None,
+    with_campaign: bool = True,
 ):
     """A guided AGGREGATING family with an approved envelope and a ledger."""
     family_id = uuid4()
@@ -189,6 +190,29 @@ def _seed_family(
             envelope["max_fuzz_seconds"] if ledger_fuzz is None else ledger_fuzz
         ),
     )
+    if with_campaign:
+        campaign_id = uuid4()
+        database.connection.execute(
+            "INSERT INTO jobs (job_id, request, state, stage, submitted_at, "
+            "job_contract_version, family_id, job_kind, parent_job_id, round_no, "
+            "generation, workflow_synced, evidence_status, evidence_path, "
+            "evidence_digest) "
+            "VALUES (%s, %s, 'COMPLETED', 'done', clock_timestamp(), 2, %s, "
+            "'campaign', %s, NULL, 1, true, 'archived', %s, %s)",
+            (
+                campaign_id,
+                Jsonb(FAMILY_REQUEST),
+                family_id,
+                family_id,
+                f"/tmp/campaign-{campaign_id}",
+                _digest("e"),
+            ),
+        )
+        database.connection.execute(
+            "INSERT INTO plans (plan_id, job_id, plan_digest, plan, summary) "
+            "VALUES (%s, %s, %s, %s, %s)",
+            (uuid4(), campaign_id, FIRST_PLAN_DIGEST, Jsonb({}), Jsonb({})),
+        )
     return family_id, envelope
 
 
@@ -537,6 +561,54 @@ def test_round_admission_runs_before_any_container(isolated_database, tmp_path, 
     assert busy["derived"] is False
     assert busy["sub_reason"] == "CHILD_NOT_TERMINAL"
 
+    # Nit 2: state.status() must strip admission_inputs from pending_plan.summary,
+    # and re-entering create_round_child with different admission_inputs must
+    # raise PlanConflict.
+    child_status = state.status(isolated_database.dsn, admitted_id)
+    assert child_status is not None
+    assert "admission_inputs" not in (
+        child_status["pending_plan"]["summary"] or {}
+    ), "state.status exposed internal admission_inputs in pending_plan.summary"
+    other_exp = deepcopy(DEFAULT_EXPERIMENT)
+    other_exp["mutation_constraints"]["max_input_bytes"] = 1024
+    with pytest.raises(state.PlanConflict):
+        state.create_round_child(
+            isolated_database.dsn,
+            family_id=family_id,
+            round_no=2,
+            plan=_round_plan(family_id, envelope, round_no=2),
+            admission_inputs={
+                "envelope": envelope,
+                "seed_digest": SEED_CORPUS_DIGEST,
+                "experiment": other_exp,
+                "recomputable": True,
+                "campaign_bundle_digest": None,
+            },
+        )
+    # Invalid or oversized admission_inputs rejected fail-closed.
+    with pytest.raises(state.StateError):
+        state.create_round_child(
+            isolated_database.dsn,
+            family_id=family_id,
+            round_no=2,
+            plan=_round_plan(family_id, envelope, round_no=2),
+            admission_inputs={"envelope": envelope},
+        )
+    with pytest.raises(state.StateError):
+        state.create_round_child(
+            isolated_database.dsn,
+            family_id=family_id,
+            round_no=2,
+            plan=_round_plan(family_id, envelope, round_no=2),
+            admission_inputs={
+                "envelope": envelope,
+                "seed_digest": SEED_CORPUS_DIGEST,
+                "experiment": {"rationale": "x" * (70 * 1024)},
+                "recomputable": True,
+                "campaign_bundle_digest": None,
+            },
+        )
+
 
 def _round_jobs(database, family_id):
     return [
@@ -601,11 +673,18 @@ def test_round_derivation_is_gated_before_creating_a_child(
 
     # round_no beyond max_rounds: refused before any child exists.
     family_id, envelope = _seed_family(isolated_database, max_rounds=1)
+    r1 = _running_round(isolated_database, family_id, envelope, round_no=1)
+    isolated_database.connection.execute(
+        "UPDATE jobs SET state = 'INCONCLUSIVE', verdict = 'INCONCLUSIVE', "
+        "reason_code = 'EVIDENCE_INCOMPLETE', lease_owner = NULL, "
+        "lease_expires_at = NULL WHERE job_id = %s",
+        (r1.job_id,),
+    )
     beyond = _derive(isolated_database, family_id, envelope, round_no=2)
     assert beyond["derived"] is False
     assert beyond["reason_code"] == "BUDGET_EXHAUSTED"
     assert beyond["sub_reason"] == "ROUND_BEYOND_MAX_ROUNDS"
-    assert _round_jobs(isolated_database, family_id) == []
+    assert len(_round_jobs(isolated_database, family_id)) == 1
 
     # Total budget exhausted: refused before any child exists.
     family_id, envelope = _seed_family(
@@ -1018,7 +1097,9 @@ def test_crash_between_block_and_record_blocked_is_recovered(
     """T12 B4: a crash between block_round_child and record_blocked is archived by worker scan."""
     evidence_root = tmp_path / "evidence"
     monkeypatch.setenv("DATACON_EVIDENCE_ROOT", str(evidence_root))
-    family_id, envelope = _seed_family(isolated_database, max_rounds=2)
+    family_id, envelope = _seed_family(
+        isolated_database, max_rounds=2, with_campaign=False
+    )
     _insert_completed_campaign(isolated_database, family_id, tmp_path)
 
     outside = deepcopy(DEFAULT_EXPERIMENT)
@@ -1061,7 +1142,9 @@ def test_crash_between_block_and_record_blocked_is_recovered(
 
     # With max_rounds=1, once the crashed blocked round is archived, no legal
     # rounds remain so the family converges to BLOCKED(ENVELOPE_VIOLATION).
-    fam1, env1 = _seed_family(isolated_database, max_rounds=1)
+    fam1, env1 = _seed_family(
+        isolated_database, max_rounds=1, with_campaign=False
+    )
     _insert_completed_campaign(isolated_database, fam1, tmp_path)
     with monkeypatch.context() as patch:
         patch.setattr(execution, "record_blocked", crash)
@@ -1082,7 +1165,9 @@ def test_policy_denied_round_keeps_family_aggregating_until_rounds_exhausted(
     """T12 S1: a single policy-denied round does not immediately terminate the family."""
     evidence_root = tmp_path / "evidence"
     monkeypatch.setenv("DATACON_EVIDENCE_ROOT", str(evidence_root))
-    family_id, envelope = _seed_family(isolated_database, max_rounds=2)
+    family_id, envelope = _seed_family(
+        isolated_database, max_rounds=2, with_campaign=False
+    )
     _insert_completed_campaign(isolated_database, family_id, tmp_path)
 
     outside = deepcopy(DEFAULT_EXPERIMENT)
@@ -1127,3 +1212,225 @@ def test_policy_denied_round_keeps_family_aggregating_until_rounds_exhausted(
         (1, "BLOCKED"),
         (2, "INCONCLUSIVE"),
     ]
+
+
+def test_admitted_round_cannot_be_blocked_by_stale_recovery_or_direct_call(
+    isolated_database, tmp_path, monkeypatch
+):
+    """T12 S3: once a round has an admission row, neither recovery nor block_round_child may block it."""
+    monkeypatch.setenv("DATACON_EVIDENCE_ROOT", str(tmp_path / "evidence"))
+    family_id, envelope = _seed_family(isolated_database)
+    first = _derive(isolated_database, family_id, envelope, round_no=1)
+    assert first["admitted"] is True
+    job_id = UUID(first["job_id"])
+
+    # Simulate the family ledger moving after admission (e.g. a recovered charge
+    # from an earlier child) so a stale admission retry sees a different snapshot.
+    campaign_id = isolated_database.connection.execute(
+        "SELECT job_id FROM jobs WHERE parent_job_id = %s AND job_kind = 'campaign'",
+        (family_id,),
+    ).fetchone()[0]
+    isolated_database.connection.execute(
+        "UPDATE budget_ledger SET remaining_total_seconds = remaining_total_seconds - 7 "
+        "WHERE family_id = %s",
+        (family_id,),
+    )
+    isolated_database.connection.execute(
+        "INSERT INTO budget_charges (charge_id, family_id, job_id, step_key, "
+        "attempt_no, charge_kind, seconds, fuzz_seconds) "
+        "VALUES (%s, %s, %s, 'build:vulnerable', 1, 'general', 7, 0)",
+        (uuid4(), family_id, campaign_id),
+    )
+
+    summary = isolated_database.connection.execute(
+        "SELECT summary FROM plans WHERE job_id = %s", (job_id,)
+    ).fetchone()[0]
+    out = workflow._admit_derived_round(
+        isolated_database.dsn,
+        job_id=job_id,
+        family_id=family_id,
+        round_no=1,
+        admission_inputs=summary["admission_inputs"],
+        run_root=None,
+    )
+    job = state.load_job(isolated_database.dsn, job_id)
+    assert out["admitted"] is True and job["state"] == "READY", (
+        "already-admitted round was overwritten to BLOCKED by stale recovery"
+    )
+    assert (
+        _count(
+            isolated_database,
+            "SELECT count(*) FROM admissions WHERE job_id = %s",
+            (job_id,),
+        )
+        == 1
+    )
+
+    # Direct block_round_child on an admitted READY round must refuse.
+    blocked = state.block_round_child(
+        isolated_database.dsn,
+        job_id,
+        reason_code="ADMISSION_DENIED",
+        message="stale block attempt",
+    )
+    assert blocked is False, (
+        "block_round_child blocked a round that already has an admission row"
+    )
+    assert state.load_job(isolated_database.dsn, job_id)["state"] == "READY"
+
+    # recover_unadmitted_rounds must re-verify no admission exists in a tx
+    # before handling a stale candidate list.
+    real_list = state.unadmitted_round_children
+    stale_rows = [
+        {
+            "job_id": job_id,
+            "family_id": family_id,
+            "round_no": 1,
+            "plan": _round_plan(family_id, envelope, round_no=1),
+            "summary": summary,
+        }
+    ]
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            state, "unadmitted_round_children", lambda *_a, **_k: stale_rows
+        )
+        assert workflow.recover_unadmitted_rounds(isolated_database.dsn) == 0
+    assert real_list is not None
+    assert state.load_job(isolated_database.dsn, job_id)["state"] == "READY"
+
+
+def test_transient_db_error_keeps_round_ready_for_recovery(
+    isolated_database, tmp_path, monkeypatch
+):
+    """T12 S5: a transient psycopg.Error during admission leaves the round READY for retry."""
+    monkeypatch.setenv("DATACON_EVIDENCE_ROOT", str(tmp_path / "evidence"))
+    family_id, envelope = _seed_family(isolated_database)
+
+    def db_glitch(*args, **kwargs):
+        raise psycopg.OperationalError("connection reset by peer")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(state, "record_admission", db_glitch)
+        try:
+            _derive(isolated_database, family_id, envelope, round_no=1)
+        except psycopg.OperationalError:
+            pass
+    (job_id, _round_no, job_state, _reason), = _round_jobs(
+        isolated_database, family_id
+    )
+    assert job_state == "READY", (
+        f"transient DB error permanently moved derived round to {job_state}"
+    )
+    assert (
+        _count(
+            isolated_database,
+            "SELECT count(*) FROM admissions WHERE job_id = %s",
+            (job_id,),
+        )
+        == 0
+    )
+
+    # After the 300s grace window, worker scan retries admission and succeeds.
+    _age_round(isolated_database, job_id, 3600)
+    assert workflow.recover_unadmitted_rounds(isolated_database.dsn) == 1
+    assert (
+        _count(
+            isolated_database,
+            "SELECT count(*) FROM admissions WHERE job_id = %s",
+            (job_id,),
+        )
+        == 1
+    )
+    claimed = state.claim_next(
+        isolated_database.dsn, "worker-t12", job_contract_version=2
+    )
+    assert claimed is not None and claimed["job_id"] == job_id
+
+
+def test_round_derivation_enforces_family_campaign_and_sequence_preconditions(
+    isolated_database, tmp_path, monkeypatch
+):
+    """T12 S6: reject missing/incomplete campaign, round_no gaps, fixed families, and pending envelopes."""
+    monkeypatch.setenv("DATACON_EVIDENCE_ROOT", str(tmp_path / "evidence"))
+
+    # Empty guided family (no campaign): deriving round 5 or round 1 is refused.
+    empty_fam, empty_env = _seed_family(
+        isolated_database, with_campaign=False
+    )
+    r5 = _derive(isolated_database, empty_fam, empty_env, round_no=5)
+    assert r5["derived"] is False, (
+        "round 5 was derived on an empty guided family with no campaign"
+    )
+    assert r5["reason_code"] is None
+    assert _round_jobs(isolated_database, empty_fam) == []
+    r1 = _derive(isolated_database, empty_fam, empty_env, round_no=1)
+    assert r1["derived"] is False and r1["sub_reason"] == "CAMPAIGN_NOT_COMPLETED"
+    with pytest.raises(state.StateError):
+        state.create_round_child(
+            isolated_database.dsn,
+            family_id=empty_fam,
+            round_no=1,
+            plan=_round_plan(empty_fam, empty_env, round_no=1),
+        )
+
+    # Guided family with COMPLETED campaign: round_no gap (5 instead of 1) refused.
+    seq_fam, seq_env = _seed_family(isolated_database, with_campaign=True)
+    gap = _derive(isolated_database, seq_fam, seq_env, round_no=5)
+    assert gap["derived"] is False
+    assert gap["reason_code"] is None
+    assert gap["sub_reason"] == "ROUND_NO_NOT_SEQUENTIAL"
+    assert _round_jobs(isolated_database, seq_fam) == []
+    with pytest.raises(state.StateError):
+        state.create_round_child(
+            isolated_database.dsn,
+            family_id=seq_fam,
+            round_no=5,
+            plan=_round_plan(seq_fam, seq_env, round_no=5),
+        )
+
+    # Fixed family must not derive rounds through this path.
+    fixed_fam, fixed_env = _seed_family(
+        isolated_database, max_rounds=1, with_campaign=False
+    )
+    isolated_database.connection.execute(
+        "UPDATE jobs SET request = %s WHERE job_id = %s",
+        (Jsonb({"schema_version": 2, "exploration": {"mode": "fixed"}}), fixed_fam),
+    )
+    fixed_gate = state.check_round_derivation(
+        isolated_database.dsn, family_id=fixed_fam, round_no=1
+    )
+    assert fixed_gate.allowed is False
+    assert fixed_gate.sub_reason == "FIXED_FAMILY_NO_DERIVATION"
+    with pytest.raises(state.StateError):
+        state.create_round_child(
+            isolated_database.dsn,
+            family_id=fixed_fam,
+            round_no=1,
+            plan=_round_plan(fixed_fam, fixed_env, round_no=1),
+        )
+
+    # Family with pending envelope or non-AGGREGATING state is refused.
+    pend_fam, pend_env = _seed_family(isolated_database, with_campaign=True)
+    isolated_database.connection.execute(
+        "INSERT INTO family_envelopes (envelope_id, family_id, envelope_digest, "
+        "envelope_json, status, review_deadline_at) "
+        "VALUES (%s, %s, %s, %s, 'pending', clock_timestamp() + interval '1 day')",
+        (uuid4(), pend_fam, _digest("b"), Jsonb(pend_env)),
+    )
+    pend_gate = state.check_round_derivation(
+        isolated_database.dsn, family_id=pend_fam, round_no=1
+    )
+    assert pend_gate.allowed is False
+    assert pend_gate.sub_reason == "PENDING_ENVELOPE"
+
+    closed_fam, _closed_env = _seed_family(isolated_database, with_campaign=True)
+    isolated_database.connection.execute(
+        "UPDATE jobs SET state = 'BLOCKED', reason_code = 'REVIEW_REJECTED' "
+        "WHERE job_id = %s",
+        (closed_fam,),
+    )
+    closed_gate = state.check_round_derivation(
+        isolated_database.dsn, family_id=closed_fam, round_no=1
+    )
+    assert closed_gate.allowed is False
+    assert closed_gate.sub_reason == "FAMILY_NOT_AGGREGATING"

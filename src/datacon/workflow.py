@@ -727,7 +727,27 @@ def _admit_derived_round(
     admission_inputs: Any,
     run_root: str | None,
 ) -> dict[str, Any]:
-    """Run ``record_admission`` for a derived READY round; fail closed otherwise."""
+    """Run ``record_admission`` for a derived READY round; fail closed on deterministic errors.
+
+    S3: if the round already has an admission row (including when a concurrent
+    admission committed before a stale recovery retry), return it as admitted
+    and never block the round.
+    S5: transient ``psycopg.Error`` propagates without blocking the round so
+    ``recover_unadmitted_rounds`` can retry after the 300 s grace window,
+    matching the worker's existing DB-error propagation contract.
+    """
+    existing_admission = state_store.get_admission(dsn, job_id)
+    if existing_admission is not None:
+        current = state_store.load_job(dsn, job_id)
+        return {
+            "job_id": str(job_id),
+            "derived": True,
+            "state": current["state"] if current else "READY",
+            "admitted": True,
+            "reason_code": None,
+            "sub_reason": "ROUND_ALREADY_ADMITTED",
+            "admission": existing_admission,
+        }
     try:
         if not isinstance(admission_inputs, dict):
             raise state_store.StateError(
@@ -746,7 +766,12 @@ def _admit_derived_round(
             recomputable=admission_inputs.get("recomputable", True),
             campaign_bundle_digest=admission_inputs.get("campaign_bundle_digest"),
         )
-    except (state_store.StateError, psycopg.Error, KeyError, TypeError) as error:
+    except psycopg.Error:
+        # S5: do not permanently block a round on a transient database failure;
+        # leave it READY so recover_unadmitted_rounds retries after the grace
+        # window. Propagate consistently with run_worker's DB-error semantics.
+        raise
+    except (state_store.StateError, KeyError, TypeError) as error:
         message = f"round {round_no} admission failed: {error}"
         _block_derived_round(
             dsn,
@@ -775,6 +800,19 @@ def _admit_derived_round(
             "sub_reason": None,
             "admission": outcome.admission,
         }
+    if outcome.sub_reason == "ROUND_ALREADY_ADMITTED":
+        existing_admission = state_store.get_admission(dsn, job_id)
+        if existing_admission is not None:
+            current = state_store.load_job(dsn, job_id)
+            return {
+                "job_id": str(job_id),
+                "derived": True,
+                "state": current["state"] if current else "READY",
+                "admitted": True,
+                "reason_code": None,
+                "sub_reason": "ROUND_ALREADY_ADMITTED",
+                "admission": existing_admission,
+            }
     reason_code = (
         outcome.reason_code
         if outcome.reason_code in _DENIED_ROUND_BLOCK_REASONS
@@ -889,6 +927,11 @@ def recover_unadmitted_rounds(
     for row in state_store.unadmitted_round_children(
         dsn, grace_seconds=grace_seconds
     ):
+        # S3: re-confirm in a transaction that the round still has no admission
+        # before retrying, so an admission that committed after the listing
+        # query is never raced or blocked.
+        if not state_store.round_needs_admission_recovery(dsn, row["job_id"]):
+            continue
         raw_summary = row.get("summary")
         summary: dict[str, Any] = raw_summary if isinstance(raw_summary, dict) else {}
         _admit_derived_round(

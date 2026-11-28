@@ -875,6 +875,98 @@ _ROUND_CHILD_ACTIVE_STATES = (
 )
 
 
+MAX_ADMISSION_INPUTS_BYTES = 64 * 1024
+_ADMISSION_INPUT_KEYS = frozenset(
+    {
+        "envelope",
+        "seed_digest",
+        "experiment",
+        "recomputable",
+        "campaign_bundle_digest",
+    }
+)
+
+
+def _family_mode(request: Any) -> str:
+    """Return the family's exploration mode, defaulting to ``fixed``."""
+    if isinstance(request, Mapping):
+        exploration = request.get("exploration")
+        if isinstance(exploration, Mapping):
+            mode = exploration.get("mode")
+            if isinstance(mode, str) and mode:
+                return mode
+    return "fixed"
+
+
+def _validate_admission_inputs(admission_inputs: Any) -> dict[str, Any]:
+    """Validate structure, types, and size of persisted ``admission_inputs`` (Nit 2)."""
+    if not isinstance(admission_inputs, Mapping):
+        raise StateError("admission_inputs must be a JSON object")
+    unknown = set(admission_inputs) - _ADMISSION_INPUT_KEYS
+    if unknown:
+        raise StateError(
+            "admission_inputs has unknown field(s): "
+            + ", ".join(sorted(str(key) for key in unknown))
+        )
+    if "envelope" not in admission_inputs or "seed_digest" not in admission_inputs:
+        raise StateError(
+            "admission_inputs requires 'envelope' and 'seed_digest'"
+        )
+    raw_envelope = admission_inputs["envelope"]
+    if not isinstance(raw_envelope, Mapping):
+        raise StateError("admission_inputs.envelope must be a JSON object")
+    try:
+        normalized_envelope = contracts.normalize_envelope(raw_envelope)
+    except ValueError as error:
+        raise StateError(f"admission_inputs.envelope is invalid: {error}") from error
+    try:
+        seed_digest = jsonutil.require_digest(
+            admission_inputs["seed_digest"], "admission_inputs.seed_digest"
+        )
+    except ValueError as error:
+        raise StateError(str(error)) from error
+    raw_experiment = admission_inputs.get("experiment")
+    experiment: dict[str, Any] | None
+    if raw_experiment is None:
+        experiment = None
+    elif isinstance(raw_experiment, Mapping):
+        experiment = dict(raw_experiment)
+    else:
+        raise StateError(
+            "admission_inputs.experiment must be a JSON object or null"
+        )
+    recomputable = admission_inputs.get("recomputable", True)
+    if type(recomputable) is not bool:
+        raise StateError("admission_inputs.recomputable must be a boolean")
+    raw_bundle_digest = admission_inputs.get("campaign_bundle_digest")
+    campaign_bundle_digest: str | None = None
+    if raw_bundle_digest is not None:
+        try:
+            campaign_bundle_digest = jsonutil.require_digest(
+                raw_bundle_digest, "admission_inputs.campaign_bundle_digest"
+            )
+        except ValueError as error:
+            raise StateError(str(error)) from error
+    normalized = {
+        "envelope": normalized_envelope,
+        "seed_digest": seed_digest,
+        "experiment": experiment,
+        "recomputable": recomputable,
+        "campaign_bundle_digest": campaign_bundle_digest,
+    }
+    try:
+        encoded = jsonutil.canonical_bytes(normalized)
+    except (TypeError, ValueError) as error:
+        raise StateError(
+            f"admission_inputs must be canonical JSON: {error}"
+        ) from error
+    if len(encoded) > MAX_ADMISSION_INPUTS_BYTES:
+        raise StateError(
+            f"admission_inputs exceeds {MAX_ADMISSION_INPUTS_BYTES} bytes"
+        )
+    return normalized
+
+
 def create_round_child(
     dsn: str,
     *,
@@ -924,6 +1016,11 @@ def create_round_child(
         plan_digest = contracts.plan_digest(plan)
     except (TypeError, ValueError) as error:
         raise StateError(f"plan is invalid: {error}") from error
+    normalized_inputs = (
+        None
+        if admission_inputs is None
+        else _validate_admission_inputs(admission_inputs)
+    )
     with _connect(dsn) as connection:
         family = connection.execute(
             "SELECT job_id, job_kind, job_contract_version, state, request "
@@ -935,7 +1032,7 @@ def create_round_child(
         if family["job_contract_version"] != 2 or family["job_kind"] != "family":
             raise StateError("family_id is not a v2 family")
         existing = connection.execute(
-            "SELECT j.job_id, j.state, p.plan_digest FROM jobs j "
+            "SELECT j.job_id, j.state, p.plan_digest, p.summary FROM jobs j "
             "LEFT JOIN plans p ON p.job_id = j.job_id "
             "WHERE j.parent_job_id = %s AND j.job_kind = 'round' "
             "AND j.round_no = %s",
@@ -946,15 +1043,41 @@ def create_round_child(
                 raise PlanConflict(
                     "a different plan is already frozen for this round"
                 )
+            existing_summary = existing["summary"]
+            stored_inputs = (
+                existing_summary.get("admission_inputs")
+                if isinstance(existing_summary, Mapping)
+                else None
+            )
+            if (normalized_inputs is None) != (stored_inputs is None) or (
+                normalized_inputs is not None
+                and stored_inputs is not None
+                and jsonutil.canonical_bytes(normalized_inputs)
+                != jsonutil.canonical_bytes(stored_inputs)
+            ):
+                raise PlanConflict(
+                    "different admission_inputs are already stored for this round"
+                )
             return {
                 "job_id": str(existing["job_id"]),
                 "plan_digest": plan_digest,
                 "state": existing["state"],
                 "created": False,
             }
+        if _family_mode(family["request"]) != "guided":
+            raise StateError("fixed families do not derive later rounds")
         if family["state"] != "AGGREGATING":
             raise StateError(
                 f"cannot derive a round while the family is {family['state']}"
+            )
+        pending_envelope = connection.execute(
+            "SELECT 1 FROM family_envelopes "
+            "WHERE family_id = %s AND status = 'pending' LIMIT 1",
+            (family_id,),
+        ).fetchone()
+        if pending_envelope is not None:
+            raise StateError(
+                "cannot derive a round while an envelope re-approval is pending"
             )
         active = connection.execute(
             "SELECT job_id FROM jobs WHERE parent_job_id = %s "
@@ -971,6 +1094,25 @@ def create_round_child(
             raise StateError(
                 "the family already has a non-terminal child; children run "
                 "serially"
+            )
+        campaigns = connection.execute(
+            "SELECT state FROM jobs "
+            "WHERE parent_job_id = %s AND job_kind = 'campaign'",
+            (family_id,),
+        ).fetchall()
+        if len(campaigns) != 1 or campaigns[0]["state"] != "COMPLETED":
+            raise StateError(
+                "guided family requires a single COMPLETED campaign child "
+                "before deriving a round"
+            )
+        max_round = connection.execute(
+            "SELECT COALESCE(MAX(round_no), 0) AS max_round FROM jobs "
+            "WHERE parent_job_id = %s AND job_kind = 'round'",
+            (family_id,),
+        ).fetchone()["max_round"]
+        if round_no != max_round + 1:
+            raise StateError(
+                f"round_no must be {max_round + 1}, got {round_no}"
             )
         _validate_later_v2_plan_in_tx(
             connection, {"family_id": family_id}, plan
@@ -994,8 +1136,8 @@ def create_round_child(
                 Jsonb(dict(plan)),
                 Jsonb(
                     {}
-                    if admission_inputs is None
-                    else {"admission_inputs": dict(admission_inputs)}
+                    if normalized_inputs is None
+                    else {"admission_inputs": normalized_inputs}
                 ),
             ),
         )
@@ -1038,7 +1180,7 @@ def check_round_derivation(
         raise StateError("round_no must be a positive integer")
     with _connect(dsn) as connection:
         family = connection.execute(
-            "SELECT job_kind, job_contract_version, request FROM jobs "
+            "SELECT job_kind, job_contract_version, state, request FROM jobs "
             "WHERE job_id = %s",
             (family_id,),
         ).fetchone()
@@ -1048,6 +1190,23 @@ def check_round_derivation(
             or family["job_kind"] != "family"
         ):
             raise StateError("family_id is not a v2 family")
+        if _family_mode(family["request"]) != "guided":
+            return BudgetDecision(
+                False, None, 0, sub_reason="FIXED_FAMILY_NO_DERIVATION"
+            )
+        if family["state"] != "AGGREGATING":
+            return BudgetDecision(
+                False, None, 0, sub_reason="FAMILY_NOT_AGGREGATING"
+            )
+        pending_envelope = connection.execute(
+            "SELECT 1 FROM family_envelopes "
+            "WHERE family_id = %s AND status = 'pending' LIMIT 1",
+            (family_id,),
+        ).fetchone()
+        if pending_envelope is not None:
+            return BudgetDecision(
+                False, None, 0, sub_reason="PENDING_ENVELOPE"
+            )
         active = connection.execute(
             "SELECT 1 FROM jobs WHERE parent_job_id = %s "
             "AND job_kind IN ('campaign', 'round') "
@@ -1062,6 +1221,24 @@ def check_round_derivation(
         if active is not None:
             return BudgetDecision(
                 False, None, 0, sub_reason="CHILD_NOT_TERMINAL"
+            )
+        campaigns = connection.execute(
+            "SELECT state FROM jobs "
+            "WHERE parent_job_id = %s AND job_kind = 'campaign'",
+            (family_id,),
+        ).fetchall()
+        if len(campaigns) != 1 or campaigns[0]["state"] != "COMPLETED":
+            return BudgetDecision(
+                False, None, 0, sub_reason="CAMPAIGN_NOT_COMPLETED"
+            )
+        max_round = connection.execute(
+            "SELECT COALESCE(MAX(round_no), 0) AS max_round FROM jobs "
+            "WHERE parent_job_id = %s AND job_kind = 'round'",
+            (family_id,),
+        ).fetchone()["max_round"]
+        if round_no != max_round + 1:
+            return BudgetDecision(
+                False, None, 0, sub_reason="ROUND_NO_NOT_SEQUENTIAL"
             )
         max_rounds = _effective_family_max_rounds(
             connection, family_id, family["request"]
@@ -1420,42 +1597,85 @@ def _recover_uncharged_attempt(dsn: str, candidate: Mapping[str, Any]) -> bool:
             return True
 
 
+def round_needs_admission_recovery(dsn: str, job_id: UUID | str) -> bool:
+    """Re-verify in a transaction that a candidate round still lacks an admission (S3)."""
+    try:
+        job_id = uuid.UUID(str(job_id))
+    except (TypeError, ValueError) as error:
+        raise StateError("job_id must be a UUID") from error
+    with _connect(dsn) as connection:
+        with connection.transaction():
+            row = connection.execute(
+                "SELECT job_id FROM jobs "
+                "WHERE job_id = %s AND job_contract_version = 2 "
+                "AND job_kind = 'round' AND state = 'READY' "
+                "AND stage = 'admission' AND generation = 0 "
+                "AND lease_owner IS NULL FOR KEY SHARE",
+                (job_id,),
+            ).fetchone()
+            if row is None:
+                return False
+            existing = connection.execute(
+                "SELECT 1 FROM admissions WHERE job_id = %s",
+                (job_id,),
+            ).fetchone()
+            return existing is None
+
+
 def block_round_child(
     dsn: str, job_id: UUID | str, *, reason_code: str, message: str
 ) -> bool:
-    """Close a derived, never-claimed round whose admission was denied.
+    """Close a derived, never-claimed, unadmitted round whose admission was denied.
 
     Only a ``READY`` round still in the ``admission`` stage (never claimed,
-    generation 0, no lease) may be blocked here; anything else returns False.
-    The row is left ``workflow_synced=true`` so no worker claims it, and the
-    caller archives the blocked bundle with ``execution.record_blocked``.
+    generation 0, no lease, and no ``admissions`` row) may be blocked here;
+    anything else returns False. The row is left ``workflow_synced=true`` so no
+    worker claims it, and the caller archives the blocked bundle with
+    ``execution.record_blocked``.
     """
     try:
         job_id = uuid.UUID(str(job_id))
     except (TypeError, ValueError) as error:
         raise StateError("job_id must be a UUID") from error
     with _connect(dsn) as connection:
-        updated = connection.execute(
-            "UPDATE jobs SET state = 'BLOCKED', stage = 'blocked', "
-            "reason_code = %s, last_error = %s, "
-            "state_version = state_version + 1, updated_at = clock_timestamp() "
-            "WHERE job_id = %s AND job_contract_version = 2 "
-            "AND job_kind = 'round' AND state = 'READY' AND stage = 'admission' "
-            "AND generation = 0 AND lease_owner IS NULL "
-            "RETURNING job_id",
-            (reason_code, _truncate(message), job_id),
-        ).fetchone()
-        if updated is None:
-            return False
-        _audit(
-            connection,
-            job_id,
-            "blocked",
-            stage="blocked",
-            reason_code=reason_code,
-            detail={"message": _truncate(message), "generation": 0},
-        )
-        return True
+        with connection.transaction():
+            probe = connection.execute(
+                "SELECT family_id FROM jobs WHERE job_id = %s",
+                (job_id,),
+            ).fetchone()
+            if probe is None:
+                return False
+            # Lock order jobs(family) -> jobs(round) matches record_admission.
+            if probe["family_id"] is not None:
+                connection.execute(
+                    "SELECT 1 FROM jobs WHERE job_id = %s FOR KEY SHARE",
+                    (probe["family_id"],),
+                ).fetchone()
+            updated = connection.execute(
+                "UPDATE jobs SET state = 'BLOCKED', stage = 'blocked', "
+                "reason_code = %s, last_error = %s, "
+                "state_version = state_version + 1, "
+                "updated_at = clock_timestamp() "
+                "WHERE job_id = %s AND job_contract_version = 2 "
+                "AND job_kind = 'round' AND state = 'READY' "
+                "AND stage = 'admission' "
+                "AND generation = 0 AND lease_owner IS NULL "
+                "AND NOT EXISTS ("
+                "SELECT 1 FROM admissions a WHERE a.job_id = jobs.job_id) "
+                "RETURNING job_id",
+                (reason_code, _truncate(message), job_id),
+            ).fetchone()
+            if updated is None:
+                return False
+            _audit(
+                connection,
+                job_id,
+                "blocked",
+                stage="blocked",
+                reason_code=reason_code,
+                detail={"message": _truncate(message), "generation": 0},
+            )
+            return True
 
 
 def ensure_awaiting_review(dsn: str, job_id: UUID, *, generation: int) -> None:
@@ -7512,9 +7732,19 @@ def _job_status_payload(row: Mapping[str, Any]) -> dict[str, Any]:
     pending_plan = None
     evidence_refs: list[str] = []
     if row["plan_digest"] is not None:
+        raw_summary = row["summary"]
+        public_summary = (
+            {
+                key: value
+                for key, value in raw_summary.items()
+                if key != "admission_inputs"
+            }
+            if isinstance(raw_summary, Mapping)
+            else raw_summary
+        )
         pending_plan = {
             "plan_digest": row["plan_digest"],
-            "summary": row["summary"],
+            "summary": public_summary,
             "plan": row["plan"],
             "created_at": jsonutil.timestamp(row["plan_created_at"]),
         }
