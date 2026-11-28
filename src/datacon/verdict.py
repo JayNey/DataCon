@@ -161,12 +161,19 @@ class VerdictPolicy:
     signature: Mapping[str, Any]
     expected_exit: Mapping[str, int]
     expected_stdout: Mapping[str, str]
+    # 改9 增补 (T12 C): a guided validation round that reuses the campaign
+    # build replays a campaign crash seed, whose clean output is not
+    # registered. Only for those rounds is the candidate "clean" decided by
+    # the exit code and the absence of an ASan diagnostic alone. The normal
+    # control and every other rule are unchanged; True is the v0.1 rule.
+    candidate_stdout_checked: bool = True
 
     def as_dict(self) -> dict[str, Any]:
         return {
             "signature": dict(self.signature),
             "expected_exit": dict(self.expected_exit),
             "expected_stdout": dict(self.expected_stdout),
+            "candidate_stdout_checked": self.candidate_stdout_checked,
         }
 
 
@@ -264,7 +271,12 @@ def classify_candidate(policy: VerdictPolicy, run: RunObservation) -> str:
         return "target_signature"
     if (
         _exit_matches(run.exit_code, policy.expected_exit.get("candidate_clean"))
-        and _stdout_matches(run.stdout, policy.expected_stdout.get("candidate_clean"))
+        and (
+            not policy.candidate_stdout_checked
+            or _stdout_matches(
+                run.stdout, policy.expected_stdout.get("candidate_clean")
+            )
+        )
         and not has_asan_diagnostic(run.stderr)
     ):
         return "clean"
@@ -294,6 +306,7 @@ def decide_verdict(
         "vulnerable_candidates": [],
         "fixed_candidates": [],
         "controls": {},
+        "candidate_stdout_checked": policy.candidate_stdout_checked,
     }
 
     comparable_error = _compare_builds(builds)

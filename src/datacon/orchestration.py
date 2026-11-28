@@ -30,6 +30,7 @@ from uuid import uuid4
 
 from langgraph.graph import END, START, StateGraph
 
+from datacon import fuzz as fuzz_rules
 from datacon import jsonutil
 from datacon import verdict as verdict_mod
 from datacon.tools.sandbox import BuildResult, ProbeReport, ReplayResult
@@ -845,16 +846,72 @@ class CampaignRunner(Protocol):
 
 
 class DefaultCampaignRunner:
-    """Deterministic campaign runner advancing the injected clock without sleeping."""
+    """Campaign runner for the ``campaign`` node; never produces a verdict.
+
+    With a ``fuzz_executor`` (the sandbox's ``fuzz`` entry, T12 B) the node
+    runs a real, time-bounded libFuzzer search on the vulnerable fuzzer built
+    once for the campaign: the RNG seed is derived deterministically from the
+    job and family, the injected clock advances by the search's own duration
+    and the crash inputs become the candidate seeds (deduplicated, discovery
+    order). Without an executor the runner stays the deterministic in-memory
+    stand-in used by the graph contract tests. Either way the result is only
+    a search observation; conclusions need six replays in a later round.
+    """
 
     def __init__(
         self,
         *,
         clock: ClockProtocol | None = None,
         fuzz_duration_seconds: float = 1.0,
+        fuzz_executor: Callable[..., Any] | None = None,
+        max_len: int = 4096,
+        asan_options: str = "detect_leaks=0:halt_on_error=1:abort_on_error=0",
     ) -> None:
         self._clock = clock
         self._fuzz_duration_seconds = float(fuzz_duration_seconds)
+        self._fuzz_executor = fuzz_executor
+        self._max_len = int(max_len)
+        self._asan_options = asan_options
+
+    def _search(
+        self,
+        *,
+        job_id: str,
+        family_id: str,
+        build_artifacts: Mapping[str, Mapping[str, Any]],
+    ) -> tuple[tuple[bytes, ...], float, int]:
+        assert self._fuzz_executor is not None
+        vulnerable = build_artifacts.get("vulnerable")
+        if not isinstance(vulnerable, Mapping):
+            vulnerable = {}
+        fuzzer_path = vulnerable.get("fuzzer_path")
+        corpus_dir = vulnerable.get("corpus_dir")
+        if not fuzzer_path or not corpus_dir:
+            raise ValueError(
+                "a real campaign search needs the vulnerable fuzzer and the "
+                "staged seed corpus from the campaign build"
+            )
+        rng_seed = fuzz_rules.campaign_rng_seed(job_id, family_id)
+        max_total_time = max(1, int(self._fuzz_duration_seconds))
+        result = self._fuzz_executor(
+            fuzzer_path=fuzzer_path,
+            corpus_dir=corpus_dir,
+            rng_seed=rng_seed,
+            max_total_time=max_total_time,
+            deadline_seconds=max_total_time + 30.0,
+            max_len=self._max_len,
+            asan_options=self._asan_options,
+            expected_fuzzer_digest=vulnerable.get("fuzzer_digest"),
+        )
+        if getattr(result, "status", None) != "completed":
+            raise RuntimeError(
+                f"the campaign search ended with status {getattr(result, 'status', None)}"
+            )
+        return (
+            tuple(getattr(result, "crashes", ())),
+            float(getattr(result, "duration_seconds", max_total_time)),
+            rng_seed,
+        )
 
     def run_campaign(
         self,
@@ -864,9 +921,22 @@ class DefaultCampaignRunner:
         build_artifacts: Mapping[str, Mapping[str, Any]],
         candidate_seeds: Sequence[bytes] = (),
     ) -> CampaignResult:
-        if self._clock is not None and self._fuzz_duration_seconds > 0:
-            self._clock.advance(self._fuzz_duration_seconds)
-        seeds = tuple(candidate_seeds)
+        found: tuple[bytes, ...] = ()
+        duration = self._fuzz_duration_seconds
+        rng_seed: int | None = None
+        if self._fuzz_executor is not None:
+            found, duration, rng_seed = self._search(
+                job_id=job_id, family_id=family_id, build_artifacts=build_artifacts
+            )
+        if self._clock is not None and duration > 0:
+            self._clock.advance(duration)
+        seeds: list[bytes] = []
+        seen: set[str] = set()
+        for seed in (*tuple(candidate_seeds), *found):
+            digest = _sha256_bytes(seed)
+            if digest not in seen:
+                seen.add(digest)
+                seeds.append(seed)
         bundle_payload = {
             "job_id": job_id,
             "family_id": family_id,
@@ -876,11 +946,14 @@ class DefaultCampaignRunner:
                 for version in verdict_mod.VERSIONS
             },
         }
+        metadata: dict[str, Any] = {"seed_count": len(seeds)}
+        if rng_seed is not None:
+            metadata.update({"engine": "libfuzzer", "rng_seed": rng_seed})
         return CampaignResult(
-            candidate_seeds=seeds,
+            candidate_seeds=tuple(seeds),
             campaign_bundle_digest=jsonutil.digest_json(bundle_payload),
-            fuzz_seconds_used=self._fuzz_duration_seconds,
-            metadata={"seed_count": len(seeds)},
+            fuzz_seconds_used=duration,
+            metadata=metadata,
         )
 
 

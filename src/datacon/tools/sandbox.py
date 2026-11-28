@@ -12,6 +12,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePosixPath
 import hashlib
 import json
+import math
 import os
 import posixpath
 import re
@@ -335,6 +336,180 @@ class ReplayResult:
         payload["capture_error"] = self.capture_error
         payload["truncated_roles"] = list(self.truncated_roles)
         return payload
+
+
+FUZZ_MAX_CRASH_FILES = 8
+FUZZ_MAX_CRASH_BYTES = 8 * MIB
+FUZZ_STARTUP_GRACE_SECONDS = 30.0
+FUZZER_CONTAINER_PATH = "/artifact/fuzzer"
+CORPUS_CONTAINER_PATH = "/corpus"
+# Wrapper markers are whole lines: a target cannot splice a look-alike into
+# another line, and an extra (forged) whole line makes the count wrong.
+_FUZZ_RESULT = re.compile(
+    rb"^DATACON_FUZZ_RESULT code=(-?\d+) crashes=(\d+)$", re.MULTILINE
+)
+_FUZZ_CRASH = re.compile(
+    rb"^DATACON_FUZZ_CRASH index=(\d+) size=(\d+) sha256=([0-9a-f]{64})$",
+    re.MULTILINE,
+)
+
+
+@dataclass(frozen=True)
+class FuzzResult:
+    """One bounded libFuzzer search in a one-shot container (never a verdict)."""
+
+    status: str
+    exit_code: int | None
+    duration_seconds: float
+    container_id: str | None
+    rng_seed: int
+    max_total_time_seconds: int
+    log: bytes
+    log_truncated: bool
+    crashes: tuple[bytes, ...]
+    crash_truncated: bool
+    metadata: dict[str, Any]
+    capture_error: str | None = None
+
+    def as_dict(self) -> dict[str, Any]:
+        # The raw log and crash bytes are evidence files; the journal and the
+        # attempt row only carry digests, sizes and counts.
+        return {
+            "status": self.status,
+            "exit_code": self.exit_code,
+            "duration_seconds": self.duration_seconds,
+            "container_id": self.container_id,
+            "rng_seed": self.rng_seed,
+            "max_total_time_seconds": self.max_total_time_seconds,
+            "log_sha256": "sha256:" + hashlib.sha256(self.log).hexdigest(),
+            "log_bytes": len(self.log),
+            "log_truncated": self.log_truncated,
+            "crash_count": len(self.crashes),
+            "crash_truncated": self.crash_truncated,
+            "capture_error": self.capture_error,
+            "metadata": dict(self.metadata),
+        }
+
+
+def render_fuzz_runner_script() -> str:
+    """The fixed fuzz container template; every operand is a positional argument.
+
+    The fuzzer writes new inputs only to ``/work/new`` (bounded tmpfs) and crash
+    artifacts only to ``/work/crashes``; the seed corpus is a read-only bind
+    mount at ``/corpus``. At most ``$6`` regular crash files are moved to
+    ``/work/crash-N`` for the host copy, then the container waits for release.
+    """
+    return "\n".join(
+        [
+            "set -u",
+            '_seed=$1; _time=$2; _len=$3; _rss=$4; _timeout=$5; _max=$6',
+            "mkdir /work/new /work/crashes || exit 1",
+            f'{FUZZER_CONTAINER_PATH} -seed="$_seed" -max_total_time="$_time" '
+            '-max_len="$_len" -rss_limit_mb="$_rss" -timeout="$_timeout" '
+            "-print_final_stats=1 -artifact_prefix=/work/crashes/ "
+            f"/work/new {CORPUS_CONTAINER_PATH}",
+            "_code=$?",
+            "_total=0",
+            "for _f in /work/crashes/crash-*; do",
+            '  if [ -f "$_f" ] && [ ! -L "$_f" ]; then _total=$((_total + 1)); fi',
+            "done",
+            "_i=0",
+            "for _f in /work/crashes/crash-*; do",
+            '  [ "$_i" -lt "$_max" ] || break',
+            '  if [ -f "$_f" ] && [ ! -L "$_f" ]; then',
+            '    mv -T -- "$_f" "/work/crash-$_i" || exit 1',
+            '    _size=$(wc -c < "/work/crash-$_i" | tr -d " ")',
+            '    _sum=$(sha256sum -- "/work/crash-$_i" | cut -d" " -f1)',
+            r"    printf '\nDATACON_FUZZ_CRASH index=%s size=%s sha256=%s\n' "
+            '"$_i" "$_size" "$_sum" >&2',
+            "    _i=$((_i + 1))",
+            "  fi",
+            "done",
+            r"printf '\nDATACON_FUZZ_RESULT code=%s crashes=%s\n' "
+            '"$_code" "$_total" >&2',
+            "cat /sys/fs/cgroup/pids.events > /work/pids.events 2>/dev/null || true",
+            "cat /sys/fs/cgroup/memory.events > /work/memory.events 2>/dev/null || true",
+            "touch /work/done",
+            "while [ ! -e /work/release ]; do sleep 0.1; done",
+            "exit 0",
+        ]
+    ) + "\n"
+
+
+def fuzz_runner_command(
+    *,
+    rng_seed: int,
+    max_total_time: int,
+    max_len: int,
+    rss_limit_mb: int,
+    input_timeout_seconds: int,
+    max_crashes: int = FUZZ_MAX_CRASH_FILES,
+) -> list[str]:
+    """Return the exact argv of the fuzz container (no shell splicing)."""
+    for label, value, minimum in (
+        ("rng_seed", rng_seed, 1),
+        ("max_total_time", max_total_time, 1),
+        ("max_len", max_len, 1),
+        ("rss_limit_mb", rss_limit_mb, 1),
+        ("input_timeout_seconds", input_timeout_seconds, 1),
+        ("max_crashes", max_crashes, 1),
+    ):
+        if type(value) is not int or value < minimum:
+            raise SandboxPolicyError(f"fuzz {label} must be an integer >= {minimum}")
+    return [
+        "/bin/sh",
+        "-c",
+        render_fuzz_runner_script(),
+        "datacon-fuzz-runner",
+        str(rng_seed),
+        str(max_total_time),
+        str(max_len),
+        str(rss_limit_mb),
+        str(input_timeout_seconds),
+        str(max_crashes),
+    ]
+
+
+def validate_fuzz_corpus_dir(corpus_dir: Path | str) -> list[Path]:
+    """The corpus mount is a flat directory of regular, read-only files only.
+
+    The §5 corpus ceilings (file count, per-file and total bytes) are checked
+    again at this boundary, from ``lstat`` only, before any container exists.
+    """
+    from datacon import fuzz as fuzz_rules
+
+    directory = Path(corpus_dir)
+    try:
+        directory_info = directory.lstat()
+    except OSError as error:
+        raise SandboxPolicyError(f"fuzz corpus is not readable: {error}") from error
+    if not stat.S_ISDIR(directory_info.st_mode):
+        raise SandboxPolicyError("fuzz corpus must be a real directory")
+    files: list[Path] = []
+    sizes: list[int] = []
+    for child in sorted(directory.iterdir()):
+        info = child.lstat()
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+            raise SandboxPolicyError(
+                f"fuzz corpus may only contain regular files: {child.name}"
+            )
+        if info.st_mode & 0o222:
+            raise SandboxPolicyError(
+                f"fuzz corpus file must be read-only: {child.name}"
+            )
+        files.append(child)
+        sizes.append(info.st_size)
+    if not files:
+        raise SandboxPolicyError("fuzz corpus is empty")
+    try:
+        fuzz_rules.check_corpus_limits(sizes)
+    except fuzz_rules.CorpusPolicyDenied as error:
+        raise SandboxPolicyError(
+            error.message, reason_code=fuzz_rules.POLICY_DENIED
+        ) from error
+    if directory_info.st_mode & 0o022:
+        raise SandboxPolicyError("fuzz corpus directory must not be group/other writable")
+    return files
 
 
 def _absolute_mount(source: str | os.PathLike[str]) -> str:
@@ -3337,6 +3512,200 @@ printf 'uid=%s\nseccomp=%s\nseccomp_filters=%s\nno_new_privs=%s\ncap_eff=%s\ncgr
             metadata=metadata,
             capture_error=capture_error,
             truncated_roles=truncated_roles,
+        )
+
+
+    def fuzz(
+        self,
+        *,
+        fuzzer_path: Path | str,
+        corpus_dir: Path | str,
+        rng_seed: int,
+        max_total_time: int,
+        deadline_seconds: float,
+        max_len: int,
+        asan_options: str,
+        input_timeout_seconds: int = 10,
+        expected_fuzzer_digest: str | None = None,
+    ) -> FuzzResult:
+        """Run one time-bounded libFuzzer search in the standard isolation profile.
+
+        The container is created by the same ``container_create_args`` baseline
+        as build/replay (no network, non-root, read-only root, cap-drop ALL,
+        no-new-privileges, pinned seccomp) and ``validate_host_config`` proves
+        it after create. Only the fuzzer binary and the seed corpus are bind
+        mounted, both read-only; every write lands on the bounded ``/work``
+        tmpfs. No Docker socket, evidence or campaign directory is mounted.
+        """
+        if (
+            isinstance(deadline_seconds, bool)
+            or not isinstance(deadline_seconds, (int, float))
+            or not math.isfinite(deadline_seconds)
+            or deadline_seconds <= 0
+        ):
+            raise SandboxPolicyError("fuzz deadline_seconds must be a finite positive number")
+        if (
+            not isinstance(asan_options, str)
+            or any(ord(character) < 0x20 or ord(character) == 0x7F for character in asan_options)
+        ):
+            raise SandboxPolicyError(
+                "fuzz asan_options must be one line without control characters"
+            )
+        fuzzer = Path(fuzzer_path)
+        if fuzzer.is_symlink() or not fuzzer.is_file():
+            raise SandboxError("built fuzzer is missing")
+        if expected_fuzzer_digest is not None:
+            data = _read_bounded_file(
+                fuzzer,
+                max_bytes=MAX_ARTIFACT_BYTES,
+                label="built fuzzer is not readable",
+                reason_code="EVIDENCE_WRITE_FAILED",
+            )
+            actual = "sha256:" + hashlib.sha256(data).hexdigest()
+            if actual != expected_fuzzer_digest:
+                raise SandboxError(
+                    "built fuzzer changed before fuzzing", reason_code="PLAN_MISMATCH"
+                )
+        validate_fuzz_corpus_dir(corpus_dir)
+        try:
+            fuzzer.chmod(0o555)
+        except OSError as error:
+            raise SandboxError(f"cannot make the fuzzer executable: {error}") from error
+        rss_limit_mb = max(64, self.limits.memory_mib - 256)
+        command = fuzz_runner_command(
+            rng_seed=rng_seed,
+            max_total_time=max_total_time,
+            max_len=max_len,
+            rss_limit_mb=rss_limit_mb,
+            input_timeout_seconds=input_timeout_seconds,
+        )
+        started = time.monotonic()
+        name, _ = self._create(
+            suffix="fuzz",
+            command=command,
+            mounts=[
+                (str(fuzzer), FUZZER_CONTAINER_PATH, True),
+                (str(Path(corpus_dir)), CORPUS_CONTAINER_PATH, True),
+            ],
+            env={
+                "TMPDIR": "/work",
+                "HOME": "/work",
+                "ASAN_OPTIONS": asan_options,
+            },
+        )
+        (
+            raw_stdout,
+            raw_stderr,
+            files,
+            truncated_files,
+            state,
+            timed_out,
+            exit_code,
+            cleanup_error,
+        ) = self._start_and_wait(
+            name,
+            deadline_seconds=deadline_seconds,
+            artifact=True,
+            extra_copy_paths=[
+                (f"/work/crash-{index}", FUZZ_MAX_CRASH_BYTES)
+                for index in range(FUZZ_MAX_CRASH_FILES)
+            ],
+        )
+        duration = time.monotonic() - started
+        capture_error = state.pop("_capture_error", None)
+        errors: list[str] = [capture_error] if capture_error else []
+        log, log_truncated = _truncate_log(raw_stderr + raw_stdout)
+        log_truncated = (
+            log_truncated
+            or "stderr" in truncated_files
+            or "stdout" in truncated_files
+        )
+        # Exactly one anchored result line, from a wrapper that exited 0.
+        markers = list(_FUZZ_RESULT.finditer(raw_stderr))
+        fuzzer_code: int | None = None
+        reported_crashes = 0
+        if len(markers) == 1:
+            fuzzer_code = int(markers[0].group(1))
+            reported_crashes = int(markers[0].group(2))
+        elif not timed_out:
+            errors.append(
+                f"the fuzz runner reported {len(markers)} result lines, not exactly one"
+            )
+        if not timed_out and exit_code != 0:
+            errors.append(f"the fuzz runner exited with {exit_code}, not 0")
+        expected_copies = min(reported_crashes, FUZZ_MAX_CRASH_FILES)
+        crash_truncated = reported_crashes > FUZZ_MAX_CRASH_FILES
+        declared: dict[int, tuple[int, str]] = {}
+        for match in _FUZZ_CRASH.finditer(raw_stderr):
+            index = int(match.group(1))
+            if index in declared:
+                errors.append(f"crash {index} was reported twice")
+            declared[index] = (int(match.group(2)), match.group(3).decode("ascii"))
+        crashes: list[bytes] = []
+        if not errors and set(declared) != set(range(expected_copies)):
+            errors.append(
+                "the crash lines do not match the reported crash count "
+                f"({sorted(declared)} vs {expected_copies})"
+            )
+        if not errors:
+            for index in range(expected_copies):
+                path = f"/work/crash-{index}"
+                size, digest = declared[index]
+                if path in truncated_files:
+                    crash_truncated = True
+                    continue
+                # The copy skips empty files: a zero-byte crash is still real.
+                data = files.get(path, b"" if size == 0 else None)
+                if (
+                    data is None
+                    or len(data) != size
+                    or hashlib.sha256(data).hexdigest() != digest
+                ):
+                    errors.append(
+                        f"crash {index} does not match the size/sha256 the runner reported"
+                    )
+                    crashes = []
+                    break
+                crashes.append(data)
+        capture_error = "; ".join(dict.fromkeys(errors)) or None
+        oom = bool(state.get("OOMKilled"))
+        limits_hit = _quota_events(files)
+        status = "completed"
+        if timed_out:
+            status = "timeout"
+        elif capture_error is not None or exit_code is None:
+            status = "infra_error"
+            crashes = []
+        elif oom or limits_hit:
+            status = "resource_limited"
+        metadata: dict[str, Any] = {
+            "image_digest": self.image_digest,
+            "asan_options": asan_options,
+            "fuzzer_exit_code": fuzzer_code,
+            "runner_exit_code": exit_code,
+            "reported_crashes": reported_crashes,
+            "oom_killed": oom,
+            "deadline_seconds": deadline_seconds,
+            "max_len": max_len,
+            "rss_limit_mb": rss_limit_mb,
+            "input_timeout_seconds": input_timeout_seconds,
+            "limits_hit": limits_hit,
+        }
+        if cleanup_error is not None:
+            metadata["cleanup_errors"] = [cleanup_error]
+        return FuzzResult(
+            status=status,
+            exit_code=fuzzer_code,
+            duration_seconds=duration,
+            container_id=name,
+            rng_seed=rng_seed,
+            max_total_time_seconds=max_total_time,
+            log=log,
+            log_truncated=log_truncated,
+            crashes=tuple(crashes),
+            crash_truncated=crash_truncated,
+            metadata=metadata,
+            capture_error=capture_error,
         )
 
 

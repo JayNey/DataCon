@@ -898,16 +898,17 @@ def _v2_artifacts(value: Any, label: str) -> dict[str, dict[str, str]]:
     result: dict[str, dict[str, str]] = {}
     for version in _REPLAY_VERSIONS:
         artifact = value.get(version)
-        if not isinstance(artifact, dict) or set(artifact) != {
-            "artifact_digest",
-            "build_log_digest",
-        }:
+        if not isinstance(artifact, dict) or set(artifact) not in (
+            {"artifact_digest", "build_log_digest"},
+            {"artifact_digest", "build_log_digest", "fuzzer_digest"},
+        ):
             raise BundleError(
                 "INVALID_MANIFEST",
-                f"{label}.{version} must contain artifact_digest and build_log_digest",
+                f"{label}.{version} must contain artifact_digest and "
+                "build_log_digest (and optionally fuzzer_digest)",
             )
         entry: dict[str, str] = {}
-        for field in ("artifact_digest", "build_log_digest"):
+        for field in sorted(artifact):
             digest = _v2_digest(
                 artifact.get(field), f"{label}.{version}.{field}"
             )
@@ -917,6 +918,11 @@ def _v2_artifacts(value: Any, label: str) -> dict[str, dict[str, str]]:
                 )
             entry[field] = digest
         result[version] = entry
+    if len({"fuzzer_digest" in item for item in result.values()}) != 1:
+        raise BundleError(
+            "INVALID_MANIFEST",
+            f"{label} must bind fuzzer_digest for both versions or neither",
+        )
     return result
 
 
@@ -3777,6 +3783,58 @@ def _verify_v2_reuse_artifacts(
     version, so binding several outputs requires extending the ``build_ref``
     contract first rather than widening this verifier.
     """
+    artifacts = plan_build_ref["artifacts"]
+    binds_fuzzer = all(
+        "fuzzer_digest" in artifacts[version] for version in _REPLAY_VERSIONS
+    )
+    if binds_fuzzer:
+        # 改9 (T12 C): a guided validation reuses the campaign's two products
+        # per version: the replay parser (artifact_digest) and the fuzzer
+        # (fuzzer_digest), at the plan's exact two output paths.
+        declared = (
+            _declared_build_outputs(plan_build_spec)
+            if plan_build_spec is not None
+            else []
+        )
+        by_name = {PurePosixPath(item).name: item for item in declared}
+        if (
+            len(declared) != 2
+            or set(by_name) != {"parser", "fuzzer"}
+        ):
+            raise BundleError(
+                "INVALID_MANIFEST",
+                "a build_ref with fuzzer_digest requires build_spec.outputs to "
+                "declare exactly the parser and the fuzzer",
+            )
+        for version in _REPLAY_VERSIONS:
+            prefix = f"build/{version}/"
+            shipped = sorted(
+                path
+                for path in data
+                if path.startswith(prefix)
+                and path not in (prefix + "metadata.json", prefix + "build.log")
+                and not path.startswith(prefix + "build_provenance/")
+            )
+            expected_paths = sorted(prefix + item for item in declared)
+            if shipped != expected_paths:
+                raise BundleError(
+                    "INVALID_MANIFEST",
+                    f"{version} build artifact layout does not match the "
+                    f"campaign products {expected_paths}",
+                )
+            expected = artifacts[version]
+            for field, relative in (
+                ("build_log_digest", prefix + "build.log"),
+                ("artifact_digest", prefix + by_name["parser"]),
+                ("fuzzer_digest", prefix + by_name["fuzzer"]),
+            ):
+                if _digest(data[relative]) != expected[field]:
+                    raise BundleError(
+                        "REUSE_MISMATCH",
+                        f"{relative} sha256 does not match plan "
+                        f"build_ref.{version}.{field}",
+                    )
+        return
     if plan_build_spec is None:
         expected_rel = "parser"
     else:

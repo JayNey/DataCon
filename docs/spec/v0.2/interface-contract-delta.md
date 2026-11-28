@@ -214,7 +214,7 @@ Plan v2 在 v0.1 `_PLAN_FIELDS`（21 个既有字段）之上**新增且仅新�
 | `parent_job_id` / `round_no` | 绑定 child job 与轮次；`family_id = parent_job_id`，round 的 `round_no >= 1`，campaign 的 `round_no = null`；与数据库 CHECK 和唯一约束一致；均计入 `plan_digest` |
 | `parent_approval_digest` | 父审批摘要；首份计划为 `null`，后续轮次引用 `family_approvals.approval_digest` 的当前链尾；计入 `plan_digest` |
 | `envelope_digest` | 信封规范化摘要（含 `mutation_limits`）；v2 execution/campaign 必填，fixed 的退化信封同样非空；计入 `plan_digest` |
-| `build_ref` | 仅复用 campaign 的 validation execution 非空；fixed/non-reuse 与 campaign 必须为 null；含 `vulnerable`/`fixed` 两版 artifacts，全部计入 `plan_digest`；`generation` 是 campaign 构建 attempt 的 generation，两版共享同一值 |
+| `build_ref` | 仅复用 campaign 的 validation execution 非空；fixed/non-reuse 与 campaign 必须为 null；含 `vulnerable`/`fixed` 两版 artifacts，全部计入 `plan_digest`；`generation` 是 campaign 构建 attempt 的 generation，两版共享同一值；每版 `artifact_digest` 绑回放 parser，guided validation 另加 `fuzzer_digest` 绑 fuzzer（改9 增补：两版同绑或都不绑，`reuse_origin.artifacts` 同形） |
 | `build_spec` | 结构化构建输入；字段见第 5 节，`kind` 为 `cmake`、`make` 或 `shell`；计入 `plan_digest` |
 | `compile_flags` | 冻结的声明参数，按第 5 节规则归一化后与 `build_spec.declared_compile_flags` 一致，保留顺序；计入 `plan_digest` |
 | `experiment_digest` | ExperimentSpec 规范化摘要；fixed 与 campaign 为 null 但仍参与规范化，并计入 `plan_digest` |
@@ -708,7 +708,7 @@ v2 manifest 保留 v1 的 `verdict`、`reason_code`、`created_at`，并新增 f
 | `reuse_origin` | 复用型 validation 必填并指向 campaign；fixed/normal execution 为 null；campaign 为 null |
 | `files` | 路径、角色、字节数、SHA-256；角色必须来自 v2 封闭角色表，路径必须符合“固定路径”表；完整 validation 必须列出六组回放的 18 个条目 |
 
-validation 与 fixed execution 包必须包含 `metadata/execution.json`、`metadata/probe.json`、`metadata/case.json`、两版 `build_metadata`、`build_log`、`build_artifact` 与 `build_provenance`（按分阶段生效规则）、六组回放的 `stdout.log`/`stderr.log`/`metadata.json`（18 个条目），以及 `envelope` 与 `budget_snapshot`；campaign 包必须包含两版 `build_metadata`/`build_log`/`build_artifact`/`build_provenance`、fuzz 日志与 fuzz provenance（不含 18 个回放文件），记录到候选 crash seed 时还必须包含 crash seed 与对应 provenance；0 crash 的 campaign 允许没有 `crash_seed`，验包不得因此失败。campaign 包与复用型 validation 包的两版 `build_artifact` 同时包含 parser 与 fuzzer 两个产物（改9）；validation 复用 campaign 两版的这两个产物。`reuse_origin.artifacts` 必须与 plan `build_ref.artifacts` 逐字段相等；不一致返回 `REUSE_MISMATCH`，plan 的 `build_ref` 是唯一权威。
+validation 与 fixed execution 包必须包含 `metadata/execution.json`、`metadata/probe.json`、`metadata/case.json`、两版 `build_metadata`、`build_log`、`build_artifact` 与 `build_provenance`（按分阶段生效规则）、六组回放的 `stdout.log`/`stderr.log`/`metadata.json`（18 个条目），以及 `envelope` 与 `budget_snapshot`；campaign 包必须包含两版 `build_metadata`/`build_log`/`build_artifact`/`build_provenance`、fuzz 日志与 fuzz provenance（不含 18 个回放文件），记录到候选 crash seed 时还必须包含 crash seed 与对应 provenance；0 crash 的 campaign 允许没有 `crash_seed`，验包不得因此失败。campaign 包与复用型 validation 包的两版 `build_artifact` 同时包含 parser 与 fuzzer 两个产物（改9）；validation 复用 campaign 两版的这两个产物。`reuse_origin.artifacts` 必须与 plan `build_ref.artifacts` 逐字段相等；不一致返回 `REUSE_MISMATCH`，plan 的 `build_ref` 是唯一权威。复用型 validation 的每版 artifacts 为 `{artifact_digest, build_log_digest, fuzzer_digest}`：`artifact_digest` 绑 `build/{version}/parser`，`fuzzer_digest` 绑 `build/{version}/fuzzer`，二者与 `build.log` 的字节摘要任一不符即 `REUSE_MISMATCH`（改9 增补）；`build_inputs_digest` 为 `digest_json({build_recipe_digest, build_spec, compile_flags, image_digest, staged_materials})`，只覆盖构建材料、工具链与 BuildSpec。
 
 ### 固定路径
 
@@ -1044,6 +1044,7 @@ v2 `execution` 恰好包含 `review` 或 `admission` 之一，不得两者都缺
 | `experiments` | ExperimentSpec 摘要与结果引用（含对应 `evidence_refs`） |
 | `budget` | family 预算汇总，必须含 `max_total_seconds`、`max_fuzz_seconds`、`spent_seconds`、`spent_fuzz_seconds`、`remaining_seconds`（对应 DB 列 `remaining_total_seconds`）、`remaining_fuzz_seconds`，并能由 `budget_charges` 重建 |
 | `reuse_origin` | 复用型 validation 指向 campaign；fixed/normal execution 为 null；campaign 为 null |
+| `fuzz` | 改9 增补：只出现在 campaign report，execution/blocked 不带；封闭对象 `{engine, status, rng_seed, fuzz_log_digest, crash_count, crash_seeds}`，`engine` 固定 `libfuzzer`，`status` 为 fuzz 搜索状态（`COMPLETED` campaign 恒为 `completed`），`rng_seed` 为确定性 libFuzzer `-seed`，`fuzz_log_digest` 为 `fuzz/fuzz.log` 的 SHA-256，`crash_seeds` 每项 `{path, sha256}`；与 `fuzz/provenance.json` 同口径，`crash_count` 等于 `crash_seeds` 项数，每项与一个 `crash_seed` 文件及 provenance 中同 `path`/`sha256` 的记录一一对应；只是搜索观测，不产 verdict |
 | `evidence_refs` | 位于 `report` 发现项或 `experiments[]` 内的可解析构建、回放、fuzz 引用（语法见第 11 节）；越界、日志缺失或摘要不符视为不可解析并失败 |
 
 `replays` 在完整 validation 报告中必须恰好覆盖两版的 `normal`、`candidate_1`、`candidate_2` 六项。campaign report 的 `verdict` 与 `reason_code` 为 null，不要求六次回放，但必须记录搜索观测、候选 seed 与 provenance。`spent_seconds` 与 `spent_fuzz_seconds` 必须等于 `budget_charges` 中 `seconds` 与 `fuzz_seconds` 的 family 汇总；不一致即证据不可对账。

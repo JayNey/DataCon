@@ -493,3 +493,42 @@ def test_validation_rejects_parser_fallback_for_custom_or_multi_output_build_spe
             plan_build_spec=None,
         )
     assert raised.value.reason_code == "INVALID_MANIFEST"
+
+
+FUZZER_ARTIFACT = b"fuzzer\n"
+FUZZER_DIGEST = "sha256:" + hashlib.sha256(FUZZER_ARTIFACT).hexdigest()
+
+
+def test_guided_validation_binds_campaign_parser_and_fuzzer(tmp_path):
+    """改9 (T12 C): build_ref binds both campaign products per version."""
+    build_ref = _campaign_build_ref()
+    for version in VERSIONS:
+        build_ref["artifacts"][version]["fuzzer_digest"] = FUZZER_DIGEST
+    plan = _with_build_spec_outputs(ROUND_PLAN_V2, ["parser", "fuzzer"])
+    plan["build_ref"] = deepcopy(build_ref)
+    root = _write_validation(tmp_path, "reuse-both", build_ref=build_ref, plan=plan)
+    for version in VERSIONS:
+        _add_manifested_file(root, f"build/{version}/fuzzer", FUZZER_ARTIFACT)
+
+    verified = verify_bundle(root)
+    assert verified.manifest["build_ref"]["artifacts"]["fixed"]["fuzzer_digest"] == FUZZER_DIGEST
+    assert verified.file_data["build/vulnerable/fuzzer"] == FUZZER_ARTIFACT
+
+    # A rewritten fuzzer is a REUSE_MISMATCH, like a rewritten parser.
+    _rewrite_manifested_file(root, "build/fixed/fuzzer", b"other fuzzer\n")
+    with pytest.raises(BundleError) as raised:
+        verify_bundle(root)
+    assert raised.value.reason_code == "REUSE_MISMATCH"
+    assert "fuzzer_digest" in raised.value.message
+
+    # The fuzzer must be bound for both versions or neither.
+    half = deepcopy(build_ref)
+    del half["artifacts"]["fixed"]["fuzzer_digest"]
+    with pytest.raises(ValueError, match="both versions or neither"):
+        plan_digest({**plan, "build_ref": half})
+    # A missing fuzzer product does not verify.
+    missing = _write_validation(
+        tmp_path, "reuse-missing-fuzzer", build_ref=build_ref, plan=plan
+    )
+    with pytest.raises(BundleError, match="campaign products"):
+        verify_bundle(missing)

@@ -255,7 +255,18 @@ def claim_next(
     lease_seconds: int = LEASE_SECONDS,
     execute: bool = True,
     job_contract_version: int = 1,
+    v2_worker_scope: bool = False,
 ) -> dict | None:
+    """Claim the next workable job.
+
+    ``v2_worker_scope`` (T12 B, P2 B6) narrows a v2 claim to what
+    ``workflow.run_worker`` can finish for a v2 row: execution
+    (READY/RUNNING/ARCHIVING), synchronization (unsynced READY/BLOCKED or
+    AWAITING_REVIEW) and an expired review window. v2 rows in QUEUED,
+    PREPARING or an open AWAITING_REVIEW window belong to the v2 preparation
+    entry and are left untouched instead of being claimed and released in a
+    loop.
+    """
     if not isinstance(worker_id, str) or not worker_id.strip():
         raise StateError("worker_id must be non-empty")
     if type(lease_seconds) is not int or not 1 <= lease_seconds <= 86400:
@@ -330,6 +341,16 @@ def claim_next(
                           )
                       ))
               )"""
+    v2_scope_clause = ""
+    if job_contract_version == 2 and v2_worker_scope:
+        v2_scope_clause = """
+              AND state NOT IN ('QUEUED', 'PREPARING')
+              AND NOT (
+                  state = 'AWAITING_REVIEW'
+                  AND workflow_synced = true
+                  AND (review_deadline_at IS NULL
+                       OR review_deadline_at > clock_timestamp())
+              )"""
     with _connect(dsn) as connection:
         # A claim may run while a release is being promoted. Take the shared
         # side of the release lock for this transaction so a promotion that
@@ -367,6 +388,7 @@ def claim_next(
                         OR lease_expires_at <= clock_timestamp()))
                {execution_clause})
                {v2_parent_gate}
+               {v2_scope_clause}
             ORDER BY submitted_at
             FOR UPDATE SKIP LOCKED
             LIMIT 1
@@ -2178,8 +2200,13 @@ def finish_execution(
     evidence_error: str | None = None,
     last_error: str | None = None,
     stage: str = "done",
+    audit_detail: Mapping[str, Any] | None = None,
 ) -> bool:
     """Atomically commit a terminal execution state and fence older writers.
+
+    ``audit_detail`` adds fine-grained, non-terminal context (for example the
+    §10 ``sub_reason`` of a ``POLICY_DENIED`` corpus ceiling) to the terminal
+    audit event; it never overrides the fixed keys and adds no reason code.
 
     The generation is advanced so a worker that lost the lease can never write
     again. A terminal that did not archive a bundle becomes FAILED and clears
@@ -2296,6 +2323,10 @@ def finish_execution(
             stage=stage,
             reason_code=reason_code,
             detail={
+                **{
+                    str(key): value
+                    for key, value in (audit_detail or {}).items()
+                },
                 "generation": generation,
                 "state": state,
                 "verdict": verdict,
@@ -6735,6 +6766,16 @@ def _family_archive_disposition(
     campaigns = [
         child for child in children if child["job_kind"] == "campaign"
     ]
+    if (
+        not rounds
+        and len(campaigns) == 1
+        and campaigns[0]["state"] in ("BLOCKED", "FAILED")
+    ):
+        # T12 B: a campaign that was blocked (for example HARNESS_REJECTED or
+        # a corpus POLICY_DENIED) or failed can never seed a round, so the
+        # family cannot make progress: end it with the campaign's reason.
+        family_state, reason = _family_terminal_state(campaigns[0])
+        return ("terminal", family_state, reason)
     no_next_round = False
     if len(campaigns) == 1:
         decision = _family_transition_decision_at(
@@ -7519,6 +7560,91 @@ def _check_transition_point(
             f"round {after_round_no} must be INCONCLUSIVE or policy-denied "
             "before the family decides"
         )
+
+
+def family_transition_decision(
+    dsn: str, family_id: UUID, *, campaign_job_id: UUID, after_round_no: int
+) -> dict[str, Any] | None:
+    """Return the decision already recorded at one point, or None (read-only)."""
+    with _connect(dsn) as connection:
+        row = _family_transition_decision_at(
+            connection, family_id, campaign_job_id, after_round_no
+        )
+    return None if row is None else _transition_decision_record(family_id, row)
+
+
+def family_transition_inputs(dsn: str, family_id: UUID) -> dict[str, Any] | None:
+    """Read what the runtime needs to decide a guided family transition.
+
+    Returns None unless ``family_id`` is a v2 guided family. The snapshot is
+    lock-free and advisory: every write it leads to (decision, child,
+    admission) re-validates under the family lock.
+    """
+    with _connect(dsn) as connection:
+        family = connection.execute(
+            "SELECT job_id, state, job_kind, job_contract_version, request "
+            "FROM jobs WHERE job_id = %s",
+            (family_id,),
+        ).fetchone()
+        if (
+            family is None
+            or family["job_contract_version"] != 2
+            or family["job_kind"] != "family"
+            or _family_mode(family["request"]) != "guided"
+        ):
+            return None
+        children = [dict(row) for row in _family_children(connection, family_id)]
+        tail = _family_approval_chain_tail(connection, family_id)
+        envelope = None
+        if tail is not None:
+            row = connection.execute(
+                "SELECT envelope_json FROM family_envelopes "
+                "WHERE family_id = %s AND envelope_digest = %s "
+                "AND status = 'approved'",
+                (family_id, tail[1]),
+            ).fetchone()
+            envelope = None if row is None else row["envelope_json"]
+        campaign_plan = None
+        campaigns = [child for child in children if child["job_kind"] == "campaign"]
+        if len(campaigns) == 1:
+            row = connection.execute(
+                "SELECT plan FROM plans WHERE job_id = %s",
+                (campaigns[0]["job_id"],),
+            ).fetchone()
+            campaign_plan = None if row is None else row["plan"]
+        pending = connection.execute(
+            "SELECT 1 FROM family_envelopes WHERE family_id = %s "
+            "AND status = 'pending' LIMIT 1",
+            (family_id,),
+        ).fetchone()
+        admitted = _family_admitted_job_ids(connection, family_id)
+    return {
+        "family": dict(family),
+        "children": children,
+        "campaigns": campaigns,
+        "campaign_plan": campaign_plan,
+        "approval_tail": None if tail is None else {
+            "approval_digest": tail[0],
+            "envelope_digest": tail[1],
+        },
+        "envelope": envelope,
+        "pending_envelope": pending is not None,
+        "admitted_job_ids": admitted,
+    }
+
+
+def guided_aggregating_families(dsn: str) -> list[UUID]:
+    """List v2 guided families still AGGREGATING (transition sweep input)."""
+    with _connect(dsn) as connection:
+        rows = connection.execute(
+            "SELECT job_id FROM jobs WHERE job_contract_version = 2 "
+            "AND job_kind = 'family' AND state = 'AGGREGATING' "
+            "AND COALESCE(request->'exploration'->>'mode', 'fixed') = 'guided' "
+            "AND EXISTS (SELECT 1 FROM jobs c WHERE c.parent_job_id = jobs.job_id "
+            "AND c.job_kind = 'campaign' AND c.state = 'COMPLETED') "
+            "ORDER BY submitted_at, job_id"
+        ).fetchall()
+    return [row["job_id"] for row in rows]
 
 
 def record_family_transition_decision(

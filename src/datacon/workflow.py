@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
+import hashlib
+import logging
 import os
 import socket
 import time
-from typing import Any, TypedDict
+from typing import Any, Mapping, TypedDict
 from uuid import UUID
 
 import psycopg
@@ -15,7 +18,9 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, interrupt
 
 from datacon import contracts
+from datacon import evidence
 from datacon import execution
+from datacon import fuzz as fuzz_rules
 from datacon import jsonutil
 from datacon import state as state_store
 from datacon.agents.analysis import (
@@ -24,7 +29,8 @@ from datacon.agents.analysis import (
     RetryableAnalysisError,
     analyze_case,
 )
-from datacon.cases import TransientCaseError
+from datacon.cases import CaseConfigurationError, TransientCaseError, load_registry
+from datacon.experiment_spec import ExperimentSpecError, parse_experiment_spec
 from datacon.orchestration import (
     AdmissionDecision as AdmissionDecision,
     ArchiveRecord as ArchiveRecord,
@@ -66,6 +72,8 @@ from datacon.orchestration import (
     run_idempotent as run_idempotent,
 )
 from datacon.tools.source import TransientSourceToolError
+
+logger = logging.getLogger(__name__)
 
 
 class RetryableWorkflowError(RuntimeError):
@@ -979,6 +987,409 @@ def recover_unarchived_blocked_rounds(
     return archived
 
 
+# ---------------------------------------------------------------------------
+# T12 B1 (改8/改9): family-level transitions after a campaign or a round.
+# ---------------------------------------------------------------------------
+
+_TERMINAL_CHILD_STATES = frozenset(
+    {"COMPLETED", "REPRODUCED", "NOT_REPRODUCED", "INCONCLUSIVE", "BLOCKED", "FAILED"}
+)
+_POLICY_DENIED_REASONS = frozenset(
+    {"ENVELOPE_VIOLATION", "ADMISSION_DENIED", "HARNESS_REJECTED"}
+)
+
+
+def _verified_campaign_bundle(campaign: Mapping[str, Any]) -> Any:
+    """The campaign's archived bundle, verified offline and digest-bound, or None."""
+    path = campaign.get("evidence_path")
+    if campaign.get("evidence_status") != "archived" or not isinstance(path, str):
+        return None
+    try:
+        verified = evidence.verify_bundle(path)
+    except (evidence.BundleError, OSError):
+        return None
+    if evidence.canonical_manifest_digest(verified.manifest) != campaign.get(
+        "evidence_digest"
+    ):
+        return None
+    if verified.manifest.get("bundle_kind") != "campaign":
+        return None
+    return verified
+
+
+def campaign_candidate_seeds(campaign: Mapping[str, Any]) -> list[dict[str, Any]] | None:
+    """Return the campaign's frozen crash seeds from its verified bundle.
+
+    The archived campaign bundle is the only source: it is verified offline,
+    its manifest digest must equal the job's ``evidence_digest``, and every
+    seed must carry complete provenance bound to its bytes and this campaign.
+    Returns None when the bundle cannot be trusted (no decision is taken).
+    """
+    verified = _verified_campaign_bundle(campaign)
+    if verified is None:
+        return None
+    raw = verified.file_data.get(fuzz_rules.FUZZ_PROVENANCE_PATH)
+    if raw is None:
+        return None
+    try:
+        provenance = jsonutil.loads_strict(raw)
+    except ValueError:
+        return None
+    records = provenance.get("crash_seeds") if isinstance(provenance, Mapping) else None
+    if not isinstance(records, list):
+        return None
+    seeds: list[dict[str, Any]] = []
+    log = verified.file_data.get(fuzz_rules.FUZZ_LOG_PATH, b"")
+    for record in records:
+        path_value = record.get("path") if isinstance(record, Mapping) else None
+        data = (
+            verified.file_data.get(path_value) if isinstance(path_value, str) else None
+        )
+        try:
+            checked = fuzz_rules.validate_crash_seed_record(
+                record,
+                data=data,
+                campaign_job_id=str(campaign["job_id"]),
+            )
+        except ValueError:
+            return None
+        if data is None:
+            return None
+        # The validated provenance record stays exactly as archived; the
+        # fuzz-log line used for the ExperimentSpec ref lives beside it.
+        seeds.append(
+            {
+                "sha256": checked["sha256"],
+                "campaign_job_id": checked["campaign_job_id"],
+                "log_line": _crash_log_line(log, data),
+                "record": checked,
+            }
+        )
+    return seeds
+
+
+def _crash_log_line(log: bytes, data: bytes) -> int:
+    """The fuzz log line that names this crash (libFuzzer ``crash-<sha1>``)."""
+    marker = ("crash-" + hashlib.sha1(data).hexdigest()).encode("ascii")
+    for number, line in enumerate(log.splitlines(), start=1):
+        if marker in line:
+            return number
+    return 1
+
+
+def _round_experiment(
+    plan: Mapping[str, Any],
+    envelope: Mapping[str, Any],
+    seed: Mapping[str, Any],
+) -> dict[str, Any]:
+    """The ExperimentSpec for validating one campaign crash seed (§4)."""
+    analysis = plan.get("analysis")
+    symbols = analysis.get("symbols") if isinstance(analysis, Mapping) else None
+    symbol = next(
+        (
+            item
+            for item in (symbols or [])
+            if isinstance(item, Mapping) and item.get("role") == "definition"
+        ),
+        (symbols or [None])[0],
+    )
+    if not isinstance(symbol, Mapping):
+        raise ValueError("the campaign plan names no target symbol")
+    families = envelope.get("allowed_mutation_families")
+    limits = envelope.get("mutation_limits")
+    if not families or not isinstance(limits, Mapping):
+        raise ValueError("the envelope allows no mutation family")
+    experiment = {
+        "target_symbol": symbol["name"],
+        "target_path": symbol["path"],
+        "target_line": symbol.get("start_line", 1),
+        "input_family": families[0],
+        "mutation_constraints": {
+            "allowed_ops": list(limits["allowed_ops"]),
+            "max_input_bytes": limits["max_input_bytes"],
+        },
+        "expected_signature": dict(plan["asan_signature"]),
+        "rationale": (
+            "validate campaign crash seed "
+            f"{seed['sha256']} from campaign {seed['campaign_job_id']}"
+        ),
+        "evidence_refs": [f"log/fuzz:0#L{seed.get('log_line', 1)}"],
+        "confidence": "medium",
+    }
+    parse_experiment_spec(experiment)
+    return experiment
+
+
+def _round_plan(
+    campaign_plan: Mapping[str, Any],
+    *,
+    round_no: int,
+    approval_tail: Mapping[str, Any],
+    envelope: Mapping[str, Any],
+    normal_digest: str,
+    seed_digest: str,
+    experiment_digest: str,
+    build_ref: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Derive the next round's frozen plan from the human-approved campaign plan.
+
+    Only the round identity, the approval chain tail, the inputs and the
+    experiment change; build, case and policy bindings are the approved ones.
+    ``build_ref`` (stage C) binds the campaign's parser and fuzzer per
+    version so the round reuses them and never rebuilds.
+    """
+    plan = deepcopy(dict(campaign_plan))
+    plan.update(
+        {
+            "round_no": round_no,
+            "parent_approval_digest": approval_tail["approval_digest"],
+            "envelope_digest": approval_tail["envelope_digest"],
+            "harness_digest": envelope["harness_digest"],
+            "inputs": {"normal": normal_digest, "candidate": seed_digest},
+            "experiment_digest": experiment_digest,
+            "build_ref": deepcopy(dict(build_ref)),
+        }
+    )
+    contracts.plan_digest(plan)
+    return plan
+
+
+def _transition_point(
+    snapshot: Mapping[str, Any],
+) -> tuple[int, Mapping[str, Any]] | None:
+    """Return ``(after_round_no, campaign)`` when the family stands at a point."""
+    campaigns = snapshot["campaigns"]
+    if len(campaigns) != 1:
+        return None
+    campaign = campaigns[0]
+    if campaign["state"] != "COMPLETED" or campaign["evidence_status"] != "archived":
+        return None
+    children = snapshot["children"]
+    if any(
+        child["state"] not in _TERMINAL_CHILD_STATES
+        or (child["state"] == "BLOCKED" and not child["workflow_synced"])
+        or (child["job_kind"] == "round" and child["evidence_status"] is None)
+        for child in children
+    ):
+        return None
+    rounds = sorted(
+        (child for child in children if child["job_kind"] == "round"),
+        key=lambda child: child["round_no"],
+    )
+    if not rounds:
+        return 0, campaign
+    last = rounds[-1]
+    policy_denied = (
+        last["state"] == "BLOCKED"
+        and last["reason_code"] in _POLICY_DENIED_REASONS
+        and str(last["job_id"]) not in snapshot["admitted_job_ids"]
+    )
+    if last["state"] != "INCONCLUSIVE" and not policy_denied:
+        # A verdict, a failure or a non-policy block: convergence decides.
+        return None
+    return int(last["round_no"]), campaign
+
+
+def _normal_input_digest(campaign_plan: Mapping[str, Any], case_root: str | None) -> str:
+    registry = load_registry(case_root)
+    case = registry.case(campaign_plan["case_id"])
+    relative = case.manifest_case["inputs"]["normal"]
+    return jsonutil.require_digest(
+        case.manifest["materials"][relative], "normal input digest"
+    )
+
+
+def advance_family_transition(
+    dsn: str,
+    family_id: UUID | str,
+    *,
+    case_root: str | None = None,
+    run_root: str | None = None,
+) -> dict[str, Any] | None:
+    """Take the family-level decision at the family's current decision point.
+
+    Edge #23/#24 (``after_round_no=0``, after the campaign archived) and edge
+    #26 (``after_round_no=k``, after round k archived INCONCLUSIVE or was
+    policy-denied) share this one entry. With a remaining candidate seed the
+    runtime gates the derivation (``check_round_derivation``), records
+    ``next_round`` and derives + admits round k+1 through
+    ``derive_and_admit_round``; with no seed left it records
+    ``no_next_round`` (``NO_CANDIDATE_SEED`` at 0, ``NO_REMAINING_SEEDS``
+    after a round) and ``converge_families`` archives the family.
+
+    The decision is recorded *before* the child: ``_check_transition_point``
+    accepts a point only while no later round exists, so recording after the
+    child would always be refused. Re-entry is idempotent: a recorded
+    ``no_next_round`` is final, a recorded ``next_round`` whose round is
+    missing (crash between the two writes) re-derives exactly the same
+    deterministic plan, and an existing child is never duplicated.
+    """
+    family_uuid = UUID(str(family_id))
+    snapshot = state_store.family_transition_inputs(dsn, family_uuid)
+    if snapshot is None or snapshot["family"]["state"] != "AGGREGATING":
+        return None
+    if snapshot["pending_envelope"]:
+        return None
+    point = _transition_point(snapshot)
+    if point is None:
+        return None
+    after_round_no, campaign = point
+    campaign_id = UUID(str(campaign["job_id"]))
+    seeds = campaign_candidate_seeds(campaign)
+    if seeds is None:
+        logger.warning("campaign %s bundle is not trustworthy; no transition", campaign_id)
+        return None
+    remaining = len(seeds) - after_round_no
+    next_round_no = after_round_no + 1
+    existing = state_store.family_transition_decision(
+        dsn, family_uuid, campaign_job_id=campaign_id, after_round_no=after_round_no
+    )
+    if existing is not None and existing["decision"] == "no_next_round":
+        return {"decision": existing, "derived": None}
+    if existing is None and remaining <= 0:
+        decision = state_store.record_family_transition_decision(
+            dsn,
+            family_uuid,
+            campaign_job_id=campaign_id,
+            after_round_no=after_round_no,
+            decision="no_next_round",
+            reason_code=(
+                "NO_CANDIDATE_SEED" if after_round_no == 0 else "NO_REMAINING_SEEDS"
+            ),
+            candidate_seed_count=0,
+        )
+        return {"decision": decision, "derived": None}
+    if remaining <= 0:
+        # A stored next_round that the seeds cannot back: never invent one.
+        return {"decision": existing, "derived": None}
+    envelope = snapshot["envelope"]
+    tail = snapshot["approval_tail"]
+    campaign_plan = snapshot["campaign_plan"]
+    if not isinstance(envelope, Mapping) or tail is None or not isinstance(
+        campaign_plan, Mapping
+    ):
+        return None
+    seed = seeds[after_round_no]
+    verified = _verified_campaign_bundle(campaign)
+    if verified is None:
+        return None
+    try:
+        build_ref = execution.campaign_build_ref(
+            verified.file_data,
+            campaign_job_id=str(campaign_id),
+            plan=campaign_plan,
+        )
+        experiment = _round_experiment(campaign_plan, envelope, seed)
+        plan = _round_plan(
+            campaign_plan,
+            round_no=next_round_no,
+            approval_tail=tail,
+            envelope=envelope,
+            normal_digest=_normal_input_digest(campaign_plan, case_root),
+            seed_digest=seed["sha256"],
+            experiment_digest=jsonutil.digest_json(experiment),
+            build_ref=build_ref,
+        )
+    except (CaseConfigurationError, ExperimentSpecError, KeyError, TypeError, ValueError) as error:
+        logger.warning("family %s cannot derive round %s: %s", family_uuid, next_round_no, error)
+        return None
+    if existing is None:
+        gate = state_store.check_round_derivation(
+            dsn, family_id=family_uuid, round_no=next_round_no
+        )
+        if not gate.allowed:
+            # Rounds or budget exhausted: convergence archives the family; any
+            # other refusal (child not terminal, pending envelope) is retried.
+            return {"decision": None, "derived": None, "gate": gate.sub_reason}
+        existing = state_store.record_family_transition_decision(
+            dsn,
+            family_uuid,
+            campaign_job_id=campaign_id,
+            after_round_no=after_round_no,
+            decision="next_round",
+            candidate_seed_count=remaining,
+            next_round_no=next_round_no,
+        )
+    derived = derive_and_admit_round(
+        dsn,
+        family_id=family_uuid,
+        round_no=next_round_no,
+        plan=plan,
+        envelope=dict(envelope),
+        seed_digest=seed["sha256"],
+        experiment=experiment,
+        recomputable=True,
+        campaign_bundle_digest=campaign["evidence_digest"],
+        run_root=run_root,
+    )
+    return {"decision": existing, "derived": derived}
+
+
+def advance_family_transitions(
+    dsn: str, *, case_root: str | None = None, run_root: str | None = None
+) -> int:
+    """Worker sweep: take every pending guided family decision (crash-safe)."""
+    advanced = 0
+    for family_id in state_store.guided_aggregating_families(dsn):
+        try:
+            outcome = advance_family_transition(
+                dsn, family_id, case_root=case_root, run_root=run_root
+            )
+        except state_store.StateError as error:
+            # A decision the family state no longer admits (for example a
+            # concurrent writer moved the point): skip, the next sweep re-reads.
+            logger.warning("family %s transition skipped: %s", family_id, error)
+            continue
+        if outcome is not None and (
+            outcome.get("decision") is not None or outcome.get("derived") is not None
+        ):
+            advanced += 1
+    return advanced
+
+
+def _sync_v2_claim(
+    dsn: str, claimed: dict[str, Any], *, run_root: str | None
+) -> dict[str, Any]:
+    """Synchronize a claimed v2 row that has nothing to execute.
+
+    The v1 LangGraph Supervisor never runs a v2 row. A v2 claim that is not an
+    execution (an unsynchronized BLOCKED family or child) only needs its
+    blocked bundle archived when it has none, then its lease released.
+    """
+    job_id = claimed["job_id"]
+    generation = claimed["generation"]
+    if claimed["state"] == "AWAITING_REVIEW":
+        # Same entry as the v1 Supervisor's await_review node: an expired
+        # first-plan window converges to REVIEW_EXPIRED (and its family).
+        try:
+            state_store.expire_review(dsn, job_id, generation)
+        except state_store.StaleGeneration:
+            pass
+    elif claimed["state"] == "BLOCKED" and claimed.get("evidence_status") is None:
+        try:
+            execution.record_blocked(
+                dsn,
+                job_id,
+                reason_code=claimed.get("reason_code") or "INVALID_STATE",
+                message=claimed.get("last_error") or "v2 job blocked",
+                generation=generation,
+                run_root=run_root,
+            )
+        except state_store.StateError:
+            pass
+    try:
+        state_store.finalize_workflow(dsn, job_id, generation)
+    except state_store.StateError:
+        pass
+    job = state_store.load_job(dsn, job_id)
+    return {
+        "processed": 1,
+        "job_id": str(job_id),
+        "state": job["state"] if job else None,
+        "workflow": "synchronized",
+    }
+
+
 def _worker_id() -> str:
     return os.getenv("DATACON_WORKER_ID") or f"{socket.gethostname()}:{os.getpid()}"
 
@@ -1013,12 +1424,36 @@ def run_worker(
             recovered_blocked_rounds = recover_unarchived_blocked_rounds(
                 dsn, run_root=run_root
             )
+            # T12 B1: take pending family decisions (campaign point and
+            # round points) before sealing, so a family with a remaining seed
+            # derives its next round and a seedless one records no_next_round.
+            # Re-running the sweep after a crash is idempotent.
+            transitions = advance_family_transitions(
+                dsn, case_root=case_root, run_root=run_root
+            )
             # T12/D43 crash-recovery sweep: converge families whose children
             # are terminal, archived, and whose charges are accounted for.
             family_sweep = state_store.converge_families_detailed(dsn)
             claimed = state_store.claim_next(
                 dsn, worker, lease_seconds=lease_seconds, execute=execute
             )
+            claimed_v2 = False
+            if claimed is None:
+                # v2 children (campaign/round) are claimed through the v2 gate
+                # after v1 work: one claim per poll keeps the single execution
+                # slot, and the gate keeps release/lease/generation rules.
+                # Only execution claims depend on ``execute``; v2 sync and
+                # review expiry run for every worker. The worker scope never
+                # claims a v2 row it cannot finish (P2 B6).
+                claimed = state_store.claim_next(
+                    dsn,
+                    worker,
+                    lease_seconds=lease_seconds,
+                    execute=execute,
+                    job_contract_version=2,
+                    v2_worker_scope=True,
+                )
+                claimed_v2 = claimed is not None
             if claimed is None:
                 if once:
                     return {
@@ -1029,25 +1464,65 @@ def run_worker(
                         "rounds_recovered": recovered_rounds,
                         "blocked_rounds_archived": recovered_blocked_rounds,
                         "charges_recovered": recovered_charges,
+                        "family_transitions": transitions,
                     }
                 time.sleep(poll_seconds)
                 continue
-            result = _process_claim(
-                graph,
-                dsn,
-                claimed,
-                case_root=case_root,
-                execute=execute,
-                run_root=run_root,
-            )
+            if claimed_v2:
+                if claimed["state"] in ("RUNNING", "ARCHIVING"):
+                    result = _run_execution_claim(
+                        dsn, claimed, case_root=case_root, run_root=run_root
+                    )
+                    # The campaign/round just archived: take its family
+                    # decision now instead of waiting for the next poll.
+                    _advance_after_child(
+                        dsn, claimed, case_root=case_root, run_root=run_root
+                    )
+                else:
+                    result = _sync_v2_claim(dsn, claimed, run_root=run_root)
+            else:
+                result = _process_claim(
+                    graph,
+                    dsn,
+                    claimed,
+                    case_root=case_root,
+                    execute=execute,
+                    run_root=run_root,
+                )
             result["expired_envelopes"] = expired_envelopes
             result["families_converged"] = len(family_sweep.converged)
             result["families_terminated"] = len(family_sweep.terminated)
             result["rounds_recovered"] = recovered_rounds
             result["blocked_rounds_archived"] = recovered_blocked_rounds
             result["charges_recovered"] = recovered_charges
+            result["family_transitions"] = transitions
             if once:
                 return result
+
+
+def _advance_after_child(
+    dsn: str,
+    claimed: Mapping[str, Any],
+    *,
+    case_root: str | None,
+    run_root: str | None,
+) -> None:
+    job = state_store.load_job(dsn, claimed["job_id"])
+    if job is None or job.get("family_id") is None:
+        return
+    if job.get("job_kind") not in ("campaign", "round"):
+        return
+    try:
+        advance_family_transition(
+            dsn, job["family_id"], case_root=case_root, run_root=run_root
+        )
+    except state_store.StateError as error:
+        logger.warning(
+            "family %s transition after %s deferred: %s",
+            job["family_id"],
+            claimed["job_id"],
+            error,
+        )
 
 
 def _run_execution_claim(

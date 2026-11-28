@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+from pathlib import Path as _Path
+import sys as _sys
 import threading
 from uuid import uuid4
 
@@ -20,6 +22,24 @@ import pytest
 from psycopg.types.json import Jsonb
 
 from datacon import evidence, state, workflow
+from datacon import execution as _execution
+from datacon import fuzz as _fuzz
+
+_CONTRACT_DIR = str(_Path(__file__).resolve().parents[1] / "contract")
+if _CONTRACT_DIR not in _sys.path:
+    _sys.path.append(_CONTRACT_DIR)
+
+from test_build_spec_execution import (  # noqa: E402
+    FIXTURE_CASES as _FIXTURE_CASES,
+    _configure_isolated_roots,
+)
+from test_fuzz import (  # noqa: E402
+    _Clock,
+    _FakeCampaignSandbox,
+    _cmake_compile_commands_bytes,
+    FACE_FLAGS,
+    guided_campaign_plan,
+)
 
 pytestmark = pytest.mark.postgres
 
@@ -1699,3 +1719,638 @@ def test_worker_scan_charges_before_family_is_sealed(
         ).fetchone()[0]
         == 1
     )
+
+
+# ---------------------------------------------------------------------------
+# T12 B1 (改9 增补): the worker runs a v2 campaign end to end and takes the
+# family decision at the campaign point (edges #20/#23/#24).
+# ---------------------------------------------------------------------------
+
+def _seed_ready_campaign(database, *, max_fuzz_seconds=60, build_spec=None):
+    """A guided family whose human-approved campaign child is READY to claim."""
+    job, plan, plan_digest, review, envelope = guided_campaign_plan(
+        max_fuzz_seconds=max_fuzz_seconds, build_spec=build_spec
+    )
+    family_id = uuid4()
+    campaign_id = uuid4()
+    plan = json.loads(json.dumps(plan))
+    plan["family_id"] = plan["parent_job_id"] = str(family_id)
+    from datacon import contracts as _contracts
+
+    plan_digest = _contracts.plan_digest(plan)
+    request = json.loads(json.dumps(job["request"]))
+    envelope_digest = _contracts.envelope_digest(envelope)
+    connection = database.connection
+    connection.execute(
+        "INSERT INTO jobs (job_id, request, state, stage, submitted_at, "
+        "job_contract_version, family_id, job_kind, parent_job_id, round_no, "
+        "generation, workflow_synced) VALUES (%s, %s, 'AGGREGATING', 'family', "
+        "clock_timestamp(), 2, %s, 'family', NULL, NULL, 1, true)",
+        (family_id, Jsonb(request), family_id),
+    )
+    connection.execute(
+        "INSERT INTO family_envelopes (envelope_id, family_id, envelope_digest, "
+        "envelope_json, status, review_deadline_at) "
+        "VALUES (%s, %s, %s, %s, 'approved', clock_timestamp())",
+        (uuid4(), family_id, envelope_digest, Jsonb(envelope)),
+    )
+    approval_digest = "sha256:" + hashlib.sha256(str(family_id).encode()).hexdigest()
+    connection.execute(
+        "INSERT INTO family_approvals (approval_id, family_id, approval_digest, "
+        "envelope_digest, first_plan_digest, reviewer_id, decided_at, supersedes) "
+        "VALUES (%s, %s, %s, %s, %s, 'reviewer-01', clock_timestamp(), NULL)",
+        (uuid4(), family_id, approval_digest, envelope_digest, plan_digest),
+    )
+    connection.execute(
+        "INSERT INTO reviews (review_id, job_id, plan_digest, reviewer_id, "
+        "decision, review_deadline_at, decided_at) VALUES (%s, %s, %s, "
+        "'reviewer-01', 'approve', clock_timestamp(), clock_timestamp())",
+        (uuid4(), family_id, plan_digest),
+    )
+    state.initialize_budget_ledger(
+        database.dsn,
+        family_id,
+        max_total_seconds=envelope["max_total_seconds"],
+        max_fuzz_seconds=envelope["max_fuzz_seconds"],
+    )
+    connection.execute(
+        "INSERT INTO jobs (job_id, request, state, stage, submitted_at, "
+        "job_contract_version, family_id, job_kind, parent_job_id, round_no, "
+        "generation, workflow_synced) VALUES (%s, %s, 'READY', 'review', "
+        "clock_timestamp(), 2, %s, 'campaign', %s, NULL, 0, true)",
+        (campaign_id, Jsonb(request), family_id, family_id),
+    )
+    connection.execute(
+        "INSERT INTO plans (plan_id, job_id, plan_digest, plan, summary) "
+        "VALUES (%s, %s, %s, %s, %s)",
+        (uuid4(), campaign_id, plan_digest, Jsonb(plan), Jsonb({})),
+    )
+    return family_id, campaign_id, plan, approval_digest, envelope
+
+
+def _install_fake_campaign_sandbox(monkeypatch, plan, *, crashes, fixed_candidate_stdout=None):
+    clock = _Clock()
+    monkeypatch.setattr(_execution, "STEP_CLOCK", clock)
+    created = []
+
+    def _factory(**_kwargs):
+        sandbox = _FakeCampaignSandbox(
+            crashes=crashes,
+            clock=clock,
+            fixed_candidate_stdout=fixed_candidate_stdout,
+            image_digest=plan["image_digest"],
+            build_recipe_digest=plan["build_recipe_digest"],
+            faces={
+                version: _cmake_compile_commands_bytes(flags=list(FACE_FLAGS))
+                for version in ("vulnerable", "fixed")
+            },
+            face_name="compile_commands.json",
+        )
+        created.append(sandbox)
+        return sandbox
+
+    monkeypatch.setattr(_execution, "DockerSandbox", _factory)
+    return created
+
+
+def _transition_events(database, family_id):
+    return [
+        row[0]
+        for row in database.connection.execute(
+            "SELECT detail FROM audit_events WHERE job_id = %s "
+            "AND event_type = 'family_transition_decided' ORDER BY event_id",
+            (family_id,),
+        ).fetchall()
+    ]
+
+
+def test_worker_runs_v2_campaign_and_derives_admitted_round(
+    isolated_database, tmp_path, monkeypatch
+):
+    """v2 claim → campaign → COMPLETED → next_round@0 → round 1 READY + admitted."""
+    database = isolated_database
+    run_root, _evidence_root = _configure_isolated_roots(tmp_path, monkeypatch)
+    family_id, campaign_id, plan, approval_digest, envelope = _seed_ready_campaign(
+        database
+    )
+    sandboxes = _install_fake_campaign_sandbox(
+        monkeypatch, plan, crashes=(b"WXYZ\n", b"QRST\n")
+    )
+
+    result = workflow.run_worker(
+        database.dsn, once=True, case_root=str(_FIXTURE_CASES), run_root=str(run_root)
+    )
+
+    assert result["job_id"] == str(campaign_id)
+    campaign = state.load_job(database.dsn, campaign_id)
+    assert campaign["state"] == "COMPLETED", campaign
+    assert campaign["verdict"] is None and campaign["reason_code"] is None
+    assert campaign["evidence_status"] == "archived"
+    assert campaign["lease_owner"] is None and campaign["workflow_synced"] is True
+    verified = evidence.verify_bundle(campaign["evidence_path"])
+    assert evidence.canonical_manifest_digest(verified.manifest) == campaign["evidence_digest"]
+    assert len(sandboxes) == 1 and len(sandboxes[0].fuzz_calls) == 1
+    assert sandboxes[0].replay_calls == []
+
+    # Fuzz time is charged to both budgets; general steps only to the total.
+    charges = database.connection.execute(
+        "SELECT charge_kind, seconds, fuzz_seconds FROM budget_charges "
+        "WHERE job_id = %s ORDER BY step_key",
+        (campaign_id,),
+    ).fetchall()
+    fuzz_rows = [row for row in charges if row[0] == "fuzz"]
+    assert len(fuzz_rows) == 1 and fuzz_rows[0][1] == fuzz_rows[0][2] >= 1
+    assert all(row[2] == 0 for row in charges if row[0] == "general")
+
+    # The family decided at the campaign point and derived round 1.
+    events = _transition_events(database, family_id)
+    assert len(events) == 1
+    assert events[0]["after_round_no"] == 0
+    assert events[0]["decision"] == "next_round"
+    assert events[0]["candidate_seed_count"] == 2
+    assert events[0]["next_round_no"] == 1
+    rounds = database.connection.execute(
+        "SELECT job_id, state, round_no FROM jobs WHERE parent_job_id = %s "
+        "AND job_kind = 'round'",
+        (family_id,),
+    ).fetchall()
+    assert len(rounds) == 1 and rounds[0][1] == "READY" and rounds[0][2] == 1
+    round_id = rounds[0][0]
+    admission = state.get_admission(database.dsn, round_id)
+    assert admission is not None and admission["approval_kind"] == "policy"
+    assert admission["seed_digest"] == _fuzz.validate_crash_seed_record(
+        json.loads(verified.file_data[_fuzz.FUZZ_PROVENANCE_PATH])["crash_seeds"][0]
+    )["sha256"]
+    round_plan = state.get_plan(database.dsn, round_id)["plan"]
+    assert round_plan["parent_approval_digest"] == approval_digest
+    assert round_plan["inputs"]["candidate"] == admission["seed_digest"]
+    # Stage C: the round reuses the campaign's two products per version.
+    build_ref = round_plan["build_ref"]
+    assert build_ref["source_job_id"] == str(campaign_id)
+    for version in ("vulnerable", "fixed"):
+        prefix = f"build/{version}/"
+        assert build_ref["artifacts"][version] == {
+            "artifact_digest": "sha256:" + hashlib.sha256(verified.file_data[prefix + "parser"]).hexdigest(),
+            "build_log_digest": "sha256:" + hashlib.sha256(verified.file_data[prefix + "build.log"]).hexdigest(),
+            "fuzzer_digest": "sha256:" + hashlib.sha256(verified.file_data[prefix + "fuzzer"]).hexdigest(),
+        }
+    assert state.load_job(database.dsn, family_id)["state"] == "AGGREGATING"
+
+    # Re-entry is idempotent: while round 1 is not terminal the family stands
+    # at no decision point, so nothing is decided or derived again.
+    assert workflow.advance_family_transition(
+        database.dsn, family_id, case_root=str(_FIXTURE_CASES), run_root=str(run_root)
+    ) is None
+    workflow.advance_family_transitions(
+        database.dsn, case_root=str(_FIXTURE_CASES), run_root=str(run_root)
+    )
+    assert len(_transition_events(database, family_id)) == 1
+    assert database.connection.execute(
+        "SELECT count(*) FROM jobs WHERE parent_job_id = %s AND job_kind = 'round'",
+        (family_id,),
+    ).fetchone()[0] == 1
+
+    # Crash window: next_round recorded but the child never created. The
+    # sweep re-derives exactly the same plan without a second decision.
+    database.connection.execute(
+        "DELETE FROM admissions WHERE job_id = %s", (round_id,)
+    )
+    database.connection.execute("DELETE FROM audit_events WHERE job_id = %s", (round_id,))
+    database.connection.execute("DELETE FROM plans WHERE job_id = %s", (round_id,))
+    database.connection.execute("DELETE FROM jobs WHERE job_id = %s", (round_id,))
+    swept = workflow.advance_family_transitions(
+        database.dsn, case_root=str(_FIXTURE_CASES), run_root=str(run_root)
+    )
+    assert swept == 1
+    rederived = database.connection.execute(
+        "SELECT p.plan_digest FROM jobs j JOIN plans p ON p.job_id = j.job_id "
+        "WHERE j.parent_job_id = %s AND j.job_kind = 'round'",
+        (family_id,),
+    ).fetchall()
+    from datacon import contracts as _contracts
+
+    assert [row[0] for row in rederived] == [_contracts.plan_digest(round_plan)]
+    assert len(_transition_events(database, family_id)) == 1
+
+
+def test_worker_archives_family_after_zero_seed_campaign(
+    isolated_database, tmp_path, monkeypatch
+):
+    """0 crash: no_next_round(NO_CANDIDATE_SEED)@0 then the sweep archives."""
+    database = isolated_database
+    run_root, _evidence_root = _configure_isolated_roots(tmp_path, monkeypatch)
+    family_id, campaign_id, plan, _approval, _envelope = _seed_ready_campaign(database)
+    _install_fake_campaign_sandbox(monkeypatch, plan, crashes=())
+
+    workflow.run_worker(
+        database.dsn, once=True, case_root=str(_FIXTURE_CASES), run_root=str(run_root)
+    )
+
+    assert state.load_job(database.dsn, campaign_id)["state"] == "COMPLETED"
+    events = _transition_events(database, family_id)
+    assert len(events) == 1
+    assert events[0]["decision"] == "no_next_round"
+    assert events[0]["reason_code"] == "NO_CANDIDATE_SEED"
+    assert events[0]["candidate_seed_count"] == 0
+    assert database.connection.execute(
+        "SELECT count(*) FROM jobs WHERE parent_job_id = %s AND job_kind = 'round'",
+        (family_id,),
+    ).fetchone()[0] == 0
+
+    second = workflow.run_worker(
+        database.dsn, once=True, case_root=str(_FIXTURE_CASES), run_root=str(run_root)
+    )
+
+    assert second["processed"] == 0
+    assert second["families_converged"] == 1
+    family = state.load_job(database.dsn, family_id)
+    assert family["state"] == "COMPLETED"
+    assert family["evidence_status"] == "archived"
+    index = json.loads(open(family["evidence_path"], "rb").read())
+    assert index["campaign"]["job_id"] == str(campaign_id)
+    assert index["rounds"] == []
+    assert len(_transition_events(database, family_id)) == 1
+
+
+def _finish_round_inconclusive(database, round_id, token):
+    database.connection.execute(
+        "UPDATE jobs SET state = 'INCONCLUSIVE', stage = 'done', "
+        "verdict = 'INCONCLUSIVE', verdict_reason = 'INTERMITTENT', "
+        "reason_code = 'INTERMITTENT', evidence_status = 'archived', "
+        "evidence_path = %s, evidence_digest = %s, workflow_synced = true "
+        "WHERE job_id = %s",
+        (f"/tmp/round-{round_id}", "sha256:" + token * 64, round_id),
+    )
+
+
+def test_round_points_use_the_next_seed_then_record_no_remaining_seeds(
+    isolated_database, tmp_path, monkeypatch
+):
+    """Edge #26: round k INCONCLUSIVE → next seed, until the seeds run out."""
+    database = isolated_database
+    run_root, _evidence_root = _configure_isolated_roots(tmp_path, monkeypatch)
+    family_id, campaign_id, plan, _approval, _envelope = _seed_ready_campaign(database)
+    _install_fake_campaign_sandbox(
+        monkeypatch, plan, crashes=(b"WXYZ\n", b"QRST\n")
+    )
+    workflow.run_worker(
+        database.dsn, once=True, case_root=str(_FIXTURE_CASES), run_root=str(run_root)
+    )
+    campaign = state.load_job(database.dsn, campaign_id)
+    seeds = workflow.campaign_candidate_seeds(campaign)
+    assert [seed["sha256"] for seed in seeds] == [
+        "sha256:" + hashlib.sha256(b"WXYZ\n").hexdigest(),
+        "sha256:" + hashlib.sha256(b"QRST\n").hexdigest(),
+    ]
+
+    def _round(round_no):
+        row = database.connection.execute(
+            "SELECT j.job_id, p.plan FROM jobs j JOIN plans p ON p.job_id = j.job_id "
+            "WHERE j.parent_job_id = %s AND j.round_no = %s",
+            (family_id, round_no),
+        ).fetchone()
+        return row[0], row[1]
+
+    round1, plan1 = _round(1)
+    assert plan1["inputs"]["candidate"] == seeds[0]["sha256"]
+    _finish_round_inconclusive(database, round1, "6")
+    assert workflow.advance_family_transitions(
+        database.dsn, case_root=str(_FIXTURE_CASES), run_root=str(run_root)
+    ) == 1
+    round2, plan2 = _round(2)
+    assert plan2["inputs"]["candidate"] == seeds[1]["sha256"]
+    assert state.get_admission(database.dsn, round2) is not None
+    _finish_round_inconclusive(database, round2, "7")
+
+    result = workflow.run_worker(
+        database.dsn, once=True, case_root=str(_FIXTURE_CASES), run_root=str(run_root)
+    )
+
+    events = _transition_events(database, family_id)
+    assert [(e["after_round_no"], e["decision"]) for e in events] == [
+        (0, "next_round"),
+        (1, "next_round"),
+        (2, "no_next_round"),
+    ]
+    assert events[1]["candidate_seed_count"] == 1
+    assert events[2]["reason_code"] == "NO_REMAINING_SEEDS"
+    assert result["family_transitions"] == 1
+    # Archived in the same poll: the decision is taken before sealing.
+    family = state.load_job(database.dsn, family_id)
+    assert family["state"] == "COMPLETED", family
+    index = json.loads(open(family["evidence_path"], "rb").read())
+    assert [item["round_no"] for item in index["rounds"]] == [1, 2]
+
+
+# ---------------------------------------------------------------------------
+# T12 C (改9 增补): the derived round reuses the campaign build, replays six
+# times and is the family's conclusion; drift is REUSE_MISMATCH.
+# ---------------------------------------------------------------------------
+
+
+def _derive_round_one(
+    database, tmp_path, monkeypatch, *, crashes=(b"ABCD\n",), fixed_candidate_stdout=None
+):
+    run_root, _evidence_root = _configure_isolated_roots(tmp_path, monkeypatch)
+    family_id, campaign_id, plan, _approval, _envelope = _seed_ready_campaign(database)
+    sandboxes = _install_fake_campaign_sandbox(
+        monkeypatch, plan, crashes=crashes, fixed_candidate_stdout=fixed_candidate_stdout
+    )
+    workflow.run_worker(
+        database.dsn, once=True, case_root=str(_FIXTURE_CASES), run_root=str(run_root)
+    )
+    round_id = database.connection.execute(
+        "SELECT job_id FROM jobs WHERE parent_job_id = %s AND round_no = 1",
+        (family_id,),
+    ).fetchone()[0]
+    return run_root, family_id, campaign_id, round_id, sandboxes
+
+
+def test_worker_runs_guided_validation_round_reusing_campaign_build(
+    isolated_database, tmp_path, monkeypatch
+):
+    database = isolated_database
+    run_root, family_id, campaign_id, round_id, sandboxes = _derive_round_one(
+        database, tmp_path, monkeypatch
+    )
+    campaign = state.load_job(database.dsn, campaign_id)
+    campaign_bundle = evidence.verify_bundle(campaign["evidence_path"])
+
+    result = workflow.run_worker(
+        database.dsn, once=True, case_root=str(_FIXTURE_CASES), run_root=str(run_root)
+    )
+
+    assert result["job_id"] == str(round_id)
+    round_job = state.load_job(database.dsn, round_id)
+    assert round_job["state"] == "REPRODUCED", round_job
+    validation_sandbox = sandboxes[-1]
+    assert validation_sandbox.build_calls == [], "the validation round rebuilt"
+    assert validation_sandbox.fuzz_calls == []
+    assert len(validation_sandbox.replay_calls) == 6
+    seed_digest = state.get_plan(database.dsn, round_id)["plan"]["inputs"]["candidate"]
+    assert {
+        call["input_digest"]
+        for call in validation_sandbox.replay_calls
+        if call["phase"] != "normal"
+    } == {seed_digest}
+    verified = evidence.verify_bundle(round_job["evidence_path"])
+    manifest = verified.manifest
+    assert manifest["bundle_kind"] == "execution"
+    assert manifest["reuse_origin"]["source_job_id"] == str(campaign_id)
+    assert manifest["reuse_origin"]["campaign_bundle_digest"] == campaign["evidence_digest"]
+    assert manifest["reuse_origin"]["artifacts"] == manifest["build_ref"]["artifacts"]
+    for version in ("vulnerable", "fixed"):
+        for output in ("parser", "fuzzer", "build.log"):
+            path = f"build/{version}/{output}"
+            assert verified.file_data[path] == campaign_bundle.file_data[path]
+    assert sum(1 for path in verified.file_data if path.startswith("replay/")) == 18
+    # The reuse validation bundle carries the writer-segment documents too.
+    roles = {entry["path"]: entry["role"] for entry in manifest["files"]}
+    assert roles["model/audit.json"] == "model_audit"
+    assert roles["intel/snapshot.json"] == "intel_snapshot"
+    assert roles["intel/license.json"] == "license_record"
+    assert json.loads(verified.file_data["report.json"])["intel"] is not None
+    seed_bytes = verified.file_data["materials/inputs/candidate.txt"]
+    assert "sha256:" + hashlib.sha256(seed_bytes).hexdigest() == seed_digest
+    # Reused builds cost nothing; only the probe and the replays were charged.
+    fuzz_charged = database.connection.execute(
+        "SELECT COALESCE(SUM(fuzz_seconds), 0) FROM budget_charges WHERE job_id = %s",
+        (round_id,),
+    ).fetchone()[0]
+    assert fuzz_charged == 0
+
+    workflow.run_worker(
+        database.dsn, once=True, case_root=str(_FIXTURE_CASES), run_root=str(run_root)
+    )
+    family = state.load_job(database.dsn, family_id)
+    assert family["state"] == "COMPLETED", family
+    index = json.loads(open(family["evidence_path"], "rb").read())
+    assert [(item["round_no"], item["state"]) for item in index["rounds"]] == [
+        (1, "REPRODUCED")
+    ]
+
+
+def test_validation_round_fails_closed_on_campaign_drift(
+    isolated_database, tmp_path, monkeypatch
+):
+    database = isolated_database
+    run_root, _family_id, campaign_id, round_id, sandboxes = _derive_round_one(
+        database, tmp_path, monkeypatch
+    )
+    campaign = state.load_job(database.dsn, campaign_id)
+    fuzzer = _Path(campaign["evidence_path"]) / "build" / "fixed" / "fuzzer"
+    fuzzer.chmod(0o644)
+    fuzzer.write_bytes(b"tampered fuzzer")
+
+    workflow.run_worker(
+        database.dsn, once=True, case_root=str(_FIXTURE_CASES), run_root=str(run_root)
+    )
+
+    round_job = state.load_job(database.dsn, round_id)
+    assert round_job["state"] == "FAILED"
+    assert round_job["reason_code"] == "REUSE_MISMATCH"
+    assert round_job["verdict"] is None
+    # Only the campaign ever got a sandbox: the mismatched round failed
+    # before any container could be created.
+    assert len(sandboxes) == 1, "a mismatched reuse reached a container"
+    assert "REUSE_MISMATCH" in (round_job["evidence_error"] or "")
+
+
+def test_validation_round_concludes_on_an_unregistered_crash_seed(
+    isolated_database, tmp_path, monkeypatch
+):
+    """改9 增补: a real seed's fixed output is not registered; exit + no ASan decide."""
+    database = isolated_database
+    run_root, _family_id, _campaign_id, round_id, _sandboxes = _derive_round_one(
+        database,
+        tmp_path,
+        monkeypatch,
+        crashes=(b"WXYZ\n",),
+        fixed_candidate_stdout=b"WXYZ\n",
+    )
+
+    workflow.run_worker(
+        database.dsn, once=True, case_root=str(_FIXTURE_CASES), run_root=str(run_root)
+    )
+
+    round_job = state.load_job(database.dsn, round_id)
+    assert (round_job["state"], round_job["verdict_reason"]) == (
+        "REPRODUCED",
+        "ASAN_SIGNATURE_MATCHED",
+    ), round_job
+    report = json.loads(
+        evidence.verify_bundle(round_job["evidence_path"]).file_data["report.json"]
+    )
+    assert report["rule"]["checks"]["candidate_stdout_checked"] is False
+    assert report["reuse_origin"] is not None
+
+
+def test_reused_build_steps_are_never_charged(isolated_database, tmp_path, monkeypatch):
+    """P2 B7: adopting the campaign build runs no container and costs nothing."""
+    import time as _time
+
+    database = isolated_database
+    run_root, _family_id, _campaign_id, round_id, _sandboxes = _derive_round_one(
+        database, tmp_path, monkeypatch
+    )
+    monkeypatch.setattr(_execution, "STEP_CLOCK", _time.monotonic)  # real clock
+    workflow.run_worker(
+        database.dsn, once=True, case_root=str(_FIXTURE_CASES), run_root=str(run_root)
+    )
+    assert state.load_job(database.dsn, round_id)["state"] == "REPRODUCED"
+    charged_steps = [
+        row[0]
+        for row in database.connection.execute(
+            "SELECT step_key FROM budget_charges WHERE job_id = %s", (round_id,)
+        ).fetchall()
+    ]
+    assert not [step for step in charged_steps if step.startswith("build:")], charged_steps
+    started = database.connection.execute(
+        "SELECT result FROM attempts WHERE job_id = %s AND step_key LIKE 'build:%%' "
+        "AND status = 'started'",
+        (round_id,),
+    ).fetchall()
+    # No started reuse-build row carries a recovery ceiling to over-charge.
+    assert all(not (row[0] or {}).get("budget") for row in started)
+    # Even a crash right after a reuse-build "started" row is never charged.
+    database.connection.execute(
+        "INSERT INTO attempts (attempt_id, job_id, stage, step_key, attempt_no, "
+        "generation, status, result, started_at) VALUES (%s, %s, 'execute', "
+        "'build:fixed', 9, 99, 'started', NULL, clock_timestamp() - interval '1 hour')",
+        (uuid4(), round_id),
+    )
+    state.recover_uncharged_attempts(database.dsn, job_id=round_id)
+    assert not [
+        row[0]
+        for row in database.connection.execute(
+            "SELECT step_key FROM budget_charges WHERE job_id = %s "
+            "AND step_key LIKE 'build:%%'",
+            (round_id,),
+        ).fetchall()
+    ]
+
+
+def test_campaign_archiving_crash_recovers_without_steps_or_charges(
+    isolated_database, tmp_path, monkeypatch
+):
+    """P2 B5: a campaign that crashed while ARCHIVING re-archives, nothing reruns."""
+    database = isolated_database
+    run_root, _evidence_root = _configure_isolated_roots(tmp_path, monkeypatch)
+    family_id, campaign_id, plan, _approval, _envelope = _seed_ready_campaign(database)
+    sandboxes = _install_fake_campaign_sandbox(monkeypatch, plan, crashes=(b"WXYZ\n",))
+
+    class _Crash(Exception):
+        pass
+
+    real_finish = state.finish_execution
+
+    def _crash_on_completed(*args, **kwargs):
+        if kwargs.get("state") == "COMPLETED":
+            raise _Crash("worker died after publishing the campaign bundle")
+        return real_finish(*args, **kwargs)
+
+    monkeypatch.setattr(_execution.state, "finish_execution", _crash_on_completed)
+    workflow.run_worker(
+        database.dsn, once=True, case_root=str(_FIXTURE_CASES), run_root=str(run_root)
+    )
+    crashed = state.load_job(database.dsn, campaign_id)
+    assert crashed["state"] == "ARCHIVING", crashed
+    monkeypatch.setattr(_execution.state, "finish_execution", real_finish)
+    charges_before = database.connection.execute(
+        "SELECT count(*), COALESCE(SUM(seconds), 0) FROM budget_charges WHERE job_id = %s",
+        (campaign_id,),
+    ).fetchone()
+    # The lease is gone and the execute deadline has passed: nothing may run.
+    database.connection.execute(
+        "UPDATE jobs SET lease_expires_at = clock_timestamp() - interval '1 second', "
+        "execute_deadline_at = clock_timestamp() - interval '1 hour' WHERE job_id = %s",
+        (campaign_id,),
+    )
+
+    result = workflow.run_worker(
+        database.dsn, once=True, case_root=str(_FIXTURE_CASES), run_root=str(run_root)
+    )
+
+    assert result["job_id"] == str(campaign_id)
+    recovered = state.load_job(database.dsn, campaign_id)
+    assert recovered["state"] == "COMPLETED", recovered
+    assert recovered["generation"] > crashed["generation"]
+    verified = evidence.verify_bundle(recovered["evidence_path"])
+    assert verified.manifest["bundle_kind"] == "campaign"
+    charges_after = database.connection.execute(
+        "SELECT count(*), COALESCE(SUM(seconds), 0) FROM budget_charges WHERE job_id = %s",
+        (campaign_id,),
+    ).fetchone()
+    assert charges_after == charges_before
+    assert len(sandboxes) == 1, "archive recovery created a sandbox"
+    assert state.load_job(database.dsn, family_id)["state"] == "AGGREGATING"
+
+
+def _seed_expired_review_campaign(database):
+    """A v2 family whose first-plan campaign review window already closed."""
+    family_id, campaign_id, _plan, _approval, _envelope = _seed_ready_campaign(database)
+    database.connection.execute("DELETE FROM reviews WHERE job_id = %s", (family_id,))
+    database.connection.execute(
+        "UPDATE jobs SET state = 'AWAITING_REVIEW', stage = 'review', "
+        "review_deadline_at = clock_timestamp() - interval '1 minute', "
+        "submitted_at = clock_timestamp() - interval '1 day' WHERE job_id = %s",
+        (campaign_id,),
+    )
+    return family_id, campaign_id
+
+
+def _claims_of(database, job_id):
+    return database.connection.execute(
+        "SELECT count(*) FROM audit_events WHERE job_id = %s AND event_type = 'claim'",
+        (job_id,),
+    ).fetchone()[0]
+
+
+@pytest.mark.parametrize("execute", [True, False])
+def test_v2_expired_review_converges_and_does_not_starve_the_queue(
+    isolated_database, tmp_path, monkeypatch, execute
+):
+    """P2 B6: an expired v2 review converges to REVIEW_EXPIRED; nothing loops."""
+    database = isolated_database
+    run_root, _evidence_root = _configure_isolated_roots(tmp_path, monkeypatch)
+    expired_family, expired_child = _seed_expired_review_campaign(database)
+    _family_id, ready_campaign, plan, _approval, _envelope = _seed_ready_campaign(database)
+    # A v2 child still preparing belongs to the v2 preparation entry.
+    database.connection.execute(
+        "INSERT INTO jobs (job_id, request, state, stage, submitted_at, "
+        "job_contract_version, family_id, job_kind, parent_job_id, round_no, "
+        "generation, workflow_synced) SELECT %s, request, 'QUEUED', NULL, "
+        "clock_timestamp() - interval '2 days', 2, job_id, 'round', job_id, 9, 0, "
+        "false FROM jobs WHERE job_id = %s",
+        (uuid4(), _family_id),
+    )
+    _install_fake_campaign_sandbox(monkeypatch, plan, crashes=())
+
+    claimed_ids = []
+    for _ in range(4):
+        result = workflow.run_worker(
+            database.dsn,
+            once=True,
+            execute=execute,
+            case_root=str(_FIXTURE_CASES),
+            run_root=str(run_root),
+        )
+        claimed_ids.append(result.get("job_id"))
+
+    child = state.load_job(database.dsn, expired_child)
+    assert (child["state"], child["reason_code"]) == ("BLOCKED", "REVIEW_EXPIRED")
+    assert child["workflow_synced"] is True and child["lease_owner"] is None
+    family = state.load_job(database.dsn, expired_family)
+    assert (family["state"], family["reason_code"]) == ("BLOCKED", "REVIEW_EXPIRED")
+    # Expire once, then synchronize once: never claimed again after that.
+    assert _claims_of(database, expired_child) <= 2
+    queued = database.connection.execute(
+        "SELECT state, generation FROM jobs WHERE state = 'QUEUED'"
+    ).fetchone()
+    assert tuple(queued) == ("QUEUED", 0), "a preparing v2 row was claimed"
+    if execute:
+        # The READY campaign behind it is not starved.
+        assert str(ready_campaign) in claimed_ids, claimed_ids
+        assert state.load_job(database.dsn, ready_campaign)["state"] == "COMPLETED"
+    else:
+        assert state.load_job(database.dsn, ready_campaign)["state"] == "READY"

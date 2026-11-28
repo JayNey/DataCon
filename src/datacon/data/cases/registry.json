@@ -97,7 +97,19 @@
       ],
       "max_rounds": 8,
       "max_total_seconds": 900,
-      "max_fuzz_seconds": 300
+      "max_fuzz_seconds": 300,
+      "seed_corpus": [
+        {
+          "name": "normal.txt",
+          "path": "inputs/normal.txt",
+          "digest": "sha256:a12b7cb43c9d9134b5bb1b35e9096b66775d9e92e7611d1cc92b02edd6782a87"
+        },
+        {
+          "name": "candidate.txt",
+          "path": "inputs/candidate.txt",
+          "digest": "sha256:7b7632005be0f36c5d1663a6c5ec4d13315589d65e1ef8687fb4b9866f9bc4b0"
+        }
+      ]
     }
   }
 }
