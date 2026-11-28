@@ -2104,6 +2104,8 @@ def test_worker_runs_guided_validation_round_reusing_campaign_build(
             path = f"build/{version}/{output}"
             assert verified.file_data[path] == campaign_bundle.file_data[path]
     assert sum(1 for path in verified.file_data if path.startswith("replay/")) == 18
+    seed_bytes = verified.file_data["materials/inputs/candidate.txt"]
+    assert "sha256:" + hashlib.sha256(seed_bytes).hexdigest() == seed_digest
     # Reused builds cost nothing; only the probe and the replays were charged.
     fuzz_charged = database.connection.execute(
         "SELECT COALESCE(SUM(fuzz_seconds), 0) FROM budget_charges WHERE job_id = %s",
@@ -2175,3 +2177,174 @@ def test_validation_round_concludes_on_an_unregistered_crash_seed(
     )
     assert report["rule"]["checks"]["candidate_stdout_checked"] is False
     assert report["reuse_origin"] is not None
+
+
+def test_reused_build_steps_are_never_charged(isolated_database, tmp_path, monkeypatch):
+    """P2 B7: adopting the campaign build runs no container and costs nothing."""
+    import time as _time
+
+    database = isolated_database
+    run_root, _family_id, _campaign_id, round_id, _sandboxes = _derive_round_one(
+        database, tmp_path, monkeypatch
+    )
+    monkeypatch.setattr(_execution, "STEP_CLOCK", _time.monotonic)  # real clock
+    workflow.run_worker(
+        database.dsn, once=True, case_root=str(_FIXTURE_CASES), run_root=str(run_root)
+    )
+    assert state.load_job(database.dsn, round_id)["state"] == "REPRODUCED"
+    charged_steps = [
+        row[0]
+        for row in database.connection.execute(
+            "SELECT step_key FROM budget_charges WHERE job_id = %s", (round_id,)
+        ).fetchall()
+    ]
+    assert not [step for step in charged_steps if step.startswith("build:")], charged_steps
+    started = database.connection.execute(
+        "SELECT result FROM attempts WHERE job_id = %s AND step_key LIKE 'build:%%' "
+        "AND status = 'started'",
+        (round_id,),
+    ).fetchall()
+    # No started reuse-build row carries a recovery ceiling to over-charge.
+    assert all(not (row[0] or {}).get("budget") for row in started)
+    # Even a crash right after a reuse-build "started" row is never charged.
+    database.connection.execute(
+        "INSERT INTO attempts (attempt_id, job_id, stage, step_key, attempt_no, "
+        "generation, status, result, started_at) VALUES (%s, %s, 'execute', "
+        "'build:fixed', 9, 99, 'started', NULL, clock_timestamp() - interval '1 hour')",
+        (uuid4(), round_id),
+    )
+    state.recover_uncharged_attempts(database.dsn, job_id=round_id)
+    assert not [
+        row[0]
+        for row in database.connection.execute(
+            "SELECT step_key FROM budget_charges WHERE job_id = %s "
+            "AND step_key LIKE 'build:%%'",
+            (round_id,),
+        ).fetchall()
+    ]
+
+
+def test_campaign_archiving_crash_recovers_without_steps_or_charges(
+    isolated_database, tmp_path, monkeypatch
+):
+    """P2 B5: a campaign that crashed while ARCHIVING re-archives, nothing reruns."""
+    database = isolated_database
+    run_root, _evidence_root = _configure_isolated_roots(tmp_path, monkeypatch)
+    family_id, campaign_id, plan, _approval, _envelope = _seed_ready_campaign(database)
+    sandboxes = _install_fake_campaign_sandbox(monkeypatch, plan, crashes=(b"WXYZ\n",))
+
+    class _Crash(Exception):
+        pass
+
+    real_finish = state.finish_execution
+
+    def _crash_on_completed(*args, **kwargs):
+        if kwargs.get("state") == "COMPLETED":
+            raise _Crash("worker died after publishing the campaign bundle")
+        return real_finish(*args, **kwargs)
+
+    monkeypatch.setattr(_execution.state, "finish_execution", _crash_on_completed)
+    workflow.run_worker(
+        database.dsn, once=True, case_root=str(_FIXTURE_CASES), run_root=str(run_root)
+    )
+    crashed = state.load_job(database.dsn, campaign_id)
+    assert crashed["state"] == "ARCHIVING", crashed
+    monkeypatch.setattr(_execution.state, "finish_execution", real_finish)
+    charges_before = database.connection.execute(
+        "SELECT count(*), COALESCE(SUM(seconds), 0) FROM budget_charges WHERE job_id = %s",
+        (campaign_id,),
+    ).fetchone()
+    # The lease is gone and the execute deadline has passed: nothing may run.
+    database.connection.execute(
+        "UPDATE jobs SET lease_expires_at = clock_timestamp() - interval '1 second', "
+        "execute_deadline_at = clock_timestamp() - interval '1 hour' WHERE job_id = %s",
+        (campaign_id,),
+    )
+
+    result = workflow.run_worker(
+        database.dsn, once=True, case_root=str(_FIXTURE_CASES), run_root=str(run_root)
+    )
+
+    assert result["job_id"] == str(campaign_id)
+    recovered = state.load_job(database.dsn, campaign_id)
+    assert recovered["state"] == "COMPLETED", recovered
+    assert recovered["generation"] > crashed["generation"]
+    verified = evidence.verify_bundle(recovered["evidence_path"])
+    assert verified.manifest["bundle_kind"] == "campaign"
+    charges_after = database.connection.execute(
+        "SELECT count(*), COALESCE(SUM(seconds), 0) FROM budget_charges WHERE job_id = %s",
+        (campaign_id,),
+    ).fetchone()
+    assert charges_after == charges_before
+    assert len(sandboxes) == 1, "archive recovery created a sandbox"
+    assert state.load_job(database.dsn, family_id)["state"] == "AGGREGATING"
+
+
+def _seed_expired_review_campaign(database):
+    """A v2 family whose first-plan campaign review window already closed."""
+    family_id, campaign_id, _plan, _approval, _envelope = _seed_ready_campaign(database)
+    database.connection.execute("DELETE FROM reviews WHERE job_id = %s", (family_id,))
+    database.connection.execute(
+        "UPDATE jobs SET state = 'AWAITING_REVIEW', stage = 'review', "
+        "review_deadline_at = clock_timestamp() - interval '1 minute', "
+        "submitted_at = clock_timestamp() - interval '1 day' WHERE job_id = %s",
+        (campaign_id,),
+    )
+    return family_id, campaign_id
+
+
+def _claims_of(database, job_id):
+    return database.connection.execute(
+        "SELECT count(*) FROM audit_events WHERE job_id = %s AND event_type = 'claim'",
+        (job_id,),
+    ).fetchone()[0]
+
+
+@pytest.mark.parametrize("execute", [True, False])
+def test_v2_expired_review_converges_and_does_not_starve_the_queue(
+    isolated_database, tmp_path, monkeypatch, execute
+):
+    """P2 B6: an expired v2 review converges to REVIEW_EXPIRED; nothing loops."""
+    database = isolated_database
+    run_root, _evidence_root = _configure_isolated_roots(tmp_path, monkeypatch)
+    expired_family, expired_child = _seed_expired_review_campaign(database)
+    _family_id, ready_campaign, plan, _approval, _envelope = _seed_ready_campaign(database)
+    # A v2 child still preparing belongs to the v2 preparation entry.
+    database.connection.execute(
+        "INSERT INTO jobs (job_id, request, state, stage, submitted_at, "
+        "job_contract_version, family_id, job_kind, parent_job_id, round_no, "
+        "generation, workflow_synced) SELECT %s, request, 'QUEUED', NULL, "
+        "clock_timestamp() - interval '2 days', 2, job_id, 'round', job_id, 9, 0, "
+        "false FROM jobs WHERE job_id = %s",
+        (uuid4(), _family_id),
+    )
+    _install_fake_campaign_sandbox(monkeypatch, plan, crashes=())
+
+    claimed_ids = []
+    for _ in range(4):
+        result = workflow.run_worker(
+            database.dsn,
+            once=True,
+            execute=execute,
+            case_root=str(_FIXTURE_CASES),
+            run_root=str(run_root),
+        )
+        claimed_ids.append(result.get("job_id"))
+
+    child = state.load_job(database.dsn, expired_child)
+    assert (child["state"], child["reason_code"]) == ("BLOCKED", "REVIEW_EXPIRED")
+    assert child["workflow_synced"] is True and child["lease_owner"] is None
+    family = state.load_job(database.dsn, expired_family)
+    assert (family["state"], family["reason_code"]) == ("BLOCKED", "REVIEW_EXPIRED")
+    # Expire once, then synchronize once: never claimed again after that.
+    assert _claims_of(database, expired_child) <= 2
+    queued = database.connection.execute(
+        "SELECT state, generation FROM jobs WHERE state = 'QUEUED'"
+    ).fetchone()
+    assert tuple(queued) == ("QUEUED", 0), "a preparing v2 row was claimed"
+    if execute:
+        # The READY campaign behind it is not starved.
+        assert str(ready_campaign) in claimed_ids, claimed_ids
+        assert state.load_job(database.dsn, ready_campaign)["state"] == "COMPLETED"
+    else:
+        assert state.load_job(database.dsn, ready_campaign)["state"] == "READY"

@@ -255,7 +255,18 @@ def claim_next(
     lease_seconds: int = LEASE_SECONDS,
     execute: bool = True,
     job_contract_version: int = 1,
+    v2_worker_scope: bool = False,
 ) -> dict | None:
+    """Claim the next workable job.
+
+    ``v2_worker_scope`` (T12 B, P2 B6) narrows a v2 claim to what
+    ``workflow.run_worker`` can finish for a v2 row: execution
+    (READY/RUNNING/ARCHIVING), synchronization (unsynced READY/BLOCKED or
+    AWAITING_REVIEW) and an expired review window. v2 rows in QUEUED,
+    PREPARING or an open AWAITING_REVIEW window belong to the v2 preparation
+    entry and are left untouched instead of being claimed and released in a
+    loop.
+    """
     if not isinstance(worker_id, str) or not worker_id.strip():
         raise StateError("worker_id must be non-empty")
     if type(lease_seconds) is not int or not 1 <= lease_seconds <= 86400:
@@ -330,6 +341,16 @@ def claim_next(
                           )
                       ))
               )"""
+    v2_scope_clause = ""
+    if job_contract_version == 2 and v2_worker_scope:
+        v2_scope_clause = """
+              AND state NOT IN ('QUEUED', 'PREPARING')
+              AND NOT (
+                  state = 'AWAITING_REVIEW'
+                  AND workflow_synced = true
+                  AND (review_deadline_at IS NULL
+                       OR review_deadline_at > clock_timestamp())
+              )"""
     with _connect(dsn) as connection:
         # A claim may run while a release is being promoted. Take the shared
         # side of the release lock for this transaction so a promotion that
@@ -367,6 +388,7 @@ def claim_next(
                         OR lease_expires_at <= clock_timestamp()))
                {execution_clause})
                {v2_parent_gate}
+               {v2_scope_clause}
             ORDER BY submitted_at
             FOR UPDATE SKIP LOCKED
             LIMIT 1

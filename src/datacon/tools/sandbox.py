@@ -12,6 +12,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePosixPath
 import hashlib
 import json
+import math
 import os
 import posixpath
 import re
@@ -339,11 +340,18 @@ class ReplayResult:
 
 FUZZ_MAX_CRASH_FILES = 8
 FUZZ_MAX_CRASH_BYTES = 8 * MIB
-FUZZ_MAX_CORPUS_FILES = 4096
 FUZZ_STARTUP_GRACE_SECONDS = 30.0
 FUZZER_CONTAINER_PATH = "/artifact/fuzzer"
 CORPUS_CONTAINER_PATH = "/corpus"
-_FUZZ_RESULT = re.compile(rb"DATACON_FUZZ_RESULT code=(-?\d+) crashes=(\d+)")
+# Wrapper markers are whole lines: a target cannot splice a look-alike into
+# another line, and an extra (forged) whole line makes the count wrong.
+_FUZZ_RESULT = re.compile(
+    rb"^DATACON_FUZZ_RESULT code=(-?\d+) crashes=(\d+)$", re.MULTILINE
+)
+_FUZZ_CRASH = re.compile(
+    rb"^DATACON_FUZZ_CRASH index=(\d+) size=(\d+) sha256=([0-9a-f]{64})$",
+    re.MULTILINE,
+)
 
 
 @dataclass(frozen=True)
@@ -401,15 +409,24 @@ def render_fuzz_runner_script() -> str:
             "-print_final_stats=1 -artifact_prefix=/work/crashes/ "
             f"/work/new {CORPUS_CONTAINER_PATH}",
             "_code=$?",
+            "_total=0",
+            "for _f in /work/crashes/crash-*; do",
+            '  if [ -f "$_f" ] && [ ! -L "$_f" ]; then _total=$((_total + 1)); fi',
+            "done",
             "_i=0",
             "for _f in /work/crashes/crash-*; do",
             '  [ "$_i" -lt "$_max" ] || break',
             '  if [ -f "$_f" ] && [ ! -L "$_f" ]; then',
-            '    mv -- "$_f" "/work/crash-$_i" && _i=$((_i + 1))',
+            '    mv -T -- "$_f" "/work/crash-$_i" || exit 1',
+            '    _size=$(wc -c < "/work/crash-$_i" | tr -d " ")',
+            '    _sum=$(sha256sum -- "/work/crash-$_i" | cut -d" " -f1)',
+            r"    printf '\nDATACON_FUZZ_CRASH index=%s size=%s sha256=%s\n' "
+            '"$_i" "$_size" "$_sum" >&2',
+            "    _i=$((_i + 1))",
             "  fi",
             "done",
             r"printf '\nDATACON_FUZZ_RESULT code=%s crashes=%s\n' "
-            '"$_code" "$_i" >&2',
+            '"$_code" "$_total" >&2',
             "cat /sys/fs/cgroup/pids.events > /work/pids.events 2>/dev/null || true",
             "cat /sys/fs/cgroup/memory.events > /work/memory.events 2>/dev/null || true",
             "touch /work/done",
@@ -454,11 +471,22 @@ def fuzz_runner_command(
 
 
 def validate_fuzz_corpus_dir(corpus_dir: Path | str) -> list[Path]:
-    """The corpus mount is a flat directory of regular, read-only files only."""
+    """The corpus mount is a flat directory of regular, read-only files only.
+
+    The §5 corpus ceilings (file count, per-file and total bytes) are checked
+    again at this boundary, from ``lstat`` only, before any container exists.
+    """
+    from datacon import fuzz as fuzz_rules
+
     directory = Path(corpus_dir)
-    if directory.is_symlink() or not directory.is_dir():
+    try:
+        directory_info = directory.lstat()
+    except OSError as error:
+        raise SandboxPolicyError(f"fuzz corpus is not readable: {error}") from error
+    if not stat.S_ISDIR(directory_info.st_mode):
         raise SandboxPolicyError("fuzz corpus must be a real directory")
     files: list[Path] = []
+    sizes: list[int] = []
     for child in sorted(directory.iterdir()):
         info = child.lstat()
         if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
@@ -470,11 +498,16 @@ def validate_fuzz_corpus_dir(corpus_dir: Path | str) -> list[Path]:
                 f"fuzz corpus file must be read-only: {child.name}"
             )
         files.append(child)
+        sizes.append(info.st_size)
     if not files:
         raise SandboxPolicyError("fuzz corpus is empty")
-    if len(files) > FUZZ_MAX_CORPUS_FILES:
-        raise SandboxPolicyError("fuzz corpus has too many files")
-    if directory.stat().st_mode & 0o222 & ~0o200:
+    try:
+        fuzz_rules.check_corpus_limits(sizes)
+    except fuzz_rules.CorpusPolicyDenied as error:
+        raise SandboxPolicyError(
+            error.message, reason_code=fuzz_rules.POLICY_DENIED
+        ) from error
+    if directory_info.st_mode & 0o022:
         raise SandboxPolicyError("fuzz corpus directory must not be group/other writable")
     return files
 
@@ -3504,6 +3537,20 @@ printf 'uid=%s\nseccomp=%s\nseccomp_filters=%s\nno_new_privs=%s\ncap_eff=%s\ncgr
         mounted, both read-only; every write lands on the bounded ``/work``
         tmpfs. No Docker socket, evidence or campaign directory is mounted.
         """
+        if (
+            isinstance(deadline_seconds, bool)
+            or not isinstance(deadline_seconds, (int, float))
+            or not math.isfinite(deadline_seconds)
+            or deadline_seconds <= 0
+        ):
+            raise SandboxPolicyError("fuzz deadline_seconds must be a finite positive number")
+        if (
+            not isinstance(asan_options, str)
+            or any(ord(character) < 0x20 or ord(character) == 0x7F for character in asan_options)
+        ):
+            raise SandboxPolicyError(
+                "fuzz asan_options must be one line without control characters"
+            )
         fuzzer = Path(fuzzer_path)
         if fuzzer.is_symlink() or not fuzzer.is_file():
             raise SandboxError("built fuzzer is missing")
@@ -3520,7 +3567,10 @@ printf 'uid=%s\nseccomp=%s\nseccomp_filters=%s\nno_new_privs=%s\ncap_eff=%s\ncgr
                     "built fuzzer changed before fuzzing", reason_code="PLAN_MISMATCH"
                 )
         validate_fuzz_corpus_dir(corpus_dir)
-        fuzzer.chmod(0o555)
+        try:
+            fuzzer.chmod(0o555)
+        except OSError as error:
+            raise SandboxError(f"cannot make the fuzzer executable: {error}") from error
         rss_limit_mb = max(64, self.limits.memory_mib - 256)
         command = fuzz_runner_command(
             rng_seed=rng_seed,
@@ -3563,48 +3613,83 @@ printf 'uid=%s\nseccomp=%s\nseccomp_filters=%s\nno_new_privs=%s\ncap_eff=%s\ncgr
         )
         duration = time.monotonic() - started
         capture_error = state.pop("_capture_error", None)
+        errors: list[str] = [capture_error] if capture_error else []
         log, log_truncated = _truncate_log(raw_stderr + raw_stdout)
+        log_truncated = (
+            log_truncated
+            or "stderr" in truncated_files
+            or "stdout" in truncated_files
+        )
+        # Exactly one anchored result line, from a wrapper that exited 0.
         markers = list(_FUZZ_RESULT.finditer(raw_stderr))
         fuzzer_code: int | None = None
         reported_crashes = 0
-        if markers:
-            fuzzer_code = int(markers[-1].group(1))
-            reported_crashes = int(markers[-1].group(2))
-        elif not timed_out and capture_error is None:
-            capture_error = "the fuzz runner did not report a result"
+        if len(markers) == 1:
+            fuzzer_code = int(markers[0].group(1))
+            reported_crashes = int(markers[0].group(2))
+        elif not timed_out:
+            errors.append(
+                f"the fuzz runner reported {len(markers)} result lines, not exactly one"
+            )
+        if not timed_out and exit_code != 0:
+            errors.append(f"the fuzz runner exited with {exit_code}, not 0")
+        expected_copies = min(reported_crashes, FUZZ_MAX_CRASH_FILES)
+        crash_truncated = reported_crashes > FUZZ_MAX_CRASH_FILES
+        declared: dict[int, tuple[int, str]] = {}
+        for match in _FUZZ_CRASH.finditer(raw_stderr):
+            index = int(match.group(1))
+            if index in declared:
+                errors.append(f"crash {index} was reported twice")
+            declared[index] = (int(match.group(2)), match.group(3).decode("ascii"))
         crashes: list[bytes] = []
-        crash_truncated = False
-        for index in range(min(reported_crashes, FUZZ_MAX_CRASH_FILES)):
-            path = f"/work/crash-{index}"
-            if path in truncated_files:
-                crash_truncated = True
-                continue
-            data = files.get(path)
-            if data is None:
-                capture_error = capture_error or (
-                    f"reported crash {index} could not be copied"
-                )
-                continue
-            crashes.append(data)
+        if not errors and set(declared) != set(range(expected_copies)):
+            errors.append(
+                "the crash lines do not match the reported crash count "
+                f"({sorted(declared)} vs {expected_copies})"
+            )
+        if not errors:
+            for index in range(expected_copies):
+                path = f"/work/crash-{index}"
+                size, digest = declared[index]
+                if path in truncated_files:
+                    crash_truncated = True
+                    continue
+                # The copy skips empty files: a zero-byte crash is still real.
+                data = files.get(path, b"" if size == 0 else None)
+                if (
+                    data is None
+                    or len(data) != size
+                    or hashlib.sha256(data).hexdigest() != digest
+                ):
+                    errors.append(
+                        f"crash {index} does not match the size/sha256 the runner reported"
+                    )
+                    crashes = []
+                    break
+                crashes.append(data)
+        capture_error = "; ".join(dict.fromkeys(errors)) or None
         oom = bool(state.get("OOMKilled"))
+        limits_hit = _quota_events(files)
         status = "completed"
         if timed_out:
             status = "timeout"
         elif capture_error is not None or exit_code is None:
             status = "infra_error"
-        elif oom:
+            crashes = []
+        elif oom or limits_hit:
             status = "resource_limited"
         metadata: dict[str, Any] = {
             "image_digest": self.image_digest,
             "asan_options": asan_options,
             "fuzzer_exit_code": fuzzer_code,
+            "runner_exit_code": exit_code,
             "reported_crashes": reported_crashes,
             "oom_killed": oom,
             "deadline_seconds": deadline_seconds,
             "max_len": max_len,
             "rss_limit_mb": rss_limit_mb,
             "input_timeout_seconds": input_timeout_seconds,
-            "limits_hit": _quota_events(files),
+            "limits_hit": limits_hit,
         }
         if cleanup_error is not None:
             metadata["cleanup_errors"] = [cleanup_error]
@@ -3616,7 +3701,7 @@ printf 'uid=%s\nseccomp=%s\nseccomp_filters=%s\nno_new_privs=%s\ncap_eff=%s\ncgr
             rng_seed=rng_seed,
             max_total_time_seconds=max_total_time,
             log=log,
-            log_truncated=log_truncated or "stderr" in truncated_files,
+            log_truncated=log_truncated,
             crashes=tuple(crashes),
             crash_truncated=crash_truncated,
             metadata=metadata,

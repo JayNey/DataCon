@@ -173,17 +173,27 @@ def test_fuzz_container_profile_and_corpus_are_isolated(sandbox, tmp_path, monke
     assert "ALL" in {item.upper() for item in config["CapDrop"]}
     assert not config.get("CapAdd") and not config.get("Privileged")
     security = [str(item) for item in config["SecurityOpt"]]
-    assert any(item.startswith("no-new-privileges") for item in security)
-    assert any(item.startswith("seccomp=") for item in security)
+    assert len(security) == 2
+    assert sum(item.lower() in ("no-new-privileges", "no-new-privileges:true") for item in security) == 1
+    assert sum(item.startswith("seccomp=") for item in security) == 1
+    assert len(config["Mounts"]) == 2
     mounts = {
         mount["Destination"]: mount for mount in config["Mounts"]
     }
-    # Only the fuzzer and the corpus are mounted, both read-only; no Docker
-    # socket, evidence directory or campaign directory.
+    # Exactly the fuzzer and the corpus are mounted, both read-only bind
+    # mounts of the staged paths; no Docker socket, evidence or campaign dir.
     assert set(mounts) == {FUZZER_CONTAINER_PATH, CORPUS_CONTAINER_PATH}
+    assert all(mount["Type"] == "bind" for mount in mounts.values())
     assert all(mount["RW"] is False for mount in mounts.values())
+    assert Path(mounts[FUZZER_CONTAINER_PATH]["Source"]).resolve() == fuzzer.resolve()
+    assert Path(mounts[CORPUS_CONTAINER_PATH]["Source"]).resolve() == corpus.resolve()
     assert all("docker.sock" not in mount["Source"] for mount in mounts.values())
     assert set(config["Tmpfs"]) == {"/work", "/tmp"}
+    tmpfs_mib = [
+        int(next(part for part in str(options).split(",") if part.startswith("size="))[5:-1])
+        for options in config["Tmpfs"].values()
+    ]
+    assert sum(tmpfs_mib) <= LIMITS.scratch_mib
     assert fuzz_create["command"][:2] == ["/bin/sh", "-c"]
     assert fuzz_create["command"][3:] == fuzz_runner_command(
         rng_seed=result.rng_seed,

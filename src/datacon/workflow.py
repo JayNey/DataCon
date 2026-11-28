@@ -1055,8 +1055,16 @@ def campaign_candidate_seeds(campaign: Mapping[str, Any]) -> list[dict[str, Any]
             return None
         if data is None:
             return None
-        checked["log_line"] = _crash_log_line(log, data)
-        seeds.append(checked)
+        # The validated provenance record stays exactly as archived; the
+        # fuzz-log line used for the ExperimentSpec ref lives beside it.
+        seeds.append(
+            {
+                "sha256": checked["sha256"],
+                "campaign_job_id": checked["campaign_job_id"],
+                "log_line": _crash_log_line(log, data),
+                "record": checked,
+            }
+        )
     return seeds
 
 
@@ -1350,7 +1358,14 @@ def _sync_v2_claim(
     """
     job_id = claimed["job_id"]
     generation = claimed["generation"]
-    if claimed["state"] == "BLOCKED" and claimed.get("evidence_status") is None:
+    if claimed["state"] == "AWAITING_REVIEW":
+        # Same entry as the v1 Supervisor's await_review node: an expired
+        # first-plan window converges to REVIEW_EXPIRED (and its family).
+        try:
+            state_store.expire_review(dsn, job_id, generation)
+        except state_store.StaleGeneration:
+            pass
+    elif claimed["state"] == "BLOCKED" and claimed.get("evidence_status") is None:
         try:
             execution.record_blocked(
                 dsn,
@@ -1423,16 +1438,20 @@ def run_worker(
                 dsn, worker, lease_seconds=lease_seconds, execute=execute
             )
             claimed_v2 = False
-            if claimed is None and execute:
+            if claimed is None:
                 # v2 children (campaign/round) are claimed through the v2 gate
                 # after v1 work: one claim per poll keeps the single execution
                 # slot, and the gate keeps release/lease/generation rules.
+                # Only execution claims depend on ``execute``; v2 sync and
+                # review expiry run for every worker. The worker scope never
+                # claims a v2 row it cannot finish (P2 B6).
                 claimed = state_store.claim_next(
                     dsn,
                     worker,
                     lease_seconds=lease_seconds,
                     execute=execute,
                     job_contract_version=2,
+                    v2_worker_scope=True,
                 )
                 claimed_v2 = claimed is not None
             if claimed is None:

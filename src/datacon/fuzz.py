@@ -20,6 +20,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 from pathlib import Path, PurePosixPath
+import re
 from typing import Any, Mapping, Sequence
 
 from datacon import jsonutil
@@ -55,6 +56,7 @@ FUZZ_LOG_PATH = "fuzz/fuzz.log"
 FUZZ_PROVENANCE_PATH = "fuzz/provenance.json"
 CRASH_SEED_DIRECTORY = "fuzz/crashes"
 
+_CRASH_SEED_NAME = re.compile(r"seed-[0-9]{3}\.bin")
 CRASH_SEED_PROVENANCE_FIELDS = (
     "path",
     "sha256",
@@ -241,8 +243,16 @@ def seed_corpus_digest(entries: Sequence[SeedCorpusEntry]) -> str:
     )
 
 
+def _require_size(value: Any, label: str) -> int:
+    if type(value) is not int or value < 0:
+        raise ValueError(f"{label} must be a non-negative integer")
+    return value
+
+
 def check_corpus_limits(sizes: Sequence[int]) -> None:
     """Fail closed when a corpus exceeds the §5 count, per-file or total ceiling."""
+    for size in sizes:
+        _require_size(size, "a seed corpus file size")
     if len(sizes) > CORPUS_MAX_FILE_COUNT:
         raise CorpusPolicyDenied(
             CORPUS_FILE_COUNT_EXCEEDED,
@@ -285,11 +295,20 @@ def crash_seed_records(
 ) -> list[dict[str, Any]]:
     """Freeze each distinct crash input with its provenance, discovery order."""
     jsonutil.require_digest(fuzz_log_digest, "fuzz_log_digest")
+    if type(rng_seed) is not int or rng_seed < 1:
+        raise ValueError("rng_seed must be a positive integer")
+    if not isinstance(campaign_job_id, str) or not campaign_job_id:
+        raise ValueError("campaign_job_id is required")
     records: list[dict[str, Any]] = []
     seen: set[str] = set()
     for data in crashes:
         if not isinstance(data, (bytes, bytearray)):
             raise ValueError("a crash seed must be bytes")
+        if len(data) > CORPUS_MAX_FILE_BYTES:
+            raise ValueError(
+                f"a crash seed has {len(data)} bytes; the ceiling is "
+                f"{CORPUS_MAX_FILE_BYTES}"
+            )
         digest = jsonutil.digest_bytes(bytes(data))
         if digest in seen:
             continue
@@ -320,13 +339,33 @@ def validate_crash_seed_record(
         raise ValueError(
             "crash seed provenance is missing " + ", ".join(missing)
         )
+    unknown = sorted(str(key) for key in record if key not in CRASH_SEED_PROVENANCE_FIELDS)
+    if unknown:
+        raise ValueError("crash seed provenance has unknown field(s): " + ", ".join(unknown))
     path = record["path"]
-    if not isinstance(path, str) or not path.startswith(CRASH_SEED_DIRECTORY + "/"):
-        raise ValueError("crash seed path must live under fuzz/crashes/")
+    if not isinstance(path, str):
+        raise ValueError("crash seed path must be a string")
+    normalized = jsonutil.safe_relative_path(path, "crash seed path")
+    parts = PurePosixPath(normalized).parts
+    if (
+        normalized != path
+        or len(parts) != 3
+        or "/".join(parts[:2]) != CRASH_SEED_DIRECTORY
+        or _CRASH_SEED_NAME.fullmatch(parts[2]) is None
+    ):
+        raise ValueError(
+            "crash seed path must be exactly fuzz/crashes/seed-NNN.bin"
+        )
     digest = jsonutil.require_digest(record["sha256"], "crash seed sha256")
     jsonutil.require_digest(record["fuzz_log_digest"], "crash seed fuzz_log_digest")
-    if type(record["size_bytes"]) is not int or record["size_bytes"] < 0:
-        raise ValueError("crash seed size_bytes must be a non-negative integer")
+    if (
+        type(record["size_bytes"]) is not int
+        or not 0 <= record["size_bytes"] <= CORPUS_MAX_FILE_BYTES
+    ):
+        raise ValueError(
+            "crash seed size_bytes must be an integer between 0 and "
+            f"{CORPUS_MAX_FILE_BYTES}"
+        )
     if type(record["rng_seed"]) is not int or record["rng_seed"] < 1:
         raise ValueError("crash seed rng_seed must be a positive integer")
     if not isinstance(record["campaign_job_id"], str) or not record["campaign_job_id"]:

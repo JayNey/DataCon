@@ -3086,8 +3086,13 @@ def _run_step(
     reusable: Callable[[Mapping[str, Any]], bool] | None = None,
     charge_kind: str = "general",
     step_timeout_seconds: float | None = None,
+    budgeted: bool = True,
 ) -> tuple[Any, bool]:
     """Execute one logical step with generation fencing and crash recovery.
+
+    ``budgeted=False`` is for steps that start no container (adopting the
+    campaign build in a reuse round): no budget gate, no recovery ceiling on
+    the started row and no charge.
 
     A completed attempt for this generation is reused only when its input
     digest matches. Otherwise a journal is adopted only when a database attempt
@@ -3174,8 +3179,10 @@ def _run_step(
     # container, so an exhausted family never starts the step. The recovery
     # ceiling recorded on the started row is the effective container hard
     # timeout: min(step timeout, remaining deadline, gate ceiling).
-    gate_ceiling = _gate_step_budget(
-        dsn, context, step_key=step_key, charge_kind=charge_kind
+    gate_ceiling = (
+        _gate_step_budget(dsn, context, step_key=step_key, charge_kind=charge_kind)
+        if budgeted
+        else None
     )
     ceiling: float | None = gate_ceiling
     if gate_ceiling is not None:
@@ -4311,6 +4318,13 @@ def _case_materials(
         )
     materials: dict[str, tuple[str, bytes]] = {}
     snapshot = getattr(context, "material_payloads", None)
+    reuse = getattr(context, "reuse", None)
+    if reuse is not None and isinstance(plan_inputs, Mapping):
+        # A reuse round's candidate is the campaign crash seed, never a case
+        # file: archive-only recovery (no materialization) must keep it.
+        candidate_relative = context.manifest_case["inputs"]["candidate"]
+        if not (isinstance(snapshot, Mapping) and candidate_relative in snapshot):
+            snapshot = {**(snapshot or {}), candidate_relative: reuse.seed}
     for relative, role, expected in entries:
         if isinstance(snapshot, Mapping) and relative in snapshot:
             data = snapshot[relative]
@@ -5567,7 +5581,12 @@ def _campaign_outputs(context: ExecutionContext) -> tuple[str, str]:
         by_name.setdefault(PurePosixPath(relative).name, relative)
     parser = by_name.get(fuzz_rules.PARSER_OUTPUT)
     fuzzer = by_name.get(fuzz_rules.FUZZER_OUTPUT)
-    if parser is None or fuzzer is None:
+    if (
+        parser is None
+        or fuzzer is None
+        or len(raw_outputs) != 2
+        or set(by_name) != {fuzz_rules.PARSER_OUTPUT, fuzz_rules.FUZZER_OUTPUT}
+    ):
         raise ExecutionBlocked(
             "PLAN_MISMATCH",
             "a campaign build_spec.outputs must list both the replay parser and "
@@ -5885,14 +5904,7 @@ def _do_fuzz(
     timeout_seconds: float,
     attempt_no: int,
     token: str,
-    archive_only: bool,
 ) -> dict[str, Any]:
-    if archive_only:
-        raise ExecutionFailed(
-            "RUN_INCOMPLETE",
-            "archive recovery found no reusable fuzz result and never starts "
-            "a container",
-        )
     deadline = _cap_to_step_budget(context, timeout_seconds)
     if deadline < 1:
         raise ExecutionFailed(
@@ -5958,28 +5970,123 @@ def _finish_campaign_failed(
     bundle shape requires a round, so a failed campaign archives no bundle;
     the reason stays on the job and the family ends through convergence.
     """
-    try:
-        finished = state.finish_execution(
+    return _finish_failed_without_bundle(
+        dsn,
+        context.job_id,
+        context.generation,
+        error,
+        explanation="a failed campaign has no campaign bundle",
+    )
+
+
+def _archive_only_campaign(dsn: str, context: ExecutionContext) -> ExecutionResult:
+    """Recover a campaign whose generation crashed while ARCHIVING (P2 B5).
+
+    Like ``_archive_only``: only completed, plan-bound, digest-verified step
+    results from any generation are used; no budget gate, no step, no
+    container and no charge. A past execute deadline is irrelevant because
+    nothing runs. Anything missing fails closed without a bundle.
+    """
+    build_root = _work_root(context)
+    completed: dict[str, dict[str, Any]] = {}
+    for row in state.execution_attempts_across_generations(dsn, context.job_id):
+        if row["status"] == "completed" and isinstance(row["result"], dict):
+            completed.setdefault(row["step_key"], row["result"])
+
+    def _fail(message: str) -> ExecutionResult:
+        return _finish_campaign_failed(
             dsn,
-            context.job_id,
-            generation=context.generation,
-            state="FAILED",
-            reason_code=error.reason_code,
-            verdict=None,
-            verdict_reason=None,
-            evidence_status="failed",
-            evidence_error=(
-                "a failed campaign has no campaign bundle: "
-                f"{error.reason_code}: {error.message}"
+            context,
+            ExecutionFailed(
+                "RUN_INCOMPLETE", f"campaign archive recovery: {message}"
             ),
-            last_error=error.message,
-            stage="failed",
         )
-    except (state.StateError, state.StaleGeneration):
+
+    def _bound(step: str) -> dict[str, Any] | None:
+        result = completed.get(step)
+        if isinstance(result, dict) and result.get("plan_digest") == context.plan_digest:
+            return result
+        return None
+
+    probe = _bound("sandbox.probe")
+    if probe is None or probe.get("status") != "completed":
+        return _fail("no completed probe for this plan")
+    try:
+        parser_output, fuzzer_output = _campaign_outputs(context)
+    except ExecutionBlocked as error:
+        return _fail(error.message)
+    builds: dict[str, dict[str, Any]] = {}
+    for version in ("vulnerable", "fixed"):
+        result = _bound(f"build:{version}")
+        if (
+            result is None
+            or result.get("input_digest") != context.plan["analysis_digest"]
+            or not _reusable_build(
+                build_root,
+                result,
+                check_provenance_face=False,
+                artifact_suffix=_primary_artifact_suffix(context),
+            )
+        ):
+            return _fail(f"no verified {version} build")
+        try:
+            for output in (parser_output, fuzzer_output):
+                _build_output_file(context, result, output)
+        except ExecutionFailed as error:
+            return _fail(error.message)
+        builds[version] = result
+    provenance_outcome = _verify_v2_build_provenance(context, build_root, builds)
+    if not provenance_outcome.comparable:
+        return _finish_campaign_failed(
+            dsn,
+            context,
+            ExecutionFailed(
+                build_provenance.BUILD_PROVENANCE_MISSING,
+                provenance_outcome.error_detail or "v2 build provenance verification failed",
+            ),
+        )
+    fuzz_payload = _bound(CAMPAIGN_FUZZ_STEP)
+    if (
+        fuzz_payload is None
+        or fuzz_payload.get("status") != "completed"
+        or fuzz_payload.get("log_truncated")
+        or fuzz_payload.get("crash_truncated")
+    ):
+        return _fail("no complete fuzz search for this plan")
+    read_back = _fuzz_files(build_root, fuzz_payload)
+    if read_back is None:
+        return _fail("the fuzz evidence no longer matches its journal")
+    rng_seed = fuzz_rules.campaign_rng_seed(context.job_id_text, context.plan_digest)
+    if fuzz_payload.get("rng_seed") != rng_seed:
+        return _fail("the fuzz search used another RNG seed")
+    envelope = context.envelope if isinstance(context.envelope, Mapping) else {}
+    harness_relative = context.case.manifest["harness"]
+    harness_pair = {
+        "harness": str(context.materials.get(harness_relative)),
+        "fuzz_shim": fuzz_rules.FUZZ_SHIM_REVIEWED_DIGEST,
+    }
+    if envelope.get("harness_digest") != fuzz_rules.guided_harness_digest(
+        harness_pair["harness"], harness_pair["fuzz_shim"]
+    ):
+        return _fail("the approved harness pair no longer matches")
+    fuzz_log, crashes = read_back
+    try:
+        return _archive_campaign_bundle(
+            dsn,
+            context,
+            probe_payload=probe,
+            builds=builds,
+            fuzz_payload=fuzz_payload,
+            fuzz_log=fuzz_log,
+            crashes=crashes,
+            rng_seed=rng_seed,
+            harness_pair=harness_pair,
+            seed_corpus_digest=str(envelope.get("seed_corpus_digest")),
+            fuzzer_output=fuzzer_output,
+            provenance_outcome=provenance_outcome,
+        )
+    except state.StaleGeneration:
         return ExecutionResult("STALE")
-    if not finished:
-        return ExecutionResult("STALE")
-    return ExecutionResult("FAILED", reason_code=error.reason_code)
 
 
 def _run_campaign(
@@ -5990,12 +6097,11 @@ def _run_campaign(
     materials_dir: Path,
     material_digests: Mapping[str, str],
     build_root: Path,
-    archive_only: bool = False,
 ) -> ExecutionResult:
     """Run the campaign child: preflight, one build per version, one search.
 
-    ``archive_only`` (a crashed ``ARCHIVING`` generation) re-adopts the
-    journaled steps and rewrites the bundle; it never starts a container.
+    A crashed ``ARCHIVING`` generation never comes here: it is recovered by
+    ``_archive_only_campaign`` without any step, charge or container.
     """
     job_id = context.job_id
     generation = context.generation
@@ -6004,17 +6110,8 @@ def _run_campaign(
     provenance_outcome: _ProvenanceCheckOutcome | None = None
 
     def _guard(step: str, action: Callable[[int, str], Any]) -> Callable[[int, str], Any]:
-        if not archive_only:
-            return action
-
-        def _refuse(attempt_no: int, token: str) -> Any:
-            raise ExecutionFailed(
-                "RUN_INCOMPLETE",
-                f"archive recovery found no reusable {step} result and never "
-                "starts a container",
-            )
-
-        return _refuse
+        del step
+        return action
 
     try:
         preflight = _campaign_preflight(context, materials_dir)
@@ -6121,7 +6218,6 @@ def _run_campaign(
                 timeout_seconds=fuzz_timeout,
                 attempt_no=attempt_no,
                 token=token,
-                archive_only=archive_only,
             ),
             reusable=lambda payload: _fuzz_files(build_root, payload) is not None,
             charge_kind="fuzz",
@@ -6186,6 +6282,41 @@ def _run_campaign(
     except state.StaleGeneration:
         return ExecutionResult("STALE")
 
+    return _archive_campaign_bundle(
+        dsn,
+        context,
+        probe_payload=probe_payload,
+        builds=builds,
+        fuzz_payload=fuzz_payload,
+        fuzz_log=fuzz_log,
+        crashes=crashes,
+        rng_seed=rng_seed,
+        harness_pair=preflight.harness_pair,
+        seed_corpus_digest=preflight.seed_corpus_digest,
+        fuzzer_output=preflight.fuzzer_output,
+        provenance_outcome=provenance_outcome,
+    )
+
+
+def _archive_campaign_bundle(
+    dsn: str,
+    context: ExecutionContext,
+    *,
+    probe_payload: Mapping[str, Any] | None,
+    builds: Mapping[str, Mapping[str, Any]],
+    fuzz_payload: Mapping[str, Any],
+    fuzz_log: bytes,
+    crashes: Sequence[bytes],
+    rng_seed: int,
+    harness_pair: Mapping[str, str],
+    seed_corpus_digest: str,
+    fuzzer_output: str,
+    provenance_outcome: "_ProvenanceCheckOutcome | None",
+) -> ExecutionResult:
+    """Write the campaign bundle from verified step results and land COMPLETED."""
+    job_id = context.job_id
+    generation = context.generation
+    build_root = _work_root(context)
     fuzz_log_digest = _digest(fuzz_log)
     try:
         seed_records = fuzz_rules.crash_seed_records(
@@ -6201,15 +6332,15 @@ def _run_campaign(
     seed_bytes = {jsonutil.digest_bytes(data): data for data in crashes}
     fuzzer_digests = {}
     for version in ("vulnerable", "fixed"):
-        _path, digest = _build_output_file(context, builds[version], preflight.fuzzer_output)
+        _path, digest = _build_output_file(context, builds[version], fuzzer_output)
         fuzzer_digests[version] = digest
     fuzz_provenance = fuzz_rules.fuzz_provenance_document(
         campaign_job_id=context.job_id_text,
         plan_digest=context.plan_digest,
         rng_seed=rng_seed,
         fuzz_log_digest=fuzz_log_digest,
-        harness_pair=preflight.harness_pair,
-        seed_corpus_digest_value=preflight.seed_corpus_digest,
+        harness_pair=harness_pair,
+        seed_corpus_digest_value=seed_corpus_digest,
         fuzzer_digests=fuzzer_digests,
         max_total_time_seconds=int(fuzz_payload.get("max_total_time_seconds") or 0),
         status=str(fuzz_payload.get("status")),
@@ -6700,7 +6831,9 @@ def run_execution(
         return _finish_evidence_path_failure(dsn, job_id, generation, error)
 
     campaign = _is_campaign_context(context)
-    if context.job["state"] == "ARCHIVING" and not campaign:
+    if context.job["state"] == "ARCHIVING":
+        if campaign:
+            return _archive_only_campaign(dsn, context)
         return _archive_only(dsn, context)
 
     try:
@@ -6768,7 +6901,6 @@ def run_execution(
             materials_dir=materials_dir,
             material_digests=material_digests,
             build_root=build_root,
-            archive_only=context.job["state"] == "ARCHIVING",
         )
 
     probe_payload: dict[str, Any] | None = None
@@ -6859,6 +6991,7 @@ def run_execution(
                     artifact_suffix=_primary_artifact_suffix(context),
                 ),
                 step_timeout_seconds=build_timeout,
+                budgeted=getattr(context, "reuse", None) is None,
             )
             builds[version] = result
             if result.get("status") != "completed":

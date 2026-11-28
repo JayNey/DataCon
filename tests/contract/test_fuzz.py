@@ -516,3 +516,49 @@ def test_default_campaign_runner_searches_through_the_injected_fuzzer():
         runner.run_campaign(
             job_id="job", family_id="family", build_artifacts={"vulnerable": {}}
         )
+
+
+def test_crash_seed_record_rejects_traversal_unknown_fields_and_oversize():
+    """P2 B2: a crash seed record names exactly one fuzz/crashes/seed-NNN.bin."""
+    good = {
+        "path": "fuzz/crashes/seed-000.bin",
+        "sha256": jsonutil.digest_bytes(b"WXYZ\n"),
+        "size_bytes": 5,
+        "campaign_job_id": "job",
+        "fuzz_log_digest": "sha256:" + "1" * 64,
+        "rng_seed": 7,
+    }
+    fuzz.validate_crash_seed_record(good, data=b"WXYZ\n")
+    for path in (
+        "fuzz/crashes/../../report.json",
+        "/fuzz/crashes/seed-000.bin",
+        "fuzz/crashes/deep/seed-000.bin",
+        "fuzz/crashes/seed-0.bin",
+        "fuzz/crashes/./seed-000.bin",
+    ):
+        with pytest.raises(ValueError):
+            fuzz.validate_crash_seed_record({**good, "path": path})
+    with pytest.raises(ValueError, match="unknown"):
+        fuzz.validate_crash_seed_record({**good, "log_line": 3})
+    with pytest.raises(ValueError):
+        fuzz.validate_crash_seed_record(
+            {**good, "size_bytes": fuzz.CORPUS_MAX_FILE_BYTES + 1}
+        )
+    for field, value in (("size_bytes", True), ("rng_seed", True), ("size_bytes", -1)):
+        with pytest.raises(ValueError):
+            fuzz.validate_crash_seed_record({**good, field: value})
+    # The pure helpers refuse negative, boolean and over-ceiling inputs too.
+    for sizes in ([-1], [True], [1.5]):
+        with pytest.raises((ValueError, TypeError)):
+            fuzz.check_corpus_limits(sizes)
+    with pytest.raises(ValueError):
+        fuzz.crash_seed_records(
+            [b"a"], campaign_job_id="job", fuzz_log_digest=good["fuzz_log_digest"], rng_seed=True
+        )
+    with pytest.raises(ValueError):
+        fuzz.crash_seed_records(
+            [b"a" * (fuzz.CORPUS_MAX_FILE_BYTES + 1)],
+            campaign_job_id="job",
+            fuzz_log_digest=good["fuzz_log_digest"],
+            rng_seed=7,
+        )
