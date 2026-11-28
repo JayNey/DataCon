@@ -135,6 +135,12 @@ _FORBIDDEN_MAKE_CLI_VARS: Final[frozenset[str]] = frozenset(
         "TMPDIR",
         "HOME",
         "ASAN_OPTIONS",
+        # Install-destination redirects: build_spec.env already refuses
+        # DESTDIR (and the CMake output path vars) via _BUILD_ENV_PATH_VARS,
+        # so the make command line must not set them either (#64 #3). The
+        # autoconf-style lowercase "prefix=" is the same redirection.
+        "DESTDIR",
+        "prefix",
     }
 )
 _MAKE_LONG_ARG_OPTS: Final[frozenset[str]] = frozenset(

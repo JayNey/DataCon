@@ -23,7 +23,7 @@ from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import stat
 import shutil
 import subprocess
@@ -725,6 +725,51 @@ class _FakeSandbox:
                 if item.relative_path == primary_output
             )
             artifact_digest = _sha256_prefixed(artifact)
+        elif isinstance(build_spec, dict) and build_spec.get("outputs"):
+            # Journal-shape alignment with the real sandbox (sandbox.py): a
+            # build_spec build always emits one BuildOutput per declared
+            # output, archived under the plan's normalized relative output
+            # paths, with the primary selected exactly like
+            # _select_primary_output. Without this, the fake journal would
+            # lack files.outputs and look like a pre-D39 record - exactly
+            # the records the plan-derived primary artifact gate
+            # (_primary_artifact_suffix) must stop reusing.
+            normalized_outputs: list[str] = []
+            for index, raw_output in enumerate(build_spec["outputs"]):
+                normalized_outputs.append(
+                    build_provenance.validate_build_spec_output_path(
+                        raw_output, index
+                    )[0]
+                )
+            if "parser" in normalized_outputs:
+                primary_output = "parser"
+            else:
+                primary_output = next(
+                    (
+                        item
+                        for item in normalized_outputs
+                        if item.rsplit("/", 1)[-1] == "parser"
+                    ),
+                    normalized_outputs[0],
+                )
+            for rel_out in normalized_outputs:
+                data = f"ELF-{version}-{rel_out}".encode("utf-8")
+                outputs += (
+                    BuildOutput(
+                        relative_path=rel_out,
+                        archive_path=(
+                            "parser"
+                            if primary_output == "parser"
+                            and len(normalized_outputs) == 1
+                            else rel_out
+                        ),
+                        data=data,
+                        digest=_sha256_prefixed(data),
+                    ),
+                )
+                if rel_out == primary_output:
+                    artifact = data
+            artifact_digest = _sha256_prefixed(artifact)
         else:
             artifact_digest = _sha256_prefixed(artifact)
         return BuildResult(
@@ -856,6 +901,68 @@ def _configure_isolated_roots(
     monkeypatch.setenv("DATACON_STAGING_ROOT", str(staging_root))
     monkeypatch.setenv("DATACON_JOURNAL_SECRET_FILE", str(secret_file))
     return run_root, evidence_root
+
+
+def _seed_real_shape_v2_build_journal(
+    *,
+    build_dir: Path,
+    work_root: Path,
+    spec: dict[str, Any],
+    version: str,
+) -> tuple[dict[str, Any], dict[str, Any], str]:
+    """Write one completed v2 build's files in the real sandbox journal shape.
+
+    Mirrors sandbox.py + ``_persist_build``: one file per ``build_spec.outputs``
+    entry at the plan's normalized relative path, an ``outputs`` mapping
+    (relative output -> run-root path) with per-output digests, and the
+    ``artifact`` pointer aimed at the primary output selected exactly like
+    ``_select_primary_output``. Returns ``(files, file_digests,
+    artifact_digest)`` so callers can archive the matching attempt payload.
+    """
+    normalized_outputs: list[str] = []
+    for index, raw_output in enumerate(spec["outputs"]):
+        normalized_outputs.append(
+            build_provenance.validate_build_spec_output_path(
+                raw_output, index
+            )[0]
+        )
+    if "parser" in normalized_outputs:
+        primary = "parser"
+    else:
+        primary = next(
+            (
+                item
+                for item in normalized_outputs
+                if item.rsplit("/", 1)[-1] == "parser"
+            ),
+            normalized_outputs[0],
+        )
+    log_bytes = f"build {version}\n".encode("utf-8")
+    log_file = build_dir / "build.log"
+    log_file.write_bytes(log_bytes)
+    files_map: dict[str, Any] = {
+        "log": str(log_file.relative_to(work_root)),
+    }
+    digests_map: dict[str, Any] = {
+        "log": _sha256_prefixed(log_bytes),
+    }
+    outputs_map: dict[str, str] = {}
+    output_digests: dict[str, str] = {}
+    artifact_digest = ""
+    for rel_out in normalized_outputs:
+        data = f"ELF-{version}-{rel_out}".encode("utf-8")
+        out_file = build_dir / PurePosixPath(rel_out)
+        out_file.parent.mkdir(parents=True, exist_ok=True)
+        out_file.write_bytes(data)
+        outputs_map[rel_out] = str(out_file.relative_to(work_root))
+        output_digests[rel_out] = _sha256_prefixed(data)
+        if rel_out == primary:
+            artifact_digest = _sha256_prefixed(data)
+    files_map["artifact"] = outputs_map[primary]
+    digests_map["artifact"] = artifact_digest
+    files_map["outputs"] = dict(outputs_map)
+    digests_map["outputs"] = dict(output_digests)
+    return files_map, digests_map, artifact_digest
 
 
 # ---------------------------------------------------------------------------
@@ -2305,25 +2412,21 @@ def test_v2_archive_only_recovery_never_downgrades_provenance_failure(
         result=probe_payload,
     )
 
-    # Seed completed build attempts (vulnerable & fixed) on disk under generation 1.
+    # Seed completed build attempts (vulnerable & fixed) on disk under
+    # generation 1, in the real sandbox journal shape (files.outputs + the
+    # artifact pointer at the plan's primary output path), so archive-only
+    # reuse accepts them and the provenance verification below is what
+    # decides the outcome.
     face_paths: dict[str, Path] = {}
     for version, raw_face in (("vulnerable", vuln_face), ("fixed", fixed_face)):
         bdir = gen1_root / "build" / version
         bdir.mkdir(parents=True, exist_ok=True)
-        log_bytes = f"build {version}\n".encode("utf-8")
-        art_bytes = f"ELF-{version}".encode("utf-8")
-        log_file = bdir / "build.log"
-        art_file = bdir / "parser"
-        log_file.write_bytes(log_bytes)
-        art_file.write_bytes(art_bytes)
-        files_map: dict[str, Any] = {
-            "log": str(log_file.relative_to(work_root)),
-            "artifact": str(art_file.relative_to(work_root)),
-        }
-        digests_map: dict[str, Any] = {
-            "log": _sha256_prefixed(log_bytes),
-            "artifact": _sha256_prefixed(art_bytes),
-        }
+        files_map, digests_map, artifact_digest = _seed_real_shape_v2_build_journal(
+            build_dir=bdir,
+            work_root=work_root,
+            spec=spec,
+            version=version,
+        )
         if raw_face is not None:
             fdir = bdir / "build_provenance"
             fdir.mkdir(parents=True, exist_ok=True)
@@ -2341,7 +2444,7 @@ def test_v2_archive_only_recovery_never_downgrades_provenance_failure(
             "status": "completed",
             "version": version,
             "container_id": f"gen1-build-{version}",
-            "artifact_digest": _sha256_prefixed(art_bytes),
+            "artifact_digest": artifact_digest,
             "attempt_no": 1,
             "files": files_map,
             "file_digests": digests_map,
@@ -3089,20 +3192,15 @@ def _seed_archive_only_v2_job(
     for version, raw_face in faces_by_version.items():
         bdir = gen1_root / "build" / version
         bdir.mkdir(parents=True, exist_ok=True)
-        log_bytes = f"build {version}\n".encode("utf-8")
-        art_bytes = f"ELF-{version}".encode("utf-8")
-        log_file = bdir / "build.log"
-        art_file = bdir / "parser"
-        log_file.write_bytes(log_bytes)
-        art_file.write_bytes(art_bytes)
-        files_map: dict[str, Any] = {
-            "log": str(log_file.relative_to(work_root)),
-            "artifact": str(art_file.relative_to(work_root)),
-        }
-        digests_map: dict[str, Any] = {
-            "log": _sha256_prefixed(log_bytes),
-            "artifact": _sha256_prefixed(art_bytes),
-        }
+        # Real sandbox journal shape (files.outputs + plan-relative artifact
+        # pointer), so archive-only reuse accepts the seeded generation and
+        # the recovery scenarios below exercise the provenance checks.
+        files_map, digests_map, artifact_digest = _seed_real_shape_v2_build_journal(
+            build_dir=bdir,
+            work_root=work_root,
+            spec=spec,
+            version=version,
+        )
         if raw_face is not None:
             fdir = bdir / "build_provenance"
             fdir.mkdir(parents=True, exist_ok=True)
@@ -3119,7 +3217,7 @@ def _seed_archive_only_v2_job(
             "status": "completed",
             "version": version,
             "container_id": f"gen1-build-{version}",
-            "artifact_digest": _sha256_prefixed(art_bytes),
+            "artifact_digest": artifact_digest,
             "attempt_no": 1,
             "files": files_map,
             "file_digests": digests_map,
@@ -5734,3 +5832,296 @@ def test_blocked_bundle_does_not_carry_model_audit(
     report = json.loads(verified.file_data["report.json"])
     assert report["bundle_kind"] == "blocked"
     assert "model_audit" not in report
+
+
+# ---------------------------------------------------------------------------
+# SF-2 (#58 follow-up): report.evidence_refs must name only archived documents
+# ---------------------------------------------------------------------------
+
+
+def _setup_policy_round_case(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[Path, dict[str, Any], bytes, _InMemoryState]:
+    """Shared policy-round fixture: family review unbound, policy admission set.
+
+    Mirrors the construction of
+    ``test_policy_round_blocked_mid_execution_archives_blocked_bundle`` /
+    ``test_policy_round_failed_partial_bundle_keeps_admission_only``: the
+    family's human review is bound to the first plan (not this round's frozen
+    plan), so ``_load_context`` adopts the policy admission and clears the
+    review.
+    """
+    run_root, _ = _configure_isolated_roots(tmp_path, monkeypatch)
+    # outputs=["parser"]: the frozen primary target matches the fake sandbox's
+    # legacy single-artifact layout, so these coordinates isolate the SF-2
+    # evidence_refs behavior from the #64 #6 suffix tightening (the D39
+    # multi-output plumbing has its own coordinates).
+    spec = _cmake_spec(outputs=["parser"])
+    face = _cmake_compile_commands_bytes(
+        flags=["-fsanitize=address", "-g", "-O1", "-I../include", "-D_GNU_SOURCE"]
+    )
+    parent_approval = "sha256:" + "e" * 64
+    job, plan, plan_digest, review = _setup_fixture_plan_and_job(
+        version=2, build_spec=spec
+    )
+    plan["parent_approval_digest"] = parent_approval
+    plan_digest = contracts.plan_digest(plan)
+    mem_state = _InMemoryState(job, plan, plan_digest, review)
+    mem_state.install(monkeypatch)
+    mem_state.review = {
+        "reviewer_id": "family-reviewer",
+        "decision": "approve",
+        "plan_digest": "sha256:" + "9" * 64,
+        "decided_at": review["decided_at"],
+    }
+    mem_state.admission = {
+        "admission_id": str(uuid4()),
+        "job_id": str(job["job_id"]),
+        "parent_job_id": str(job["parent_job_id"]),
+        "round_no": plan["round_no"],
+        "approval_kind": "policy",
+        "envelope_digest": plan["envelope_digest"],
+        "parent_approval_digest": parent_approval,
+        "seed_digest": plan["inputs"]["candidate"],
+        "predicate_version": "admission-v1",
+        "recomputable": True,
+        "supporting_bundle_digest": None,
+        "decided_at": "2099-01-01T00:00:00Z",
+    }
+    return run_root, job, face, mem_state
+
+
+def _report_evidence_refs_of(verified: Any) -> list[str]:
+    return list(json.loads(verified.file_data["report.json"])["evidence_refs"])
+
+
+def _assert_refs_resolvable(verified: Any, refs: list[str]) -> None:
+    # Delta §8/§11: every evidence ref must resolve inside its own bundle, so
+    # the writer may never name a document it did not archive.
+    listed = {entry["path"] for entry in verified.manifest["files"]}
+    assert set(refs) <= listed, (refs, sorted(listed))
+
+
+def test_policy_round_success_refs_list_admission(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """SF-2: the main execution path derives refs from the archived documents.
+
+    A policy round that runs to a verdict carries admission.json and no
+    review.json; the report must say exactly that (previously the refs list
+    was hardcoded with review.json, a document the bundle never contains).
+    """
+    run_root, job, face, mem_state = _setup_policy_round_case(
+        tmp_path, monkeypatch
+    )
+    fake_sandbox = _FakeSandbox(
+        image_digest=mem_state.plan["image_digest"],
+        build_recipe_digest=mem_state.plan["build_recipe_digest"],
+        faces={"vulnerable": face, "fixed": face},
+        face_name="compile_commands.json",
+    )
+    result = execution.run_execution(
+        "dsn",
+        job["job_id"],
+        1,
+        case_root=str(FIXTURE_CASES),
+        run_root=run_root,
+        sandbox=fake_sandbox,
+    )
+    assert result.state == "REPRODUCED", result
+    verified = evidence.verify_bundle(result.evidence_path)
+    assert "admission.json" in verified.file_data
+    assert "review.json" not in verified.file_data
+    refs = _report_evidence_refs_of(verified)
+    assert refs == [
+        "report.json",
+        "report.md",
+        "plan.json",
+        "admission.json",
+        "metadata/execution.json",
+    ]
+    _assert_refs_resolvable(verified, refs)
+
+
+def test_blocked_policy_round_refs_list_only_archived_documents(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """SF-2: a blocked policy round's refs name neither approval document.
+
+    The blocked bundle contract forbids admission.json and the policy round
+    has no review.json; the hardcoded refs list claimed review.json anyway.
+    The report's evidence_refs must stay resolvable (delta §8) and name only
+    what the writer really archived.
+    """
+    run_root, job, face, mem_state = _setup_policy_round_case(
+        tmp_path, monkeypatch
+    )
+    fake_sandbox = _FakeSandbox(
+        image_digest=mem_state.plan["image_digest"],
+        build_recipe_digest=mem_state.plan["build_recipe_digest"],
+        faces={"vulnerable": face, "fixed": face},
+        face_name="compile_commands.json",
+    )
+    original_build = fake_sandbox.build
+
+    def build(version: str, **kwargs: Any):
+        if version == "fixed":
+            raise SandboxPolicyError("seccomp profile mismatch")
+        return original_build(version, **kwargs)
+
+    fake_sandbox.build = build
+    result = execution.run_execution(
+        "dsn",
+        job["job_id"],
+        1,
+        case_root=str(FIXTURE_CASES),
+        run_root=run_root,
+        sandbox=fake_sandbox,
+    )
+    assert result.state == "BLOCKED", result
+    assert result.reason_code == "POLICY_DENIED"
+    verified = evidence.verify_bundle(result.evidence_path)
+    assert "admission.json" not in verified.file_data
+    assert "review.json" not in verified.file_data
+    refs = _report_evidence_refs_of(verified)
+    assert "review.json" not in refs
+    assert "admission.json" not in refs
+    assert refs == ["report.json", "report.md", "plan.json"]
+    _assert_refs_resolvable(verified, refs)
+
+
+def test_failed_policy_round_refs_list_admission(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """SF-2: a FAILED partial policy round's refs name its admission.
+
+    The partial FAILED bundle is an execution bundle carrying exactly one
+    approval document, admission.json; the hardcoded refs list claimed
+    review.json instead and omitted the admission.
+    """
+    run_root, job, face, mem_state = _setup_policy_round_case(
+        tmp_path, monkeypatch
+    )
+    build_error = SandboxError(
+        "missing provenance face",
+        reason_code=build_provenance.BUILD_PROVENANCE_MISSING,
+    )
+    fake_sandbox = _FakeSandbox(
+        image_digest=mem_state.plan["image_digest"],
+        build_recipe_digest=mem_state.plan["build_recipe_digest"],
+        faces={"vulnerable": face, "fixed": None},
+        face_name="compile_commands.json",
+        build_error_by_version={"fixed": build_error},
+    )
+    result = execution.run_execution(
+        "dsn",
+        job["job_id"],
+        1,
+        case_root=str(FIXTURE_CASES),
+        run_root=run_root,
+        sandbox=fake_sandbox,
+    )
+    assert result.state == "FAILED", result
+    assert result.reason_code == build_provenance.BUILD_PROVENANCE_MISSING
+    verified = evidence.verify_bundle(result.evidence_path)
+    assert "admission.json" in verified.file_data
+    assert "review.json" not in verified.file_data
+    refs = _report_evidence_refs_of(verified)
+    assert "review.json" not in refs
+    assert "admission.json" in refs
+    assert refs == ["report.json", "report.md", "plan.json", "admission.json"]
+    _assert_refs_resolvable(verified, refs)
+
+
+# ---------------------------------------------------------------------------
+# #64 #6: the primary build artifact suffix derives from the frozen plan
+# ---------------------------------------------------------------------------
+
+
+def test_primary_artifact_suffix_derives_from_the_frozen_plan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """#64 #6: the primary artifact gate reads the plan, not the journal.
+
+    The journal payload is attacker-writable evidence of a past run, so
+    whether the frozen plan declared custom multi-output targets must not
+    depend on the payload carrying ``files.outputs``. A v2 plan with
+    ``build_spec.outputs=["bin/custom_target"]`` pins the ``/bin/custom_target``
+    suffix even for payloads that omit ``files.outputs`` (old pre-D39
+    journals, truncated records - exactly the records this tightening must
+    stop reusing). v1 jobs and plans without usable outputs keep the
+    fail-closed ``/parser`` fallback.
+    """
+    run_root, _ = _configure_isolated_roots(tmp_path, monkeypatch)
+
+    def _context(
+        build_spec: dict[str, Any] | None, *, version: int
+    ) -> Any:
+        job, plan, plan_digest, review = _setup_fixture_plan_and_job(
+            version=version, build_spec=build_spec
+        )
+        mem_state = _InMemoryState(job, plan, plan_digest, review)
+        mem_state.install(monkeypatch)
+        return execution._load_context(
+            "dsn",
+            job["job_id"],
+            1,
+            case_root=str(FIXTURE_CASES),
+            run_root=run_root,
+        )
+
+    # The frozen plan declares a custom multi-output target; the suffix is
+    # derived from the plan alone - the function no longer even accepts the
+    # journal payload, so a record that omits files.outputs cannot downgrade
+    # the suffix back to /parser.
+    plan_context = _context(
+        _cmake_spec(outputs=["bin/custom_target"]), version=2
+    )
+    assert (
+        execution._primary_artifact_suffix(plan_context)
+        == "/bin/custom_target"
+    )
+
+    # v1 has no build_spec: the legacy /parser fallback is unchanged.
+    v1_context = _context(None, version=1)
+    assert execution._primary_artifact_suffix(v1_context) == "/parser"
+    # A v2 plan without outputs keeps the /parser fallback too.
+    no_outputs_context = _context(_cmake_spec(outputs=[]), version=2)
+    assert execution._primary_artifact_suffix(no_outputs_context) == "/parser"
+    # Unusable output lists fail closed to /parser (unchanged semantics).
+    for bad_outputs in (["../x"], ["/etc/x"], [42]):
+        bad_context = _context(_cmake_spec(outputs=bad_outputs), version=2)
+        assert (
+            execution._primary_artifact_suffix(bad_context) == "/parser"
+        ), bad_outputs
+
+
+# ---------------------------------------------------------------------------
+# #64 #3: make command-line assignment gate matches the build_spec.env rule
+# ---------------------------------------------------------------------------
+
+
+def test_make_cli_rejects_destdir_and_prefix():
+    """#64 #3: make install DESTDIR=/tmp/evil and prefix=/etc fail at freeze.
+
+    ``build_spec.env`` already rejects DESTDIR (and the CMake output path
+    vars) via ``_BUILD_ENV_PATH_VARS``; the make command-line assignment gate
+    must refuse the same redirection, while a plain ``make install`` without
+    assignments stays allowed.
+    """
+    plain = _make_spec()
+    plain["install"] = ["make", "install"]
+    control = build_provenance.validate_build_spec_for_freeze(plain)
+    assert control.ok is True, control.error_detail
+
+    destdir = _make_spec()
+    destdir["install"] = ["make", "install", "DESTDIR=/tmp/evil"]
+    destdir_decision = build_provenance.validate_build_spec_for_freeze(destdir)
+    assert destdir_decision.ok is False, destdir_decision.error_detail
+    assert "DESTDIR" in destdir_decision.error_detail
+
+    prefix = _make_spec()
+    prefix["install"] = ["make", "install", "prefix=/etc"]
+    prefix_decision = build_provenance.validate_build_spec_for_freeze(prefix)
+    assert prefix_decision.ok is False, prefix_decision.error_detail
+    assert "prefix" in prefix_decision.error_detail

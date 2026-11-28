@@ -4107,6 +4107,28 @@ def _evidence_artifacts(
     return artifacts
 
 
+def _report_evidence_refs(
+    artifacts: Mapping[str, Any],
+) -> list[str]:
+    """Derive the report's document refs from the artifacts actually archived.
+
+    ``report.json``/``report.md`` are always written next to this report and
+    ``plan.json``/``review.json``/``admission.json`` are listed only when the
+    writer really archives them, so the refs can never name an approval
+    document the bundle does not carry: a policy round (admitted by its
+    admission, review cleared by ``_load_context``) lists ``admission.json``,
+    and a blocked policy round lists neither. Delta §8 requires every
+    ``evidence_refs`` entry to resolve inside the bundle. Other artifacts
+    (envelope, budget, metadata, ...) stay out: refs name the report, the
+    plan and the approval document only.
+    """
+    refs = ["report.json", "report.md"]
+    for name in ("plan.json", "review.json", "admission.json"):
+        if name in artifacts:
+            refs.append(name)
+    return refs
+
+
 def _discard_published_bundle(path: str | None) -> None:
     """Best-effort removal of a bundle this generation just published.
 
@@ -4772,7 +4794,7 @@ def _archive_only(dsn: str, context: ExecutionContext) -> ExecutionResult:
             build_root,
             result,
             check_provenance_face=not is_v2_spec,
-            artifact_suffix=_primary_artifact_suffix(context, result),
+            artifact_suffix=_primary_artifact_suffix(context),
         ):
             builds[version] = result
     runs: list[dict[str, Any]] = []
@@ -4949,22 +4971,6 @@ def _archive_only(dsn: str, context: ExecutionContext) -> ExecutionResult:
             return ExecutionResult("STALE")
         return ExecutionResult("INCONCLUSIVE", reason_code="EVIDENCE_INCOMPLETE")
 
-    report, report_markdown = _build_report(
-        context,
-        verdict=decision.verdict,
-        verdict_reason=decision.reason_code,
-        decision=decision,
-        builds=builds,
-        runs=runs,
-        probe=probe,
-        evidence_refs=["report.json", "report.md", "plan.json", "review.json"],
-        missing=missing,
-        build_provenance_summary=(
-            provenance_outcome.report_summary
-            if provenance_outcome is not None
-            else None
-        ),
-    )
     attempt_rows = []
     for row in rows:
         item = {
@@ -4974,6 +4980,9 @@ def _archive_only(dsn: str, context: ExecutionContext) -> ExecutionResult:
             if item.get(column) is not None:
                 item[column] = jsonutil.timestamp(item[column])
         attempt_rows.append(item)
+    # Artifacts first, then the report: the refs must be derived from the
+    # documents this writer really archives (SF-2), so a policy round lists
+    # its admission instead of a review.json it never carried.
     artifacts = _evidence_artifacts(
         context,
         build_root,
@@ -4993,6 +5002,22 @@ def _archive_only(dsn: str, context: ExecutionContext) -> ExecutionResult:
             "replays": [dict(item) for item in runs],
             "attempts": attempt_rows,
         },
+    )
+    report, report_markdown = _build_report(
+        context,
+        verdict=decision.verdict,
+        verdict_reason=decision.reason_code,
+        decision=decision,
+        builds=builds,
+        runs=runs,
+        probe=probe,
+        evidence_refs=_report_evidence_refs(artifacts),
+        missing=missing,
+        build_provenance_summary=(
+            provenance_outcome.report_summary
+            if provenance_outcome is not None
+            else None
+        ),
     )
     try:
         digest, path, archive_error = _archive(
@@ -5275,7 +5300,7 @@ def run_execution(
                 reusable=lambda payload: _reusable_build(
                     build_root,
                     payload,
-                    artifact_suffix=_primary_artifact_suffix(context, payload),
+                    artifact_suffix=_primary_artifact_suffix(context),
                 ),
             )
             builds[version] = result
@@ -5466,12 +5491,19 @@ def run_execution(
         "replays": [dict(item) for item in runs],
         "attempts": attempt_rows,
     }
-    evidence_refs = [
-        "report.json",
-        "report.md",
-        "plan.json",
-        "review.json",
-        "metadata/execution.json",
+    # Artifacts first, then the report: the refs must be derived from the
+    # documents this writer really archives (SF-2), so a policy round lists
+    # its admission instead of a review.json it never carried.
+    artifacts = _evidence_artifacts(
+        context,
+        build_root,
+        builds=builds,
+        runs=runs,
+        probe=probe_payload,
+        execution_metadata=execution_metadata,
+    )
+    evidence_refs = _report_evidence_refs(artifacts) + [
+        "metadata/execution.json"
     ]
     report, report_markdown = _build_report(
         context,
@@ -5488,14 +5520,6 @@ def run_execution(
             if provenance_outcome is not None
             else None
         ),
-    )
-    artifacts = _evidence_artifacts(
-        context,
-        build_root,
-        builds=builds,
-        runs=runs,
-        probe=probe_payload,
-        execution_metadata=execution_metadata,
     )
     try:
         digest, path, archive_error = _archive(
@@ -5626,19 +5650,16 @@ def _to_observation(payload: Mapping[str, Any], run_root: Path) -> RunObservatio
     )
 
 
-def _primary_artifact_suffix(
-    context: ExecutionContext,
-    payload: Mapping[str, Any] | None = None,
-) -> str:
-    """Return the trusted run-root suffix for the primary build artifact."""
-    files = payload.get("files") if isinstance(payload, Mapping) else None
-    has_outputs = (
-        isinstance(files, Mapping)
-        and isinstance(files.get("outputs"), Mapping)
-        and bool(files.get("outputs"))
-    )
-    if not has_outputs:
-        return "/parser"
+def _primary_artifact_suffix(context: ExecutionContext) -> str:
+    """Return the trusted run-root suffix for the primary build artifact.
+
+    The suffix derives from the frozen plan (``context.plan``'s
+    ``build_spec.outputs``), never from the journal payload: the payload is
+    attacker-writable evidence of a past run, so a record that omits
+    ``files.outputs`` cannot downgrade a custom-output plan back to the
+    legacy ``/parser`` path. v1 jobs and plans without usable outputs keep
+    the fail-closed ``/parser`` fallback.
+    """
     build_spec = _build_spec_from_context(context) if _is_v2_context(context) else None
     if not isinstance(build_spec, Mapping):
         return "/parser"
@@ -5857,7 +5878,7 @@ def _do_replay(
     artifact_path = _run_root_path(
         _work_root(context),
         relative,
-        _primary_artifact_suffix(context, build),
+        _primary_artifact_suffix(context),
     )
     if artifact_path is None:
         raise ExecutionBlocked(
@@ -6033,6 +6054,22 @@ def _finish_blocked(
     # One decision, two consumers: the report's bundle_kind and the
     # writer's approval gate must not drift apart.
     bundle_kind = "blocked" if _is_v2_context(context) else "execution"
+    # Artifacts first, then the report: the refs must be derived from the
+    # documents this writer really archives (SF-2). On a blocked policy
+    # round the writer drops the admission below, so the refs must not
+    # claim any approval document either.
+    artifacts = _evidence_artifacts(
+        context,
+        build_root,
+        builds=builds or {},
+        runs=runs or [],
+        probe=probe,
+        execution_metadata={},
+        # The verifier rejects a blocked bundle that still carries
+        # the policy admission, so the writer drops it here (v1
+        # has no admission row and is unchanged).
+        blocked=bundle_kind == "blocked",
+    )
     report, markdown = _build_report(
         context,
         verdict="BLOCKED",
@@ -6041,7 +6078,7 @@ def _finish_blocked(
         builds=builds or {},
         runs=runs or [],
         probe=probe,
-        evidence_refs=["report.json", "report.md", "plan.json", "review.json"],
+        evidence_refs=_report_evidence_refs(artifacts),
         missing=[
             "target execution blocked"
         ],
@@ -6054,18 +6091,7 @@ def _finish_blocked(
             context,
             report=report,
             report_markdown=markdown,
-            artifacts=_evidence_artifacts(
-                context,
-                build_root,
-                builds=builds or {},
-                runs=runs or [],
-                probe=probe,
-                execution_metadata={},
-                # The verifier rejects a blocked bundle that still carries
-                # the policy admission, so the writer drops it here (v1
-                # has no admission row and is unchanged).
-                blocked=bundle_kind == "blocked",
-            ),
+            artifacts=artifacts,
             verdict="BLOCKED",
         )
     except state.StaleGeneration:
@@ -6170,6 +6196,24 @@ def _finish_failed(
         "TIMEOUT",
     )
     terminal = "INCONCLUSIVE" if incomplete else "FAILED"
+    # Artifacts first, then the report: the refs must be derived from the
+    # documents this writer really archives (SF-2), so a policy round lists
+    # its admission instead of a review.json it never carried.
+    artifacts = _evidence_artifacts(
+        context,
+        build_root,
+        builds=builds,
+        runs=runs,
+        probe=probe,
+        execution_metadata={
+            "job_id": context.job_id_text,
+            "plan_digest": context.plan_digest,
+            "generation": generation,
+            "probe": probe,
+            "builds": [dict(item) for item in builds.values()],
+            "replays": [dict(item) for item in runs],
+        },
+    )
     report, markdown = _build_report(
         context,
         verdict=terminal,
@@ -6178,7 +6222,7 @@ def _finish_failed(
         builds=builds,
         runs=runs,
         probe=probe,
-        evidence_refs=["report.json", "report.md", "plan.json", "review.json"],
+        evidence_refs=_report_evidence_refs(artifacts),
         missing=["required replay evidence is incomplete"] if incomplete else ["execution failed"],
         error=f"{error.reason_code}: {error.message}",
         build_provenance_summary=build_provenance_summary,
@@ -6189,21 +6233,7 @@ def _finish_failed(
             context,
             report=report,
             report_markdown=markdown,
-            artifacts=_evidence_artifacts(
-                context,
-                build_root,
-                builds=builds,
-                runs=runs,
-                probe=probe,
-                execution_metadata={
-                    "job_id": context.job_id_text,
-                    "plan_digest": context.plan_digest,
-                    "generation": generation,
-                    "probe": probe,
-                    "builds": [dict(item) for item in builds.values()],
-                    "replays": [dict(item) for item in runs],
-                },
-            ),
+            artifacts=artifacts,
             verdict=terminal,
         )
     except state.StaleGeneration:
