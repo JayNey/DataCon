@@ -7,6 +7,7 @@ import subprocess
 
 import pytest
 
+from datacon.cases import CaseConfigurationError, load_registry
 from datacon.contracts import parse_request
 
 CASES = Path(__file__).resolve().parents[1] / "fixtures" / "cases"
@@ -193,3 +194,61 @@ def test_b03_admission_record_is_traceable_and_pending_or_frozen():
     markdown = (CASES / "B03-admission.md").read_text(encoding="utf-8")
     assert record["cve_id"] in markdown
     assert "T05" in markdown
+
+
+FIXTURE_SOURCE_URLS = {
+    "fixture-c-parser": "https://example.invalid/datacon/B01",
+    "fixture-c-parser-clean": "https://example.invalid/datacon/B02",
+}
+
+
+def test_registry_advisory_requires_intel_license_fields(tmp_path):
+    """Every advisory entry must carry the T15 intel source fields.
+
+    cases.py only checks key presence. Value eligibility (an https source
+    URL, ``reproduction`` inside ``permitted_uses``) stays with
+    ``intel_fetch.public_source_url`` and ``intel_fetch.license_rejection``
+    at the gate, and ``license`` may be null when a source declares no
+    license. The field names mirror the intel license document
+    (``intel_evidence.LICENSE_DOCUMENT_FIELDS``).
+    """
+    for missing in ("source_url", "license", "permitted_uses"):
+        root = tmp_path / f"missing-{missing}"
+        shutil.copytree(CASES, root)
+        registry_path = root / "registry.json"
+        document = json.loads(registry_path.read_text(encoding="utf-8"))
+        # Minimal legal case entry: the fixture entry with exactly one
+        # advisory intel field removed.
+        entry = dict(document["cases"]["fixture-c-parser"])
+        entry["advisory"] = {
+            key: value
+            for key, value in entry["advisory"].items()
+            if key != missing
+        }
+        document["cases"] = {"fixture-c-parser": entry}
+        registry_path.write_text(
+            json.dumps(document, indent=2) + "\n", encoding="utf-8"
+        )
+
+        with pytest.raises(CaseConfigurationError) as caught:
+            load_registry(str(root))
+
+        assert missing in caught.value.message, caught.value.message
+
+    registry = load("registry.json")
+    assert set(registry["cases"]) == set(FIXTURE_SOURCE_URLS)
+    for case_id, entry in registry["cases"].items():
+        advisory = entry["advisory"]
+        assert advisory["source_url"] == FIXTURE_SOURCE_URLS[case_id]
+        assert "license" in advisory
+        assert advisory["license"] == "CC0-1.0"
+        assert advisory["permitted_uses"] == ["reproduction"]
+
+    loaded = load_registry(str(CASES))
+    assert set(loaded.document["cases"]) == set(FIXTURE_SOURCE_URLS)
+    for case_id, entry in loaded.document["cases"].items():
+        advisory = entry["advisory"]
+        assert advisory["path"] == "advisory.json"
+        assert advisory["source_url"] == FIXTURE_SOURCE_URLS[case_id]
+        assert advisory["license"] == "CC0-1.0"
+        assert advisory["permitted_uses"] == ["reproduction"]
