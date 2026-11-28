@@ -683,6 +683,302 @@ def build_graph(
     return builder.compile(checkpointer=checkpointer)
 
 
+# §10 dispositions for a denied derived round. A denial blocks only that round
+# and keeps its reason code. The normal path never reaches admission with an
+# exhausted budget: ``derive_and_admit_round`` gates budget and max_rounds
+# before creating the child (改9). Only in an extreme race (the ledger moved
+# between that gate and the admission predicate) can the predicate still deny
+# with BUDGET_EXHAUSTED; that is not a BLOCKED reason, so the already-created
+# round is closed as ADMISSION_DENIED with the precise sub_reason on the
+# round_admission_denied audit. A failed or crashed admission also fails
+# closed as ADMISSION_DENIED: no admission was granted.
+_DENIED_ROUND_BLOCK_REASONS = frozenset(
+    {"ADMISSION_DENIED", "ENVELOPE_VIOLATION", "HARNESS_REJECTED"}
+)
+
+
+def _block_derived_round(
+    dsn: str,
+    job_id: UUID,
+    *,
+    reason_code: str,
+    message: str,
+    run_root: str | None,
+) -> None:
+    if state_store.block_round_child(
+        dsn, job_id, reason_code=reason_code, message=message
+    ):
+        execution.record_blocked(
+            dsn,
+            job_id,
+            reason_code=reason_code,
+            message=message,
+            generation=0,
+            run_root=run_root,
+        )
+
+
+def _admit_derived_round(
+    dsn: str,
+    *,
+    job_id: UUID,
+    family_id: UUID | str,
+    round_no: int,
+    admission_inputs: Any,
+    run_root: str | None,
+) -> dict[str, Any]:
+    """Run ``record_admission`` for a derived READY round; fail closed on deterministic errors.
+
+    S3: if the round already has an admission row (including when a concurrent
+    admission committed before a stale recovery retry), return it as admitted
+    and never block the round.
+    S5: transient ``psycopg.Error`` propagates without blocking the round so
+    ``recover_unadmitted_rounds`` can retry after the 300 s grace window,
+    matching the worker's existing DB-error propagation contract.
+    """
+    existing_admission = state_store.get_admission(dsn, job_id)
+    if existing_admission is not None:
+        current = state_store.load_job(dsn, job_id)
+        return {
+            "job_id": str(job_id),
+            "derived": True,
+            "state": current["state"] if current else "READY",
+            "admitted": True,
+            "reason_code": None,
+            "sub_reason": "ROUND_ALREADY_ADMITTED",
+            "admission": existing_admission,
+        }
+    try:
+        if not isinstance(admission_inputs, dict):
+            raise state_store.StateError(
+                "the derived round has no persisted admission inputs"
+            )
+        budget_snapshot = state_store.family_budget_summary(dsn, family_id)
+        outcome = state_store.record_admission(
+            dsn,
+            family_id=family_id,
+            job_id=job_id,
+            round_no=round_no,
+            envelope=admission_inputs["envelope"],
+            seed_digest=admission_inputs["seed_digest"],
+            budget_snapshot=budget_snapshot,
+            experiment=admission_inputs.get("experiment"),
+            recomputable=admission_inputs.get("recomputable", True),
+            campaign_bundle_digest=admission_inputs.get("campaign_bundle_digest"),
+        )
+    except psycopg.Error:
+        # S5: do not permanently block a round on a transient database failure;
+        # leave it READY so recover_unadmitted_rounds retries after the grace
+        # window. Propagate consistently with run_worker's DB-error semantics.
+        raise
+    except (state_store.StateError, KeyError, TypeError) as error:
+        message = f"round {round_no} admission failed: {error}"
+        _block_derived_round(
+            dsn,
+            job_id,
+            reason_code="ADMISSION_DENIED",
+            message=message,
+            run_root=run_root,
+        )
+        current = state_store.load_job(dsn, job_id)
+        return {
+            "job_id": str(job_id),
+            "derived": True,
+            "state": current["state"] if current else None,
+            "admitted": False,
+            "reason_code": "ADMISSION_DENIED",
+            "sub_reason": None,
+            "error": str(error),
+        }
+    if outcome.admitted or outcome.status == "already_admitted":
+        return {
+            "job_id": str(job_id),
+            "derived": True,
+            "state": "READY",
+            "admitted": True,
+            "reason_code": None,
+            "sub_reason": None,
+            "admission": outcome.admission,
+        }
+    if outcome.sub_reason == "ROUND_ALREADY_ADMITTED":
+        existing_admission = state_store.get_admission(dsn, job_id)
+        if existing_admission is not None:
+            current = state_store.load_job(dsn, job_id)
+            return {
+                "job_id": str(job_id),
+                "derived": True,
+                "state": current["state"] if current else "READY",
+                "admitted": True,
+                "reason_code": None,
+                "sub_reason": "ROUND_ALREADY_ADMITTED",
+                "admission": existing_admission,
+            }
+    reason_code = (
+        outcome.reason_code
+        if outcome.reason_code in _DENIED_ROUND_BLOCK_REASONS
+        else "ADMISSION_DENIED"
+    )
+    message = (
+        f"round {round_no} admission denied: {outcome.reason_code}"
+        + (f" ({outcome.sub_reason})" if outcome.sub_reason else "")
+    )
+    _block_derived_round(
+        dsn, job_id, reason_code=reason_code, message=message, run_root=run_root
+    )
+    current = state_store.load_job(dsn, job_id)
+    return {
+        "job_id": str(job_id),
+        "derived": True,
+        "state": current["state"] if current else None,
+        "admitted": False,
+        "reason_code": reason_code,
+        "sub_reason": outcome.sub_reason,
+    }
+
+
+def derive_and_admit_round(
+    dsn: str,
+    *,
+    family_id: UUID | str,
+    round_no: int,
+    plan: dict[str, Any],
+    envelope: dict[str, Any],
+    seed_digest: str,
+    experiment: dict[str, Any] | None = None,
+    recomputable: bool = True,
+    campaign_bundle_digest: str | None = None,
+    run_root: str | None = None,
+) -> dict[str, Any]:
+    """Family-level transition #23/#26: gate, derive the next round, admit it.
+
+    Order (改9): ``state.check_round_derivation`` first (serial children,
+    ``max_rounds``, total and — for guided — fuzz budget); a refused
+    transition creates nothing and the family archives through
+    ``converge_families``. Only then is the ``job_kind=round`` child created
+    with its frozen plan and persisted admission inputs, and
+    ``state.record_admission`` runs before anything executes. An admitted
+    round stays ``READY`` and becomes claimable through the v2 claim gate; a
+    denied or failed admission blocks and archives the round, so it never
+    starts a container. The human-approved first plan never comes through
+    here. A crash between child creation and admission is recovered by
+    ``recover_unadmitted_rounds``.
+    """
+    gate = state_store.check_round_derivation(
+        dsn, family_id=family_id, round_no=round_no
+    )
+    if not gate.allowed:
+        return {
+            "job_id": None,
+            "derived": False,
+            "state": None,
+            "admitted": False,
+            "reason_code": gate.reason_code,
+            "sub_reason": gate.sub_reason,
+        }
+    admission_inputs = {
+        "envelope": envelope,
+        "seed_digest": seed_digest,
+        "experiment": experiment,
+        "recomputable": recomputable,
+        "campaign_bundle_digest": campaign_bundle_digest,
+    }
+    child = state_store.create_round_child(
+        dsn,
+        family_id=family_id,
+        round_no=round_no,
+        plan=plan,
+        admission_inputs=admission_inputs,
+    )
+    job_id = UUID(child["job_id"])
+    if child["state"] != "READY":
+        # Re-entry after the round already left the admission phase.
+        return {
+            "job_id": child["job_id"],
+            "derived": True,
+            "state": child["state"],
+            "admitted": None,
+            "reason_code": None,
+            "sub_reason": None,
+        }
+    return _admit_derived_round(
+        dsn,
+        job_id=job_id,
+        family_id=family_id,
+        round_no=round_no,
+        admission_inputs=admission_inputs,
+        run_root=run_root,
+    )
+
+
+def recover_unadmitted_rounds(
+    dsn: str,
+    *,
+    grace_seconds: int = state_store.ROUND_ADMISSION_RECOVERY_GRACE_SECONDS,
+    run_root: str | None = None,
+) -> int:
+    """Worker scan: finish rounds a crash left between creation and admission.
+
+    Each stuck ``READY``/``stage='admission'`` round older than the grace
+    window is admitted again from the inputs persisted with its plan
+    (``record_admission`` is idempotent); a denial or a failure blocks and
+    archives it. Returns the number of rounds handled.
+    """
+    handled = 0
+    for row in state_store.unadmitted_round_children(
+        dsn, grace_seconds=grace_seconds
+    ):
+        # S3: re-confirm in a transaction that the round still has no admission
+        # before retrying, so an admission that committed after the listing
+        # query is never raced or blocked.
+        if not state_store.round_needs_admission_recovery(dsn, row["job_id"]):
+            continue
+        raw_summary = row.get("summary")
+        summary: dict[str, Any] = raw_summary if isinstance(raw_summary, dict) else {}
+        _admit_derived_round(
+            dsn,
+            job_id=row["job_id"],
+            family_id=row["family_id"],
+            round_no=row["round_no"],
+            admission_inputs=summary.get("admission_inputs"),
+            run_root=run_root,
+        )
+        handled += 1
+    return handled
+
+
+def recover_unarchived_blocked_rounds(
+    dsn: str,
+    *,
+    run_root: str | None = None,
+) -> int:
+    """Worker scan (B4): idempotently archive BLOCKED rounds left unarchived after a crash.
+
+    A crash or I/O error between ``block_round_child`` and
+    ``execution.record_blocked`` leaves a derived round ``BLOCKED`` with
+    ``evidence_status IS NULL``. Running this scan before ``converge_families``
+    guarantees every blocked round gets its archived blocked bundle before the
+    family is evaluated for convergence. Transient database errors propagate
+    consistently with the other worker sweeps.
+    """
+    archived = 0
+    for row in state_store.unarchived_blocked_round_children(dsn):
+        reason_code = row.get("reason_code") or "ADMISSION_DENIED"
+        message = (
+            row.get("last_error")
+            or f"round {row.get('round_no')} blocked: {reason_code}"
+        )
+        if execution.record_blocked(
+            dsn,
+            row["job_id"],
+            reason_code=reason_code,
+            message=message,
+            generation=row["generation"],
+            run_root=run_root,
+        ):
+            archived += 1
+    return archived
+
+
 def _worker_id() -> str:
     return os.getenv("DATACON_WORKER_ID") or f"{socket.gethostname()}:{os.getpid()}"
 
@@ -709,11 +1005,17 @@ def run_worker(
             # with the existing worker error semantics instead of being
             # swallowed.
             expired_envelopes = state_store.expire_pending_envelopes(dsn)
-            # T12/D43 minimal crash-recovery wiring: a family whose last child
-            # archived just before the process died must not stay AGGREGATING
-            # forever. The sweep is idempotent (the existing family.json bytes
-            # win) and only touches families with terminal children.
-            converged_families = state_store.converge_families(dsn)
+            # T12 改9 crash recovery runs BEFORE family sealing (B3): recover
+            # uncharged attempts and unadmitted rounds first so family.json
+            # never freezes a stale pre-recovery budget or prematurely seals.
+            recovered_charges = state_store.recover_uncharged_attempts(dsn)
+            recovered_rounds = recover_unadmitted_rounds(dsn, run_root=run_root)
+            recovered_blocked_rounds = recover_unarchived_blocked_rounds(
+                dsn, run_root=run_root
+            )
+            # T12/D43 crash-recovery sweep: converge families whose children
+            # are terminal, archived, and whose charges are accounted for.
+            family_sweep = state_store.converge_families_detailed(dsn)
             claimed = state_store.claim_next(
                 dsn, worker, lease_seconds=lease_seconds, execute=execute
             )
@@ -722,7 +1024,11 @@ def run_worker(
                     return {
                         "processed": 0,
                         "expired_envelopes": expired_envelopes,
-                        "families_converged": len(converged_families),
+                        "families_converged": len(family_sweep.converged),
+                        "families_terminated": len(family_sweep.terminated),
+                        "rounds_recovered": recovered_rounds,
+                        "blocked_rounds_archived": recovered_blocked_rounds,
+                        "charges_recovered": recovered_charges,
                     }
                 time.sleep(poll_seconds)
                 continue
@@ -735,7 +1041,11 @@ def run_worker(
                 run_root=run_root,
             )
             result["expired_envelopes"] = expired_envelopes
-            result["families_converged"] = len(converged_families)
+            result["families_converged"] = len(family_sweep.converged)
+            result["families_terminated"] = len(family_sweep.terminated)
+            result["rounds_recovered"] = recovered_rounds
+            result["blocked_rounds_archived"] = recovered_blocked_rounds
+            result["charges_recovered"] = recovered_charges
             if once:
                 return result
 

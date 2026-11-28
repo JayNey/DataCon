@@ -86,12 +86,16 @@
 | `mutation_limits.max_input_bytes` | integer | 单次输入字节上限；`ExperimentSpec.mutation_constraints.max_input_bytes` 不得大于该值；`fixed` 必须为 `0` |
 | `seed_corpus_digest` | digest | 经审核种子语料的规范化摘要；guided 必填，fixed 为 null |
 | `fuzz_image_digest` | digest | fuzz 固定镜像摘要；guided 必填且默认等于固定工具链镜像摘要，独立 fuzz 镜像必须显式审批；fixed 为 null |
-| `harness_digest` | digest | 经审核 harness 的摘要，与 build recipe 同级冻结 |
+| `harness_digest` | digest | 经审核 harness 的摘要，与 build recipe 同级冻结；guided（改9）绑定 `{harness, fuzz_shim}` 规范化对（见下），fixed 只绑定 harness |
 | `max_rounds` | integer | family 级轮次上限，由准入 predicate 校验 `round_no <= max_rounds` |
 | `max_total_seconds` | integer | family 级总时长上限 |
 | `max_fuzz_seconds` | integer | 总时长内的 fuzz 子预算 |
 | `accepted_signature_set` | array[object] | 只接受其中签名；每项与 plan `asan_signature` 同结构：`error`/`function`/`source` 必填，`operation`/`access_size` 可选 |
 | `admission_predicate_version` | string | 准入谓词版本；与 plan、admission、证据同时记录 |
+
+**固定 fuzz shim 与 guided `harness_digest`（改9）**。libFuzzer 入口由仓库固定的 fuzz shim 提供（`LLVMFuzzerTestOneInput` 把输入字节交给已审核 harness 的同一解析入口），不新增 per-case fuzz harness，模型不得合成或改写 shim。guided 信封的 `harness_digest` 为规范化对 `{"harness": <harness 文件 SHA-256>, "fuzz_shim": <shim 文件 SHA-256>}` 的 `digest_json`；fixed 信封不含 fuzz，`harness_digest` 仍为 harness 文件摘要。shim 未审核、字节与登记摘要不符或该对的摘要与信封不符时返回 `HARNESS_REJECTED`，执行入口在容器启动前再校验一次（准入阶段已查过也不例外）。
+
+**种子语料登记（改9）**。初始 seed corpus 在案例注册表 `exploration_ceilings.<case_id>.seed_corpus` 显式登记为数组，每项 `{"name": <basename>, "path": <材料相对路径>, "digest": <sha256>}`；缺省登记该案例的 `normal` 与 `candidate` 两个输入。`name` 为不含 `/` 的唯一文件名，`path` 遵守材料路径规则。`seed_corpus_digest = digest_json(sorted([{"name", "sha256"}], by name))`：只由文件名与字节摘要决定，与路径、登记顺序无关。语料受[安全 §5](security-design-delta.md) 上限约束（总 64 MiB、单文件 8 MiB、4096 个文件），超限归 `POLICY_DENIED`，审计 `detail.sub_reason` 为 `CORPUS_TOTAL_BYTES_EXCEEDED`、`CORPUS_FILE_BYTES_EXCEEDED` 或 `CORPUS_FILE_COUNT_EXCEEDED`（见第 10 节）。
 
 `mutation_limits`、`allowed_mutation_families` 以及两个预算上限都参与 `envelope_digest`。fixed 的退化信封固定为 `allowed_mutation_families=[]`、`mutation_limits={"allowed_ops":[],"max_input_bytes":0}`、`max_fuzz_seconds=0`、`seed_corpus_digest=null`、`fuzz_image_digest=null`，`harness_digest` 与 `accepted_signature_set` 仍必填。这些 null/空值是规范化信封的一部分，必须参与 `envelope_digest`；`envelope_digest` 不属于信封正文，计算时排除自身，并进入 plan、admission、manifest 与 report。
 
@@ -288,6 +292,8 @@ BuildSpec 只有一套字段：`kind`、`configure`（仅 cmake）、`build`、`
 | `cmake` | `configure`、`build`、`env`、`outputs`、`declared_compile_flags` | 构建目录中的 `compile_commands.json` |
 | `make` | `build`、`env`、`outputs`、`declared_compile_flags` | `env.CC` 指向的 `CC` shim 日志；不得依赖未记录的隐式规则 |
 | `shell` | `build`、`env`、`outputs`、`declared_compile_flags`、`shell_recipe_digest`、`shell_face_digest`、`shell_face_review` | 经审核的日志核对面；默认不构成可比性证据 |
+
+**campaign 双产物（改9）**。campaign child 每版只构建一次，`outputs` 同时列出回放用 parser（ASan）与 fuzzer（libFuzzer + 固定 shim）两个产物，二者都以 `build_artifact` 角色归档；按“固定路径”的 `BuildSpec.outputs` 映射落在 `build/{version}/` 下（默认 `build/{version}/parser` 与 `build/{version}/fuzzer`）。guided validation 复用 campaign 两版的这两个产物，不重新构建；fixed execution/validation 照常构建两版回放产物，不产 fuzzer。
 
 `install` 为可选数组，缺省等价于 `[]`。`shell_recipe_digest` 只表示配方摘要，不是核对面；`shell_face_digest` 为案例注册表预审基线核对面（已做路径与时间戳归一化）的 SHA-256，`shell_face_review` 记录审核人、审核时间与核对面类型。冻结阶段校验 `shell_face_digest` 与 `shell_face_review` 非空；构建阶段对实际构建日志执行同一路径/时间戳归一化后计算摘要并与 `shell_face_digest` 比对，不符即返回 `BUILD_PROVENANCE_MISSING`。
 
@@ -551,6 +557,18 @@ CREATE TABLE IF NOT EXISTS budget_charges (
 2. **容器退出后独立短事务落账**：容器执行本身在数据库事务外进行；容器退出后在独立短事务内计算 `charged_seconds = min(ceil(elapsed), remaining_total_seconds)`（fuzz 步骤另算 `charged_fuzz = min(max(1, ceil(elapsed_fuzz)), remaining_fuzz_seconds, charged_seconds)`），按幂等键 `(job_id, step_key, attempt_no)` 执行原子条件 `UPDATE budget_ledger ... WHERE remaining_total_seconds >= charged_seconds`（fuzz 同时校验 `remaining_fuzz_seconds >= charged_fuzz`）并写入 `budget_charges` 与步骤结果记录；若实耗触达或超过余额（扣减后归零或因并发/超时无法再扣），同时触发 `BUDGET_EXHAUSTED`。
 3. **幂等与恢复**：同一 `(job_id, step_key, attempt_no)` 重复扣费返回既有记录；恢复同一 attempt 不重复扣费，重试产生新 `attempt_no` 并新扣费。`family_id` 冗余在 charge 上，便于按 family 离线重建 `spent_seconds` 与 `spent_fuzz_seconds`。未真正启动的 fuzz 不落 charge，因此 `charge_kind='fuzz'` 的 `fuzz_seconds` 恒 ≥ 1，且始终满足 `0 <= fuzz_seconds <= seconds`。
 
+**runtime 接线（改9）**。上述协议由执行器对 v2 `campaign`/`round` child 的每个容器步骤执行（probe、build、replay 为 `general`，fuzz 为 `fuzz`）；`step_key` 为执行器步骤键（如 `build:vulnerable`、`replay:fixed:normal`），`attempt_no` 为该步骤的执行 attempt 号。门禁在写 attempt 行与创建容器之前执行，下发的上限同时约束该步容器的硬超时；容器退出后无论完成、超时、OOM、失败或被取消都按实耗落账，落账失败不掩盖步骤自身的异常。步骤开始前余额不足时，当前 child 以 `BUDGET_EXHAUSTED` 收束：尚无回放时为 `FAILED`，已有回放时为 `INCONCLUSIVE`，均保留已产出证据；campaign/family 仍按既有 `COMPLETED` 收敛。report 与 `budget/snapshot.json` 的预算按扣费后的 family charge 重建。
+
+**派生轮次与准入（改9）**。边 #23/#26 的 family 级转移先 gate、后建 child，首份人批计划（含 fixed 的 round 1）不经此路径：
+
+1. **派生前 gate**（`check_round_derivation`）：先校验前置条件——family 须为 guided 模式（fixed 不走该路径）、处于 `AGGREGATING`、无 `pending` 信封、无非终态（含未同步或未归档的 blocked）child（串行，`sub_reason=CHILD_NOT_TERMINAL`）、有且仅有一个 `COMPLETED` campaign child，且 `round_no` 等于已有最大轮次 +1（不满足时无原因码，返回对应 `sub_reason` 或 `StateError`）。随后只按 `max_rounds` 与总余额 ≥ 1 秒做容量门禁：`round_no` 超过有效 `max_rounds` 或总余额不足 1 秒时返回 `BUDGET_EXHAUSTED`。guided 的 validation 轮次只执行 general 步骤（构建/回放），不检查 fuzz 子预算；fuzz 子预算只在 fuzz 步骤自身的门禁生效。gate 不通过时**不创建任何 child**，family 按归档门禁收敛（总余额耗尽或轮次用尽可归档）。
+2. **建 child**：gate 通过后创建 `job_kind=round` child 与其冻结 plan（按非首份 plan 规则绑定审批链尾），child 以 `READY`、`workflow_synced=true`、`stage='admission'` 落库，v2 领取门禁在 policy admission 行存在前不领取；准入输入（信封正文、seed 摘要、ExperimentSpec、campaign 佐证）经结构与大小（64 KiB）校验后随 plan 存入 `plans.summary.admission_inputs`（对 `status()` 隐藏，同轮重入须一致否则 `PlanConflict`）。
+3. **准入**：随后调用 `record_admission`。通过后 child 可被领取执行；已有 `admissions` 行的 round 不得再被阻断。拒绝时 child 不启动任何容器，直接 `BLOCKED` 并归档 blocked 包，`ADMISSION_DENIED`、`ENVELOPE_VIOLATION`、`HARNESS_REJECTED` 原样作为原因码；`record_admission` 遇确定性错误（`StateError`/`KeyError`/`TypeError`）时 fail closed 为 `BLOCKED(ADMISSION_DENIED)` 并归档，遇瞬时数据库错误（`psycopg.Error`）时不阻断、保持 `READY` 待恢复重试。单轮被 policy 拒绝（`ENVELOPE_VIOLATION`/`ADMISSION_DENIED`/`HARNESS_REJECTED` 且无 admission 行）不立即终结 family：family 保持 `AGGREGATING` 可继续派生下一轮（`round_no + 1`），仍受 `max_rounds` 与总余额约束；当轮次用尽、总余额不足 1 秒或当前决策点记录 `no_next_round` 时，若存在其他合法轮次则归档 `family.json`（索引已归档的 blocked round）并收敛 `COMPLETED`，若全部轮次均被 policy 拒绝且无其他合法轮次则终态 `BLOCKED`（对应 §10）。
+4. **竞态兜底（仅防御路径）**：正常路径不会带着耗尽的预算进入准入。只有极端竞态（gate 与准入谓词之间账本变化）下谓词仍以 `BUDGET_EXHAUSTED` 拒绝时，才允许“先建后封”：已建 child 记为 `BLOCKED(ADMISSION_DENIED)`（`BUDGET_EXHAUSTED` 不属于 `BLOCKED` 封闭集），细因保留在 `round_admission_denied` 审计；这不是预算耗尽的正常语义。
+5. **崩溃恢复**：建 child 后、准入前崩溃会留下 `READY`/`stage='admission'`、无 admission 行的 round；worker 每轮扫描超过宽限期（300 秒，数据库时钟）的此类 round，在事务内复核仍无 admission 行后用已存准入输入幂等重试 `record_admission`；仍被拒或遇确定性错误按第 3 条阻断归档。阻断 round 与 `record_blocked` 归档之间崩溃（或 I/O 失败）会留下有 plan 但 `evidence_status IS NULL` 的 `BLOCKED` round；worker 在 `converge_families` 前幂等补归档 blocked 包，family 收敛前等待补归档完成。
+
+**扣费崩溃恢复（改9）**。预算步骤在容器启动前写入 `started` attempt 行（`started_at` 与 `result.budget = {charge_kind, ceiling_seconds}`，其中 `ceiling_seconds` 为该步下发给容器的硬超时，即 `min(步骤自身超时, 剩余 deadline, gate 上限)`，不超过 gate 上限）。若进程在容器退出后、落账前崩溃，该行保持 `started` 且无 `budget_charges` 行；worker 扫描按“先补扣再封存”顺序（`expire_pending_envelopes` → `recover_uncharged_attempts` → `recover_unadmitted_rounds` → `recover_unarchived_blocked_rounds` → `converge_families`）运行，在该 job 租约过期（或已由更新 generation 接管）后按 `min(ceil(now - started_at), ceiling_seconds)` 补扣（再经本节公式按余额截断），沿用幂等键 `(job_id, step_key, attempt_no)`，并写 `budget_charge_recovered` 审计。family 存在待补扣候选 attempt 时暂不封存；已封存（非 `AGGREGATING`）的 family 不再改账；不可补扣的行（已封存 family、fuzz 子预算已归零或 `ceiling_seconds` 非有限/非正）关闭为 `status='infra_error'`（`result.budget_recovery="unchargeable"`）并写 `budget_charge_recovery_skipped` 审计移出候选集，避免每个 tick 重扫。child 归档前先补扣同 child 旧 generation 未扣费 attempt，并按最新 charge 重建 `budget/snapshot.json` 与 `report.budget`。补扣偏保守，可能计入停机时间，但不超过该步下发给容器的硬超时，也不会漏扣；租约仍有效的 attempt 不补扣。
+
 预算不变量（D41）：`budget_ledger` 除上述上下界与 `max_fuzz_seconds <= max_total_seconds` 约束外，**不得**新增 `CHECK (remaining_fuzz_seconds <= remaining_total_seconds)`。原因是 `charge_kind='general'` 的 build/replay 只扣总预算、不扣 fuzz 子预算，正常运行中 `remaining_fuzz_seconds` 完全可能大于 `remaining_total_seconds`；加该 CHECK 会把合法账本判为脏数据。实际可执行的 fuzz 上限为 `min(remaining_total_seconds, remaining_fuzz_seconds)`（JSON 对应 `min(remaining_seconds, remaining_fuzz_seconds)`）：任一余额不足即返回 `BUDGET_EXHAUSTED`，不以单一余额判断。
 
 `job_contract_version` 是 job/worker 契约版本，独立于证据 `schema_version`，也独立于发布 manifest 的 `contract_version`：
@@ -690,7 +708,7 @@ v2 manifest 保留 v1 的 `verdict`、`reason_code`、`created_at`，并新增 f
 | `reuse_origin` | 复用型 validation 必填并指向 campaign；fixed/normal execution 为 null；campaign 为 null |
 | `files` | 路径、角色、字节数、SHA-256；角色必须来自 v2 封闭角色表，路径必须符合“固定路径”表；完整 validation 必须列出六组回放的 18 个条目 |
 
-validation 与 fixed execution 包必须包含 `metadata/execution.json`、`metadata/probe.json`、`metadata/case.json`、两版 `build_metadata`、`build_log`、`build_artifact` 与 `build_provenance`（按分阶段生效规则）、六组回放的 `stdout.log`/`stderr.log`/`metadata.json`（18 个条目），以及 `envelope` 与 `budget_snapshot`；campaign 包必须包含两版 `build_metadata`/`build_log`/`build_artifact`/`build_provenance`、fuzz 日志与 fuzz provenance（不含 18 个回放文件），记录到候选 crash seed 时还必须包含 crash seed 与对应 provenance；0 crash 的 campaign 允许没有 `crash_seed`，验包不得因此失败。`reuse_origin.artifacts` 必须与 plan `build_ref.artifacts` 逐字段相等；不一致返回 `REUSE_MISMATCH`，plan 的 `build_ref` 是唯一权威。
+validation 与 fixed execution 包必须包含 `metadata/execution.json`、`metadata/probe.json`、`metadata/case.json`、两版 `build_metadata`、`build_log`、`build_artifact` 与 `build_provenance`（按分阶段生效规则）、六组回放的 `stdout.log`/`stderr.log`/`metadata.json`（18 个条目），以及 `envelope` 与 `budget_snapshot`；campaign 包必须包含两版 `build_metadata`/`build_log`/`build_artifact`/`build_provenance`、fuzz 日志与 fuzz provenance（不含 18 个回放文件），记录到候选 crash seed 时还必须包含 crash seed 与对应 provenance；0 crash 的 campaign 允许没有 `crash_seed`，验包不得因此失败。campaign 包与复用型 validation 包的两版 `build_artifact` 同时包含 parser 与 fuzzer 两个产物（改9）；validation 复用 campaign 两版的这两个产物。`reuse_origin.artifacts` 必须与 plan `build_ref.artifacts` 逐字段相等；不一致返回 `REUSE_MISMATCH`，plan 的 `build_ref` 是唯一权威。
 
 ### 固定路径
 
@@ -1172,7 +1190,7 @@ record_family_transition_decision(
 | 原因码 | 触发条件 | 终态或去向 |
 | --- | --- | --- |
 | `BUILD_PROVENANCE_MISSING` | 没有可核对生效参数的核对面；或声明不 ⊆ 生效；或两版生效有序序列不相等 | 冻结阶段 `BLOCKED`；构建阶段 `FAILED`；保留已有证据 |
-| `ENVELOPE_VIOLATION` | 轮次或 ExperimentSpec 超出信封的 family、mutation 上限、预算、签名集合或模式 | 拒绝该轮次；不产生 build/replay；父 job 可继续其他合法轮次或终态 `BLOCKED` |
+| `ENVELOPE_VIOLATION` | 轮次或 ExperimentSpec 超出信封的 family、mutation 上限、预算、签名集合或模式 | 拒绝该轮次；不产生 build/replay；父 job 保持 `AGGREGATING` 可继续其他合法轮次，若轮次/总预算用尽或记录 `no_next_round` 且无其他合法轮次则终态 `BLOCKED`（已有合法轮次则归档 `COMPLETED` 并索引该 blocked round） |
 | `ADMISSION_DENIED` | 准入谓词不通过（重复轮次、人批缺失、摘要不符、不可重算且无佐证） | 该轮不执行；审计 `round_admission_denied` |
 | `REVIEW_ENVELOPE_MISMATCH` | `(family_id, envelope_digest)` 不存在或非该 family 当前 `pending`（含首轮显式信封与首份 plan 的 `envelope_digest` 不符），且未命中已审 `approved`/`rejected`/`expired` 记录 | 拒绝该次 `review`；不写 `reviews`/`family_approvals`；首轮人批时 child 保持 `AWAITING_REVIEW`、换信封重批时 child 状态不变，family 保持 `AGGREGATING` |
 | `BUDGET_EXHAUSTED` | family 总预算或 fuzz 子预算不足以启动下一轮或下一步 | 当前执行 child 的判定按已有回放为 `INCONCLUSIVE` 或 `FAILED`；campaign/family 完成归档后 job `state=COMPLETED`；不再建轮次 |
@@ -1185,6 +1203,8 @@ record_family_transition_decision(
 - 抓取路径的成帧与状态失败同归 `MATERIAL_MISSING`（`BLOCKED`）：正文截断 `CONTENT_TRUNCATED`、缺少或自相矛盾的 `Content-Length` `RESPONSE_UNFRAMED`、空正文 `EMPTY_CONTENT`、最终状态不在 2xx `HTTP_STATUS_REJECTED`、响应头超过 64 KiB `RESPONSE_HEAD_TOO_LARGE`；
 - 固定快照（离线案例）沿用 v0.1 的归类：内容摘要与登记值不符属材料无法校验，归 `MATERIAL_MISSING`（`detail.sub_reason=DIGEST_MISMATCH`）；读不到、读取出错、登记摘要格式非法分别为 `SNAPSHOT_MISSING` / `SNAPSHOT_UNREADABLE` / `SNAPSHOT_DIGEST_INVALID`，为空或超过线上上限分别为 `EMPTY_CONTENT` / `SIZE_LIMIT_EXCEEDED`。来源登记给了别的案例属 `SOURCE_CONFLICT`（`detail.sub_reason=SOURCE_CASE_MISMATCH`，该快照不被打开）；来源 URL 缺失或无法解析属 `POLICY_DENIED`（`detail.sub_reason=SOURCE_URL_INVALID`）；
 - 域名不在白名单、私网/回环/CGNAT/元数据/IPv4-mapped IPv6 被拒、缺许可或许可用途不符：归属 `POLICY_DENIED`（`BLOCKED`），其中许可拒绝的 `detail.sub_reason` 记录 `LICENSE_REJECTED`。
+
+**corpus 超限细因（改9）**：种子语料或 fuzz 语料超过总 64 MiB、单文件 8 MiB 或 4096 个文件时归属 `POLICY_DENIED`（`BLOCKED`），审计 `detail.sub_reason` 分别为 `CORPUS_TOTAL_BYTES_EXCEEDED`、`CORPUS_FILE_BYTES_EXCEEDED`、`CORPUS_FILE_COUNT_EXCEEDED`；不用 `MATERIAL_MISSING`，不新增顶层原因码。
 
 family 转移决策子码 `NO_CANDIDATE_SEED`、`NO_REMAINING_SEEDS`（见 §9.2）不是本节原因码：它们只出现在 `family_transition_decided` 审计事件的 `detail.reason_code`，不进入 `jobs.reason_code`、审计 `reason_code` 列或任何终态封闭集合。
 

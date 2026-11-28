@@ -473,6 +473,115 @@ def get_review(dsn: str, job_id: UUID) -> dict | None:
         ).fetchone()
 
 
+def _validate_later_v2_plan_in_tx(
+    connection, job: Mapping[str, Any], plan: Mapping[str, Any]
+) -> None:
+    """Bind a non-first v2 plan to the family approval chain tail.
+
+    The caller holds the family row ``FOR UPDATE``. Shared by ``freeze_plan``
+    and the lease-free ``create_round_child`` so a derived round can never be
+    frozen under weaker rules than a worker-frozen one.
+    """
+    parent_approval_digest = plan.get("parent_approval_digest")
+    if parent_approval_digest is None:
+        # A guided round 1 is a later plan even though its round_no is
+        # 1: the guided campaign was the first plan. Rejecting the
+        # null before any write keeps a frozen-but-unreviewed plan
+        # from sitting outside the approval chain.
+        raise StateError(
+            "a non-first v2 plan requires a non-null "
+            "parent_approval_digest"
+        )
+    # A pending re-approval invalidates the old chain tail for the
+    # next round: freezing now would bind a plan to an approval
+    # that the re-approval is about to supersede, leaving an
+    # immutable plan that can never be admitted. The family row is
+    # locked, so a concurrent propose-envelope cannot commit a new
+    # pending row between this check and the plan insert.
+    pending_envelope = connection.execute(
+        "SELECT 1 FROM family_envelopes "
+        "WHERE family_id = %s AND status = 'pending' LIMIT 1",
+        (job["family_id"],),
+    ).fetchone()
+    if pending_envelope is not None:
+        raise StateError(
+            "cannot freeze a non-first plan while an envelope "
+            "re-approval is pending"
+        )
+    # The family row is already locked FOR UPDATE above, so the
+    # approval chain tail cannot move while this check runs.
+    # first_plan_digest is intentionally not re-checked here: every
+    # family_approvals row is written by record_review against the
+    # family's first plan and the column is otherwise immutable,
+    # so the tail cannot name a different plan than the chain
+    # root. The plan body is still bound to the family/round above.
+    tails = connection.execute(
+        "SELECT prior.approval_digest, prior.envelope_digest "
+        "FROM family_approvals AS prior "
+        "WHERE prior.family_id = %s AND NOT EXISTS ("
+        "SELECT 1 FROM family_approvals AS later "
+        "WHERE later.supersedes = prior.approval_id)",
+        (job["family_id"],),
+    ).fetchall()
+    if len(tails) != 1:
+        raise StateError(
+            "a non-first v2 plan requires a single "
+            "family_approvals chain tail"
+        )
+    tail = tails[0]
+    if parent_approval_digest != tail["approval_digest"]:
+        raise StateError(
+            "plan parent_approval_digest does not match the "
+            "family_approvals chain tail"
+        )
+    if plan.get("envelope_digest") != tail["envelope_digest"]:
+        raise StateError(
+            "plan envelope_digest does not match the "
+            "family_approvals chain tail"
+        )
+    # The approval digest alone does not bind the plan's harness.
+    # Read the approved envelope body so a later plan cannot name
+    # a harness the operator never approved, and fail before the
+    # immutable plan row is written.
+    tail_envelope_row = connection.execute(
+        "SELECT envelope_json FROM family_envelopes "
+        "WHERE family_id = %s AND envelope_digest = %s",
+        (job["family_id"], tail["envelope_digest"]),
+    ).fetchone()
+    if tail_envelope_row is None:
+        raise StateError(
+            "a non-first v2 plan requires the approved envelope body"
+        )
+    try:
+        tail_envelope = _validate_envelope(
+            tail_envelope_row["envelope_json"]
+        )
+    except ValueError as error:
+        raise StateError(
+            f"approved envelope is invalid: {error}"
+        ) from error
+    if plan.get("harness_digest") != tail_envelope["harness_digest"]:
+        raise StateError(
+            "plan harness_digest does not match the approved "
+            "envelope body"
+        )
+    try:
+        tail_plan_signature = contracts.normalize_asan_signature(
+            plan["asan_signature"]
+        )
+    except (KeyError, ValueError) as error:
+        raise StateError(
+            f"plan asan_signature is invalid: {error}"
+        ) from error
+    if tail_plan_signature not in tail_envelope[
+        "accepted_signature_set"
+    ]:
+        raise StateError(
+            "plan asan_signature is outside the approved envelope "
+            "accepted_signature_set"
+        )
+
+
 def freeze_plan(
     dsn: str,
     job_id: UUID,
@@ -608,104 +717,7 @@ def freeze_plan(
                     "a fixed first plan must have parent_approval_digest=null"
                 )
             if not first_v2_plan:
-                parent_approval_digest = plan.get("parent_approval_digest")
-                if parent_approval_digest is None:
-                    # A guided round 1 is a later plan even though its round_no is
-                    # 1: the guided campaign was the first plan. Rejecting the
-                    # null before any write keeps a frozen-but-unreviewed plan
-                    # from sitting outside the approval chain.
-                    raise StateError(
-                        "a non-first v2 plan requires a non-null "
-                        "parent_approval_digest"
-                    )
-                # A pending re-approval invalidates the old chain tail for the
-                # next round: freezing now would bind a plan to an approval
-                # that the re-approval is about to supersede, leaving an
-                # immutable plan that can never be admitted. The family row is
-                # locked, so a concurrent propose-envelope cannot commit a new
-                # pending row between this check and the plan insert.
-                pending_envelope = connection.execute(
-                    "SELECT 1 FROM family_envelopes "
-                    "WHERE family_id = %s AND status = 'pending' LIMIT 1",
-                    (job["family_id"],),
-                ).fetchone()
-                if pending_envelope is not None:
-                    raise StateError(
-                        "cannot freeze a non-first plan while an envelope "
-                        "re-approval is pending"
-                    )
-                # The family row is already locked FOR UPDATE above, so the
-                # approval chain tail cannot move while this check runs.
-                # first_plan_digest is intentionally not re-checked here: every
-                # family_approvals row is written by record_review against the
-                # family's first plan and the column is otherwise immutable,
-                # so the tail cannot name a different plan than the chain
-                # root. The plan body is still bound to the family/round above.
-                tails = connection.execute(
-                    "SELECT prior.approval_digest, prior.envelope_digest "
-                    "FROM family_approvals AS prior "
-                    "WHERE prior.family_id = %s AND NOT EXISTS ("
-                    "SELECT 1 FROM family_approvals AS later "
-                    "WHERE later.supersedes = prior.approval_id)",
-                    (job["family_id"],),
-                ).fetchall()
-                if len(tails) != 1:
-                    raise StateError(
-                        "a non-first v2 plan requires a single "
-                        "family_approvals chain tail"
-                    )
-                tail = tails[0]
-                if parent_approval_digest != tail["approval_digest"]:
-                    raise StateError(
-                        "plan parent_approval_digest does not match the "
-                        "family_approvals chain tail"
-                    )
-                if plan.get("envelope_digest") != tail["envelope_digest"]:
-                    raise StateError(
-                        "plan envelope_digest does not match the "
-                        "family_approvals chain tail"
-                    )
-                # The approval digest alone does not bind the plan's harness.
-                # Read the approved envelope body so a later plan cannot name
-                # a harness the operator never approved, and fail before the
-                # immutable plan row is written.
-                tail_envelope_row = connection.execute(
-                    "SELECT envelope_json FROM family_envelopes "
-                    "WHERE family_id = %s AND envelope_digest = %s",
-                    (job["family_id"], tail["envelope_digest"]),
-                ).fetchone()
-                if tail_envelope_row is None:
-                    raise StateError(
-                        "a non-first v2 plan requires the approved envelope body"
-                    )
-                try:
-                    tail_envelope = _validate_envelope(
-                        tail_envelope_row["envelope_json"]
-                    )
-                except ValueError as error:
-                    raise StateError(
-                        f"approved envelope is invalid: {error}"
-                    ) from error
-                if plan.get("harness_digest") != tail_envelope["harness_digest"]:
-                    raise StateError(
-                        "plan harness_digest does not match the approved "
-                        "envelope body"
-                    )
-                try:
-                    tail_plan_signature = contracts.normalize_asan_signature(
-                        plan["asan_signature"]
-                    )
-                except (KeyError, ValueError) as error:
-                    raise StateError(
-                        f"plan asan_signature is invalid: {error}"
-                    ) from error
-                if tail_plan_signature not in tail_envelope[
-                    "accepted_signature_set"
-                ]:
-                    raise StateError(
-                        "plan asan_signature is outside the approved envelope "
-                        "accepted_signature_set"
-                    )
+                _validate_later_v2_plan_in_tx(connection, job, plan)
         normalized_envelope: dict[str, Any] | None = None
         if first_v2_plan:
             if envelope is None:
@@ -853,6 +865,819 @@ def freeze_plan(
         return True
 
 
+_ROUND_CHILD_ACTIVE_STATES = (
+    "QUEUED",
+    "PREPARING",
+    "AWAITING_REVIEW",
+    "READY",
+    "RUNNING",
+    "ARCHIVING",
+)
+
+
+MAX_ADMISSION_INPUTS_BYTES = 64 * 1024
+_ADMISSION_INPUT_KEYS = frozenset(
+    {
+        "envelope",
+        "seed_digest",
+        "experiment",
+        "recomputable",
+        "campaign_bundle_digest",
+    }
+)
+
+
+def _family_mode(request: Any) -> str:
+    """Return the family's exploration mode, defaulting to ``fixed``."""
+    if isinstance(request, Mapping):
+        exploration = request.get("exploration")
+        if isinstance(exploration, Mapping):
+            mode = exploration.get("mode")
+            if isinstance(mode, str) and mode:
+                return mode
+    return "fixed"
+
+
+def _validate_admission_inputs(admission_inputs: Any) -> dict[str, Any]:
+    """Validate structure, types, and size of persisted ``admission_inputs`` (Nit 2)."""
+    if not isinstance(admission_inputs, Mapping):
+        raise StateError("admission_inputs must be a JSON object")
+    unknown = set(admission_inputs) - _ADMISSION_INPUT_KEYS
+    if unknown:
+        raise StateError(
+            "admission_inputs has unknown field(s): "
+            + ", ".join(sorted(str(key) for key in unknown))
+        )
+    if "envelope" not in admission_inputs or "seed_digest" not in admission_inputs:
+        raise StateError(
+            "admission_inputs requires 'envelope' and 'seed_digest'"
+        )
+    raw_envelope = admission_inputs["envelope"]
+    if not isinstance(raw_envelope, Mapping):
+        raise StateError("admission_inputs.envelope must be a JSON object")
+    try:
+        normalized_envelope = contracts.normalize_envelope(raw_envelope)
+    except ValueError as error:
+        raise StateError(f"admission_inputs.envelope is invalid: {error}") from error
+    try:
+        seed_digest = jsonutil.require_digest(
+            admission_inputs["seed_digest"], "admission_inputs.seed_digest"
+        )
+    except ValueError as error:
+        raise StateError(str(error)) from error
+    raw_experiment = admission_inputs.get("experiment")
+    experiment: dict[str, Any] | None
+    if raw_experiment is None:
+        experiment = None
+    elif isinstance(raw_experiment, Mapping):
+        experiment = dict(raw_experiment)
+    else:
+        raise StateError(
+            "admission_inputs.experiment must be a JSON object or null"
+        )
+    recomputable = admission_inputs.get("recomputable", True)
+    if type(recomputable) is not bool:
+        raise StateError("admission_inputs.recomputable must be a boolean")
+    raw_bundle_digest = admission_inputs.get("campaign_bundle_digest")
+    campaign_bundle_digest: str | None = None
+    if raw_bundle_digest is not None:
+        try:
+            campaign_bundle_digest = jsonutil.require_digest(
+                raw_bundle_digest, "admission_inputs.campaign_bundle_digest"
+            )
+        except ValueError as error:
+            raise StateError(str(error)) from error
+    normalized = {
+        "envelope": normalized_envelope,
+        "seed_digest": seed_digest,
+        "experiment": experiment,
+        "recomputable": recomputable,
+        "campaign_bundle_digest": campaign_bundle_digest,
+    }
+    try:
+        encoded = jsonutil.canonical_bytes(normalized)
+    except (TypeError, ValueError) as error:
+        raise StateError(
+            f"admission_inputs must be canonical JSON: {error}"
+        ) from error
+    if len(encoded) > MAX_ADMISSION_INPUTS_BYTES:
+        raise StateError(
+            f"admission_inputs exceeds {MAX_ADMISSION_INPUTS_BYTES} bytes"
+        )
+    return normalized
+
+
+def create_round_child(
+    dsn: str,
+    *,
+    family_id: UUID | str,
+    round_no: int,
+    plan: Mapping[str, Any],
+    admission_inputs: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Derive one later-round child with its frozen plan, without a lease (T12).
+
+    Edges #23/#26 are family-level transitions: the runtime creates the round
+    child here, then calls ``record_admission`` before anything executes. The
+    child is inserted as ``READY`` with ``workflow_synced=true`` so the v2
+    claim gate keeps it unclaimable until a policy admission row exists; a
+    denied round is closed with ``block_round_child`` and never starts a
+    container. The plan is bound to the approval chain tail with exactly the
+    rules ``freeze_plan`` applies to a non-first plan.
+
+    ``admission_inputs`` (the envelope body, seed digest, ExperimentSpec and
+    campaign support the caller is about to admit with) is stored in the plan
+    row's ``summary`` so a crash between this call and ``record_admission`` can
+    be recovered by retrying the same admission (``unadmitted_round_children``).
+
+    Re-deriving the same ``(family, round_no)`` with the same plan returns the
+    existing child (``created=False``); a different plan raises
+    ``PlanConflict``. The family's children stay serial: no other child may be
+    non-terminal when a new round is derived.
+    """
+    try:
+        family_id = uuid.UUID(str(family_id))
+    except (TypeError, ValueError) as error:
+        raise StateError("family_id must be a UUID") from error
+    if type(round_no) is not int or round_no < 1:
+        raise StateError("round_no must be a positive integer")
+    if not isinstance(plan, Mapping):
+        raise StateError("plan must be a JSON object")
+    if plan.get("schema_version") != 2:
+        raise StateError("a round child requires a plan with schema_version=2")
+    if (
+        plan.get("family_id") != str(family_id)
+        or plan.get("parent_job_id") != str(family_id)
+    ):
+        raise StateError("plan family_id/parent_job_id do not match the family")
+    if plan.get("round_no") != round_no:
+        raise StateError("plan round_no does not match round_no")
+    try:
+        plan_digest = contracts.plan_digest(plan)
+    except (TypeError, ValueError) as error:
+        raise StateError(f"plan is invalid: {error}") from error
+    normalized_inputs = (
+        None
+        if admission_inputs is None
+        else _validate_admission_inputs(admission_inputs)
+    )
+    with _connect(dsn) as connection:
+        family = connection.execute(
+            "SELECT job_id, job_kind, job_contract_version, state, request "
+            "FROM jobs WHERE job_id = %s FOR UPDATE",
+            (family_id,),
+        ).fetchone()
+        if family is None:
+            raise StateError("the family does not exist")
+        if family["job_contract_version"] != 2 or family["job_kind"] != "family":
+            raise StateError("family_id is not a v2 family")
+        existing = connection.execute(
+            "SELECT j.job_id, j.state, p.plan_digest, p.summary FROM jobs j "
+            "LEFT JOIN plans p ON p.job_id = j.job_id "
+            "WHERE j.parent_job_id = %s AND j.job_kind = 'round' "
+            "AND j.round_no = %s",
+            (family_id, round_no),
+        ).fetchone()
+        if existing is not None:
+            if existing["plan_digest"] != plan_digest:
+                raise PlanConflict(
+                    "a different plan is already frozen for this round"
+                )
+            existing_summary = existing["summary"]
+            stored_inputs = (
+                existing_summary.get("admission_inputs")
+                if isinstance(existing_summary, Mapping)
+                else None
+            )
+            if (normalized_inputs is None) != (stored_inputs is None) or (
+                normalized_inputs is not None
+                and stored_inputs is not None
+                and jsonutil.canonical_bytes(normalized_inputs)
+                != jsonutil.canonical_bytes(stored_inputs)
+            ):
+                raise PlanConflict(
+                    "different admission_inputs are already stored for this round"
+                )
+            return {
+                "job_id": str(existing["job_id"]),
+                "plan_digest": plan_digest,
+                "state": existing["state"],
+                "created": False,
+            }
+        if _family_mode(family["request"]) != "guided":
+            raise StateError("fixed families do not derive later rounds")
+        if family["state"] != "AGGREGATING":
+            raise StateError(
+                f"cannot derive a round while the family is {family['state']}"
+            )
+        pending_envelope = connection.execute(
+            "SELECT 1 FROM family_envelopes "
+            "WHERE family_id = %s AND status = 'pending' LIMIT 1",
+            (family_id,),
+        ).fetchone()
+        if pending_envelope is not None:
+            raise StateError(
+                "cannot derive a round while an envelope re-approval is pending"
+            )
+        active = connection.execute(
+            "SELECT job_id FROM jobs WHERE parent_job_id = %s "
+            "AND job_kind IN ('campaign', 'round') "
+            "AND (state = ANY(%s) OR (state = 'BLOCKED' "
+            "AND workflow_synced = false) "
+            "OR (job_kind = 'round' AND state = 'BLOCKED' "
+            "AND evidence_status IS NULL "
+            "AND EXISTS (SELECT 1 FROM plans p WHERE p.job_id = jobs.job_id))) "
+            "LIMIT 1",
+            (family_id, list(_ROUND_CHILD_ACTIVE_STATES)),
+        ).fetchone()
+        if active is not None:
+            raise StateError(
+                "the family already has a non-terminal child; children run "
+                "serially"
+            )
+        campaigns = connection.execute(
+            "SELECT state FROM jobs "
+            "WHERE parent_job_id = %s AND job_kind = 'campaign'",
+            (family_id,),
+        ).fetchall()
+        if len(campaigns) != 1 or campaigns[0]["state"] != "COMPLETED":
+            raise StateError(
+                "guided family requires a single COMPLETED campaign child "
+                "before deriving a round"
+            )
+        max_round = connection.execute(
+            "SELECT COALESCE(MAX(round_no), 0) AS max_round FROM jobs "
+            "WHERE parent_job_id = %s AND job_kind = 'round'",
+            (family_id,),
+        ).fetchone()["max_round"]
+        if round_no != max_round + 1:
+            raise StateError(
+                f"round_no must be {max_round + 1}, got {round_no}"
+            )
+        _validate_later_v2_plan_in_tx(
+            connection, {"family_id": family_id}, plan
+        )
+        job_id = uuid.uuid4()
+        connection.execute(
+            "INSERT INTO jobs (job_id, request, state, stage, "
+            "job_contract_version, family_id, job_kind, parent_job_id, "
+            "round_no, workflow_synced) "
+            "VALUES (%s, %s, 'READY', 'admission', 2, %s, 'round', %s, %s, "
+            "true)",
+            (job_id, Jsonb(family["request"]), family_id, family_id, round_no),
+        )
+        connection.execute(
+            "INSERT INTO plans (plan_id, job_id, plan_digest, plan, summary) "
+            "VALUES (%s, %s, %s, %s, %s)",
+            (
+                uuid.uuid4(),
+                job_id,
+                plan_digest,
+                Jsonb(dict(plan)),
+                Jsonb(
+                    {}
+                    if normalized_inputs is None
+                    else {"admission_inputs": normalized_inputs}
+                ),
+            ),
+        )
+        _audit(
+            connection,
+            job_id,
+            "plan_frozen",
+            stage="admission",
+            detail={"plan_digest": plan_digest, "derived": True},
+        )
+        return {
+            "job_id": str(job_id),
+            "plan_digest": plan_digest,
+            "state": "READY",
+            "created": True,
+        }
+
+
+ROUND_ADMISSION_RECOVERY_GRACE_SECONDS = 300
+
+
+def check_round_derivation(
+    dsn: str, *, family_id: UUID | str, round_no: int
+) -> BudgetDecision:
+    """Gate a family-level transition before any round child is created (改9).
+
+    Order: the family's children run serially (a non-terminal child refuses
+    with ``sub_reason=CHILD_NOT_TERMINAL`` and no reason code: the family
+    simply is not ready); ``round_no`` beyond the effective ``max_rounds`` and
+    a total balance below one second refuse with ``BUDGET_EXHAUSTED``. Guided
+    validation rounds only run general steps, so the fuzz sub-budget is gated
+    only on fuzz steps, not on round derivation. A refused transition creates
+    nothing, and the family archives through ``converge_families``.
+    """
+    try:
+        family_id = uuid.UUID(str(family_id))
+    except (TypeError, ValueError) as error:
+        raise StateError("family_id must be a UUID") from error
+    if type(round_no) is not int or round_no < 1:
+        raise StateError("round_no must be a positive integer")
+    with _connect(dsn) as connection:
+        family = connection.execute(
+            "SELECT job_kind, job_contract_version, state, request FROM jobs "
+            "WHERE job_id = %s",
+            (family_id,),
+        ).fetchone()
+        if (
+            family is None
+            or family["job_contract_version"] != 2
+            or family["job_kind"] != "family"
+        ):
+            raise StateError("family_id is not a v2 family")
+        if _family_mode(family["request"]) != "guided":
+            return BudgetDecision(
+                False, None, 0, sub_reason="FIXED_FAMILY_NO_DERIVATION"
+            )
+        if family["state"] != "AGGREGATING":
+            return BudgetDecision(
+                False, None, 0, sub_reason="FAMILY_NOT_AGGREGATING"
+            )
+        pending_envelope = connection.execute(
+            "SELECT 1 FROM family_envelopes "
+            "WHERE family_id = %s AND status = 'pending' LIMIT 1",
+            (family_id,),
+        ).fetchone()
+        if pending_envelope is not None:
+            return BudgetDecision(
+                False, None, 0, sub_reason="PENDING_ENVELOPE"
+            )
+        active = connection.execute(
+            "SELECT 1 FROM jobs WHERE parent_job_id = %s "
+            "AND job_kind IN ('campaign', 'round') "
+            "AND (state = ANY(%s) OR (state = 'BLOCKED' "
+            "AND workflow_synced = false) "
+            "OR (job_kind = 'round' AND state = 'BLOCKED' "
+            "AND evidence_status IS NULL "
+            "AND EXISTS (SELECT 1 FROM plans p WHERE p.job_id = jobs.job_id))) "
+            "LIMIT 1",
+            (family_id, list(_ROUND_CHILD_ACTIVE_STATES)),
+        ).fetchone()
+        if active is not None:
+            return BudgetDecision(
+                False, None, 0, sub_reason="CHILD_NOT_TERMINAL"
+            )
+        campaigns = connection.execute(
+            "SELECT state FROM jobs "
+            "WHERE parent_job_id = %s AND job_kind = 'campaign'",
+            (family_id,),
+        ).fetchall()
+        if len(campaigns) != 1 or campaigns[0]["state"] != "COMPLETED":
+            return BudgetDecision(
+                False, None, 0, sub_reason="CAMPAIGN_NOT_COMPLETED"
+            )
+        max_round = connection.execute(
+            "SELECT COALESCE(MAX(round_no), 0) AS max_round FROM jobs "
+            "WHERE parent_job_id = %s AND job_kind = 'round'",
+            (family_id,),
+        ).fetchone()["max_round"]
+        if round_no != max_round + 1:
+            return BudgetDecision(
+                False, None, 0, sub_reason="ROUND_NO_NOT_SEQUENTIAL"
+            )
+        max_rounds = _effective_family_max_rounds(
+            connection, family_id, family["request"]
+        )
+        ledger = connection.execute(
+            "SELECT " + _BUDGET_LEDGER_COLUMNS +
+            " FROM budget_ledger WHERE family_id = %s",
+            (family_id,),
+        ).fetchone()
+    if ledger is None:
+        raise StateError("budget ledger does not exist")
+    if round_no > max_rounds:
+        return BudgetDecision(
+            False, BUDGET_EXHAUSTED, 0, sub_reason="ROUND_BEYOND_MAX_ROUNDS"
+        )
+    # Guided validation rounds run only general steps (build/replay); the fuzz
+    # sub-budget applies only to fuzz steps via _gate_step_budget (ADR-004 #7).
+    gate = budget_gate(ledger, fuzz=False)
+    if not gate.allowed:
+        return BudgetDecision(
+            False, BUDGET_EXHAUSTED, 0, sub_reason=BUDGET_EXHAUSTED
+        )
+    return BudgetDecision(True, None, gate.hard_timeout_seconds, round_no)
+
+
+def unadmitted_round_children(
+    dsn: str, *, grace_seconds: int = ROUND_ADMISSION_RECOVERY_GRACE_SECONDS
+) -> list[dict[str, Any]]:
+    """List derived rounds stuck before admission (crash recovery, 改9).
+
+    A derived round is ``READY``/``stage='admission'``, never claimed, and
+    has no admission row. Rows younger than ``grace_seconds`` (database clock)
+    belong to a derivation that may still be in flight and are skipped.
+    """
+    if type(grace_seconds) is not int or grace_seconds < 0:
+        raise StateError("grace_seconds must be a non-negative integer")
+    with _connect(dsn) as connection:
+        rows = connection.execute(
+            "SELECT j.job_id, j.family_id, j.round_no, p.plan, p.summary "
+            "FROM jobs j JOIN plans p ON p.job_id = j.job_id "
+            "WHERE j.job_contract_version = 2 AND j.job_kind = 'round' "
+            "AND j.state = 'READY' AND j.stage = 'admission' "
+            "AND j.generation = 0 AND j.lease_owner IS NULL "
+            "AND j.updated_at <= clock_timestamp() - make_interval(secs => %s) "
+            "AND NOT EXISTS (SELECT 1 FROM admissions a WHERE a.job_id = j.job_id) "
+            "ORDER BY j.updated_at",
+            (grace_seconds,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def unarchived_blocked_round_children(dsn: str) -> list[dict[str, Any]]:
+    """List BLOCKED v2 rounds with a frozen plan whose blocked bundle was not archived (B4).
+
+    A crash or I/O error between ``block_round_child`` and
+    ``execution.record_blocked`` leaves the round ``BLOCKED`` with
+    ``evidence_status IS NULL``. Worker recovery archives these idempotently
+    before family convergence runs.
+    """
+    with _connect(dsn) as connection:
+        rows = connection.execute(
+            "SELECT j.job_id, j.family_id, j.round_no, j.reason_code, "
+            "j.last_error, j.generation "
+            "FROM jobs j "
+            "WHERE j.job_contract_version = 2 AND j.job_kind = 'round' "
+            "AND j.state = 'BLOCKED' AND j.evidence_status IS NULL "
+            "AND (j.lease_expires_at IS NULL "
+            "OR j.lease_expires_at <= clock_timestamp()) "
+            "AND EXISTS (SELECT 1 FROM plans p WHERE p.job_id = j.job_id) "
+            "ORDER BY j.updated_at, j.job_id"
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def recover_uncharged_attempts(
+    dsn: str, *, job_id: UUID | str | None = None
+) -> int:
+    """Charge container steps that crashed before their budget charge (改9).
+
+    A budgeted step writes its ``started`` attempt row (with the charge kind
+    and the effective hard-timeout ceiling) before the container, and charges
+    after the container exits. If the process died in between, the row stays
+    ``started`` with no ``budget_charges`` row. Once the job's lease has
+    expired (or a newer generation owns it) this scan charges the step
+    conservatively: ``min(ceil(now - started_at), ceiling)``, then the normal
+    §7 formula clamps it to the remaining balance. Attempts that cannot be
+    charged (already-sealed family, exhausted fuzz sub-budget, or invalid
+    ceiling metadata) are closed out as ``infra_error`` with an audit event
+    so they are never re-scanned. Returns the number of charges written.
+    """
+    job_filter_uuid: UUID | None = None
+    if job_id is not None:
+        try:
+            job_filter_uuid = uuid.UUID(str(job_id))
+        except (TypeError, ValueError) as error:
+            raise StateError("job_id must be a UUID") from error
+    query = (
+        "SELECT a.job_id, a.step_key, a.attempt_no, a.generation "
+        "FROM attempts a JOIN jobs j ON j.job_id = a.job_id "
+        "WHERE j.job_contract_version = 2 "
+        "AND j.job_kind IN ('campaign', 'round') "
+        "AND a.stage = 'execute' AND a.status = 'started' "
+        "AND a.result ? 'budget' "
+        "AND (j.generation <> a.generation OR j.lease_expires_at IS NULL "
+        "OR j.lease_expires_at <= clock_timestamp()) "
+        "AND NOT EXISTS (SELECT 1 FROM budget_charges c "
+        "WHERE c.job_id = a.job_id AND c.step_key = a.step_key "
+        "AND c.attempt_no = a.attempt_no) "
+    )
+    params: tuple[Any, ...] = ()
+    if job_filter_uuid is not None:
+        query += "AND a.job_id = %s "
+        params = (job_filter_uuid,)
+    query += "ORDER BY a.started_at"
+    with _connect(dsn) as connection:
+        candidates = connection.execute(query, params).fetchall()
+    charged = 0
+    for candidate in candidates:
+        if _recover_uncharged_attempt(dsn, candidate):
+            charged += 1
+    return charged
+
+
+def _close_unchargeable_attempt(
+    connection,
+    attempt_id: UUID,
+    *,
+    job_id: UUID,
+    candidate: Mapping[str, Any],
+    reason: str,
+    extra: Mapping[str, Any] | None = None,
+) -> None:
+    """Close out an unchargeable started attempt so future scans skip it."""
+    updated = connection.execute(
+        "UPDATE attempts SET status = 'infra_error', "
+        "finished_at = COALESCE(finished_at, clock_timestamp()), "
+        "result = COALESCE(result, '{}'::jsonb) || %s "
+        "WHERE attempt_id = %s AND status = 'started' "
+        "RETURNING attempt_id",
+        (
+            Jsonb(
+                {
+                    "budget_recovery": "unchargeable",
+                    "budget_recovery_reason": reason,
+                }
+            ),
+            attempt_id,
+        ),
+    ).fetchone()
+    if updated is None:
+        return
+    detail: dict[str, Any] = {
+        "step_key": candidate["step_key"],
+        "attempt_no": candidate["attempt_no"],
+        "generation": candidate["generation"],
+        "reason": reason,
+    }
+    if extra:
+        detail.update(extra)
+    _audit(
+        connection,
+        job_id,
+        "budget_charge_recovery_skipped",
+        stage="execute",
+        detail=detail,
+    )
+
+
+def _recover_uncharged_attempt(dsn: str, candidate: Mapping[str, Any]) -> bool:
+    with _connect(dsn) as connection:
+        with connection.transaction():
+            job = connection.execute(
+                "SELECT job_id, family_id, generation, lease_expires_at, "
+                "clock_timestamp() AS db_now FROM jobs WHERE job_id = %s",
+                (candidate["job_id"],),
+            ).fetchone()
+            if job is None:
+                return False
+            # Lock order jobs(family) -> jobs(child) -> budget_ledger -> attempts.
+            # FOR SHARE on the family blocks concurrent archive_family
+            # (FOR UPDATE) so recovery and sealing never interleave.
+            family = connection.execute(
+                "SELECT state FROM jobs WHERE job_id = %s FOR SHARE",
+                (job["family_id"],),
+            ).fetchone()
+            if family is None:
+                return False
+            job = connection.execute(
+                "SELECT job_id, family_id, generation, lease_expires_at "
+                "FROM jobs WHERE job_id = %s FOR KEY SHARE",
+                (candidate["job_id"],),
+            ).fetchone()
+            if job is None:
+                return False
+            ledger = connection.execute(
+                "SELECT " + _BUDGET_LEDGER_COLUMNS +
+                " FROM budget_ledger WHERE family_id = %s FOR UPDATE",
+                (job["family_id"],),
+            ).fetchone()
+            attempt = connection.execute(
+                "SELECT attempt_id, status, result, started_at, "
+                "clock_timestamp() AS db_now "
+                "FROM attempts WHERE job_id = %s AND stage = 'execute' "
+                "AND step_key = %s AND attempt_no = %s AND generation = %s "
+                "FOR UPDATE",
+                (
+                    candidate["job_id"],
+                    candidate["step_key"],
+                    candidate["attempt_no"],
+                    candidate["generation"],
+                ),
+            ).fetchone()
+            if attempt is None or attempt["status"] != "started":
+                return False
+            live = (
+                job["generation"] == candidate["generation"]
+                and job["lease_expires_at"] is not None
+                and job["lease_expires_at"] > attempt["db_now"]
+            )
+            if live:
+                return False
+            existing = connection.execute(
+                "SELECT 1 FROM budget_charges WHERE job_id = %s "
+                "AND step_key = %s AND attempt_no = %s",
+                (
+                    candidate["job_id"],
+                    candidate["step_key"],
+                    candidate["attempt_no"],
+                ),
+            ).fetchone()
+            if existing is not None:
+                return False
+            if family["state"] != "AGGREGATING":
+                _close_unchargeable_attempt(
+                    connection,
+                    attempt["attempt_id"],
+                    job_id=candidate["job_id"],
+                    candidate=candidate,
+                    reason="family_not_aggregating",
+                    extra={"family_state": family["state"]},
+                )
+                return False
+            if ledger is None:
+                return False
+            budget = (attempt["result"] or {}).get("budget")
+            if not isinstance(budget, Mapping):
+                _close_unchargeable_attempt(
+                    connection,
+                    attempt["attempt_id"],
+                    job_id=candidate["job_id"],
+                    candidate=candidate,
+                    reason="invalid_budget_metadata",
+                )
+                return False
+            charge_kind = budget.get("charge_kind")
+            ceiling = budget.get("ceiling_seconds")
+            if (
+                charge_kind not in ("general", "fuzz")
+                or not isinstance(ceiling, (int, float))
+                or isinstance(ceiling, bool)
+                or not math.isfinite(ceiling)
+                or ceiling <= 0
+            ):
+                _close_unchargeable_attempt(
+                    connection,
+                    attempt["attempt_id"],
+                    job_id=candidate["job_id"],
+                    candidate=candidate,
+                    reason="invalid_budget_metadata",
+                    extra={
+                        "charge_kind": (
+                            charge_kind if isinstance(charge_kind, str) else None
+                        )
+                    },
+                )
+                return False
+            elapsed = max(
+                0.0,
+                (attempt["db_now"] - attempt["started_at"]).total_seconds(),
+            )
+            elapsed = min(float(math.ceil(elapsed)), float(ceiling))
+            charged_seconds, charged_fuzz = compute_budget_charge(
+                ledger,
+                charge_kind=charge_kind,
+                elapsed_seconds=elapsed,
+                elapsed_fuzz_seconds=elapsed if charge_kind == "fuzz" else 0,
+            )
+            if charge_kind == "fuzz" and charged_fuzz < 1:
+                # ADR-004: fuzz charge rows require fuzz_seconds >= 1, so an
+                # attempt whose fuzz sub-budget is already 0 cannot be charged.
+                # Close it out once so future worker scans do not spin on it.
+                _close_unchargeable_attempt(
+                    connection,
+                    attempt["attempt_id"],
+                    job_id=candidate["job_id"],
+                    candidate=candidate,
+                    reason="fuzz_budget_exhausted",
+                    extra={
+                        "charge_kind": charge_kind,
+                        "remaining_total_seconds": ledger[
+                            "remaining_total_seconds"
+                        ],
+                        "remaining_fuzz_seconds": ledger[
+                            "remaining_fuzz_seconds"
+                        ],
+                    },
+                )
+                return False
+            updated = connection.execute(
+                "UPDATE budget_ledger SET "
+                "remaining_total_seconds = remaining_total_seconds - %s, "
+                "remaining_fuzz_seconds = remaining_fuzz_seconds - %s, "
+                "updated_at = clock_timestamp() "
+                "WHERE family_id = %s AND remaining_total_seconds >= %s "
+                "AND remaining_fuzz_seconds >= %s RETURNING family_id",
+                (
+                    charged_seconds,
+                    charged_fuzz,
+                    job["family_id"],
+                    charged_seconds,
+                    charged_fuzz,
+                ),
+            ).fetchone()
+            if updated is None:
+                return False
+            connection.execute(
+                "INSERT INTO budget_charges "
+                "(charge_id, family_id, job_id, step_key, attempt_no, "
+                "charge_kind, seconds, fuzz_seconds) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+                (
+                    uuid.uuid4(),
+                    job["family_id"],
+                    candidate["job_id"],
+                    candidate["step_key"],
+                    candidate["attempt_no"],
+                    charge_kind,
+                    charged_seconds,
+                    charged_fuzz,
+                ),
+            )
+            _audit(
+                connection,
+                candidate["job_id"],
+                "budget_charge_recovered",
+                stage="execute",
+                detail={
+                    "step_key": candidate["step_key"],
+                    "attempt_no": candidate["attempt_no"],
+                    "generation": candidate["generation"],
+                    "charge_kind": charge_kind,
+                    "seconds": charged_seconds,
+                    "fuzz_seconds": charged_fuzz,
+                },
+            )
+            return True
+
+
+def round_needs_admission_recovery(dsn: str, job_id: UUID | str) -> bool:
+    """Re-verify in a transaction that a candidate round still lacks an admission (S3)."""
+    try:
+        job_id = uuid.UUID(str(job_id))
+    except (TypeError, ValueError) as error:
+        raise StateError("job_id must be a UUID") from error
+    with _connect(dsn) as connection:
+        with connection.transaction():
+            row = connection.execute(
+                "SELECT job_id FROM jobs "
+                "WHERE job_id = %s AND job_contract_version = 2 "
+                "AND job_kind = 'round' AND state = 'READY' "
+                "AND stage = 'admission' AND generation = 0 "
+                "AND lease_owner IS NULL FOR KEY SHARE",
+                (job_id,),
+            ).fetchone()
+            if row is None:
+                return False
+            existing = connection.execute(
+                "SELECT 1 FROM admissions WHERE job_id = %s",
+                (job_id,),
+            ).fetchone()
+            return existing is None
+
+
+def block_round_child(
+    dsn: str, job_id: UUID | str, *, reason_code: str, message: str
+) -> bool:
+    """Close a derived, never-claimed, unadmitted round whose admission was denied.
+
+    Only a ``READY`` round still in the ``admission`` stage (never claimed,
+    generation 0, no lease, and no ``admissions`` row) may be blocked here;
+    anything else returns False. The row is left ``workflow_synced=true`` so no
+    worker claims it, and the caller archives the blocked bundle with
+    ``execution.record_blocked``.
+    """
+    try:
+        job_id = uuid.UUID(str(job_id))
+    except (TypeError, ValueError) as error:
+        raise StateError("job_id must be a UUID") from error
+    with _connect(dsn) as connection:
+        with connection.transaction():
+            probe = connection.execute(
+                "SELECT family_id FROM jobs WHERE job_id = %s",
+                (job_id,),
+            ).fetchone()
+            if probe is None:
+                return False
+            # Lock order jobs(family) -> jobs(round) matches record_admission.
+            if probe["family_id"] is not None:
+                connection.execute(
+                    "SELECT 1 FROM jobs WHERE job_id = %s FOR KEY SHARE",
+                    (probe["family_id"],),
+                ).fetchone()
+            updated = connection.execute(
+                "UPDATE jobs SET state = 'BLOCKED', stage = 'blocked', "
+                "reason_code = %s, last_error = %s, "
+                "state_version = state_version + 1, "
+                "updated_at = clock_timestamp() "
+                "WHERE job_id = %s AND job_contract_version = 2 "
+                "AND job_kind = 'round' AND state = 'READY' "
+                "AND stage = 'admission' "
+                "AND generation = 0 AND lease_owner IS NULL "
+                "AND NOT EXISTS ("
+                "SELECT 1 FROM admissions a WHERE a.job_id = jobs.job_id) "
+                "RETURNING job_id",
+                (reason_code, _truncate(message), job_id),
+            ).fetchone()
+            if updated is None:
+                return False
+            _audit(
+                connection,
+                job_id,
+                "blocked",
+                stage="blocked",
+                reason_code=reason_code,
+                detail={"message": _truncate(message), "generation": 0},
+            )
+            return True
+
+
 def ensure_awaiting_review(dsn: str, job_id: UUID, *, generation: int) -> None:
     """Reconcile a job that has a frozen plan but is still PREPARING."""
     with _connect(dsn) as connection:
@@ -955,7 +1780,7 @@ def record_blocked_evidence(
     """
     with _connect(dsn) as connection:
         job = connection.execute(
-            "SELECT state, reason_code, generation FROM jobs "
+            "SELECT state, reason_code, generation, evidence_status FROM jobs "
             "WHERE job_id = %s FOR UPDATE",
             (job_id,),
         ).fetchone()
@@ -963,7 +1788,11 @@ def record_blocked_evidence(
             return False
         if generation is None:
             generation = job["generation"]
-        if job["generation"] != generation or job["state"] != "BLOCKED":
+        if (
+            job["generation"] != generation
+            or job["state"] != "BLOCKED"
+            or job["evidence_status"] == "archived"
+        ):
             return False
         archived = bool(evidence_digest and evidence_path)
         if evidence_error is None and not archived:
@@ -5826,6 +6655,23 @@ def _family_transition_decision_at(
     ).fetchone()
 
 
+_POLICY_DENIED_ROUND_REASONS = frozenset(
+    {"ENVELOPE_VIOLATION", "ADMISSION_DENIED", "HARNESS_REJECTED"}
+)
+
+
+def _is_policy_denied_round(
+    child: Mapping[str, Any], admitted_job_ids: set[str]
+) -> bool:
+    """Return True if a round child was rejected at policy admission before running."""
+    return (
+        child["job_kind"] == "round"
+        and child["state"] == "BLOCKED"
+        and child["reason_code"] in _POLICY_DENIED_ROUND_REASONS
+        and str(child["job_id"]) not in admitted_job_ids
+    )
+
+
 def _family_archive_disposition(
     connection,
     family_id: UUID,
@@ -5836,14 +6682,14 @@ def _family_archive_disposition(
     """Decide whether a family may archive, must wait, or ends without index.
 
     ``archive`` requires a real conclusion: the last round formed a verdict,
-    the effective round ceiling was reached, or the budget is exhausted.
-    ``terminal`` fires when a child can never enter ``family.json`` (failed or
-    plan-less blocked evidence) or when the last round is itself BLOCKED/FAILED
-    without a conclusion. ``wait`` keeps the family AGGREGATING. Before
-    waiting, the transition decision recorded for the current campaign at the
-    current point (``after_round_no == rounds_used``) is consulted: only a
-    matching ``no_next_round`` archives the family. ``next_round``, a decision
-    at another point, or no decision keeps it waiting.
+    the effective round ceiling was reached, the total budget is exhausted, or
+    a current-point ``no_next_round`` decision was recorded (with at least one
+    non-policy-denied round when rounds exist). ``terminal`` fires when a child
+    can never enter ``family.json`` (failed or plan-less blocked evidence),
+    when the last round is FAILED or a non-policy BLOCKED terminal, or when
+    every round was policy-denied and no further legal round capacity remains
+    (§10: ``可继续其他合法轮次或终态 BLOCKED``). ``wait`` keeps the family
+    AGGREGATING so further legal rounds may be derived.
     """
     rounds = sorted(
         (
@@ -5855,6 +6701,7 @@ def _family_archive_disposition(
     )
     rounds_used = max((child["round_no"] for child in rounds), default=0)
     last = rounds[-1] if rounds else None
+    admitted_job_ids = _family_admitted_job_ids(connection, family_id)
 
     unindexable = next(
         (
@@ -5867,7 +6714,14 @@ def _family_archive_disposition(
     if unindexable is not None:
         family_state, reason = _family_terminal_state(unindexable)
         return ("terminal", family_state, reason)
-    if last is not None and last["state"] in ("BLOCKED", "FAILED"):
+    last_policy_denied = last is not None and _is_policy_denied_round(
+        last, admitted_job_ids
+    )
+    if (
+        last is not None
+        and last["state"] in ("BLOCKED", "FAILED")
+        and not last_policy_denied
+    ):
         family_state, reason = _family_terminal_state(last)
         return ("terminal", family_state, reason)
 
@@ -5877,16 +6731,11 @@ def _family_archive_disposition(
         "NOT_REPRODUCED",
     ):
         return ("archive",)
-    if rounds_used >= max_rounds:
-        return ("archive",)
-    if (
-        ledger is not None
-        and ledger["remaining_total_seconds"] <= 0
-    ):
-        return ("archive",)
+
     campaigns = [
         child for child in children if child["job_kind"] == "campaign"
     ]
+    no_next_round = False
     if len(campaigns) == 1:
         decision = _family_transition_decision_at(
             connection, family_id, campaigns[0]["job_id"], rounds_used
@@ -5895,7 +6744,25 @@ def _family_archive_disposition(
             decision is not None
             and decision["detail"].get("decision") == "no_next_round"
         ):
-            return ("archive",)
+            no_next_round = True
+
+    exhausted = (
+        rounds_used >= max_rounds
+        or (ledger is not None and ledger["remaining_total_seconds"] < 1)
+        or no_next_round
+    )
+    if exhausted:
+        if (
+            last_policy_denied
+            and last is not None
+            and all(
+                _is_policy_denied_round(round_child, admitted_job_ids)
+                for round_child in rounds
+            )
+        ):
+            family_state, reason = _family_terminal_state(last)
+            return ("terminal", family_state, reason)
+        return ("archive",)
     return ("wait",)
 
 
@@ -6081,6 +6948,34 @@ def _discard_unprotected_family_index(
         return
 
 
+def _family_has_uncharged_attempts(connection, family_id: UUID) -> bool:
+    """Return True if any child still has an uncharged started budget attempt."""
+    row = connection.execute(
+        "SELECT 1 FROM attempts a "
+        "JOIN jobs c ON c.job_id = a.job_id "
+        "WHERE c.parent_job_id = %s "
+        "AND c.job_contract_version = 2 "
+        "AND c.job_kind IN ('campaign', 'round') "
+        "AND a.stage = 'execute' AND a.status = 'started' "
+        "AND a.result ? 'budget' "
+        "AND NOT EXISTS ("
+        "SELECT 1 FROM budget_charges bc "
+        "WHERE bc.job_id = a.job_id AND bc.step_key = a.step_key "
+        "AND bc.attempt_no = a.attempt_no) "
+        "LIMIT 1",
+        (family_id,),
+    ).fetchone()
+    return row is not None
+
+
+@dataclass(frozen=True)
+class FamilyConvergenceResult:
+    """Families archived as COMPLETED vs terminated as BLOCKED/FAILED."""
+
+    converged: list[str]
+    terminated: list[str]
+
+
 def archive_family(
     dsn: str,
     family_id: UUID,
@@ -6185,6 +7080,20 @@ def archive_family(
                         and not child["workflow_synced"]
                     ):
                         raise StateError("family has non-terminal children")
+                    if (
+                        child["job_kind"] == "round"
+                        and child["state"] == "BLOCKED"
+                        and child["evidence_status"] is None
+                        and child["plan_digest"] is not None
+                    ):
+                        raise FamilyNotTerminated(
+                            "family has a blocked round awaiting archive"
+                        )
+                if _family_has_uncharged_attempts(connection, family_id):
+                    raise FamilyNotTerminated(
+                        "family still has uncharged budget attempts pending "
+                        "recovery"
+                    )
                 disposition = _family_archive_disposition(
                     connection,
                     family_id,
@@ -6400,20 +7309,20 @@ def _converge_family_without_index(
             return True
 
 
-def converge_families(
+def converge_families_detailed(
     dsn: str,
     *,
     evidence_root: Path | str | None = None,
     now: Any = None,
-) -> list[str]:
+) -> FamilyConvergenceResult:
     """Idempotently converge every AGGREGATING family that is truly done.
 
     This is the worker crash-recovery sweep. It selects families with at least
-    one child, no pending envelope and no non-terminal (or unsynced BLOCKED)
-    child. ``archive_family`` then applies the termination gate: a family with
-    remaining rounds and budget is skipped silently, a terminal-but-unindexable
-    child ends the family as BLOCKED/FAILED exactly once, and any other archive
-    failure stays retryable.
+    one child, no pending envelope, no non-terminal (or unsynced BLOCKED)
+    child, and no uncharged started budget attempt. ``archive_family`` then
+    applies the termination gate: a family with remaining rounds and budget is
+    skipped silently, a terminal-but-unindexable child ends the family as
+    BLOCKED/FAILED exactly once, and any other archive failure stays retryable.
     """
     with _connect(dsn) as connection:
         family_ids = [
@@ -6427,7 +7336,21 @@ def converge_families(
                 "SELECT 1 FROM jobs c WHERE c.parent_job_id = f.job_id AND ("
                 "c.state NOT IN ('COMPLETED', 'REPRODUCED', 'NOT_REPRODUCED', "
                 "'INCONCLUSIVE', 'BLOCKED', 'FAILED') "
-                "OR (c.state = 'BLOCKED' AND c.workflow_synced = false))) "
+                "OR (c.state = 'BLOCKED' AND c.workflow_synced = false) "
+                "OR (c.job_kind = 'round' AND c.state = 'BLOCKED' "
+                "AND c.evidence_status IS NULL "
+                "AND EXISTS (SELECT 1 FROM plans p WHERE p.job_id = c.job_id)))) "
+                "AND NOT EXISTS ("
+                "SELECT 1 FROM attempts a JOIN jobs c ON c.job_id = a.job_id "
+                "WHERE c.parent_job_id = f.job_id "
+                "AND c.job_contract_version = 2 "
+                "AND c.job_kind IN ('campaign', 'round') "
+                "AND a.stage = 'execute' AND a.status = 'started' "
+                "AND a.result ? 'budget' "
+                "AND NOT EXISTS ("
+                "SELECT 1 FROM budget_charges bc "
+                "WHERE bc.job_id = a.job_id AND bc.step_key = a.step_key "
+                "AND bc.attempt_no = a.attempt_no)) "
                 "AND NOT EXISTS ("
                 "SELECT 1 FROM family_envelopes e WHERE e.family_id = f.job_id "
                 "AND e.status = 'pending') "
@@ -6435,23 +7358,26 @@ def converge_families(
             ).fetchall()
         ]
     converged: list[str] = []
+    terminated: list[str] = []
     for family_id in family_ids:
         try:
             archive_family(
                 dsn, family_id, evidence_root=evidence_root, now=now
             )
         except FamilyNotTerminated:
-            # Still has legal rounds/budget: not a failure, just later.
+            # Still has legal rounds/budget or pending charge recovery: later.
             continue
         except FamilyTerminalWithoutIndex as error:
             try:
-                _converge_family_without_index(
+                ended = _converge_family_without_index(
                     dsn,
                     family_id,
                     error.family_state,
                     error.reason_code,
                     str(error),
                 )
+                if ended:
+                    terminated.append(str(family_id))
             except (StateError, psycopg.Error) as terminal_error:
                 record_family_archive_failure(
                     dsn,
@@ -6465,7 +7391,19 @@ def converge_families(
             )
             continue
         converged.append(str(family_id))
-    return converged
+    return FamilyConvergenceResult(converged=converged, terminated=terminated)
+
+
+def converge_families(
+    dsn: str,
+    *,
+    evidence_root: Path | str | None = None,
+    now: Any = None,
+) -> list[str]:
+    """Converge AGGREGATING families and return the archived family IDs."""
+    return converge_families_detailed(
+        dsn, evidence_root=evidence_root, now=now
+    ).converged
 
 
 def _transition_decision_detail(
@@ -6557,7 +7495,7 @@ def _check_transition_point(
     and it ended ``INCONCLUSIVE`` (no conclusion); no later round exists.
     """
     rounds = connection.execute(
-        "SELECT round_no, state FROM jobs "
+        "SELECT job_id, job_kind, round_no, state, reason_code FROM jobs "
         "WHERE parent_job_id = %s AND job_kind = 'round' "
         "ORDER BY round_no DESC NULLS FIRST",
         (family_id,),
@@ -6573,10 +7511,13 @@ def _check_transition_point(
         raise StateError(
             f"after_round_no={after_round_no} is not the family's latest round"
         )
-    if rounds[0]["state"] != "INCONCLUSIVE":
+    admitted_job_ids = _family_admitted_job_ids(connection, family_id)
+    if rounds[0]["state"] != "INCONCLUSIVE" and not _is_policy_denied_round(
+        rounds[0], admitted_job_ids
+    ):
         raise StateError(
-            f"round {after_round_no} must be INCONCLUSIVE before the family "
-            "decides"
+            f"round {after_round_no} must be INCONCLUSIVE or policy-denied "
+            "before the family decides"
         )
 
 
@@ -6791,9 +7732,19 @@ def _job_status_payload(row: Mapping[str, Any]) -> dict[str, Any]:
     pending_plan = None
     evidence_refs: list[str] = []
     if row["plan_digest"] is not None:
+        raw_summary = row["summary"]
+        public_summary = (
+            {
+                key: value
+                for key, value in raw_summary.items()
+                if key != "admission_inputs"
+            }
+            if isinstance(raw_summary, Mapping)
+            else raw_summary
+        )
         pending_plan = {
             "plan_digest": row["plan_digest"],
-            "summary": row["summary"],
+            "summary": public_summary,
             "plan": row["plan"],
             "created_at": jsonutil.timestamp(row["plan_created_at"]),
         }
