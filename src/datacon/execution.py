@@ -48,6 +48,7 @@ from datacon.tools.sandbox import (
     MAX_ARTIFACT_BYTES,
     MAX_LOG_BYTES,
     MAX_PROVENANCE_FACE_BYTES,
+    BuildOutput,
     BuildResult,
     DockerSandbox,
     FuzzResult,
@@ -155,6 +156,9 @@ class ExecutionContext:
     # ceiling granted by ``state.budget_gate`` for the container step that is
     # currently running, or None outside a budgeted step.
     step_ceiling_seconds: float | None = None
+    # T12 C: a guided validation round reuses the campaign's build products
+    # and takes its candidate from the campaign's frozen crash seed.
+    reuse: Any = None
 
     @property
     def job_id_text(self) -> str:
@@ -235,6 +239,10 @@ def _harness_material_digest(context: Any) -> Any:
     if _is_guided_job(getattr(context, "job", None), getattr(context, "plan", None)):
         return context.materials.get(context.case.manifest["harness"])
     return context.plan["harness_digest"]
+
+
+def _is_reuse_plan(plan: Any) -> bool:
+    return isinstance(plan, Mapping) and plan.get("build_ref") is not None
 
 
 def _build_spec_from_context(context: Any) -> Mapping[str, Any] | None:
@@ -1415,10 +1423,13 @@ def _load_context(
             manifest_case["inputs"]["normal"],
             plan_inputs.get("normal"),
         )
-        expected_materials["input_candidate"] = (
-            manifest_case["inputs"]["candidate"],
-            plan_inputs.get("candidate"),
-        )
+        if not _is_reuse_plan(plan):
+            # A reuse validation's candidate is a campaign crash seed, bound
+            # by _load_campaign_reuse to the archived campaign bundle.
+            expected_materials["input_candidate"] = (
+                manifest_case["inputs"]["candidate"],
+                plan_inputs.get("candidate"),
+            )
     elif not is_v2:
         raise ExecutionBlocked("MATERIAL_MISSING", "plan has no inputs mapping")
     for label, (relative, expected_digest) in expected_materials.items():
@@ -1755,12 +1766,13 @@ def _assert_context_unchanged(
     if isinstance(plan_inputs, Mapping):
         expected_digests["input_normal"] = plan_inputs.get("normal")
         expected_digests["input_candidate"] = plan_inputs.get("candidate")
-        material_checks.extend(
-            [
-                ("input_normal", context.manifest_case["inputs"]["normal"]),
-                ("input_candidate", context.manifest_case["inputs"]["candidate"]),
-            ]
+        material_checks.append(
+            ("input_normal", context.manifest_case["inputs"]["normal"])
         )
+        if not _is_reuse_plan(context.plan):
+            material_checks.append(
+                ("input_candidate", context.manifest_case["inputs"]["candidate"])
+            )
     for label, relative in material_checks:
         try:
             case.read_material(relative, expected_digests.get(label))
@@ -2100,6 +2112,15 @@ def _materialize_into_generation(
         (expected_inputs, input_payloads),
     ):
         for label, (relative, digest) in expected_group.items():
+            reuse = getattr(context, "reuse", None)
+            if label == "input_candidate" and _is_reuse_plan(context.plan):
+                if reuse is None or _digest(reuse.seed) != digest:
+                    raise ExecutionBlocked(
+                        "MATERIAL_MISSING",
+                        "the campaign crash seed for this round is unavailable",
+                    )
+                target_payloads[relative] = reuse.seed
+                continue
             try:
                 data, actual = context.case.read_material(relative, digest)
             except CaseConfigurationError as error:
@@ -3929,7 +3950,11 @@ def _build_report(
         report["build_ref"] = (
             None if bundle_kind == "campaign" else context.plan.get("build_ref")
         )
-        report["reuse_origin"] = None
+        report["reuse_origin"] = (
+            _reuse_origin(context)
+            if bundle_kind != "campaign" and getattr(context, "reuse", None) is not None
+            else None
+        )
         if bundle_kind in ("execution", "campaign"):
             report["build_provenance_rules_version"] = _provenance_rules_version(
                 context
@@ -6310,6 +6335,314 @@ def _run_campaign(
     )
 
 
+# ---------------------------------------------------------------------------
+# T12 C (改9): a guided validation round reuses the campaign build products.
+# ---------------------------------------------------------------------------
+
+REUSE_MISMATCH = "REUSE_MISMATCH"
+
+
+@dataclass(frozen=True)
+class _CampaignReuse:
+    source_job_id: str
+    generation: int
+    campaign_bundle_digest: str
+    artifacts: dict[str, dict[str, str]]
+    builds: dict[str, BuildResult]
+    seed: bytes
+
+
+def _campaign_build_record(
+    files: Mapping[str, bytes], version: str
+) -> tuple[dict[str, Any], dict[str, str], bytes]:
+    """Return one version's archived build payload, its output paths and log."""
+    prefix = f"build/{version}/"
+    raw_metadata = files.get(prefix + "metadata.json")
+    log = files.get(prefix + "build.log")
+    if raw_metadata is None or log is None:
+        raise ValueError(f"the campaign bundle has no {version} build record")
+    metadata = jsonutil.loads_strict(raw_metadata)
+    if not isinstance(metadata, dict) or metadata.get("status") != "completed":
+        raise ValueError(f"the campaign {version} build is not a completed build")
+    record_files = metadata.get("files")
+    outputs = record_files.get("outputs") if isinstance(record_files, Mapping) else None
+    if not isinstance(outputs, Mapping):
+        raise ValueError(f"the campaign {version} build lists no outputs")
+    by_name = {
+        PurePosixPath(str(relative)).name: str(relative) for relative in outputs
+    }
+    if set(by_name) != {fuzz_rules.PARSER_OUTPUT, fuzz_rules.FUZZER_OUTPUT}:
+        raise ValueError(
+            f"the campaign {version} build did not produce exactly parser and fuzzer"
+        )
+    return metadata, by_name, log
+
+
+def campaign_build_ref(
+    files: Mapping[str, bytes], *, campaign_job_id: str, plan: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Derive a validation ``build_ref`` from a verified campaign bundle (D41).
+
+    ``artifact_digest`` binds the replay parser, ``fuzzer_digest`` the fuzzer,
+    both versions share the campaign build attempt's ``generation``, and
+    ``build_inputs_digest`` covers the build materials, toolchain and
+    BuildSpec only (never the inputs).
+    """
+    artifacts: dict[str, dict[str, str]] = {}
+    generations: set[Any] = set()
+    staged: dict[str, Any] = {}
+    for version in ("vulnerable", "fixed"):
+        metadata, by_name, log = _campaign_build_record(files, version)
+        prefix = f"build/{version}/"
+        parser = files.get(prefix + by_name[fuzz_rules.PARSER_OUTPUT])
+        fuzzer = files.get(prefix + by_name[fuzz_rules.FUZZER_OUTPUT])
+        if parser is None or fuzzer is None:
+            raise ValueError(f"the campaign bundle lacks the {version} products")
+        artifacts[version] = {
+            "artifact_digest": _digest(parser),
+            "build_log_digest": _digest(log),
+            "fuzzer_digest": _digest(fuzzer),
+        }
+        generations.add(metadata.get("generation"))
+        staged[version] = metadata.get("staged_materials")
+    if len(generations) != 1 or type(next(iter(generations))) is not int:
+        raise ValueError("both campaign builds must share one build generation")
+    return {
+        "source_job_id": campaign_job_id,
+        "generation": next(iter(generations)),
+        "build_inputs_digest": jsonutil.digest_json(
+            {
+                "build_recipe_digest": plan.get("build_recipe_digest"),
+                "build_spec": plan.get("build_spec"),
+                "compile_flags": plan.get("compile_flags"),
+                "image_digest": plan.get("image_digest"),
+                "staged_materials": staged,
+            }
+        ),
+        "artifacts": artifacts,
+    }
+
+
+def _load_campaign_reuse(dsn: str, context: ExecutionContext) -> _CampaignReuse:
+    """Bind a reuse round to the archived campaign; any drift is REUSE_MISMATCH.
+
+    The plan's ``build_ref`` is the single authority: the source job must be
+    this family's COMPLETED campaign, its bundle must verify offline and match
+    the job's evidence digest, the recomputed ``build_ref`` must equal the
+    plan's field by field, and the round's candidate must be one of the
+    campaign's frozen crash seeds with complete provenance.
+    """
+    plan = context.plan
+    build_ref = plan.get("build_ref")
+    if not isinstance(build_ref, Mapping):
+        raise ExecutionFailed(REUSE_MISMATCH, "the round plan has no build_ref")
+
+    def _mismatch(message: str) -> ExecutionFailed:
+        return ExecutionFailed(REUSE_MISMATCH, message)
+
+    try:
+        source_id = UUID(str(build_ref.get("source_job_id")))
+    except ValueError as error:
+        raise _mismatch("build_ref.source_job_id is not a job id") from error
+    source = state.load_job(dsn, source_id)
+    if (
+        source is None
+        or source.get("job_kind") != "campaign"
+        or str(source.get("family_id")) != str(context.job.get("family_id"))
+        or source.get("state") != "COMPLETED"
+        or source.get("evidence_status") != "archived"
+        or not isinstance(source.get("evidence_path"), str)
+    ):
+        raise _mismatch(
+            "build_ref.source_job_id is not this family's archived COMPLETED campaign"
+        )
+    try:
+        verified = verify_bundle(source["evidence_path"])
+    except (BundleError, OSError) as error:
+        raise _mismatch(f"the campaign bundle does not verify: {error}") from error
+    bundle_digest = evidence.canonical_manifest_digest(verified.manifest)
+    if bundle_digest != source.get("evidence_digest"):
+        raise _mismatch("the campaign bundle differs from the archived evidence digest")
+    files = verified.file_data
+    try:
+        campaign_plan = jsonutil.loads_strict(files["plan.json"])
+        recomputed = campaign_build_ref(
+            files, campaign_job_id=str(source_id), plan=campaign_plan
+        )
+    except (KeyError, ValueError) as error:
+        raise _mismatch(f"the campaign build record is unusable: {error}") from error
+    for name in ("build_recipe_digest", "build_spec", "compile_flags", "image_digest"):
+        if campaign_plan.get(name) != plan.get(name):
+            raise _mismatch(f"the round plan {name} differs from the campaign plan")
+    for name in ("source_job_id", "generation", "build_inputs_digest"):
+        if recomputed[name] != build_ref.get(name):
+            raise _mismatch(
+                f"build_ref.{name} does not match the campaign "
+                f"(expected {recomputed[name]!r}, got {build_ref.get(name)!r})"
+            )
+    for version in ("vulnerable", "fixed"):
+        planned = build_ref.get("artifacts", {}).get(version)
+        if planned != recomputed["artifacts"][version]:
+            raise _mismatch(
+                f"build_ref.artifacts.{version} does not match the campaign "
+                f"{version} products (expected {recomputed['artifacts'][version]}, "
+                f"got {planned})"
+            )
+    plan_inputs = plan.get("inputs")
+    candidate = plan_inputs.get("candidate") if isinstance(plan_inputs, Mapping) else None
+    provenance_raw = files.get(fuzz_rules.FUZZ_PROVENANCE_PATH)
+    seed: bytes | None = None
+    try:
+        provenance = jsonutil.loads_strict(provenance_raw or b"")
+        for record in provenance.get("crash_seeds", []):
+            path_value = record.get("path") if isinstance(record, Mapping) else None
+            data = files.get(path_value) if isinstance(path_value, str) else None
+            checked = fuzz_rules.validate_crash_seed_record(
+                record, data=data, campaign_job_id=str(source_id)
+            )
+            if checked["sha256"] == candidate and data is not None:
+                seed = data
+                break
+    except (AttributeError, ValueError) as error:
+        raise _mismatch(f"the campaign crash seed provenance is invalid: {error}") from error
+    if seed is None:
+        raise _mismatch(
+            "the round candidate is not a frozen crash seed of the referenced campaign"
+        )
+    builds: dict[str, BuildResult] = {}
+    for version in ("vulnerable", "fixed"):
+        metadata, by_name, log = _campaign_build_record(files, version)
+        prefix = f"build/{version}/"
+        outputs = tuple(
+            BuildOutput(
+                relative_path=relative,
+                archive_path=relative,
+                data=files[prefix + relative],
+                digest=_digest(files[prefix + relative]),
+            )
+            for relative in sorted(by_name.values())
+        )
+        face_name = metadata.get("provenance_face_name")
+        face = (
+            files.get(f"{prefix}build_provenance/{face_name}")
+            if isinstance(face_name, str)
+            else None
+        )
+        carried = {
+            key: value
+            for key, value in metadata.items()
+            if key
+            not in (
+                "tool_id", "job_id", "generation", "attempt_token", "plan_digest",
+                "input_digest", "status", "version", "container_id",
+                "artifact_digest", "attempt_no", "files", "file_digests",
+                "exit_code", "duration_seconds", "image_digest", "compile_args",
+                "log_digest", "log_truncated", "truncated_roles", "capture_error",
+                "provenance_face_name", "provenance_face_size",
+                "provenance_face_sha256", "staged_materials", "hmac",
+            )
+        }
+        carried["reused_from"] = {
+            "source_job_id": str(source_id),
+            "generation": recomputed["generation"],
+            "campaign_bundle_digest": bundle_digest,
+        }
+        builds[version] = BuildResult(
+            version=version,
+            status="completed",
+            exit_code=metadata.get("exit_code"),
+            duration_seconds=0.0,
+            container_id=None,
+            image_digest=str(metadata.get("image_digest")),
+            compile_args=tuple(metadata.get("compile_args") or ()),
+            artifact_digest=recomputed["artifacts"][version]["artifact_digest"],
+            log=log,
+            log_truncated=False,
+            artifact=files[prefix + by_name[fuzz_rules.PARSER_OUTPUT]],
+            metadata=carried,
+            provenance_face=face,
+            provenance_face_name=face_name if isinstance(face_name, str) else None,
+            outputs=outputs,
+        )
+    return _CampaignReuse(
+        source_job_id=str(source_id),
+        generation=recomputed["generation"],
+        campaign_bundle_digest=bundle_digest,
+        artifacts={version: dict(recomputed["artifacts"][version]) for version in ("vulnerable", "fixed")},
+        builds=builds,
+        seed=seed,
+    )
+
+
+def _reuse_origin(context: Any) -> dict[str, Any] | None:
+    reuse = getattr(context, "reuse", None)
+    if reuse is None:
+        return None
+    return {
+        "source_job_id": reuse.source_job_id,
+        "generation": reuse.generation,
+        "campaign_bundle_digest": reuse.campaign_bundle_digest,
+        "artifacts": {version: dict(item) for version, item in reuse.artifacts.items()},
+    }
+
+
+def _finish_failed_without_bundle(
+    dsn: str,
+    job_id: UUID,
+    generation: int,
+    error: ExecutionFailed,
+    *,
+    explanation: str,
+) -> ExecutionResult:
+    """FAILED with the real reason when no verifiable bundle can be written."""
+    try:
+        finished = state.finish_execution(
+            dsn,
+            job_id,
+            generation=generation,
+            state="FAILED",
+            reason_code=error.reason_code,
+            verdict=None,
+            verdict_reason=None,
+            evidence_status="failed",
+            evidence_error=f"{explanation}: {error.reason_code}: {error.message}",
+            last_error=error.message,
+            stage="failed",
+        )
+    except (state.StateError, state.StaleGeneration):
+        return ExecutionResult("STALE")
+    if not finished:
+        return ExecutionResult("STALE")
+    return ExecutionResult("FAILED", reason_code=error.reason_code)
+
+
+def _do_reuse_build(
+    dsn: str,
+    context: ExecutionContext,
+    version: str,
+    attempt_no: int,
+    token: str,
+) -> dict[str, Any]:
+    """Adopt the campaign's verified build for ``version``; no container runs."""
+    reuse = context.reuse
+    result = reuse.builds[version]
+    result = BuildResult(
+        **{
+            **{name: getattr(result, name) for name in result.__dataclass_fields__},
+            "metadata": {
+                **result.metadata,
+                "primary_output": next(
+                    output.relative_path
+                    for output in result.outputs
+                    if PurePosixPath(output.relative_path).name
+                    == fuzz_rules.PARSER_OUTPUT
+                ),
+            },
+        }
+    )
+    return _persist_build(dsn, context, result, attempt_no, token)
+
+
 def run_execution(
     dsn: str,
     job_id: UUID,
@@ -6341,6 +6674,20 @@ def run_execution(
         )
     except ExecutionFailed as error:
         return _finish_blocked_failed(dsn, job_id, generation, error)
+
+    if _is_v2_context(context) and _is_reuse_plan(context.plan):
+        try:
+            context.reuse = _load_campaign_reuse(dsn, context)
+        except ExecutionFailed as error:
+            return _finish_failed_without_bundle(
+                dsn,
+                job_id,
+                generation,
+                error,
+                explanation="the validation round cannot reuse the campaign build",
+            )
+        except state.StaleGeneration:
+            return ExecutionResult("STALE")
 
     # The evidence root must be outside the attacker-writable run root before
     # either archive recovery or the normal path can touch any bundle.
@@ -6486,16 +6833,22 @@ def run_execution(
                 context,
                 step_key=f"build:{version}",
                 input_digest=context.plan["analysis_digest"],
-                action=lambda attempt_no, token, version=version, build_timeout=build_timeout: _do_build(
-                    dsn,
-                    context,
-                    sandbox,
-                    materials_dir,
-                    material_digests,
-                    version,
-                    attempt_no,
-                    token,
-                    deadline_seconds=build_timeout,
+                action=(
+                    (lambda attempt_no, token, version=version: _do_reuse_build(
+                        dsn, context, version, attempt_no, token
+                    ))
+                    if getattr(context, "reuse", None) is not None
+                    else (lambda attempt_no, token, version=version, build_timeout=build_timeout: _do_build(
+                        dsn,
+                        context,
+                        sandbox,
+                        materials_dir,
+                        material_digests,
+                        version,
+                        attempt_no,
+                        token,
+                        deadline_seconds=build_timeout,
+                    ))
                 ),
                 reusable=lambda payload: _reusable_build(
                     build_root,

@@ -999,14 +999,8 @@ _POLICY_DENIED_REASONS = frozenset(
 )
 
 
-def campaign_candidate_seeds(campaign: Mapping[str, Any]) -> list[dict[str, Any]] | None:
-    """Return the campaign's frozen crash seeds from its verified bundle.
-
-    The archived campaign bundle is the only source: it is verified offline,
-    its manifest digest must equal the job's ``evidence_digest``, and every
-    seed must carry complete provenance bound to its bytes and this campaign.
-    Returns None when the bundle cannot be trusted (no decision is taken).
-    """
+def _verified_campaign_bundle(campaign: Mapping[str, Any]) -> Any:
+    """The campaign's archived bundle, verified offline and digest-bound, or None."""
     path = campaign.get("evidence_path")
     if campaign.get("evidence_status") != "archived" or not isinstance(path, str):
         return None
@@ -1019,6 +1013,20 @@ def campaign_candidate_seeds(campaign: Mapping[str, Any]) -> list[dict[str, Any]
     ):
         return None
     if verified.manifest.get("bundle_kind") != "campaign":
+        return None
+    return verified
+
+
+def campaign_candidate_seeds(campaign: Mapping[str, Any]) -> list[dict[str, Any]] | None:
+    """Return the campaign's frozen crash seeds from its verified bundle.
+
+    The archived campaign bundle is the only source: it is verified offline,
+    its manifest digest must equal the job's ``evidence_digest``, and every
+    seed must carry complete provenance bound to its bytes and this campaign.
+    Returns None when the bundle cannot be trusted (no decision is taken).
+    """
+    verified = _verified_campaign_bundle(campaign)
+    if verified is None:
         return None
     raw = verified.file_data.get(fuzz_rules.FUZZ_PROVENANCE_PATH)
     if raw is None:
@@ -1113,12 +1121,14 @@ def _round_plan(
     normal_digest: str,
     seed_digest: str,
     experiment_digest: str,
+    build_ref: Mapping[str, Any],
 ) -> dict[str, Any]:
     """Derive the next round's frozen plan from the human-approved campaign plan.
 
     Only the round identity, the approval chain tail, the inputs and the
     experiment change; build, case and policy bindings are the approved ones.
-    The validation build reuse (``build_ref``) is stage C and stays null here.
+    ``build_ref`` (stage C) binds the campaign's parser and fuzzer per
+    version so the round reuses them and never rebuilds.
     """
     plan = deepcopy(dict(campaign_plan))
     plan.update(
@@ -1129,7 +1139,7 @@ def _round_plan(
             "harness_digest": envelope["harness_digest"],
             "inputs": {"normal": normal_digest, "candidate": seed_digest},
             "experiment_digest": experiment_digest,
-            "build_ref": None,
+            "build_ref": deepcopy(dict(build_ref)),
         }
     )
     contracts.plan_digest(plan)
@@ -1252,7 +1262,15 @@ def advance_family_transition(
     ):
         return None
     seed = seeds[after_round_no]
+    verified = _verified_campaign_bundle(campaign)
+    if verified is None:
+        return None
     try:
+        build_ref = execution.campaign_build_ref(
+            verified.file_data,
+            campaign_job_id=str(campaign_id),
+            plan=campaign_plan,
+        )
         experiment = _round_experiment(campaign_plan, envelope, seed)
         plan = _round_plan(
             campaign_plan,
@@ -1262,6 +1280,7 @@ def advance_family_transition(
             normal_digest=_normal_input_digest(campaign_plan, case_root),
             seed_digest=seed["sha256"],
             experiment_digest=jsonutil.digest_json(experiment),
+            build_ref=build_ref,
         )
     except (CaseConfigurationError, ExperimentSpecError, KeyError, TypeError, ValueError) as error:
         logger.warning("family %s cannot derive round %s: %s", family_uuid, next_round_no, error)

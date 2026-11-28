@@ -1883,7 +1883,16 @@ def test_worker_runs_v2_campaign_and_derives_admitted_round(
     round_plan = state.get_plan(database.dsn, round_id)["plan"]
     assert round_plan["parent_approval_digest"] == approval_digest
     assert round_plan["inputs"]["candidate"] == admission["seed_digest"]
-    assert round_plan["build_ref"] is None  # validation reuse is stage C
+    # Stage C: the round reuses the campaign's two products per version.
+    build_ref = round_plan["build_ref"]
+    assert build_ref["source_job_id"] == str(campaign_id)
+    for version in ("vulnerable", "fixed"):
+        prefix = f"build/{version}/"
+        assert build_ref["artifacts"][version] == {
+            "artifact_digest": "sha256:" + hashlib.sha256(verified.file_data[prefix + "parser"]).hexdigest(),
+            "build_log_digest": "sha256:" + hashlib.sha256(verified.file_data[prefix + "build.log"]).hexdigest(),
+            "fuzzer_digest": "sha256:" + hashlib.sha256(verified.file_data[prefix + "fuzzer"]).hexdigest(),
+        }
     assert state.load_job(database.dsn, family_id)["state"] == "AGGREGATING"
 
     # Re-entry is idempotent: while round 1 is not terminal the family stands
@@ -2030,3 +2039,105 @@ def test_round_points_use_the_next_seed_then_record_no_remaining_seeds(
     assert family["state"] == "COMPLETED", family
     index = json.loads(open(family["evidence_path"], "rb").read())
     assert [item["round_no"] for item in index["rounds"]] == [1, 2]
+
+
+# ---------------------------------------------------------------------------
+# T12 C (改9 增补): the derived round reuses the campaign build, replays six
+# times and is the family's conclusion; drift is REUSE_MISMATCH.
+# ---------------------------------------------------------------------------
+
+
+def _derive_round_one(database, tmp_path, monkeypatch, *, crashes=(b"ABCD\n",)):
+    run_root, _evidence_root = _configure_isolated_roots(tmp_path, monkeypatch)
+    family_id, campaign_id, plan, _approval, _envelope = _seed_ready_campaign(database)
+    sandboxes = _install_fake_campaign_sandbox(monkeypatch, plan, crashes=crashes)
+    workflow.run_worker(
+        database.dsn, once=True, case_root=str(_FIXTURE_CASES), run_root=str(run_root)
+    )
+    round_id = database.connection.execute(
+        "SELECT job_id FROM jobs WHERE parent_job_id = %s AND round_no = 1",
+        (family_id,),
+    ).fetchone()[0]
+    return run_root, family_id, campaign_id, round_id, sandboxes
+
+
+def test_worker_runs_guided_validation_round_reusing_campaign_build(
+    isolated_database, tmp_path, monkeypatch
+):
+    database = isolated_database
+    run_root, family_id, campaign_id, round_id, sandboxes = _derive_round_one(
+        database, tmp_path, monkeypatch
+    )
+    campaign = state.load_job(database.dsn, campaign_id)
+    campaign_bundle = evidence.verify_bundle(campaign["evidence_path"])
+
+    result = workflow.run_worker(
+        database.dsn, once=True, case_root=str(_FIXTURE_CASES), run_root=str(run_root)
+    )
+
+    assert result["job_id"] == str(round_id)
+    round_job = state.load_job(database.dsn, round_id)
+    assert round_job["state"] == "REPRODUCED", round_job
+    validation_sandbox = sandboxes[-1]
+    assert validation_sandbox.build_calls == [], "the validation round rebuilt"
+    assert validation_sandbox.fuzz_calls == []
+    assert len(validation_sandbox.replay_calls) == 6
+    seed_digest = state.get_plan(database.dsn, round_id)["plan"]["inputs"]["candidate"]
+    assert {
+        call["input_digest"]
+        for call in validation_sandbox.replay_calls
+        if call["phase"] != "normal"
+    } == {seed_digest}
+    verified = evidence.verify_bundle(round_job["evidence_path"])
+    manifest = verified.manifest
+    assert manifest["bundle_kind"] == "execution"
+    assert manifest["reuse_origin"]["source_job_id"] == str(campaign_id)
+    assert manifest["reuse_origin"]["campaign_bundle_digest"] == campaign["evidence_digest"]
+    assert manifest["reuse_origin"]["artifacts"] == manifest["build_ref"]["artifacts"]
+    for version in ("vulnerable", "fixed"):
+        for output in ("parser", "fuzzer", "build.log"):
+            path = f"build/{version}/{output}"
+            assert verified.file_data[path] == campaign_bundle.file_data[path]
+    assert sum(1 for path in verified.file_data if path.startswith("replay/")) == 18
+    # Reused builds cost nothing; only the probe and the replays were charged.
+    fuzz_charged = database.connection.execute(
+        "SELECT COALESCE(SUM(fuzz_seconds), 0) FROM budget_charges WHERE job_id = %s",
+        (round_id,),
+    ).fetchone()[0]
+    assert fuzz_charged == 0
+
+    workflow.run_worker(
+        database.dsn, once=True, case_root=str(_FIXTURE_CASES), run_root=str(run_root)
+    )
+    family = state.load_job(database.dsn, family_id)
+    assert family["state"] == "COMPLETED", family
+    index = json.loads(open(family["evidence_path"], "rb").read())
+    assert [(item["round_no"], item["state"]) for item in index["rounds"]] == [
+        (1, "REPRODUCED")
+    ]
+
+
+def test_validation_round_fails_closed_on_campaign_drift(
+    isolated_database, tmp_path, monkeypatch
+):
+    database = isolated_database
+    run_root, _family_id, campaign_id, round_id, sandboxes = _derive_round_one(
+        database, tmp_path, monkeypatch
+    )
+    campaign = state.load_job(database.dsn, campaign_id)
+    fuzzer = _Path(campaign["evidence_path"]) / "build" / "fixed" / "fuzzer"
+    fuzzer.chmod(0o644)
+    fuzzer.write_bytes(b"tampered fuzzer")
+
+    workflow.run_worker(
+        database.dsn, once=True, case_root=str(_FIXTURE_CASES), run_root=str(run_root)
+    )
+
+    round_job = state.load_job(database.dsn, round_id)
+    assert round_job["state"] == "FAILED"
+    assert round_job["reason_code"] == "REUSE_MISMATCH"
+    assert round_job["verdict"] is None
+    # Only the campaign ever got a sandbox: the mismatched round failed
+    # before any container could be created.
+    assert len(sandboxes) == 1, "a mismatched reuse reached a container"
+    assert "REUSE_MISMATCH" in (round_job["evidence_error"] or "")

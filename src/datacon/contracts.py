@@ -1230,9 +1230,12 @@ def _build_ref(value: Any) -> dict[str, Any] | None:
     )
     normalized_artifacts = {}
     for version in ("vulnerable", "fixed"):
+        # ``fuzzer_digest`` (改9, T12 C): a guided validation reuses both
+        # campaign products; ``artifact_digest`` stays the replay parser.
         artifact = _object(
             artifacts[version],
             required={"artifact_digest", "build_log_digest"},
+            optional={"fuzzer_digest"},
         )
         normalized_artifacts[version] = {
             "artifact_digest": _digest(
@@ -1244,6 +1247,15 @@ def _build_ref(value: Any) -> dict[str, Any] | None:
                 label=f"build_ref.artifacts.{version}.build_log_digest",
             ),
         }
+        if "fuzzer_digest" in artifact:
+            normalized_artifacts[version]["fuzzer_digest"] = _digest(
+                artifact["fuzzer_digest"],
+                label=f"build_ref.artifacts.{version}.fuzzer_digest",
+            )
+    if len({"fuzzer_digest" in item for item in normalized_artifacts.values()}) != 1:
+        raise ValueError(
+            "build_ref.artifacts must bind fuzzer_digest for both versions or neither"
+        )
     return {
         "source_job_id": _text(
             value["source_job_id"], label="build_ref.source_job_id"
