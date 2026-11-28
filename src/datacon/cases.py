@@ -529,7 +529,10 @@ def load_registry(
             raise CaseConfigurationError("INVALID_REQUEST", "invalid case_id")
         try:
             jsonutil.require_object(
-                entry, required=set(_CASE_FIELDS), label=f"case {case_id}"
+                entry,
+                required=set(_CASE_FIELDS),
+                optional={"build_spec"},
+                label=f"case {case_id}",
             )
             jsonutil.require_text(entry["cve_id"], f"{case_id}.cve_id")
             jsonutil.require_text(entry["benchmark_id"], f"{case_id}.benchmark_id")
@@ -579,6 +582,18 @@ def load_registry(
             jsonutil.require_digest(
                 advisory["digest"], f"{case_id}.advisory.digest"
             )
+            # T12 (改9 增补): the case's reviewed BuildSpec, the only source a
+            # v2 plan takes its build_spec from. Freeze rules apply verbatim.
+            if "build_spec" in entry:
+                from datacon import build_provenance
+
+                decision = build_provenance.validate_build_spec_for_freeze(
+                    entry["build_spec"]
+                )
+                if not decision.ok:
+                    raise ValueError(
+                        f"{case_id}.build_spec is invalid: {decision.error_detail}"
+                    )
         except ValueError as error:
             raise CaseConfigurationError(
                 "MATERIAL_MISSING", f"case {case_id} is invalid: {error}"

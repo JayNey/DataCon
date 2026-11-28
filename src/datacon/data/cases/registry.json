@@ -41,6 +41,34 @@
         "permitted_uses": [
           "reproduction"
         ]
+      },
+      "build_spec": {
+        "kind": "shell",
+        "build": [
+          "sh",
+          "./build.sh"
+        ],
+        "install": [],
+        "env": {
+          "CC": "clang"
+        },
+        "outputs": [
+          "parser",
+          "fuzzer"
+        ],
+        "declared_compile_flags": [
+          "-fsanitize=address",
+          "-g",
+          "-O0",
+          "-fno-omit-frame-pointer"
+        ],
+        "shell_recipe_digest": "sha256:3d0bfa0277081c0ae547397b070cbbbb280a7931611657658769e496bb128756",
+        "shell_face_digest": "sha256:0c5252696f66ef8b8ca80aafae1214bc94f821b7b239d6af78d5cb5968b90e10",
+        "shell_face_review": {
+          "reviewer_id": "reviewer-01",
+          "reviewed_at": "2099-01-01T00:00:00Z",
+          "face_kind": "build_log"
+        }
       }
     },
     "fixture-c-parser-clean": {

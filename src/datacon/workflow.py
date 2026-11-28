@@ -17,6 +17,7 @@ from langgraph.config import get_config
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, interrupt
 
+from datacon import build_provenance
 from datacon import contracts
 from datacon import evidence
 from datacon import execution
@@ -1347,6 +1348,205 @@ def advance_family_transitions(
     return advanced
 
 
+# ---------------------------------------------------------------------------
+# T12 (改9 增补): the guided family entry. A guided submit queues the campaign
+# child; the worker prepares it here (offline analysis → campaign plan +
+# envelope from the case registry → frozen, awaiting the human review).
+# ---------------------------------------------------------------------------
+
+
+def guided_envelope_for(request: Mapping[str, Any], case: Any, ceilings: Mapping[str, Any], *, image_digest: str) -> dict[str, Any]:
+    """Build the first guided envelope from the case registry and the request.
+
+    Everything an operator must not free-type (seed corpus, fuzz image,
+    {harness, fuzz_shim} pair, signature set, mutation limits, predicate
+    version) comes from the registry; the request only narrows the mutation
+    families, rounds and budgets. ``freeze_plan`` re-checks that the result
+    never widens either side.
+    """
+    exploration = request.get("exploration") or {}
+    manifest = case.manifest
+    materials = manifest["materials"]
+    entries = fuzz_rules.registered_seed_corpus(
+        ceilings, manifest_case=case.manifest_case, materials=materials
+    )
+    harness_digest = fuzz_rules.guided_harness_digest(
+        materials[manifest["harness"]], fuzz_rules.FUZZ_SHIM_REVIEWED_DIGEST
+    )
+    families = list(exploration.get("allowed_mutation_families") or [])
+    limits = ceilings.get("mutation_limits")
+    if not isinstance(limits, Mapping):
+        raise ValueError("the case registry declares no mutation_limits")
+
+    def _bounded(field: str) -> int:
+        requested = exploration.get(field)
+        ceiling = ceilings.get(field)
+        if type(requested) is not int:
+            if type(ceiling) is not int:
+                raise ValueError(f"neither the request nor the registry sets {field}")
+            return ceiling
+        if type(ceiling) is int and requested > ceiling:
+            raise ValueError(f"exploration.{field} exceeds the registered ceiling")
+        return requested
+
+    return contracts.guided_envelope(
+        allowed_mutation_families=families,
+        mutation_limits=dict(limits),
+        seed_corpus_digest=fuzz_rules.seed_corpus_digest(entries),
+        toolchain_image_digest=image_digest,
+        harness_digest=harness_digest,
+        max_rounds=_bounded("max_rounds"),
+        max_total_seconds=_bounded("max_total_seconds"),
+        max_fuzz_seconds=_bounded("max_fuzz_seconds"),
+        accepted_signature_set=[dict(item) for item in ceilings["accepted_signature_set"]],
+    )
+
+
+def campaign_plan_for(
+    analysis_plan: Mapping[str, Any],
+    *,
+    family_id: str,
+    envelope: Mapping[str, Any],
+    build_spec: Mapping[str, Any],
+    advisory_source_url: str | None = None,
+) -> dict[str, Any]:
+    """Turn the offline analysis plan into the family's first (campaign) plan.
+
+    Delta §8 binds ``plan.intel.sources`` to the archived snapshot's
+    registered ``source_url``; the offline analysis lists the advisory's own
+    sources, so the registered source is added when it is missing.
+    """
+    plan = deepcopy(dict(analysis_plan))
+    intel = plan.get("intel")
+    if isinstance(advisory_source_url, str) and isinstance(intel, dict):
+        sources = list(intel.get("sources") or [])
+        if advisory_source_url not in sources:
+            intel["sources"] = [*sources, advisory_source_url]
+    plan.update(
+        {
+            "schema_version": contracts.SCHEMA_VERSION_V2,
+            "family_id": family_id,
+            "parent_job_id": family_id,
+            "round_no": None,
+            "parent_approval_digest": None,
+            "envelope_digest": contracts.envelope_digest(envelope),
+            "harness_digest": envelope["harness_digest"],
+            "build_ref": None,
+            "build_spec": deepcopy(dict(build_spec)),
+            "compile_flags": list(build_spec["declared_compile_flags"]),
+            "experiment_digest": None,
+            "build_provenance_rules_version": build_provenance.RULES_VERSION,
+            "build_recipe_digest": jsonutil.digest_json(dict(build_spec)),
+            "inputs": None,
+        }
+    )
+    contracts.plan_digest(plan)
+    return plan
+
+
+def _prepare_v2_campaign(
+    dsn: str,
+    claimed: Mapping[str, Any],
+    *,
+    case_root: str | None,
+    run_root: str | None,
+) -> dict[str, Any]:
+    """Freeze the guided campaign plan and its envelope for the human review."""
+    job_id = claimed["job_id"]
+    generation = claimed["generation"]
+    job = state_store.load_job(dsn, job_id)
+    if job is None:
+        return {"processed": 1, "job_id": str(job_id), "state": None, "workflow": "stale"}
+
+    def _done(workflow_state: str) -> dict[str, Any]:
+        current = state_store.load_job(dsn, job_id)
+        return {
+            "processed": 1,
+            "job_id": str(job_id),
+            "state": current["state"] if current else None,
+            "workflow": workflow_state,
+        }
+
+    def _block(reason_code: str, message: str) -> dict[str, Any]:
+        try:
+            _block_job(
+                dsn,
+                job_id,
+                generation=generation,
+                reason_code=reason_code,
+                message=message,
+            )
+            execution.record_blocked(
+                dsn, job_id, reason_code=reason_code, message=message, run_root=run_root
+            )
+            state_store.finalize_workflow(dsn, job_id, generation)
+        except (state_store.StateError, state_store.StaleGeneration):
+            pass
+        return _done("blocked")
+
+    try:
+        analyzed = analyze_case(job["request"], case_root=case_root)
+    except AnalysisBlocked as error:
+        return _block(error.reason_code, error.message)
+    except (RetryableAnalysisError, TransientSourceToolError, TransientCaseError):
+        # Leave it PREPARING: the lease expires and a later claim retries.
+        return _done("retry")
+    try:
+        registry = load_registry(case_root)
+        case = registry.case(analyzed.plan["case_id"])
+        ceilings = registry.exploration_ceilings(case.case_id)
+        build_spec = case.entry.get("build_spec")
+        if not isinstance(build_spec, Mapping):
+            raise ValueError("the case registry declares no reviewed build_spec")
+        envelope = guided_envelope_for(
+            job["request"], case, ceilings, image_digest=analyzed.plan["image_digest"]
+        )
+        plan = campaign_plan_for(
+            analyzed.plan,
+            family_id=str(job["family_id"]),
+            envelope=envelope,
+            build_spec=build_spec,
+            advisory_source_url=case.advisory.get("source_url"),
+        )
+        plan_digest = contracts.plan_digest(plan)
+    except CaseConfigurationError as error:
+        return _block(error.reason_code, error.message)
+    except (KeyError, TypeError, ValueError) as error:
+        return _block("POLICY_DENIED", f"the guided campaign cannot be planned: {error}")
+    try:
+        frozen = state_store.freeze_plan(
+            dsn,
+            job_id,
+            generation=generation,
+            plan=plan,
+            plan_digest=plan_digest,
+            summary=dict(analyzed.summary),
+            envelope=envelope,
+        )
+    except state_store.StaleGeneration:
+        return _done("stale")
+    except (state_store.PlanConflict, state_store.StateError) as error:
+        return _block("POLICY_DENIED", f"the campaign plan cannot be frozen: {error}")
+    if frozen:
+        try:
+            state_store.finalize_workflow(dsn, job_id, generation)
+        except state_store.StateError:
+            pass
+        return _done("awaiting_review")
+    # The prepare deadline passed: freeze_plan already blocked the child.
+    try:
+        execution.record_blocked(
+            dsn,
+            job_id,
+            reason_code="DEADLINE_EXCEEDED",
+            message="preparation deadline passed before the plan was frozen",
+            run_root=run_root,
+        )
+    except state_store.StateError:
+        pass
+    return _done("blocked")
+
+
 def _sync_v2_claim(
     dsn: str, claimed: dict[str, Any], *, run_root: str | None
 ) -> dict[str, Any]:
@@ -1469,7 +1669,11 @@ def run_worker(
                 time.sleep(poll_seconds)
                 continue
             if claimed_v2:
-                if claimed["state"] in ("RUNNING", "ARCHIVING"):
+                if claimed["state"] == "PREPARING":
+                    result = _prepare_v2_campaign(
+                        dsn, claimed, case_root=case_root, run_root=run_root
+                    )
+                elif claimed["state"] in ("RUNNING", "ARCHIVING"):
                     result = _run_execution_claim(
                         dsn, claimed, case_root=case_root, run_root=run_root
                     )
