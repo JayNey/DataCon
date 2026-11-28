@@ -8,6 +8,7 @@ fake sandbox and a fake step clock; no Docker daemon, no PostgreSQL, no sleep.
 from __future__ import annotations
 
 from copy import deepcopy
+from dataclasses import replace
 import json
 from pathlib import Path
 import shutil
@@ -36,11 +37,30 @@ FACE_FLAGS = ["-fsanitize=address", "-g", "-O1", "-I../include", "-D_GNU_SOURCE"
 class _FakeCampaignSandbox(_FakeSandbox):
     """The build/probe fake plus a recorded, deterministic libFuzzer search."""
 
-    def __init__(self, *, crashes: tuple[bytes, ...] = (), clock=None, **kwargs):
+    def __init__(
+        self,
+        *,
+        crashes: tuple[bytes, ...] = (),
+        clock=None,
+        fixed_candidate_stdout: bytes | None = None,
+        **kwargs,
+    ):
         super().__init__(**kwargs)
         self.crashes = tuple(crashes)
         self.clock = clock
+        self.fixed_candidate_stdout = fixed_candidate_stdout
         self.fuzz_calls: list[dict[str, Any]] = []
+
+    def replay(self, version: str, phase: str, **kwargs: Any):
+        result = super().replay(version, phase, **kwargs)
+        if (
+            self.fixed_candidate_stdout is not None
+            and version == "fixed"
+            and phase != "normal"
+        ):
+            # A real crash seed prints its own token on the fixed build.
+            return replace(result, stdout=self.fixed_candidate_stdout)
+        return result
 
     def fuzz(self, **kwargs: Any) -> FuzzResult:
         corpus_dir = Path(kwargs["corpus_dir"])

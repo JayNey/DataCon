@@ -220,7 +220,7 @@ T11 的验收必须覆盖：节点名与边可枚举并与本表逐条一致、`
 3. `envelope_digest` 进入 v2 execution/campaign plan；fixed 的退化信封同样非空；`mutation_limits` 是信封正文的一部分并进入摘要。信封正文不内联进 `plan_digest`，但绑定关系不能因此缺失。`build_ref` 只在复用 campaign 的 validation plan 中非空；证据中的 `reuse_origin` 同条件非空。fixed/non-reuse 两者为 null。
 4. 模型只产 hypothesis 与 `ExperimentSpec`；模型来源 finding 只允许 `kind=hypothesis`，确定性工具事实不经模型出口；假设不改变判定。
 5. fuzz harness 与 build recipe 同级冻结；模型合成后不得直接执行。
-6. crash seed 固化字节与 SHA-256，并回主镜像完成六次回放才允许出结论。
+6. crash seed 固化字节与 SHA-256，并回主镜像完成六次回放才允许出结论。复用 campaign 构建的 guided validation 轮（`reuse_origin` 非空）回放的是 campaign crash seed，其 clean 输出未登记，故该轮 candidate 的 clean 判定只看 `expected_exit.candidate_clean` 与无 ASan 诊断，不比 `expected_stdout.candidate_clean`；normal 对照与其余优先级规则不变，`rule.checks.candidate_stdout_checked` 记录所用策略（改9 增补；fixed 与 v1 判据不变）。
 7. 预算以 family 级原子行扣减，任何路径不得透支；幂等键为 `(job_id, step_key, attempt_no)`，恢复同一 attempt 不重复记账，重试新 attempt 新扣费；fuzz 子预算单独对账。
 8. 构建溯源判据是“声明 ⊆ 生效（多重集包含），且两版生效有序序列严格相等”；`-I a -I b` 与 `-I b -I a` 不相等；没有核对面时在冻结计划阶段失败。
 9. v1 证据只读兼容；v2 校验按 `manifest.schema_version` 分派；v1 分支不得调用新实现。v1 控制面只读 v1 时代数据，v2 终态证据由 v2 只读 verifier/export 读取。

@@ -1788,7 +1788,7 @@ def _seed_ready_campaign(database, *, max_fuzz_seconds=60):
     return family_id, campaign_id, plan, approval_digest, envelope
 
 
-def _install_fake_campaign_sandbox(monkeypatch, plan, *, crashes):
+def _install_fake_campaign_sandbox(monkeypatch, plan, *, crashes, fixed_candidate_stdout=None):
     clock = _Clock()
     monkeypatch.setattr(_execution, "STEP_CLOCK", clock)
     created = []
@@ -1797,6 +1797,7 @@ def _install_fake_campaign_sandbox(monkeypatch, plan, *, crashes):
         sandbox = _FakeCampaignSandbox(
             crashes=crashes,
             clock=clock,
+            fixed_candidate_stdout=fixed_candidate_stdout,
             image_digest=plan["image_digest"],
             build_recipe_digest=plan["build_recipe_digest"],
             faces={
@@ -2047,10 +2048,14 @@ def test_round_points_use_the_next_seed_then_record_no_remaining_seeds(
 # ---------------------------------------------------------------------------
 
 
-def _derive_round_one(database, tmp_path, monkeypatch, *, crashes=(b"ABCD\n",)):
+def _derive_round_one(
+    database, tmp_path, monkeypatch, *, crashes=(b"ABCD\n",), fixed_candidate_stdout=None
+):
     run_root, _evidence_root = _configure_isolated_roots(tmp_path, monkeypatch)
     family_id, campaign_id, plan, _approval, _envelope = _seed_ready_campaign(database)
-    sandboxes = _install_fake_campaign_sandbox(monkeypatch, plan, crashes=crashes)
+    sandboxes = _install_fake_campaign_sandbox(
+        monkeypatch, plan, crashes=crashes, fixed_candidate_stdout=fixed_candidate_stdout
+    )
     workflow.run_worker(
         database.dsn, once=True, case_root=str(_FIXTURE_CASES), run_root=str(run_root)
     )
@@ -2141,3 +2146,32 @@ def test_validation_round_fails_closed_on_campaign_drift(
     # before any container could be created.
     assert len(sandboxes) == 1, "a mismatched reuse reached a container"
     assert "REUSE_MISMATCH" in (round_job["evidence_error"] or "")
+
+
+def test_validation_round_concludes_on_an_unregistered_crash_seed(
+    isolated_database, tmp_path, monkeypatch
+):
+    """改9 增补: a real seed's fixed output is not registered; exit + no ASan decide."""
+    database = isolated_database
+    run_root, _family_id, _campaign_id, round_id, _sandboxes = _derive_round_one(
+        database,
+        tmp_path,
+        monkeypatch,
+        crashes=(b"WXYZ\n",),
+        fixed_candidate_stdout=b"WXYZ\n",
+    )
+
+    workflow.run_worker(
+        database.dsn, once=True, case_root=str(_FIXTURE_CASES), run_root=str(run_root)
+    )
+
+    round_job = state.load_job(database.dsn, round_id)
+    assert (round_job["state"], round_job["verdict_reason"]) == (
+        "REPRODUCED",
+        "ASAN_SIGNATURE_MATCHED",
+    ), round_job
+    report = json.loads(
+        evidence.verify_bundle(round_job["evidence_path"]).file_data["report.json"]
+    )
+    assert report["rule"]["checks"]["candidate_stdout_checked"] is False
+    assert report["reuse_origin"] is not None

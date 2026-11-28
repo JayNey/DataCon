@@ -3852,6 +3852,9 @@ def _policy_from_context(context: ExecutionContext) -> VerdictPolicy:
         signature=context.plan["asan_signature"],
         expected_exit=context.plan["expected_exit"],
         expected_stdout=expected_stdout,
+        # Only a reuse validation round (the candidate is a campaign crash
+        # seed with no registered clean output) drops the candidate stdout.
+        candidate_stdout_checked=getattr(context, "reuse", None) is None,
     )
 
 

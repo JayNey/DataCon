@@ -469,3 +469,53 @@ def test_blocked_reasons_cover_non_execution_terminals():
         assert reason_allowed("BLOCKED", code)
     for code in ("REVIEW_REJECTED", "REVIEW_EXPIRED", "UNSUPPORTED_TARGET"):
         assert not reason_allowed("FAILED", code)
+
+
+def test_reuse_round_candidate_clean_ignores_stdout():
+    """改9 增补 (T12 C): a reuse validation round's candidate clean ignores stdout.
+
+    A campaign crash seed is not the registered candidate, so its clean
+    output is not registered either. Under the reuse policy a candidate is
+    clean on exit code + no ASan diagnostic; the normal control still compares
+    the registered normal stdout, and every other rule is unchanged.
+    """
+    reuse_policy = replace(POLICY, candidate_stdout_checked=False)
+    seed_runs = [
+        replace(item, stdout="WXYZ\n") if item.phase != "normal" and item.version == "fixed" else item
+        for item in six_runs()
+    ]
+    # The strict policy cannot conclude on an unregistered seed's output.
+    strict = decide_verdict(POLICY, seed_runs, builds=builds())
+    assert (strict.verdict, strict.reason_code) == ("INCONCLUSIVE", "OTHER_CRASH")
+    # The reuse policy concludes and records which policy it applied.
+    decided = decide_verdict(reuse_policy, seed_runs, builds=builds())
+    assert (decided.verdict, decided.reason_code) == ("REPRODUCED", "ASAN_SIGNATURE_MATCHED")
+    assert decided.checks["candidate_stdout_checked"] is False
+    assert decide_verdict(POLICY, six_runs(), builds=builds()).checks[
+        "candidate_stdout_checked"
+    ] is True
+    # Both versions clean on any output is NOT_REPRODUCED under the reuse policy.
+    clean_runs = [
+        replace(item, stdout="ZZ\n") if item.phase != "normal" else item
+        for item in six_runs(vulnerable_clean=True)
+    ]
+    assert decide_verdict(reuse_policy, clean_runs, builds=builds()).verdict == "NOT_REPRODUCED"
+    # Exit code and ASan diagnostics still decide "clean".
+    wrong_exit = [
+        replace(item, exit_code=2) if item.phase == "candidate_1" and item.version == "fixed" else item
+        for item in seed_runs
+    ]
+    assert decide_verdict(reuse_policy, wrong_exit, builds=builds()).reason_code == "OTHER_CRASH"
+    asan_noise = [
+        replace(item, stderr="==1==ERROR: AddressSanitizer: SEGV on unknown address")
+        if item.phase == "candidate_2" and item.version == "fixed"
+        else item
+        for item in seed_runs
+    ]
+    assert decide_verdict(reuse_policy, asan_noise, builds=builds()).verdict == "INCONCLUSIVE"
+    # The normal control stdout is still compared.
+    bad_control = [
+        replace(item, stdout="NOPE\n") if item.phase == "normal" and item.version == "fixed" else item
+        for item in seed_runs
+    ]
+    assert decide_verdict(reuse_policy, bad_control, builds=builds()).reason_code == "CONTROL_FAILED"
