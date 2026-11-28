@@ -135,6 +135,20 @@ _FORBIDDEN_MAKE_CLI_VARS: Final[frozenset[str]] = frozenset(
         "TMPDIR",
         "HOME",
         "ASAN_OPTIONS",
+        # Install-directory assignments are rejected by key on both sides;
+        # the CLI additionally rejects the autoconf directory family, so
+        # CLI >= env for this family. (#64 #3, SF-2)
+        "DESTDIR",
+        "prefix",
+        "PREFIX",
+        "exec_prefix",
+        "bindir",
+        "sbindir",
+        "libdir",
+        "includedir",
+        "datadir",
+        "sysconfdir",
+        "INSTALL_ROOT",
     }
 )
 _MAKE_LONG_ARG_OPTS: Final[frozenset[str]] = frozenset(
@@ -175,7 +189,13 @@ _CMAKE_OUTPUT_DIR_PREFIXES: Final[tuple[str, ...]] = (
     "CMAKE_LIBRARY_OUTPUT_DIRECTORY_",
 )
 _BUILD_ENV_PATH_VARS: Final[frozenset[str]] = frozenset(
-    {"DESTDIR"} | set(_CMAKE_OUTPUT_PATH_VARS)
+    # Install-directory assignments are rejected on the env side too:
+    # DESTDIR plus prefix/PREFIX (values must stay inside /work). The CLI
+    # side rejects the same keys by name and additionally the autoconf
+    # directory family, so CLI >= env for install-directory assignments.
+    # The lookup compares upper-cased keys, so "PREFIX" is the effective
+    # match; "prefix" documents the family.
+    {"DESTDIR", "prefix", "PREFIX"} | set(_CMAKE_OUTPUT_PATH_VARS)
 )
 
 
