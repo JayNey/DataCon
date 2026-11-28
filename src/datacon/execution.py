@@ -37,6 +37,13 @@ from datacon.cases import (
     load_registry,
 )
 from datacon.evidence import BundleError, verify_bundle, write_bundle
+from datacon.tools.intel_evidence import (
+    IntelDocuments,
+    IntelEvidenceError,
+    build_intel_documents,
+    verify_intel_documents,
+)
+from datacon.tools.intel_provider import IntelSource
 from datacon.tools.model_outlet import (
     build_model_audit,
     model_audit_summary,
@@ -3722,6 +3729,86 @@ def _offline_model_audit(context: ExecutionContext) -> dict[str, Any]:
     return document
 
 
+def _intel_source_from_case(case: CaseDefinition) -> IntelSource:
+    """Map the case registry's advisory entry to the provider's ``IntelSource``.
+
+    The registry entry (#70) carries the five T15 keys and passes through
+    ``CaseDefinition.advisory`` unchanged, so the adapter is a field-by-field
+    rename onto the shape the snapshot provider and ``build_intel_documents``
+    share. ``source_id`` has no registry anchor of its own; ``"<case>/advisory"``
+    names the one advisory entry the case registers.
+    """
+    advisory = case.advisory
+    return IntelSource(
+        source_id=f"{case.case_id}/advisory",
+        case_id=case.case_id,
+        snapshot_path=advisory["path"],
+        snapshot_digest=advisory["digest"],
+        source_url=advisory["source_url"],
+        license=advisory["license"],
+        permitted_uses=tuple(advisory["permitted_uses"]),
+    )
+
+
+def _offline_intel_documents(
+    context: ExecutionContext,
+) -> tuple[IntelDocuments, dict[str, Any]]:
+    """Build the offline intel documents this bundle archives (delta §8).
+
+    An offline case's snapshot is the advisory bytes pinned in the case
+    material, read through the registry's digest check; no collection was
+    ever recorded for them, so the four collection fields stay null and the
+    identity comes from the registry's advisory entry alone. The documents
+    are constructed and validated through the intel evidence closed schemas
+    and re-verified against their own report summary and the frozen plan's
+    ``plan.intel``; any disagreement - including a plan whose ``sources`` do
+    not include the snapshot's source URL - refuses the archive, and the
+    refusal is raised as ``BundleError`` so it converges into the caller's
+    existing bundle-failure path instead of escaping the finish functions.
+    """
+    source = _intel_source_from_case(context.case)
+    body = context.case.read_material(source.snapshot_path, source.snapshot_digest)[0]
+    # A v2 plan freezes through contracts._intel, which requires the intel
+    # summary; a plan without one has no anchor for its snapshot, and the
+    # archive refuses rather than writing unanchored intel documents.
+    plan_intel = context.plan.get("intel")
+    if not isinstance(plan_intel, Mapping):
+        raise BundleError(
+            "EVIDENCE_INCOMPLETE",
+            "the frozen plan carries no intel summary to bind the snapshot to",
+        )
+    try:
+        documents = build_intel_documents(
+            None,
+            body,
+            case_id=source.case_id,
+            source_id=source.source_id,
+            source_url=source.source_url,
+            snapshot_digest=source.snapshot_digest,
+            license=source.license,
+            permitted_uses=source.permitted_uses,
+        )
+        report_intel = {
+            "snapshot_digest": documents.snapshot["snapshot_digest"],
+            "license": documents.snapshot["license"],
+            "redirect_chain_digest": documents.snapshot["redirect_chain_digest"],
+        }
+        verify_intel_documents(
+            documents.snapshot,
+            documents.license_record,
+            case_id=context.case.case_id,
+            report_intel=report_intel,
+            plan_intel=plan_intel,
+        )
+    except (IntelEvidenceError, CaseConfigurationError) as error:
+        message = getattr(error, "message", str(error))
+        raise BundleError(
+            "EVIDENCE_INCOMPLETE",
+            f"the intel documents could not be bound into this bundle: {message}",
+        ) from error
+    return documents, report_intel
+
+
 def _policy_from_context(context: ExecutionContext) -> VerdictPolicy:
     expected_stdout = context.playbook.get("expected_stdout")
     if not isinstance(expected_stdout, dict):
@@ -3854,6 +3941,12 @@ def _build_report(
             report["model_audit"] = model_audit_summary(
                 _offline_model_audit(context)
             )
+            # Delta §8: report.intel is the closed three-field summary of the
+            # intel/snapshot.json archived next to this report. The same
+            # offline construction feeds both, so a report may not describe
+            # another snapshot than the one in its own bundle. A blocked
+            # bundle carries neither the documents nor the summary.
+            report["intel"] = _offline_intel_documents(context)[1]
     return report, render_report_markdown(report)
 
 
@@ -4290,6 +4383,25 @@ def _evidence_artifacts(
             artifacts["model/audit.json"] = (
                 "model_audit",
                 jsonutil.canonical_bytes(_offline_model_audit(context)) + b"\n",
+            )
+            # Delta §8: an execution or campaign bundle archives the case
+            # registry's intel documents under the fixed intel_snapshot /
+            # license_record roles - the snapshot is the advisory bytes the
+            # case pins (read through the registry's digest check) and the
+            # license is the grant the registry recorded; the offline fixed
+            # snapshot records no collection, so its collection fields stay
+            # null. The documents are re-verified against report.intel and
+            # the frozen plan's intel before they enter the archive, so a
+            # bundle cannot carry intel its plan does not anchor. A blocked
+            # bundle carries neither document, mirroring the audit gate above.
+            documents, _ = _offline_intel_documents(context)
+            artifacts["intel/snapshot.json"] = (
+                "intel_snapshot",
+                jsonutil.canonical_bytes(documents.snapshot) + b"\n",
+            )
+            artifacts["intel/license.json"] = (
+                "license_record",
+                jsonutil.canonical_bytes(documents.license_record) + b"\n",
             )
     if probe is not None:
         artifacts["metadata/probe.json"] = (
