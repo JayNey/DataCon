@@ -35,7 +35,12 @@
       },
       "advisory": {
         "path": "advisory.json",
-        "digest": "sha256:0ae4a1322297c7416970967cc3e6e511b1019341068dd21c448b120854adaf91"
+        "digest": "sha256:0ae4a1322297c7416970967cc3e6e511b1019341068dd21c448b120854adaf91",
+        "source_url": "https://example.invalid/datacon/B01",
+        "license": "CC0-1.0",
+        "permitted_uses": [
+          "reproduction"
+        ]
       }
     },
     "fixture-c-parser-clean": {
@@ -58,7 +63,12 @@
       },
       "advisory": {
         "path": "advisory.json",
-        "digest": "sha256:0ae4a1322297c7416970967cc3e6e511b1019341068dd21c448b120854adaf91"
+        "digest": "sha256:0ae4a1322297c7416970967cc3e6e511b1019341068dd21c448b120854adaf91",
+        "source_url": "https://example.invalid/datacon/B02",
+        "license": "CC0-1.0",
+        "permitted_uses": [
+          "reproduction"
+        ]
       }
     }
   },

@@ -564,9 +564,15 @@ def load_registry(
             jsonutil.safe_relative_path(
                 repository["patch"], f"{case_id}.patch"
             )
+            # T15: the advisory entry must name the intel source it pins.
+            # Presence only: value eligibility is judged at the gate by
+            # intel_fetch.public_source_url / intel_fetch.license_rejection
+            # (https URL, permitted uses), so an ineligible source is
+            # rejected with a reason instead of failing registry load.
+            # ``license`` may be null when the source declares no license.
             advisory = jsonutil.require_object(
                 entry["advisory"],
-                required={"path", "digest"},
+                required={"path", "digest", "source_url", "license", "permitted_uses"},
                 label=f"{case_id}.advisory",
             )
             jsonutil.safe_relative_path(advisory["path"], f"{case_id}.advisory.path")
