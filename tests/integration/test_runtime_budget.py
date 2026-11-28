@@ -863,3 +863,122 @@ def test_budget_charge_db_error_does_not_mask_step_exception(
         f"got {type(ok_excinfo.value).__name__}"
     )
     assert ok_excinfo.value.reason_code == "RUN_INCOMPLETE"
+
+
+def test_unchargeable_attempt_recovery_closes_out_without_spinning(
+    isolated_database, step_clock, monkeypatch
+):
+    """T12 S4: unchargeable fuzz or corrupt-ceiling attempts close out once."""
+    family_id, envelope = _seed_family(
+        isolated_database, ledger_total=40, ledger_fuzz=25
+    )
+    context = _running_round(isolated_database, family_id, envelope)
+
+    def crash(*args, **kwargs):
+        raise KeyboardInterrupt("died before charge")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(execution, "_charge_step_budget", crash)
+        with pytest.raises(KeyboardInterrupt):
+            _step(
+                isolated_database,
+                context,
+                "fuzz:search",
+                RecordingContainer(context, step_clock, runtime=3.0),
+                charge_kind="fuzz",
+            )
+    # Fuzz sub-budget was drained before recovery ran.
+    isolated_database.connection.execute(
+        "UPDATE budget_ledger SET remaining_fuzz_seconds = 0 WHERE family_id = %s",
+        (family_id,),
+    )
+    isolated_database.connection.execute(
+        "UPDATE jobs SET lease_expires_at = clock_timestamp() - interval '1 second' "
+        "WHERE job_id = %s",
+        (context.job_id,),
+    )
+
+    assert state.recover_uncharged_attempts(isolated_database.dsn) == 0
+    still_started = _count(
+        isolated_database,
+        "SELECT count(*) FROM attempts a WHERE a.job_id = %s "
+        "AND a.status = 'started' AND a.result ? 'budget' AND NOT EXISTS "
+        "(SELECT 1 FROM budget_charges c WHERE c.job_id = a.job_id "
+        "AND c.step_key = a.step_key AND c.attempt_no = a.attempt_no)",
+        (context.job_id,),
+    )
+    assert still_started == 0, (
+        "unchargeable fuzz attempt remained a started recovery candidate and spun forever"
+    )
+    row = isolated_database.connection.execute(
+        "SELECT status, result FROM attempts "
+        "WHERE job_id = %s AND step_key = 'fuzz:search'",
+        (context.job_id,),
+    ).fetchone()
+    assert row[0] == "infra_error"
+    assert row[1]["budget_recovery"] == "unchargeable"
+    assert (
+        _count(
+            isolated_database,
+            "SELECT count(*) FROM audit_events "
+            "WHERE job_id = %s AND event_type = 'budget_charge_recovery_skipped'",
+            (context.job_id,),
+        )
+        == 1
+    )
+    # Subsequent scans are no-ops and do not duplicate the audit event.
+    assert state.recover_uncharged_attempts(isolated_database.dsn) == 0
+    assert (
+        _count(
+            isolated_database,
+            "SELECT count(*) FROM audit_events "
+            "WHERE job_id = %s AND event_type = 'budget_charge_recovery_skipped'",
+            (context.job_id,),
+        )
+        == 1
+    )
+
+    # Non-positive or non-finite ceilings are also closed out fail-closed.
+    bad_attempt_id = uuid4()
+    isolated_database.connection.execute(
+        "INSERT INTO attempts (attempt_id, job_id, stage, step_key, attempt_no, "
+        "generation, status, result, started_at) "
+        "VALUES (%s, %s, 'execute', 'build:bad', 1, 1, 'started', %s, "
+        "clock_timestamp() - interval '1 hour')",
+        (
+            bad_attempt_id,
+            context.job_id,
+            Jsonb({"budget": {"charge_kind": "general", "ceiling_seconds": 0}}),
+        ),
+    )
+    assert state.recover_uncharged_attempts(isolated_database.dsn) == 0
+    bad_row = isolated_database.connection.execute(
+        "SELECT status, result FROM attempts WHERE attempt_id = %s",
+        (bad_attempt_id,),
+    ).fetchone()
+    assert bad_row[0] == "infra_error"
+    assert bad_row[1]["budget_recovery"] == "unchargeable"
+
+    # B3 #4: before a child archives, _refresh_budget_summary_before_archive
+    # recovers any uncharged old-generation attempt on the same child and
+    # rebuilds budget_summary from latest committed charges.
+    b3_fam, b3_env = _seed_family(isolated_database, ledger_total=900, ledger_fuzz=300)
+    b3_ctx = _running_round(isolated_database, b3_fam, b3_env)
+    isolated_database.connection.execute(
+        "UPDATE jobs SET generation = 2 WHERE job_id = %s", (b3_ctx.job_id,)
+    )
+    b3_ctx.generation = 2
+    isolated_database.connection.execute(
+        "INSERT INTO attempts (attempt_id, job_id, stage, step_key, attempt_no, "
+        "generation, status, result, started_at) "
+        "VALUES (%s, %s, 'execute', 'build:vulnerable', 1, 1, 'started', %s, "
+        "clock_timestamp() - interval '1 hour')",
+        (
+            uuid4(),
+            b3_ctx.job_id,
+            Jsonb({"budget": {"charge_kind": "general", "ceiling_seconds": 45.0}}),
+        ),
+    )
+    execution._refresh_budget_summary_before_archive(isolated_database.dsn, b3_ctx)
+    assert b3_ctx.budget_summary["spent_seconds"] == 45
+    assert b3_ctx.budget_summary["remaining_seconds"] == 855

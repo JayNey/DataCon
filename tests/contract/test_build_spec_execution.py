@@ -462,6 +462,11 @@ class _InMemoryState:
             execution.state, "charge_step_budget", self.charge_step_budget
         )
         monkeypatch.setattr(
+            execution.state,
+            "recover_uncharged_attempts",
+            lambda _dsn, **_kwargs: 0,
+        )
+        monkeypatch.setattr(
             execution.state, "get_family_envelope", self.get_family_envelope
         )
         monkeypatch.setattr(

@@ -929,16 +929,14 @@ def run_worker(
             # with the existing worker error semantics instead of being
             # swallowed.
             expired_envelopes = state_store.expire_pending_envelopes(dsn)
-            # T12/D43 minimal crash-recovery wiring: a family whose last child
-            # archived just before the process died must not stay AGGREGATING
-            # forever. The sweep is idempotent (the existing family.json bytes
-            # win) and only touches families with terminal children.
-            converged_families = state_store.converge_families(dsn)
-            # T12 改9 crash recovery: a derived round left without admission
-            # is admitted again or blocked, and a container step that died
-            # before its budget charge is charged once its lease expired.
-            recovered_rounds = recover_unadmitted_rounds(dsn, run_root=run_root)
+            # T12 改9 crash recovery runs BEFORE family sealing (B3): recover
+            # uncharged attempts and unadmitted rounds first so family.json
+            # never freezes a stale pre-recovery budget or prematurely seals.
             recovered_charges = state_store.recover_uncharged_attempts(dsn)
+            recovered_rounds = recover_unadmitted_rounds(dsn, run_root=run_root)
+            # T12/D43 crash-recovery sweep: converge families whose children
+            # are terminal and whose charges are accounted for.
+            family_sweep = state_store.converge_families_detailed(dsn)
             claimed = state_store.claim_next(
                 dsn, worker, lease_seconds=lease_seconds, execute=execute
             )
@@ -947,7 +945,8 @@ def run_worker(
                     return {
                         "processed": 0,
                         "expired_envelopes": expired_envelopes,
-                        "families_converged": len(converged_families),
+                        "families_converged": len(family_sweep.converged),
+                        "families_terminated": len(family_sweep.terminated),
                         "rounds_recovered": recovered_rounds,
                         "charges_recovered": recovered_charges,
                     }
@@ -962,7 +961,8 @@ def run_worker(
                 run_root=run_root,
             )
             result["expired_envelopes"] = expired_envelopes
-            result["families_converged"] = len(converged_families)
+            result["families_converged"] = len(family_sweep.converged)
+            result["families_terminated"] = len(family_sweep.terminated)
             result["rounds_recovered"] = recovered_rounds
             result["charges_recovered"] = recovered_charges
             if once:

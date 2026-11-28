@@ -1105,39 +1105,98 @@ def unadmitted_round_children(
     return [dict(row) for row in rows]
 
 
-def recover_uncharged_attempts(dsn: str) -> int:
+def recover_uncharged_attempts(
+    dsn: str, *, job_id: UUID | str | None = None
+) -> int:
     """Charge container steps that crashed before their budget charge (改9).
 
     A budgeted step writes its ``started`` attempt row (with the charge kind
-    and the hard-timeout ceiling the gate granted) before the container, and
-    charges after the container exits. If the process died in between, the
-    row stays ``started`` with no ``budget_charges`` row. Once the job's lease
-    has expired (or a newer generation owns it) this scan charges the step
+    and the effective hard-timeout ceiling) before the container, and charges
+    after the container exits. If the process died in between, the row stays
+    ``started`` with no ``budget_charges`` row. Once the job's lease has
+    expired (or a newer generation owns it) this scan charges the step
     conservatively: ``min(ceil(now - started_at), ceiling)``, then the normal
-    §7 formula clamps it to the remaining balance. The charge uses the same
-    idempotency key ``(job_id, step_key, attempt_no)``, so it runs at most
-    once and never races a live worker. Returns the number of charges written.
+    §7 formula clamps it to the remaining balance. Attempts that cannot be
+    charged (already-sealed family, exhausted fuzz sub-budget, or invalid
+    ceiling metadata) are closed out as ``infra_error`` with an audit event
+    so they are never re-scanned. Returns the number of charges written.
     """
+    job_filter_uuid: UUID | None = None
+    if job_id is not None:
+        try:
+            job_filter_uuid = uuid.UUID(str(job_id))
+        except (TypeError, ValueError) as error:
+            raise StateError("job_id must be a UUID") from error
+    query = (
+        "SELECT a.job_id, a.step_key, a.attempt_no, a.generation "
+        "FROM attempts a JOIN jobs j ON j.job_id = a.job_id "
+        "WHERE j.job_contract_version = 2 "
+        "AND j.job_kind IN ('campaign', 'round') "
+        "AND a.stage = 'execute' AND a.status = 'started' "
+        "AND a.result ? 'budget' "
+        "AND (j.generation <> a.generation OR j.lease_expires_at IS NULL "
+        "OR j.lease_expires_at <= clock_timestamp()) "
+        "AND NOT EXISTS (SELECT 1 FROM budget_charges c "
+        "WHERE c.job_id = a.job_id AND c.step_key = a.step_key "
+        "AND c.attempt_no = a.attempt_no) "
+    )
+    params: tuple[Any, ...] = ()
+    if job_filter_uuid is not None:
+        query += "AND a.job_id = %s "
+        params = (job_filter_uuid,)
+    query += "ORDER BY a.started_at"
     with _connect(dsn) as connection:
-        candidates = connection.execute(
-            "SELECT a.job_id, a.step_key, a.attempt_no, a.generation "
-            "FROM attempts a JOIN jobs j ON j.job_id = a.job_id "
-            "WHERE j.job_contract_version = 2 "
-            "AND j.job_kind IN ('campaign', 'round') "
-            "AND a.stage = 'execute' AND a.status = 'started' "
-            "AND a.result ? 'budget' "
-            "AND (j.generation <> a.generation OR j.lease_expires_at IS NULL "
-            "OR j.lease_expires_at <= clock_timestamp()) "
-            "AND NOT EXISTS (SELECT 1 FROM budget_charges c "
-            "WHERE c.job_id = a.job_id AND c.step_key = a.step_key "
-            "AND c.attempt_no = a.attempt_no) "
-            "ORDER BY a.started_at",
-        ).fetchall()
+        candidates = connection.execute(query, params).fetchall()
     charged = 0
     for candidate in candidates:
         if _recover_uncharged_attempt(dsn, candidate):
             charged += 1
     return charged
+
+
+def _close_unchargeable_attempt(
+    connection,
+    attempt_id: UUID,
+    *,
+    job_id: UUID,
+    candidate: Mapping[str, Any],
+    reason: str,
+    extra: Mapping[str, Any] | None = None,
+) -> None:
+    """Close out an unchargeable started attempt so future scans skip it."""
+    updated = connection.execute(
+        "UPDATE attempts SET status = 'infra_error', "
+        "finished_at = COALESCE(finished_at, clock_timestamp()), "
+        "result = COALESCE(result, '{}'::jsonb) || %s "
+        "WHERE attempt_id = %s AND status = 'started' "
+        "RETURNING attempt_id",
+        (
+            Jsonb(
+                {
+                    "budget_recovery": "unchargeable",
+                    "budget_recovery_reason": reason,
+                }
+            ),
+            attempt_id,
+        ),
+    ).fetchone()
+    if updated is None:
+        return
+    detail: dict[str, Any] = {
+        "step_key": candidate["step_key"],
+        "attempt_no": candidate["attempt_no"],
+        "generation": candidate["generation"],
+        "reason": reason,
+    }
+    if extra:
+        detail.update(extra)
+    _audit(
+        connection,
+        job_id,
+        "budget_charge_recovery_skipped",
+        stage="execute",
+        detail=detail,
+    )
 
 
 def _recover_uncharged_attempt(dsn: str, candidate: Mapping[str, Any]) -> bool:
@@ -1150,27 +1209,33 @@ def _recover_uncharged_attempt(dsn: str, candidate: Mapping[str, Any]) -> bool:
             ).fetchone()
             if job is None:
                 return False
-            # Lock order jobs(family) -> jobs(child) -> budget_ledger.
-            connection.execute(
-                "SELECT 1 FROM jobs WHERE job_id = %s FOR KEY SHARE",
+            # Lock order jobs(family) -> jobs(child) -> budget_ledger -> attempts.
+            # FOR SHARE on the family blocks concurrent archive_family
+            # (FOR UPDATE) so recovery and sealing never interleave.
+            family = connection.execute(
+                "SELECT state FROM jobs WHERE job_id = %s FOR SHARE",
                 (job["family_id"],),
             ).fetchone()
+            if family is None:
+                return False
             job = connection.execute(
                 "SELECT job_id, family_id, generation, lease_expires_at "
                 "FROM jobs WHERE job_id = %s FOR KEY SHARE",
                 (candidate["job_id"],),
             ).fetchone()
+            if job is None:
+                return False
             ledger = connection.execute(
                 "SELECT " + _BUDGET_LEDGER_COLUMNS +
                 " FROM budget_ledger WHERE family_id = %s FOR UPDATE",
                 (job["family_id"],),
             ).fetchone()
-            if ledger is None:
-                return False
             attempt = connection.execute(
-                "SELECT status, result, started_at, clock_timestamp() AS db_now "
+                "SELECT attempt_id, status, result, started_at, "
+                "clock_timestamp() AS db_now "
                 "FROM attempts WHERE job_id = %s AND stage = 'execute' "
-                "AND step_key = %s AND attempt_no = %s AND generation = %s",
+                "AND step_key = %s AND attempt_no = %s AND generation = %s "
+                "FOR UPDATE",
                 (
                     candidate["job_id"],
                     candidate["step_key"],
@@ -1198,14 +1263,49 @@ def _recover_uncharged_attempt(dsn: str, candidate: Mapping[str, Any]) -> bool:
             ).fetchone()
             if existing is not None:
                 return False
+            if family["state"] != "AGGREGATING":
+                _close_unchargeable_attempt(
+                    connection,
+                    attempt["attempt_id"],
+                    job_id=candidate["job_id"],
+                    candidate=candidate,
+                    reason="family_not_aggregating",
+                    extra={"family_state": family["state"]},
+                )
+                return False
+            if ledger is None:
+                return False
             budget = (attempt["result"] or {}).get("budget")
             if not isinstance(budget, Mapping):
+                _close_unchargeable_attempt(
+                    connection,
+                    attempt["attempt_id"],
+                    job_id=candidate["job_id"],
+                    candidate=candidate,
+                    reason="invalid_budget_metadata",
+                )
                 return False
             charge_kind = budget.get("charge_kind")
             ceiling = budget.get("ceiling_seconds")
-            if charge_kind not in ("general", "fuzz") or not isinstance(
-                ceiling, (int, float)
-            ) or isinstance(ceiling, bool) or ceiling < 0:
+            if (
+                charge_kind not in ("general", "fuzz")
+                or not isinstance(ceiling, (int, float))
+                or isinstance(ceiling, bool)
+                or not math.isfinite(ceiling)
+                or ceiling <= 0
+            ):
+                _close_unchargeable_attempt(
+                    connection,
+                    attempt["attempt_id"],
+                    job_id=candidate["job_id"],
+                    candidate=candidate,
+                    reason="invalid_budget_metadata",
+                    extra={
+                        "charge_kind": (
+                            charge_kind if isinstance(charge_kind, str) else None
+                        )
+                    },
+                )
                 return False
             elapsed = max(
                 0.0,
@@ -1219,8 +1319,25 @@ def _recover_uncharged_attempt(dsn: str, candidate: Mapping[str, Any]) -> bool:
                 elapsed_fuzz_seconds=elapsed if charge_kind == "fuzz" else 0,
             )
             if charge_kind == "fuzz" and charged_fuzz < 1:
-                # Nothing left to charge on the fuzz sub-budget; a fuzz charge
-                # row must carry fuzz_seconds >= 1, so record none.
+                # ADR-004: fuzz charge rows require fuzz_seconds >= 1, so an
+                # attempt whose fuzz sub-budget is already 0 cannot be charged.
+                # Close it out once so future worker scans do not spin on it.
+                _close_unchargeable_attempt(
+                    connection,
+                    attempt["attempt_id"],
+                    job_id=candidate["job_id"],
+                    candidate=candidate,
+                    reason="fuzz_budget_exhausted",
+                    extra={
+                        "charge_kind": charge_kind,
+                        "remaining_total_seconds": ledger[
+                            "remaining_total_seconds"
+                        ],
+                        "remaining_fuzz_seconds": ledger[
+                            "remaining_fuzz_seconds"
+                        ],
+                    },
+                )
                 return False
             updated = connection.execute(
                 "UPDATE budget_ledger SET "
@@ -6538,6 +6655,34 @@ def _discard_unprotected_family_index(
         return
 
 
+def _family_has_uncharged_attempts(connection, family_id: UUID) -> bool:
+    """Return True if any child still has an uncharged started budget attempt."""
+    row = connection.execute(
+        "SELECT 1 FROM attempts a "
+        "JOIN jobs c ON c.job_id = a.job_id "
+        "WHERE c.parent_job_id = %s "
+        "AND c.job_contract_version = 2 "
+        "AND c.job_kind IN ('campaign', 'round') "
+        "AND a.stage = 'execute' AND a.status = 'started' "
+        "AND a.result ? 'budget' "
+        "AND NOT EXISTS ("
+        "SELECT 1 FROM budget_charges bc "
+        "WHERE bc.job_id = a.job_id AND bc.step_key = a.step_key "
+        "AND bc.attempt_no = a.attempt_no) "
+        "LIMIT 1",
+        (family_id,),
+    ).fetchone()
+    return row is not None
+
+
+@dataclass(frozen=True)
+class FamilyConvergenceResult:
+    """Families archived as COMPLETED vs terminated as BLOCKED/FAILED."""
+
+    converged: list[str]
+    terminated: list[str]
+
+
 def archive_family(
     dsn: str,
     family_id: UUID,
@@ -6642,6 +6787,11 @@ def archive_family(
                         and not child["workflow_synced"]
                     ):
                         raise StateError("family has non-terminal children")
+                if _family_has_uncharged_attempts(connection, family_id):
+                    raise FamilyNotTerminated(
+                        "family still has uncharged budget attempts pending "
+                        "recovery"
+                    )
                 disposition = _family_archive_disposition(
                     connection,
                     family_id,
@@ -6857,20 +7007,20 @@ def _converge_family_without_index(
             return True
 
 
-def converge_families(
+def converge_families_detailed(
     dsn: str,
     *,
     evidence_root: Path | str | None = None,
     now: Any = None,
-) -> list[str]:
+) -> FamilyConvergenceResult:
     """Idempotently converge every AGGREGATING family that is truly done.
 
     This is the worker crash-recovery sweep. It selects families with at least
-    one child, no pending envelope and no non-terminal (or unsynced BLOCKED)
-    child. ``archive_family`` then applies the termination gate: a family with
-    remaining rounds and budget is skipped silently, a terminal-but-unindexable
-    child ends the family as BLOCKED/FAILED exactly once, and any other archive
-    failure stays retryable.
+    one child, no pending envelope, no non-terminal (or unsynced BLOCKED)
+    child, and no uncharged started budget attempt. ``archive_family`` then
+    applies the termination gate: a family with remaining rounds and budget is
+    skipped silently, a terminal-but-unindexable child ends the family as
+    BLOCKED/FAILED exactly once, and any other archive failure stays retryable.
     """
     with _connect(dsn) as connection:
         family_ids = [
@@ -6886,29 +7036,43 @@ def converge_families(
                 "'INCONCLUSIVE', 'BLOCKED', 'FAILED') "
                 "OR (c.state = 'BLOCKED' AND c.workflow_synced = false))) "
                 "AND NOT EXISTS ("
+                "SELECT 1 FROM attempts a JOIN jobs c ON c.job_id = a.job_id "
+                "WHERE c.parent_job_id = f.job_id "
+                "AND c.job_contract_version = 2 "
+                "AND c.job_kind IN ('campaign', 'round') "
+                "AND a.stage = 'execute' AND a.status = 'started' "
+                "AND a.result ? 'budget' "
+                "AND NOT EXISTS ("
+                "SELECT 1 FROM budget_charges bc "
+                "WHERE bc.job_id = a.job_id AND bc.step_key = a.step_key "
+                "AND bc.attempt_no = a.attempt_no)) "
+                "AND NOT EXISTS ("
                 "SELECT 1 FROM family_envelopes e WHERE e.family_id = f.job_id "
                 "AND e.status = 'pending') "
                 "ORDER BY f.submitted_at, f.job_id"
             ).fetchall()
         ]
     converged: list[str] = []
+    terminated: list[str] = []
     for family_id in family_ids:
         try:
             archive_family(
                 dsn, family_id, evidence_root=evidence_root, now=now
             )
         except FamilyNotTerminated:
-            # Still has legal rounds/budget: not a failure, just later.
+            # Still has legal rounds/budget or pending charge recovery: later.
             continue
         except FamilyTerminalWithoutIndex as error:
             try:
-                _converge_family_without_index(
+                ended = _converge_family_without_index(
                     dsn,
                     family_id,
                     error.family_state,
                     error.reason_code,
                     str(error),
                 )
+                if ended:
+                    terminated.append(str(family_id))
             except (StateError, psycopg.Error) as terminal_error:
                 record_family_archive_failure(
                     dsn,
@@ -6922,7 +7086,19 @@ def converge_families(
             )
             continue
         converged.append(str(family_id))
-    return converged
+    return FamilyConvergenceResult(converged=converged, terminated=terminated)
+
+
+def converge_families(
+    dsn: str,
+    *,
+    evidence_root: Path | str | None = None,
+    now: Any = None,
+) -> list[str]:
+    """Converge AGGREGATING families and return the archived family IDs."""
+    return converge_families_detailed(
+        dsn, evidence_root=evidence_root, now=now
+    ).converged
 
 
 def _transition_decision_detail(

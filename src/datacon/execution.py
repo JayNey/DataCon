@@ -2899,6 +2899,22 @@ def _charge_step_budget(
     )
 
 
+def _refresh_budget_summary_before_archive(
+    dsn: str, context: ExecutionContext
+) -> None:
+    """Recover prior-generation uncharged attempts for this child and rebuild budget_summary.
+
+    B3: the child's archived ``budget/snapshot.json`` and ``report.budget`` must
+    reflect the latest committed family charges, including any crashed attempt
+    from an earlier generation of the same child.
+    """
+    family_id = _budget_family_id(context)
+    if family_id is None:
+        return
+    state.recover_uncharged_attempts(dsn, job_id=context.job_id)
+    context.budget_summary = state.family_budget_summary(dsn, family_id)
+
+
 def _cap_to_step_budget(context: ExecutionContext, seconds: float) -> float:
     """Bound a container hard timeout by the ceiling the budget gate granted."""
     # Contexts built outside run_execution (unit doubles) may predate the
@@ -5729,6 +5745,10 @@ def run_execution(
         "replays": [dict(item) for item in runs],
         "attempts": attempt_rows,
     }
+    try:
+        _refresh_budget_summary_before_archive(dsn, context)
+    except (state.StateError, psycopg.Error):
+        return ExecutionResult("STALE")
     evidence_refs = [
         "report.json",
         "report.md",
@@ -6313,6 +6333,10 @@ def _finish_blocked(
     work_root = context.run_root / context.job_id_text / context.plan_digest.split(":")[1]
     build_root = work_root / "run"
     build_root.mkdir(parents=True, exist_ok=True)
+    try:
+        _refresh_budget_summary_before_archive(dsn, context)
+    except (state.StateError, psycopg.Error):
+        return ExecutionResult("STALE")
     # One decision, two consumers: the report's bundle_kind and the
     # writer's approval gate must not drift apart.
     bundle_kind = "blocked" if _is_v2_context(context) else "execution"
@@ -6447,6 +6471,10 @@ def _finish_failed(
     work_root = context.run_root / context.job_id_text / context.plan_digest.split(":")[1]
     build_root = work_root / "run"
     build_root.mkdir(parents=True, exist_ok=True)
+    try:
+        _refresh_budget_summary_before_archive(dsn, context)
+    except (state.StateError, psycopg.Error):
+        return ExecutionResult("STALE")
     incomplete = error.reason_code in (
         "RUN_INCOMPLETE",
         "NOT_COMPARABLE",
