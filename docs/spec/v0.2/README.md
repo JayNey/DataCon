@@ -2,7 +2,7 @@
 
 **版本** v0.2  
 **日期** 2026-11-21  
-**状态** 已批准，改9 修订（T09 门禁改动保留；改7 的 T12 准入持久化、信封绑定、预算快照与审批账本初始化坐标保留；改8 的 T12 family 转移决策入口与坐标保留；改9 只补 T12 runtime 契约：固定 fuzz shim 与 guided `harness_digest` 绑定、campaign 每版 parser + fuzzer 两个构建产物、种子语料登记与摘要、corpus 超限细因、预算门禁/扣费与派生轮次“先 gate 后建 child”的准入接线、准入与扣费的崩溃恢复，以及 guided fuzz 子预算耗尽时 family 可归档；不改 REQ/TC 编号，不新增 §10 原因码）  
+**状态** 已批准，改9 修订（T09 门禁改动保留；改7 的 T12 准入持久化、信封绑定、预算快照与审批账本初始化坐标保留；改8 的 T12 family 转移决策入口与坐标保留；改9 只补 T12 runtime 契约：固定 fuzz shim 与 guided `harness_digest` 绑定、campaign 每版 parser + fuzzer 两个构建产物、种子语料登记与摘要、corpus 超限细因、预算门禁/扣费与派生轮次“先 gate 后建 child”的准入接线，以及准入、阻断归档与扣费的崩溃恢复；不改 REQ/TC 编号，不新增 §10 原因码）  
 **适用范围** 多轮探索、计划身份、自动准入、构建溯源与证据 v2
 
 ## 1. 版本声明
