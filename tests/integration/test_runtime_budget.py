@@ -12,6 +12,7 @@ from copy import deepcopy
 from types import SimpleNamespace
 from uuid import UUID, uuid4
 
+import psycopg
 from psycopg.types.json import Jsonb
 import pytest
 
@@ -353,6 +354,12 @@ def test_budget_gate_caps_hard_timeout_before_container_start(
         _step(isolated_database, context, "replay:fixed:normal", starved)
     assert excinfo.value.reason_code == "BUDGET_EXHAUSTED"
     assert starved.calls == []
+
+    # Nit: _cap_to_step_budget must never raise a sub-second deadline up to 1s.
+    sub_second = SimpleNamespace(step_ceiling_seconds=10.0)
+    assert execution._cap_to_step_budget(sub_second, 0.4) == 0.4, (
+        "_cap_to_step_budget raised a sub-second timeout above the remaining deadline"
+    )
 
 
 def test_container_exit_charges_both_budgets_once_per_attempt(
@@ -771,3 +778,88 @@ def test_crash_before_charge_is_recovered_by_the_worker_scan(
     # Idempotent: a second scan charges nothing.
     assert state.recover_uncharged_attempts(isolated_database.dsn) == 0
     assert len(_charges(isolated_database, context.job_id)) == 1
+
+    # B2: general replay step with a 10s step timeout on a 900s family ledger.
+    # Crash recovery must cap the charge to the step's actual 10s hard timeout,
+    # never the entire 900s family balance.
+    replay_family_id, replay_envelope = _seed_family(
+        isolated_database, ledger_total=900, ledger_fuzz=300
+    )
+    replay_ctx = _running_round(
+        isolated_database, replay_family_id, replay_envelope
+    )
+    replay_container = RecordingContainer(replay_ctx, step_clock, runtime=2.0)
+    with monkeypatch.context() as patch:
+        patch.setattr(execution, "_charge_step_budget", crash)
+        with pytest.raises(KeyboardInterrupt):
+            _step(
+                isolated_database,
+                replay_ctx,
+                "replay:vulnerable:normal",
+                replay_container,
+            )
+    assert replay_container.calls[0]["ceiling"] == 10.0, (
+        "general replay ceiling was not capped to the 10s step hard timeout"
+    )
+    started_budget = isolated_database.connection.execute(
+        "SELECT result FROM attempts WHERE job_id = %s AND step_key = 'replay:vulnerable:normal'",
+        (replay_ctx.job_id,),
+    ).fetchone()[0]
+    assert started_budget["budget"]["ceiling_seconds"] == 10.0, (
+        "started attempt recorded the whole family balance instead of the 10s replay timeout"
+    )
+    isolated_database.connection.execute(
+        "UPDATE jobs SET lease_expires_at = clock_timestamp() - interval '1 second' "
+        "WHERE job_id = %s",
+        (replay_ctx.job_id,),
+    )
+    isolated_database.connection.execute(
+        "UPDATE attempts SET started_at = clock_timestamp() - interval '2 hours' "
+        "WHERE job_id = %s AND step_key = 'replay:vulnerable:normal'",
+        (replay_ctx.job_id,),
+    )
+    assert state.recover_uncharged_attempts(isolated_database.dsn) == 1
+    assert _charges(isolated_database, replay_ctx.job_id) == [
+        ("replay:vulnerable:normal", 1, "general", 10, 0)
+    ], "crashed general replay was charged more than its 10s hard timeout"
+    assert _ledger(isolated_database, replay_family_id)["remaining_total_seconds"] == 890
+
+
+def test_budget_charge_db_error_does_not_mask_step_exception(
+    isolated_database, step_clock, monkeypatch
+):
+    """T12 S2: a DB error while recording a charge must not hide the step error."""
+    family_id, envelope = _seed_family(isolated_database)
+    context = _running_round(isolated_database, family_id, envelope)
+
+    def db_down(*args, **kwargs):
+        raise psycopg.OperationalError("connection refused")
+
+    monkeypatch.setattr(execution, "_charge_step_budget", db_down)
+    step_error = SandboxError("container timed out", reason_code="TIMEOUT")
+    with pytest.raises(BaseException) as excinfo:
+        _step(
+            isolated_database,
+            context,
+            "replay:vulnerable:normal",
+            RecordingContainer(context, step_clock, runtime=1.0, error=step_error),
+        )
+    assert isinstance(excinfo.value, SandboxError), (
+        f"charge DB error masked the step exception: got {type(excinfo.value).__name__}"
+    )
+    assert excinfo.value.reason_code == "TIMEOUT"
+
+    # When the step itself succeeded, a DB error during charge maps uniformly
+    # to ExecutionFailed("RUN_INCOMPLETE", ...).
+    with pytest.raises(BaseException) as ok_excinfo:
+        _step(
+            isolated_database,
+            context,
+            "replay:vulnerable:candidate_1",
+            RecordingContainer(context, step_clock, runtime=1.0),
+        )
+    assert isinstance(ok_excinfo.value, execution.ExecutionFailed), (
+        f"charge DB error after step success was not mapped to ExecutionFailed: "
+        f"got {type(ok_excinfo.value).__name__}"
+    )
+    assert ok_excinfo.value.reason_code == "RUN_INCOMPLETE"

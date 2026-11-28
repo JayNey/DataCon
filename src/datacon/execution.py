@@ -13,6 +13,8 @@ from datetime import datetime, timezone
 import hashlib
 import hmac
 import json
+import logging
+import math
 import os
 from pathlib import Path, PurePosixPath
 import re
@@ -24,6 +26,8 @@ import unicodedata
 import uuid
 from typing import Any, Callable, Mapping, Sequence
 from uuid import UUID
+
+import psycopg
 
 from datacon import build_provenance, contracts, evidence, fileio, jsonutil, state
 from datacon.cases import (
@@ -68,6 +72,7 @@ ARCHIVE_RESERVE_MAX = 60
 ARCHIVE_RESERVE_RATIO = 0.1
 BUILD_TIMEOUT = 300.0
 PROBE_TIMEOUT = 120.0
+logger = logging.getLogger(__name__)
 MAX_ATTEMPTS_PER_STEP = 2
 FAULT_ENV = "DATACON_FAULT_AFTER_TOOL"
 TEST_MODE_ENV = "DATACON_TEST_MODE"
@@ -2901,7 +2906,43 @@ def _cap_to_step_budget(context: ExecutionContext, seconds: float) -> float:
     ceiling = getattr(context, "step_ceiling_seconds", None)
     if ceiling is None:
         return seconds
-    return max(1.0, min(float(seconds), ceiling))
+    return min(float(seconds), ceiling)
+
+
+def _default_step_timeout_seconds(
+    context: ExecutionContext, step_key: str
+) -> float | None:
+    """Derive a step's own hard-timeout cap when the caller did not pass one."""
+    has_deadline = getattr(context, "deadline_at", None) is not None
+    reserve = float(getattr(context, "reserve_seconds", 0.0))
+    if step_key == "sandbox.probe":
+        return (
+            min(PROBE_TIMEOUT, _remaining(context))
+            if has_deadline
+            else PROBE_TIMEOUT
+        )
+    if step_key.startswith("build:"):
+        return (
+            min(BUILD_TIMEOUT, _remaining(context) - reserve)
+            if has_deadline
+            else BUILD_TIMEOUT
+        )
+    if step_key.startswith("replay:"):
+        plan = getattr(context, "plan", None)
+        limits = plan.get("limits") if isinstance(plan, Mapping) else None
+        raw_replay = (
+            limits.get("replay_seconds") if isinstance(limits, Mapping) else None
+        )
+        if isinstance(raw_replay, (int, float)) and not isinstance(
+            raw_replay, bool
+        ):
+            replay_cap = float(raw_replay)
+            return (
+                min(replay_cap, _remaining(context) - reserve)
+                if has_deadline
+                else replay_cap
+            )
+    return None
 
 
 def _run_step(
@@ -2913,6 +2954,7 @@ def _run_step(
     action: Callable[[int, str], Any],
     reusable: Callable[[Mapping[str, Any]], bool] | None = None,
     charge_kind: str = "general",
+    step_timeout_seconds: float | None = None,
 ) -> tuple[Any, bool]:
     """Execute one logical step with generation fencing and crash recovery.
 
@@ -2998,10 +3040,26 @@ def _run_step(
     # tree ordered without colliding with an adopted result.
     attempt_no = next_attempt_no
     # T12 §7: the budget gate runs before the attempt row and before any
-    # container, so an exhausted family never starts the step.
-    ceiling = _gate_step_budget(
+    # container, so an exhausted family never starts the step. The recovery
+    # ceiling recorded on the started row is the effective container hard
+    # timeout: min(step timeout, remaining deadline, gate ceiling).
+    gate_ceiling = _gate_step_budget(
         dsn, context, step_key=step_key, charge_kind=charge_kind
     )
+    ceiling: float | None = gate_ceiling
+    if gate_ceiling is not None:
+        resolved_timeout = (
+            float(step_timeout_seconds)
+            if step_timeout_seconds is not None
+            else _default_step_timeout_seconds(context, step_key)
+        )
+        if resolved_timeout is not None:
+            if not math.isfinite(resolved_timeout) or resolved_timeout <= 0:
+                raise ExecutionBlocked(
+                    "DEADLINE_EXCEEDED",
+                    f"execution deadline exhausted before {step_key}",
+                )
+            ceiling = min(resolved_timeout, gate_ceiling)
     token = uuid.uuid4().hex
     stored = state.record_attempt(
         dsn,
@@ -3108,13 +3166,24 @@ def _run_budgeted_action(
         except state.StaleGeneration:
             if failure is None:
                 raise
-        except state.StateError as charge_error:
+            logger.warning(
+                "budget charge lost lease after step %s raised %s",
+                step_key,
+                type(failure).__name__,
+            )
+        except (state.StateError, psycopg.Error) as charge_error:
             if failure is None:
                 raise ExecutionFailed(
                     "RUN_INCOMPLETE",
                     f"the {step_key} budget charge could not be recorded: "
                     f"{charge_error}",
                 ) from charge_error
+            logger.warning(
+                "budget charge failed after step %s raised %s: %s",
+                step_key,
+                type(failure).__name__,
+                charge_error,
+            )
 
 
 def _journal_path(
@@ -5424,13 +5493,17 @@ def run_execution(
                     build_provenance.BUILD_PROVENANCE_MISSING,
                     spec_error,
                 )
+        probe_timeout = min(PROBE_TIMEOUT, _remaining(context))
         probe_result, _ = _run_step(
             dsn,
             context,
             step_key="sandbox.probe",
             input_digest=context.plan_digest,
-            action=lambda attempt_no, token: _do_probe(context, sandbox),
+            action=lambda attempt_no, token: _do_probe(
+                context, sandbox, deadline_seconds=probe_timeout
+            ),
             reusable=lambda payload: payload.get("status") == "completed",
+            step_timeout_seconds=probe_timeout,
         )
         probe_payload = probe_result
         for version in ("vulnerable", "fixed"):
@@ -5441,12 +5514,15 @@ def run_execution(
                 material_digests=material_digests,
             )
             _assert_budget(context, purpose=f"building {version}")
+            build_timeout = min(
+                BUILD_TIMEOUT, _remaining(context) - context.reserve_seconds
+            )
             result, reused = _run_step(
                 dsn,
                 context,
                 step_key=f"build:{version}",
                 input_digest=context.plan["analysis_digest"],
-                action=lambda attempt_no, token, version=version: _do_build(
+                action=lambda attempt_no, token, version=version, build_timeout=build_timeout: _do_build(
                     dsn,
                     context,
                     sandbox,
@@ -5455,12 +5531,14 @@ def run_execution(
                     version,
                     attempt_no,
                     token,
+                    deadline_seconds=build_timeout,
                 ),
                 reusable=lambda payload: _reusable_build(
                     build_root,
                     payload,
                     artifact_suffix=_primary_artifact_suffix(context, payload),
                 ),
+                step_timeout_seconds=build_timeout,
             )
             builds[version] = result
             if result.get("status") != "completed":
@@ -5492,7 +5570,7 @@ def run_execution(
                 remaining = _remaining(context) - context.reserve_seconds
                 replay_timeout = min(
                     float(context.plan["limits"]["replay_seconds"]),
-                    max(1.0, remaining),
+                    remaining,
                 )
                 result, reused = _run_step(
                     dsn,
@@ -5514,6 +5592,7 @@ def run_execution(
                         token,
                     ),
                     reusable=lambda payload: _reusable_replay(build_root, payload),
+                    step_timeout_seconds=replay_timeout,
                 )
                 runs.append(result)
         input_mismatch = False
@@ -5910,12 +5989,20 @@ def _reusable_replay(run_root: Path, payload: Mapping[str, Any]) -> bool:
     return True
 
 
-def _do_probe(context: ExecutionContext, sandbox: Any) -> dict[str, Any]:
+def _do_probe(
+    context: ExecutionContext,
+    sandbox: Any,
+    *,
+    deadline_seconds: float | None = None,
+) -> dict[str, Any]:
+    raw_deadline = (
+        min(PROBE_TIMEOUT, _remaining(context))
+        if deadline_seconds is None
+        else deadline_seconds
+    )
     try:
         report: ProbeReport = sandbox.probe(
-            deadline_seconds=_cap_to_step_budget(
-                context, min(PROBE_TIMEOUT, _remaining(context))
-            )
+            deadline_seconds=_cap_to_step_budget(context, raw_deadline)
         )
     except SandboxPolicyError:
         raise
@@ -5968,11 +6055,15 @@ def _do_build(
     version: str,
     attempt_no: int,
     token: str,
+    *,
+    deadline_seconds: float | None = None,
 ) -> dict[str, Any]:
-    deadline = _cap_to_step_budget(
-        context,
-        max(1.0, min(BUILD_TIMEOUT, _remaining(context) - context.reserve_seconds)),
+    raw_deadline = (
+        min(BUILD_TIMEOUT, _remaining(context) - context.reserve_seconds)
+        if deadline_seconds is None
+        else deadline_seconds
     )
+    deadline = _cap_to_step_budget(context, raw_deadline)
     # Hash the exact tree that will be mounted immediately before the
     # container is created. A replaced recipe/source aborts the step.
     _verify_materialized_tree(materials_dir, material_digests)
