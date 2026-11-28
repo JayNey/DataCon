@@ -38,6 +38,12 @@ from datacon import build_provenance, contracts, evidence, execution, jsonutil
 from datacon.asan import ASanSignature
 from datacon.cases import load_registry
 from datacon.tools import sandbox as sandbox_mod
+from datacon.tools.intel_evidence import (
+    snapshot_body,
+    validate_license_document,
+    validate_snapshot_document,
+    verify_intel_documents,
+)
 from datacon.tools.model_outlet import (
     DEFAULT_REDACTION_VERSION,
     MODEL_AUDIT_FIELDS,
@@ -329,7 +335,14 @@ def _setup_fixture_plan_and_job(
             "snapshot": case.advisory["path"],
             "collected_at": "2099-01-01T00:00:00Z",
             "content_digest": case.advisory["digest"],
-            "sources": ["https://github.com/JayNey/DataCon"],
+            # The sources this analysis relied on include the snapshot's own
+            # registered source: delta §8 binds plan.intel.sources to the
+            # snapshot's source_url, and the fixture registry names it per
+            # benchmark (B01 -> https://example.invalid/datacon/B01).
+            "sources": [
+                "https://github.com/JayNey/DataCon",
+                case.advisory["source_url"],
+            ],
         },
         "analysis": analysis,
         "analysis_digest": analysis_dig,
@@ -6513,3 +6526,208 @@ def test_v1_success_refs_list_review(tmp_path: Path, monkeypatch: pytest.MonkeyP
         "metadata/execution.json",
     ]
     _assert_refs_resolvable(verified, refs)
+
+
+# ---------------------------------------------------------------------------
+# T15/R2: v2 bundles archive the case registry's intel documents (delta §8)
+# ---------------------------------------------------------------------------
+
+
+def test_v2_execution_bundle_archives_intel_documents(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """A successful v2 execution bundle archives intel/snapshot.json and
+    intel/license.json built from the case registry's advisory entry and the
+    pinned advisory bytes, plus the closed three-field report.intel summary.
+
+    The offline fixed snapshot has no collection record: the four collection
+    fields stay null and the identity comes from the registry alone. The two
+    archived documents must bind to each other, to report.intel and to the
+    frozen plan's intel summary offline (delta §8 verification rules).
+    """
+    run_root, _ = _configure_isolated_roots(tmp_path, monkeypatch)
+    spec = _cmake_spec()
+    job, plan, plan_digest, review = _setup_fixture_plan_and_job(
+        version=2, build_spec=spec
+    )
+    mem_state = _InMemoryState(job, plan, plan_digest, review)
+    mem_state.install(monkeypatch)
+    # The offline identity comes from the case registry: the loaded context
+    # carries the advisory entry with all five T15 keys (#70).
+    context = execution._load_context(
+        "dsn",
+        job["job_id"],
+        1,
+        case_root=str(FIXTURE_CASES),
+        run_root=run_root,
+    )
+    advisory = context.case.advisory
+    assert {"path", "digest", "source_url", "license", "permitted_uses"} <= set(
+        advisory
+    )
+
+    vuln_face = _cmake_compile_commands_bytes(
+        flags=["-fsanitize=address", "-g", "-O1", "-I../include", "-D_GNU_SOURCE"]
+    )
+    fixed_face = _cmake_compile_commands_bytes(
+        flags=[
+            "-fsanitize=address",
+            "-g",
+            "-O1",
+            "-I",
+            "/work/include",
+            "-D_GNU_SOURCE",
+        ]
+    )
+    fake_sandbox = _FakeSandbox(
+        image_digest=plan["image_digest"],
+        build_recipe_digest=plan["build_recipe_digest"],
+        faces={"vulnerable": vuln_face, "fixed": fixed_face},
+        face_name="compile_commands.json",
+    )
+    result = execution.run_execution(
+        "dsn",
+        job["job_id"],
+        1,
+        case_root=str(FIXTURE_CASES),
+        run_root=run_root,
+        sandbox=fake_sandbox,
+    )
+    assert result.state == "REPRODUCED", result
+
+    verified = evidence.verify_bundle(result.evidence_path)
+    assert "intel/snapshot.json" in verified.file_data
+    assert "intel/license.json" in verified.file_data
+    roles = {entry["path"]: entry["role"] for entry in verified.manifest["files"]}
+    assert roles["intel/snapshot.json"] == "intel_snapshot"
+    assert roles["intel/license.json"] == "license_record"
+
+    snapshot_doc = json.loads(
+        verified.file_data["intel/snapshot.json"].decode("utf-8")
+    )
+    license_doc = json.loads(
+        verified.file_data["intel/license.json"].decode("utf-8")
+    )
+    validate_snapshot_document(snapshot_doc)
+    validate_license_document(license_doc)
+    # No collection was ever recorded for the pinned bytes: the collection
+    # fields stay null and the identity is the registry's advisory entry.
+    assert snapshot_doc["case_id"] == context.case.case_id
+    assert snapshot_doc["source_id"] == f"{context.case.case_id}/advisory"
+    assert snapshot_doc["source_url"] == advisory["source_url"]
+    assert snapshot_doc["snapshot_digest"] == advisory["digest"]
+    assert snapshot_doc["license"] == advisory["license"]
+    for field in (
+        "fetched_at",
+        "http_status",
+        "redirect_chain_digest",
+        "tool_version",
+    ):
+        assert snapshot_doc[field] is None, snapshot_doc
+    # The archived body is exactly the advisory bytes pinned in the case
+    # material, and the registry digest describes those bytes.
+    material_bytes, material_digest = context.case.read_material(
+        advisory["path"], advisory["digest"]
+    )
+    assert snapshot_body(snapshot_doc) == material_bytes
+    assert material_digest == advisory["digest"]
+
+    report = json.loads(verified.file_data["report.json"].decode("utf-8"))
+    assert report["intel"] == {
+        "snapshot_digest": advisory["digest"],
+        "license": advisory["license"],
+        "redirect_chain_digest": None,
+    }
+    assert report["intel"]["snapshot_digest"] == snapshot_doc["snapshot_digest"]
+    assert report["intel"]["license"] == snapshot_doc["license"]
+    assert (
+        report["intel"]["redirect_chain_digest"]
+        == snapshot_doc["redirect_chain_digest"]
+    )
+    # The bundle's intel material binds offline: the two documents to each
+    # other, to report.intel and to the frozen plan's intel summary.
+    verify_intel_documents(
+        snapshot_doc,
+        license_doc,
+        case_id=context.case.case_id,
+        report_intel=report["intel"],
+        plan_intel=plan["intel"],
+    )
+
+
+def test_blocked_bundle_does_not_carry_intel_documents(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """A blocked v2 bundle carries neither intel document nor report.intel.
+
+    intel_snapshot/license_record are required for execution/campaign bundles
+    only; a blocked bundle is the archive of a block reason and must not
+    claim the intel material was part of a run that never happened.
+    """
+    run_root, _ = _configure_isolated_roots(tmp_path, monkeypatch)
+    spec = _cmake_spec()
+    face = _cmake_compile_commands_bytes(
+        flags=["-fsanitize=address", "-g", "-O1", "-I../include", "-D_GNU_SOURCE"]
+    )
+    parent_approval = "sha256:" + "e" * 64
+    job, plan, plan_digest, review = _setup_fixture_plan_and_job(
+        version=2, build_spec=spec
+    )
+    plan["parent_approval_digest"] = parent_approval
+    plan_digest = contracts.plan_digest(plan)
+    mem_state = _InMemoryState(job, plan, plan_digest, review)
+    mem_state.install(monkeypatch)
+    # The family's human review is bound to the first plan, not this later
+    # round: the round is admitted by policy only (same shape as
+    # test_policy_round_blocked_mid_execution_archives_blocked_bundle).
+    mem_state.review = {
+        "reviewer_id": "family-reviewer",
+        "decision": "approve",
+        "plan_digest": "sha256:" + "9" * 64,
+        "decided_at": review["decided_at"],
+    }
+    mem_state.admission = {
+        "admission_id": str(uuid4()),
+        "job_id": str(job["job_id"]),
+        "parent_job_id": str(job["parent_job_id"]),
+        "round_no": plan["round_no"],
+        "approval_kind": "policy",
+        "envelope_digest": plan["envelope_digest"],
+        "parent_approval_digest": parent_approval,
+        "seed_digest": plan["inputs"]["candidate"],
+        "predicate_version": "admission-v1",
+        "recomputable": True,
+        "supporting_bundle_digest": None,
+        "decided_at": "2099-01-01T00:00:00Z",
+    }
+    fake_sandbox = _FakeSandbox(
+        image_digest=plan["image_digest"],
+        build_recipe_digest=plan["build_recipe_digest"],
+        faces={"vulnerable": face, "fixed": face},
+        face_name="compile_commands.json",
+    )
+    original_build = fake_sandbox.build
+
+    def build(version: str, **kwargs: Any):
+        if version == "fixed":
+            raise SandboxPolicyError("seccomp profile mismatch")
+        return original_build(version, **kwargs)
+
+    fake_sandbox.build = build
+    result = execution.run_execution(
+        "dsn",
+        job["job_id"],
+        1,
+        case_root=str(FIXTURE_CASES),
+        run_root=run_root,
+        sandbox=fake_sandbox,
+    )
+    assert result.state == "BLOCKED", result
+    assert result.reason_code == "POLICY_DENIED"
+    assert result.evidence_path, "blocked policy round archived no evidence"
+    verified = evidence.verify_bundle(result.evidence_path)
+    assert "intel/snapshot.json" not in verified.file_data
+    assert "intel/license.json" not in verified.file_data
+    report = json.loads(verified.file_data["report.json"])
+    assert report["bundle_kind"] == "blocked"
+    assert "intel" not in report
