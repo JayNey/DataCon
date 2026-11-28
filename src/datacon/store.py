@@ -60,6 +60,22 @@ def _submit_v2(dsn: str, request: dict, *, operator_id: str | None = None) -> di
                 None,
             ),
         )
+        exploration = request.get("exploration")
+        guided = isinstance(exploration, dict) and exploration.get("mode") == "guided"
+        if guided and not binary:
+            # T12 (改9 增补): a guided family's first plan is its campaign.
+            # The campaign child is queued with the family, in the same
+            # transaction, so the worker's v2 prepare entry can freeze the
+            # campaign plan and envelope for the human review.
+            connection.execute(
+                "INSERT INTO jobs "
+                "(job_id, request, state, reason_code, operator_id, "
+                "workflow_synced, job_contract_version, family_id, job_kind, "
+                "parent_job_id, round_no) "
+                "VALUES (%s, %s, 'QUEUED', NULL, %s, false, 2, %s, 'campaign', "
+                "%s, NULL)",
+                (uuid4(), Jsonb(request), operator_id, family_id, family_id),
+            )
     if binary:
         # A submit-time rejection never enters a worker claim, so it has no
         # lease and must use the same direct blocked-evidence path as v1. A

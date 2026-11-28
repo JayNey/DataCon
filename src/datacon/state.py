@@ -262,10 +262,10 @@ def claim_next(
     ``v2_worker_scope`` (T12 B, P2 B6) narrows a v2 claim to what
     ``workflow.run_worker`` can finish for a v2 row: execution
     (READY/RUNNING/ARCHIVING), synchronization (unsynced READY/BLOCKED or
-    AWAITING_REVIEW) and an expired review window. v2 rows in QUEUED,
-    PREPARING or an open AWAITING_REVIEW window belong to the v2 preparation
-    entry and are left untouched instead of being claimed and released in a
-    loop.
+    AWAITING_REVIEW), an expired review window and the guided campaign
+    preparation (QUEUED/PREPARING campaign children). Other v2 rows in
+    QUEUED/PREPARING and any open AWAITING_REVIEW window are left untouched
+    instead of being claimed and released in a loop.
     """
     if not isinstance(worker_id, str) or not worker_id.strip():
         raise StateError("worker_id must be non-empty")
@@ -344,7 +344,8 @@ def claim_next(
     v2_scope_clause = ""
     if job_contract_version == 2 and v2_worker_scope:
         v2_scope_clause = """
-              AND state NOT IN ('QUEUED', 'PREPARING')
+              AND NOT (state IN ('QUEUED', 'PREPARING')
+                       AND job_kind IS DISTINCT FROM 'campaign')
               AND NOT (
                   state = 'AWAITING_REVIEW'
                   AND workflow_synced = true

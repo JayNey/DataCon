@@ -341,6 +341,8 @@ shell legacy 的核对面必须显式审核并归档：
 
 核对面原文（CMake 的 `compile_commands.json`、Make shim 日志、shell 审核日志）以 `build_provenance` 角色随证据归档，两版各一份；`build_metadata` 只存结构化摘要。
 
+**BuildSpec 来源（改9 增补）**。v2 plan 的 `build_spec` 只取自案例注册表 `cases.<case_id>.build_spec`（可选字段，加载注册表时按冻结规则校验；shell 需同时登记 `shell_recipe_digest`、预审基线 `shell_face_digest` 与 `shell_face_review`）。注册表条目进入 `case_config`，因此 BuildSpec 同时被 `case_config_digest` 与 `build_recipe_digest` 绑定；未登记 BuildSpec 的案例不能生成 v2 首份计划（`POLICY_DENIED`）。guided campaign 计划的 `outputs` 为 parser 与 fuzzer 两个产物。
+
 ### 多编译单元解析与 compile_flags 归一化
 
 **多编译单元解析规则**。当目标包含多个 `.c`/`.cc`/`.cpp` 编译单元时：从 `compile_commands.json` 或 `cc-shim.log` 中过滤仅编译目标源码的命令（按仓库相对源文件路径升序确定性排序，排除纯链接命令以及编译器可执行文件名、`-c`、`-o <obj>` 与源文件本身等非编译选项项）；为每个编译单元记录归一化后的有序生效标志序列（按文件映射），并汇总得到用于全局声明核对的扁平生效标志集合。两版可比判据要求：两版共同编译单元（交集）的归一化有序生效标志序列必须**逐编译单元严格相等**，且两版各自满足“声明 ⊆ 生效（多重集包含）”。若某编译单元在单版缺失且无法由目标补丁解释，仍以 `BUILD_PROVENANCE_MISSING` 失败关闭。
@@ -1053,7 +1055,7 @@ v2 `execution` 恰好包含 `review` 或 `admission` 之一，不得两者都缺
 
 | 命令 | v0.2 行为 |
 | --- | --- |
-| `datacon submit --request request.json` | 接受 Request v2；`exploration` 缺省为 fixed；**返回 family job_id**，而不是首份 child 的 job_id |
+| `datacon submit --request request.json` | 接受 Request v2；`exploration` 缺省为 fixed；**返回 family job_id**，而不是首份 child 的 job_id。guided 请求在同一事务中同时建 `QUEUED` 的 campaign child（改9 增补）；worker 的 v2 prepare 入口对它做离线分析，按案例注册表与请求生成首份 campaign plan 与信封（信封规则见第 2 节），经 `freeze_plan` 进入 `AWAITING_REVIEW` 并写入待审信封，之后由 `datacon review` 人批 |
 | `datacon status JOB_ID` | family job 返回 `family`、`campaign`、`rounds` 与 `budget`，运行中 `state` 为 `AGGREGATING`、归档后为 `COMPLETED`；child job 返回单轮视图 |
 | `datacon export JOB_ID --out DIR` | 导出单个轮次或 campaign 的 v2 包；v1 包仍按 v1 导出 |
 | `datacon export --family FAMILY_ID --out DIR` | 聚合导出 family；每个轮次目录仍是独立 bundle，campaign 单独目录归档；根 `family.json` 是 family index（D43），与 family 归档件字节一致 |
