@@ -6359,7 +6359,7 @@ def _finish_blocked(
     work_root = context.run_root / context.job_id_text / context.plan_digest.split(":")[1]
     build_root = work_root / "run"
     build_root.mkdir(parents=True, exist_ok=True)
-    if context.budget_summary:
+    if getattr(context, "budget_summary", None):
         try:
             _refresh_budget_summary_before_archive(dsn, context)
         except (state.StateError, psycopg.Error):
@@ -6506,7 +6506,7 @@ def _finish_failed(
     work_root = context.run_root / context.job_id_text / context.plan_digest.split(":")[1]
     build_root = work_root / "run"
     build_root.mkdir(parents=True, exist_ok=True)
-    if context.budget_summary:
+    if getattr(context, "budget_summary", None):
         try:
             _refresh_budget_summary_before_archive(dsn, context)
         except (state.StateError, psycopg.Error):
