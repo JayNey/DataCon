@@ -2,7 +2,7 @@
 
 **版本** v0.2  
 **日期** 2026-11-21  
-**状态** 已批准，改8 修订（T09 门禁改动保留；改7 的 T12 准入持久化、信封绑定、预算快照与审批账本初始化坐标保留；改8 增补 T12 family 转移决策入口与坐标）  
+**状态** 已批准，改9 修订（T09 门禁改动保留；改7 的 T12 准入持久化、信封绑定、预算快照与审批账本初始化坐标保留；改8 的 T12 family 转移决策入口与坐标保留；改9 只补 T12 runtime 契约：固定 fuzz shim 与 guided `harness_digest` 绑定、campaign 每版 parser + fuzzer 两个构建产物、种子语料登记与摘要、corpus 超限细因、预算门禁/扣费与派生轮次“先 gate 后建 child”的准入接线，以及准入、阻断归档与扣费的崩溃恢复；不改 REQ/TC 编号，不新增 §10 原因码）  
 **适用范围** 多轮探索、计划身份、自动准入、构建溯源与证据 v2
 
 ## 1. 版本声明
@@ -246,5 +246,6 @@ T09 门禁在改8 后仍应满足：
 - 改6 只改本目录的 Markdown，不触及业务代码、工作流、迁移、`scripts/`、`examples/`、根 README 或 v0.1 文档；`git status --short` 只出现未跟踪的 `docs/spec/v0.2/`（默认折叠；使用 `-uall` 时列出本目录 12 个文件）与两个保留的 T09 门禁改动 `src/datacon/ci_gates.py`、`tests/contract/test_ci_gates.py`（均显示为 `M`，不新增其他改动）。
 - 改7 只登记 T12 准入持久化坐标、预算快照幂等冲突坐标、审批/计划信封绑定坐标、审批初始化预算账本坐标与三路径语义，不改变 REQ/TC、§10 原因码或行为契约。
 - 改8 增补 family 转移决策入口与坐标（`record_family_transition_decision`、T12 的 `postgres` 坐标与边 #24/#26 的说明），不改变 REQ/TC 与 §10 原因码；决策子码 `NO_CANDIDATE_SEED`/`NO_REMAINING_SEEDS` 只出现在决策审计的 `detail.reason_code`，不进入 `jobs.reason_code`、审计 `reason_code` 列或 §10 终态封闭集。
+- 改9 只补 T12 runtime 契约（[接口 §2/§5/§7/§8/§10](interface-contract-delta.md)、[安全 §5](security-design-delta.md)）与 A 阶段坐标，不改变 REQ/TC 编号与 §10 原因码；corpus 超限细因 `CORPUS_TOTAL_BYTES_EXCEEDED`/`CORPUS_FILE_BYTES_EXCEEDED`/`CORPUS_FILE_COUNT_EXCEEDED` 只出现在审计 `detail.sub_reason`，顶层归 `POLICY_DENIED`；B（campaign fuzz runtime）与 C（guided validation 复用）阶段坐标在其落地 PR 中登记。
 - 本目录所有相对链接可解析，REQ/TC 引用落在允许集合内；六份 ADR 文件总行数（含空行）60–120 行，含标题、Status、Date 与 6 个二级节。
 - 不新增 `xfail`、`skip` 或业务代码；T09 不新增 T10–T15 的测试代码，仅新增四条门禁作用域用例；各任务开工时再按坐标创建测试。

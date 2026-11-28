@@ -317,7 +317,11 @@ def test_manifest_uses_fixed_evidence_paths(tmp_path):
 
 
 @pytest.mark.parametrize("relative", ["envelope.json", "budget/snapshot.json"])
-def test_v2_execution_requires_envelope_and_budget_snapshot(tmp_path, relative):
+def test_validation_bundle_requires_envelope_and_budget_snapshot(tmp_path, relative):
+    # T12 registered coordinate (renamed from
+    # test_v2_execution_requires_envelope_and_budget_snapshot; registration
+    # and rename only, no new capability). A round execution bundle is the
+    # validation/fixed execution shape.
     files = _base_files(execution=True, campaign=False)
     del files[relative]
     root = _write_v2_bundle(
@@ -447,7 +451,11 @@ def _blocked_files(
     return files
 
 
-def test_blocked_bundle_only_requires_the_two_reports(tmp_path):
+def test_v2_blocked_bundle_requires_only_blocked_fields(tmp_path):
+    # T12 registered coordinate (renamed from
+    # test_blocked_bundle_only_requires_the_two_reports; registration and
+    # rename only, no new capability). The blocked manifest carries null
+    # family/envelope/plan_digest/build_ref identity fields.
     manifest = _manifest("blocked")
     root = _write_v2_bundle(
         tmp_path, manifest, _blocked_files(manifest), name="blocked"

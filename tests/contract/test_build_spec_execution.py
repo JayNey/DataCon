@@ -456,6 +456,17 @@ class _InMemoryState:
             self.family_budget_summary,
         )
         monkeypatch.setattr(
+            execution.state, "load_budget_ledger", self.load_budget_ledger
+        )
+        monkeypatch.setattr(
+            execution.state, "charge_step_budget", self.charge_step_budget
+        )
+        monkeypatch.setattr(
+            execution.state,
+            "recover_uncharged_attempts",
+            lambda _dsn, **_kwargs: 0,
+        )
+        monkeypatch.setattr(
             execution.state, "get_family_envelope", self.get_family_envelope
         )
         monkeypatch.setattr(
@@ -501,6 +512,44 @@ class _InMemoryState:
             "remaining_seconds": max_total - spent,
             "remaining_fuzz_seconds": max_fuzz - spent_fuzz,
         }
+
+    def load_budget_ledger(
+        self, dsn: str, family_id: UUID | str
+    ) -> dict[str, Any] | None:
+        summary = self.family_budget_summary(dsn, family_id)
+        return {
+            "family_id": str(family_id),
+            "max_total_seconds": summary["max_total_seconds"],
+            "max_fuzz_seconds": summary["max_fuzz_seconds"],
+            "remaining_total_seconds": summary["remaining_seconds"],
+            "remaining_fuzz_seconds": summary["remaining_fuzz_seconds"],
+        }
+
+    def charge_step_budget(self, dsn: str, **kwargs: Any) -> Any:
+        """Record T12 step charges with the real §7 formula, in memory."""
+        key = (str(kwargs["job_id"]), kwargs["step_key"], kwargs["attempt_no"])
+        for charge in self.budget_charges:
+            if charge.get("key") == key:
+                return execution.state.BudgetChargeOutcome(
+                    "recovered", None, dict(charge), {}
+                )
+        ledger = self.load_budget_ledger(dsn, kwargs["family_id"])
+        seconds, fuzz_seconds = execution.state.compute_budget_charge(
+            ledger,
+            charge_kind=kwargs["charge_kind"],
+            elapsed_seconds=kwargs["elapsed_seconds"],
+            elapsed_fuzz_seconds=kwargs.get("elapsed_fuzz_seconds", 0),
+        )
+        charge = {
+            "key": key,
+            "charge_kind": kwargs["charge_kind"],
+            "seconds": seconds,
+            "fuzz_seconds": fuzz_seconds,
+        }
+        self.budget_charges.append(charge)
+        return execution.state.BudgetChargeOutcome(
+            "charged", None, dict(charge), ledger
+        )
 
     def load_job(self, dsn: str, job_id: UUID) -> dict[str, Any] | None:
         return deepcopy(self.job) if str(job_id) == str(self.job["job_id"]) else None
@@ -5625,6 +5674,74 @@ def test_evidence_artifacts_policy_blocked_never_falls_back_to_review(
 
     assert "admission.json" not in artifacts
     assert "review.json" not in artifacts
+
+
+@pytest.mark.parametrize(
+    ("remaining", "expected_state", "expected_replays"),
+    [(5, "INCONCLUSIVE", 2), (2, "FAILED", 0)],
+    ids=["during-replay", "before-replay"],
+)
+def test_v2_runtime_budget_exhaustion_archives_partial_bundle(
+    tmp_path, monkeypatch, remaining, expected_state, expected_replays
+):
+    """T12 A2 (改9 §7 runtime): an exhausted family budget stops the child.
+
+    Every container step is charged one second by the fake step clock. With
+    the budget drained mid-replay the child archives an INCONCLUSIVE partial
+    bundle; drained before any replay it archives FAILED. Both carry
+    ``BUDGET_EXHAUSTED``, verify offline, and no further container starts.
+    """
+    run_root, _ = _configure_isolated_roots(tmp_path, monkeypatch)
+    job, plan, plan_digest, review = _setup_fixture_plan_and_job(
+        version=2, build_spec=_cmake_spec()
+    )
+    mem_state = _InMemoryState(job, plan, plan_digest, review)
+    mem_state.install(monkeypatch)
+    max_total = int(job["envelope"]["max_total_seconds"])
+    mem_state.budget_charges.append(
+        {
+            "key": ("earlier-child", "build:vulnerable", 1),
+            "charge_kind": "general",
+            "seconds": max_total - remaining,
+            "fuzz_seconds": 0,
+        }
+    )
+    ticks = iter(range(0, 10_000))
+    monkeypatch.setattr(execution, "STEP_CLOCK", lambda: float(next(ticks)))
+    fake_sandbox = _FakeSandbox(
+        image_digest=plan["image_digest"],
+        build_recipe_digest=plan["build_recipe_digest"],
+        faces={
+            version: _cmake_compile_commands_bytes(
+                flags=["-fsanitize=address", "-g", "-O1", "-I../include", "-D_GNU_SOURCE"]
+            )
+            for version in ("vulnerable", "fixed")
+        },
+        face_name="compile_commands.json",
+    )
+
+    result = execution.run_execution(
+        "dsn",
+        job["job_id"],
+        1,
+        case_root=str(FIXTURE_CASES),
+        run_root=run_root,
+        sandbox=fake_sandbox,
+    )
+
+    assert result.state == expected_state, result
+    assert result.reason_code == "BUDGET_EXHAUSTED"
+    assert len(fake_sandbox.replay_calls) == expected_replays
+    # probe + builds + replays that started were each charged; nothing more.
+    started_steps = 1 + len(fake_sandbox.build_calls) + expected_replays
+    assert len(mem_state.budget_charges) == 1 + started_steps
+    assert sum(c["seconds"] for c in mem_state.budget_charges) == max_total
+    verified = evidence.verify_bundle(result.evidence_path)
+    assert verified.manifest["verdict"] == expected_state
+    assert verified.manifest["reason_code"] == "BUDGET_EXHAUSTED"
+    snapshot = json.loads(verified.file_data["budget/snapshot.json"])
+    assert snapshot["remaining_seconds"] == 0
+    assert snapshot["spent_seconds"] == max_total
 
 
 # ---------------------------------------------------------------------------

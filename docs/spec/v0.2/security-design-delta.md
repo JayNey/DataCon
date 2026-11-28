@@ -100,7 +100,7 @@ v0.2 新增三类材料或出口：
 
 - fuzz 与 build/replay 使用同一套一次性容器基线：`--network none`、非 root UID、只读根文件系统、`--cap-drop ALL`、`no-new-privileges`、固定 seccomp profile。
 - fuzz 容器额外限制：语料只读挂载；工作区可写但有上限；不得挂载 Docker socket、宿主凭证、证据目录或 campaign 目录；不得访问控制面网络。
-- fuzz harness 是审核过的冻结材料，与 build recipe 同级；模型合成、改写或未审核的 harness 一律拒绝并给出 `HARNESS_REJECTED`。
+- fuzz harness 是审核过的冻结材料，与 build recipe 同级；模型合成、改写或未审核的 harness 一律拒绝并给出 `HARNESS_REJECTED`。libFuzzer 入口使用仓库固定 fuzz shim（改9），guided 的 `harness_digest` 绑定 `{harness, fuzz_shim}` 规范化对；shim 未审核或字节不符同样返回 `HARNESS_REJECTED`。
 - fuzz 输出只允许声明过的目录与文件角色；符号链接、设备文件、绝对路径、父路径与越界写入一律拒绝。
 - 超时、OOM、PID 耗尽或磁盘写满时终止容器并记录限额事件；崩溃本身是观测，不是判定。
 
@@ -108,7 +108,7 @@ v0.2 新增三类材料或出口：
 
 | 对象 | 预算与规则 |
 | --- | --- |
-| 种子语料 | 按 `seed_corpus_digest` 冻结；**总 64 MiB、单文件 8 MiB、文件数 4096**；新增语料必须进入新轮次信封 |
+| 种子语料 | 按 `seed_corpus_digest` 冻结；**总 64 MiB、单文件 8 MiB、文件数 4096**；新增语料必须进入新轮次信封；超限归 `POLICY_DENIED`（改9），审计 `detail.sub_reason` 为 `CORPUS_TOTAL_BYTES_EXCEEDED`、`CORPUS_FILE_BYTES_EXCEEDED` 或 `CORPUS_FILE_COUNT_EXCEEDED`，不用 `MATERIAL_MISSING`，不新增顶层原因码 |
 | crash seed | 固化字节与 SHA-256，附 provenance（campaign job、fuzz log digest、RNG seed）；不得用可变路径或模型生成文本代替 |
 | fuzz 日志 | 沿用单次工具调用原始日志总量上限；按角色记录截断，截断影响证据完整性 |
 | 证据文件 | 单文件、总字节与文件数上限沿用 v0.1（单文件 128 MiB、总 256 MiB、4096 个文件、1024 个目录）；目录单独计数，防止用大量空目录规避文件上限 |

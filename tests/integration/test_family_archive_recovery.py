@@ -1292,7 +1292,9 @@ def test_unindexable_blocked_child_without_plan_converges_family_once(
     _insert_approval(isolated_database, family_id)
     _insert_ledger(isolated_database, family_id)
 
-    assert state.converge_families(isolated_database.dsn) == []
+    out_term = workflow.run_worker(isolated_database.dsn, once=True, execute=False)
+    assert out_term["families_converged"] == 0
+    assert out_term["families_terminated"] == 1
     row = _family_row(isolated_database, family_id)
     assert row[0] == "BLOCKED"
     assert row[2] == "REVIEW_REJECTED"
@@ -1543,3 +1545,157 @@ def test_archive_family_retries_after_envelope_is_approved(
     document = json.loads(path.read_bytes())
     assert document["family_approval_digest"] == new_approval_digest
     assert _family_row(isolated_database, family_id)[5] == _digest(path)
+
+
+def test_guided_family_waits_for_validation_when_only_fuzz_budget_is_exhausted(
+    isolated_database, tmp_path, monkeypatch
+):
+    """改9: a guided family whose fuzz sub-budget is exhausted stays AGGREGATING.
+
+    Validation rounds only execute general steps (build/replay), so exhausting
+    the fuzz sub-budget during campaign must not prematurely archive the family
+    while total budget and rounds remain.
+    """
+    evidence_root = tmp_path / "evidence"
+    monkeypatch.setenv("DATACON_EVIDENCE_ROOT", str(evidence_root))
+    family_id, campaign_id, round_ids = _archived_family(
+        isolated_database, tmp_path,
+        max_rounds=8,
+        rounds=[(1, "INCONCLUSIVE", "INCONCLUSIVE", "EVIDENCE_INCOMPLETE")],
+    )
+    isolated_database.connection.execute(
+        "UPDATE budget_ledger SET remaining_total_seconds = 600, "
+        "remaining_fuzz_seconds = 0 WHERE family_id = %s",
+        (family_id,),
+    )
+    _insert_charge(
+        isolated_database,
+        family_id,
+        campaign_id,
+        step_key="fuzz:campaign",
+        kind="fuzz",
+        seconds=300,
+        fuzz=300,
+    )
+
+    # A fixed family before its first round finishes is unaffected too.
+    fixed_family = _insert_family(isolated_database, request=_fixed_request())
+    _insert_approval(isolated_database, fixed_family, "sha256:" + "5f" * 32)
+    _insert_ledger(
+        isolated_database,
+        fixed_family,
+        max_total=900,
+        max_fuzz=0,
+        remaining_total=900,
+        remaining_fuzz=0,
+    )
+
+    result = workflow.run_worker(isolated_database.dsn, once=True, execute=False)
+
+    assert _family_row(isolated_database, family_id)[0] == "AGGREGATING", (
+        "guided family archived before validation when only fuzz sub-budget was exhausted"
+    )
+    assert result["families_converged"] == 0
+    assert not (evidence_root / str(family_id) / "family.json").exists()
+    assert _family_row(isolated_database, fixed_family)[0] == "AGGREGATING"
+
+
+def test_worker_scan_charges_before_family_is_sealed(
+    isolated_database, tmp_path, monkeypatch
+):
+    """T12 B3: recover uncharged attempts before sealing, and never charge a sealed family."""
+    evidence_root = tmp_path / "evidence"
+    monkeypatch.setenv("DATACON_EVIDENCE_ROOT", str(evidence_root))
+    family_id, campaign_id, round_ids = _archived_family(
+        isolated_database,
+        tmp_path,
+        max_rounds=1,
+        rounds=[(1, "INCONCLUSIVE", "INCONCLUSIVE", "EVIDENCE_INCOMPLETE")],
+    )
+    # Round 1 completed in generation 2; generation 1 crashed before charging.
+    isolated_database.connection.execute(
+        "UPDATE jobs SET generation = 2 WHERE job_id = %s",
+        (round_ids[0],),
+    )
+    isolated_database.connection.execute(
+        "INSERT INTO attempts (attempt_id, job_id, stage, step_key, attempt_no, "
+        "generation, status, result, started_at) "
+        "VALUES (%s, %s, 'execute', 'build:vulnerable', 1, 1, 'started', %s, "
+        "clock_timestamp() - interval '1 hour')",
+        (
+            uuid4(),
+            round_ids[0],
+            Jsonb({"budget": {"charge_kind": "general", "ceiling_seconds": 120.0}}),
+        ),
+    )
+
+    # Direct converge_families must wait while an uncharged attempt is pending.
+    assert state.converge_families(isolated_database.dsn) == [], (
+        "family was sealed while an uncharged budget attempt was still pending"
+    )
+    assert _family_row(isolated_database, family_id)[0] == "AGGREGATING"
+
+    # Worker scan recovers the charge first, then seals family.json with the
+    # exact post-recovery budget.
+    out = workflow.run_worker(isolated_database.dsn, once=True, execute=False)
+    assert out["charges_recovered"] == 1
+    assert out["families_converged"] == 1
+    assert out["families_terminated"] == 0
+    assert _family_row(isolated_database, family_id)[0] == "COMPLETED"
+    doc = json.loads((evidence_root / str(family_id) / "family.json").read_bytes())
+    summary = state.family_budget_summary(isolated_database.dsn, family_id)
+    assert doc["budget"] == summary, (
+        f"family.json budget {doc['budget']} diverged from family_budget_summary {summary}"
+    )
+    assert doc["budget"]["spent_seconds"] == 120
+    assert doc["budget"]["remaining_seconds"] == 780
+
+    # A second scan changes nothing.
+    again = workflow.run_worker(isolated_database.dsn, once=True, execute=False)
+    assert again["charges_recovered"] == 0
+    assert again["families_converged"] == 0
+    assert state.family_budget_summary(isolated_database.dsn, family_id) == summary
+
+    # Once a family is already sealed (not AGGREGATING), a late uncharged
+    # attempt row must never mutate its ledger: skip, audit, and remove from
+    # future candidate scans.
+    late_attempt_id = uuid4()
+    isolated_database.connection.execute(
+        "INSERT INTO attempts (attempt_id, job_id, stage, step_key, attempt_no, "
+        "generation, status, result, started_at) "
+        "VALUES (%s, %s, 'execute', 'build:fixed', 2, 1, 'started', %s, "
+        "clock_timestamp() - interval '1 hour')",
+        (
+            late_attempt_id,
+            round_ids[0],
+            Jsonb({"budget": {"charge_kind": "general", "ceiling_seconds": 60.0}}),
+        ),
+    )
+    assert state.recover_uncharged_attempts(isolated_database.dsn) == 0, (
+        "recover_uncharged_attempts mutated the budget of an already-sealed family"
+    )
+    assert state.family_budget_summary(isolated_database.dsn, family_id) == summary
+    late_row = isolated_database.connection.execute(
+        "SELECT status, result FROM attempts WHERE attempt_id = %s",
+        (late_attempt_id,),
+    ).fetchone()
+    assert late_row[0] == "infra_error", (
+        "skipped attempt on sealed family stayed a started candidate"
+    )
+    assert late_row[1]["budget_recovery"] == "unchargeable"
+    skipped_events = isolated_database.connection.execute(
+        "SELECT detail FROM audit_events "
+        "WHERE job_id = %s AND event_type = 'budget_charge_recovery_skipped'",
+        (round_ids[0],),
+    ).fetchall()
+    assert len(skipped_events) == 1
+    assert skipped_events[0][0]["reason"] == "family_not_aggregating"
+    assert state.recover_uncharged_attempts(isolated_database.dsn) == 0
+    assert (
+        isolated_database.connection.execute(
+            "SELECT count(*) FROM audit_events "
+            "WHERE job_id = %s AND event_type = 'budget_charge_recovery_skipped'",
+            (round_ids[0],),
+        ).fetchone()[0]
+        == 1
+    )

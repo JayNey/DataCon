@@ -13,16 +13,21 @@ from datetime import datetime, timezone
 import hashlib
 import hmac
 import json
+import logging
+import math
 import os
 from pathlib import Path, PurePosixPath
 import re
 import shutil
 import stat
 import sys
+import time
 import unicodedata
 import uuid
 from typing import Any, Callable, Mapping, Sequence
 from uuid import UUID
+
+import psycopg
 
 from datacon import build_provenance, contracts, evidence, fileio, jsonutil, state
 from datacon.cases import (
@@ -67,6 +72,7 @@ ARCHIVE_RESERVE_MAX = 60
 ARCHIVE_RESERVE_RATIO = 0.1
 BUILD_TIMEOUT = 300.0
 PROBE_TIMEOUT = 120.0
+logger = logging.getLogger(__name__)
 MAX_ATTEMPTS_PER_STEP = 2
 FAULT_ENV = "DATACON_FAULT_AFTER_TOOL"
 TEST_MODE_ENV = "DATACON_TEST_MODE"
@@ -143,6 +149,10 @@ class ExecutionContext:
     envelope: dict[str, Any] | None = None
     budget_summary: dict[str, int] = field(default_factory=dict)
     admission: dict[str, Any] | None = None
+    # T12 runtime budget (interface-contract-delta §7): the hard-timeout
+    # ceiling granted by ``state.budget_gate`` for the container step that is
+    # currently running, or None outside a budgeted step.
+    step_ceiling_seconds: float | None = None
 
     @property
     def job_id_text(self) -> str:
@@ -2804,6 +2814,153 @@ def _journal_hmac(payload: Mapping[str, Any], secret: bytes) -> str:
     return hmac.new(secret, encoded, hashlib.sha256).hexdigest()
 
 
+# Injectable step clock. The budget charge measures the wall time of the
+# container step (including timeouts and failures) with this monotonic clock;
+# tests replace it with a fake clock instead of sleeping.
+STEP_CLOCK: Callable[[], float] = time.monotonic
+
+
+def _budget_family_id(context: ExecutionContext) -> str | None:
+    """Return the family whose ledger pays for this job's container steps.
+
+    Only v2 campaign/round children spend the family budget (§7); v1 jobs and
+    any other shape keep the v0.1 deadline-only behaviour.
+    """
+    job = context.job
+    if job.get("job_contract_version") != 2:
+        return None
+    if job.get("job_kind") not in ("campaign", "round"):
+        return None
+    family_id = job.get("family_id")
+    return None if family_id is None else str(family_id)
+
+
+def _gate_step_budget(
+    dsn: str, context: ExecutionContext, *, step_key: str, charge_kind: str
+) -> float | None:
+    """Check the family ledger before a container starts (§7 step 1).
+
+    Returns the hard-timeout ceiling: the total balance for a ``general``
+    step, ``min(remaining_total_seconds, remaining_fuzz_seconds)`` for a
+    ``fuzz`` step. Less than one second raises ``BUDGET_EXHAUSTED`` before any
+    container exists. Returns None for jobs without a family ledger.
+    """
+    family_id = _budget_family_id(context)
+    if family_id is None:
+        return None
+    try:
+        ledger = state.load_budget_ledger(dsn, family_id)
+    except state.StateError as error:
+        raise ExecutionBlocked(
+            "MATERIAL_MISSING",
+            f"the family budget ledger is unavailable: {error}",
+        ) from error
+    if ledger is None:
+        raise ExecutionBlocked(
+            "MATERIAL_MISSING", "the family budget ledger is unavailable"
+        )
+    decision = state.budget_gate(ledger, fuzz=charge_kind == "fuzz")
+    if not decision.allowed:
+        raise ExecutionFailed(
+            state.BUDGET_EXHAUSTED,
+            f"the family {charge_kind} budget is exhausted before {step_key}",
+        )
+    return float(decision.hard_timeout_seconds)
+
+
+def _charge_step_budget(
+    dsn: str,
+    context: ExecutionContext,
+    *,
+    step_key: str,
+    attempt_no: int,
+    charge_kind: str,
+    elapsed_seconds: float,
+) -> state.BudgetChargeOutcome:
+    """Charge one finished container step in its own short transaction (§7 step 2).
+
+    Fuzz steps charge the same span against the fuzz sub-budget as well, so
+    both balances move together. The idempotency key is
+    ``(job_id, step_key, attempt_no)``.
+    """
+    family_id = _budget_family_id(context)
+    assert family_id is not None
+    elapsed = max(0.0, float(elapsed_seconds))
+    return state.charge_step_budget(
+        dsn,
+        family_id=family_id,
+        job_id=context.job_id,
+        step_key=step_key,
+        attempt_no=attempt_no,
+        charge_kind=charge_kind,
+        elapsed_seconds=elapsed,
+        elapsed_fuzz_seconds=elapsed if charge_kind == "fuzz" else 0,
+        generation=context.generation,
+    )
+
+
+def _refresh_budget_summary_before_archive(
+    dsn: str, context: ExecutionContext
+) -> None:
+    """Recover prior-generation uncharged attempts for this child and rebuild budget_summary.
+
+    B3: the child's archived ``budget/snapshot.json`` and ``report.budget`` must
+    reflect the latest committed family charges, including any crashed attempt
+    from an earlier generation of the same child.
+    """
+    family_id = _budget_family_id(context)
+    if family_id is None:
+        return
+    state.recover_uncharged_attempts(dsn, job_id=context.job_id)
+    context.budget_summary = state.family_budget_summary(dsn, family_id)
+
+
+def _cap_to_step_budget(context: ExecutionContext, seconds: float) -> float:
+    """Bound a container hard timeout by the ceiling the budget gate granted."""
+    # Contexts built outside run_execution (unit doubles) may predate the
+    # field; they have no budgeted step and keep the plain timeout.
+    ceiling = getattr(context, "step_ceiling_seconds", None)
+    if ceiling is None:
+        return seconds
+    return min(float(seconds), ceiling)
+
+
+def _default_step_timeout_seconds(
+    context: ExecutionContext, step_key: str
+) -> float | None:
+    """Derive a step's own hard-timeout cap when the caller did not pass one."""
+    has_deadline = getattr(context, "deadline_at", None) is not None
+    reserve = float(getattr(context, "reserve_seconds", 0.0))
+    if step_key == "sandbox.probe":
+        return (
+            min(PROBE_TIMEOUT, _remaining(context))
+            if has_deadline
+            else PROBE_TIMEOUT
+        )
+    if step_key.startswith("build:"):
+        return (
+            min(BUILD_TIMEOUT, _remaining(context) - reserve)
+            if has_deadline
+            else BUILD_TIMEOUT
+        )
+    if step_key.startswith("replay:"):
+        plan = getattr(context, "plan", None)
+        limits = plan.get("limits") if isinstance(plan, Mapping) else None
+        raw_replay = (
+            limits.get("replay_seconds") if isinstance(limits, Mapping) else None
+        )
+        if isinstance(raw_replay, (int, float)) and not isinstance(
+            raw_replay, bool
+        ):
+            replay_cap = float(raw_replay)
+            return (
+                min(replay_cap, _remaining(context) - reserve)
+                if has_deadline
+                else replay_cap
+            )
+    return None
+
+
 def _run_step(
     dsn: str,
     context: ExecutionContext,
@@ -2812,6 +2969,8 @@ def _run_step(
     input_digest: str | None,
     action: Callable[[int, str], Any],
     reusable: Callable[[Mapping[str, Any]], bool] | None = None,
+    charge_kind: str = "general",
+    step_timeout_seconds: float | None = None,
 ) -> tuple[Any, bool]:
     """Execute one logical step with generation fencing and crash recovery.
 
@@ -2896,6 +3055,27 @@ def _run_step(
     # Attempt numbers are unique per generation; max(all)+1 keeps the journal
     # tree ordered without colliding with an adopted result.
     attempt_no = next_attempt_no
+    # T12 §7: the budget gate runs before the attempt row and before any
+    # container, so an exhausted family never starts the step. The recovery
+    # ceiling recorded on the started row is the effective container hard
+    # timeout: min(step timeout, remaining deadline, gate ceiling).
+    gate_ceiling = _gate_step_budget(
+        dsn, context, step_key=step_key, charge_kind=charge_kind
+    )
+    ceiling: float | None = gate_ceiling
+    if gate_ceiling is not None:
+        resolved_timeout = (
+            float(step_timeout_seconds)
+            if step_timeout_seconds is not None
+            else _default_step_timeout_seconds(context, step_key)
+        )
+        if resolved_timeout is not None:
+            if not math.isfinite(resolved_timeout) or resolved_timeout <= 0:
+                raise ExecutionBlocked(
+                    "DEADLINE_EXCEEDED",
+                    f"execution deadline exhausted before {step_key}",
+                )
+            ceiling = min(resolved_timeout, gate_ceiling)
     token = uuid.uuid4().hex
     stored = state.record_attempt(
         dsn,
@@ -2906,11 +3086,31 @@ def _run_step(
         generation=context.generation,
         input_digest=input_digest,
         status="started",
+        # The started row carries what a crash-recovery charge needs
+        # (state.recover_uncharged_attempts): the charge kind and the
+        # hard-timeout ceiling granted before the container started.
+        result=(
+            None
+            if ceiling is None
+            else {"budget": {"charge_kind": charge_kind, "ceiling_seconds": ceiling}}
+        ),
         attempt_token=token,
     )
     if not stored:
         raise state.StaleGeneration("the worker lease was lost before the step")
-    result = action(attempt_no, token)
+    if ceiling is None:
+        result = action(attempt_no, token)
+    else:
+        result = _run_budgeted_action(
+            dsn,
+            context,
+            step_key=step_key,
+            attempt_no=attempt_no,
+            token=token,
+            charge_kind=charge_kind,
+            ceiling=ceiling,
+            action=action,
+        )
     if os.getenv(FAULT_ENV):
         prefixes = [item.strip() for item in os.getenv(FAULT_ENV, "").split(",") if item.strip()]
         if any(step_key.startswith(prefix) for prefix in prefixes):
@@ -2931,6 +3131,75 @@ def _run_step(
     if not recorded:
         raise state.StaleGeneration("the worker lease was lost before the result")
     return result, False
+
+
+def _run_budgeted_action(
+    dsn: str,
+    context: ExecutionContext,
+    *,
+    step_key: str,
+    attempt_no: int,
+    token: str,
+    charge_kind: str,
+    ceiling: float,
+    action: Callable[[int, str], Any],
+) -> Any:
+    """Run one container step under its budget ceiling and always charge it.
+
+    The ceiling is visible to the step through ``context.step_ceiling_seconds``
+    and caps its container hard timeout. After the container exits, whether
+    the step completed, timed out, hit a limit or raised, the elapsed time is
+    charged in an independent short transaction. A charge failure never masks
+    the step's own exception.
+    """
+    context.step_ceiling_seconds = ceiling
+    started = STEP_CLOCK()
+    failure: BaseException | None = None
+    try:
+        return action(attempt_no, token)
+    except BaseException as error:
+        failure = error
+        raise
+    finally:
+        context.step_ceiling_seconds = None
+        elapsed = STEP_CLOCK() - started
+        try:
+            _charge_step_budget(
+                dsn,
+                context,
+                step_key=step_key,
+                attempt_no=attempt_no,
+                charge_kind=charge_kind,
+                elapsed_seconds=elapsed,
+            )
+            # The archived budget snapshot and report.budget must describe
+            # the ledger after this charge, rebuilt from the family charges.
+            family_id = _budget_family_id(context)
+            assert family_id is not None
+            context.budget_summary = state.family_budget_summary(
+                dsn, family_id
+            )
+        except state.StaleGeneration:
+            if failure is None:
+                raise
+            logger.warning(
+                "budget charge lost lease after step %s raised %s",
+                step_key,
+                type(failure).__name__,
+            )
+        except (state.StateError, psycopg.Error) as charge_error:
+            if failure is None:
+                raise ExecutionFailed(
+                    "RUN_INCOMPLETE",
+                    f"the {step_key} budget charge could not be recorded: "
+                    f"{charge_error}",
+                ) from charge_error
+            logger.warning(
+                "budget charge failed after step %s raised %s: %s",
+                step_key,
+                type(failure).__name__,
+                charge_error,
+            )
 
 
 def _journal_path(
@@ -5273,13 +5542,17 @@ def run_execution(
                     build_provenance.BUILD_PROVENANCE_MISSING,
                     spec_error,
                 )
+        probe_timeout = min(PROBE_TIMEOUT, _remaining(context))
         probe_result, _ = _run_step(
             dsn,
             context,
             step_key="sandbox.probe",
             input_digest=context.plan_digest,
-            action=lambda attempt_no, token: _do_probe(context, sandbox),
+            action=lambda attempt_no, token: _do_probe(
+                context, sandbox, deadline_seconds=probe_timeout
+            ),
             reusable=lambda payload: payload.get("status") == "completed",
+            step_timeout_seconds=probe_timeout,
         )
         probe_payload = probe_result
         for version in ("vulnerable", "fixed"):
@@ -5290,12 +5563,15 @@ def run_execution(
                 material_digests=material_digests,
             )
             _assert_budget(context, purpose=f"building {version}")
+            build_timeout = min(
+                BUILD_TIMEOUT, _remaining(context) - context.reserve_seconds
+            )
             result, reused = _run_step(
                 dsn,
                 context,
                 step_key=f"build:{version}",
                 input_digest=context.plan["analysis_digest"],
-                action=lambda attempt_no, token, version=version: _do_build(
+                action=lambda attempt_no, token, version=version, build_timeout=build_timeout: _do_build(
                     dsn,
                     context,
                     sandbox,
@@ -5304,12 +5580,14 @@ def run_execution(
                     version,
                     attempt_no,
                     token,
+                    deadline_seconds=build_timeout,
                 ),
                 reusable=lambda payload: _reusable_build(
                     build_root,
                     payload,
                     artifact_suffix=_primary_artifact_suffix(context),
                 ),
+                step_timeout_seconds=build_timeout,
             )
             builds[version] = result
             if result.get("status") != "completed":
@@ -5341,7 +5619,7 @@ def run_execution(
                 remaining = _remaining(context) - context.reserve_seconds
                 replay_timeout = min(
                     float(context.plan["limits"]["replay_seconds"]),
-                    max(1.0, remaining),
+                    remaining,
                 )
                 result, reused = _run_step(
                     dsn,
@@ -5363,6 +5641,7 @@ def run_execution(
                         token,
                     ),
                     reusable=lambda payload: _reusable_replay(build_root, payload),
+                    step_timeout_seconds=replay_timeout,
                 )
                 runs.append(result)
         input_mismatch = False
@@ -5499,6 +5778,10 @@ def run_execution(
         "replays": [dict(item) for item in runs],
         "attempts": attempt_rows,
     }
+    try:
+        _refresh_budget_summary_before_archive(dsn, context)
+    except (state.StateError, psycopg.Error):
+        return ExecutionResult("STALE")
     # Artifacts first, then the report: the refs must be derived from the
     # documents this writer really archives (SF-2), so a policy round lists
     # its admission instead of a review.json it never carried.
@@ -5752,9 +6035,21 @@ def _reusable_replay(run_root: Path, payload: Mapping[str, Any]) -> bool:
     return True
 
 
-def _do_probe(context: ExecutionContext, sandbox: Any) -> dict[str, Any]:
+def _do_probe(
+    context: ExecutionContext,
+    sandbox: Any,
+    *,
+    deadline_seconds: float | None = None,
+) -> dict[str, Any]:
+    raw_deadline = (
+        min(PROBE_TIMEOUT, _remaining(context))
+        if deadline_seconds is None
+        else deadline_seconds
+    )
     try:
-        report: ProbeReport = sandbox.probe(deadline_seconds=min(PROBE_TIMEOUT, _remaining(context)))
+        report: ProbeReport = sandbox.probe(
+            deadline_seconds=_cap_to_step_budget(context, raw_deadline)
+        )
     except SandboxPolicyError:
         raise
     except SandboxUnavailable:
@@ -5806,8 +6101,15 @@ def _do_build(
     version: str,
     attempt_no: int,
     token: str,
+    *,
+    deadline_seconds: float | None = None,
 ) -> dict[str, Any]:
-    deadline = max(1.0, min(BUILD_TIMEOUT, _remaining(context) - context.reserve_seconds))
+    raw_deadline = (
+        min(BUILD_TIMEOUT, _remaining(context) - context.reserve_seconds)
+        if deadline_seconds is None
+        else deadline_seconds
+    )
+    deadline = _cap_to_step_budget(context, raw_deadline)
     # Hash the exact tree that will be mounted immediately before the
     # container is created. A replaced recipe/source aborts the step.
     _verify_materialized_tree(materials_dir, material_digests)
@@ -5878,6 +6180,7 @@ def _do_replay(
     attempt_no: int,
     token: str,
 ) -> dict[str, Any]:
+    timeout_seconds = _cap_to_step_budget(context, timeout_seconds)
     files = build.get("files") if isinstance(build.get("files"), Mapping) else {}
     relative = files.get("artifact") if isinstance(files, Mapping) else None
     artifact_path = _run_root_path(
@@ -6056,6 +6359,11 @@ def _finish_blocked(
     work_root = context.run_root / context.job_id_text / context.plan_digest.split(":")[1]
     build_root = work_root / "run"
     build_root.mkdir(parents=True, exist_ok=True)
+    if getattr(context, "budget_summary", None):
+        try:
+            _refresh_budget_summary_before_archive(dsn, context)
+        except (state.StateError, psycopg.Error):
+            return ExecutionResult("STALE")
     # One decision, two consumers: the report's bundle_kind and the
     # writer's approval gate must not drift apart.
     bundle_kind = "blocked" if _is_v2_context(context) else "execution"
@@ -6198,10 +6506,20 @@ def _finish_failed(
     work_root = context.run_root / context.job_id_text / context.plan_digest.split(":")[1]
     build_root = work_root / "run"
     build_root.mkdir(parents=True, exist_ok=True)
+    if getattr(context, "budget_summary", None):
+        try:
+            _refresh_budget_summary_before_archive(dsn, context)
+        except (state.StateError, psycopg.Error):
+            return ExecutionResult("STALE")
     incomplete = error.reason_code in (
         "RUN_INCOMPLETE",
         "NOT_COMPARABLE",
         "TIMEOUT",
+    ) or (
+        # §10: an exhausted budget is INCONCLUSIVE once replays exist and
+        # FAILED before any replay; no new reason code is introduced.
+        error.reason_code == state.BUDGET_EXHAUSTED
+        and bool(runs)
     )
     terminal = "INCONCLUSIVE" if incomplete else "FAILED"
     try:
