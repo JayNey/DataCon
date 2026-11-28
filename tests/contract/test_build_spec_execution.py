@@ -38,6 +38,12 @@ from datacon import build_provenance, contracts, evidence, execution, jsonutil
 from datacon.asan import ASanSignature
 from datacon.cases import load_registry
 from datacon.tools import sandbox as sandbox_mod
+from datacon.tools.model_outlet import (
+    DEFAULT_REDACTION_VERSION,
+    MODEL_AUDIT_FIELDS,
+    MODEL_AUDIT_SUMMARY_FIELDS,
+    verify_model_audit_document,
+)
 from datacon.tools.sandbox import (
     MAX_ARTIFACT_BYTES,
     MAX_PROVENANCE_FACE_BYTES,
@@ -5621,3 +5627,222 @@ def test_v2_runtime_budget_exhaustion_archives_partial_bundle(
     snapshot = json.loads(verified.file_data["budget/snapshot.json"])
     assert snapshot["remaining_seconds"] == 0
     assert snapshot["spent_seconds"] == max_total
+
+
+# ---------------------------------------------------------------------------
+# R2 writer: the v2 execution/campaign bundles archive the offline model audit
+# ---------------------------------------------------------------------------
+
+
+def test_v2_execution_bundle_archives_offline_model_audit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """R2 (delta §8): a completed v2 execution bundle archives the audit.
+
+    This fixed round was analyzed offline - no model call happened - so the
+    archive writes the honest offline audit: the closed 11-field
+    model/audit.json under the model_audit role and exactly its 6-field
+    summary in report.model_audit (never a missing object, never a null
+    provider). The writer-side self-check re-derives the binding offline.
+    """
+    run_root, _ = _configure_isolated_roots(tmp_path, monkeypatch)
+    spec = _cmake_spec()
+    face = _cmake_compile_commands_bytes(
+        flags=["-fsanitize=address", "-g", "-O1", "-I../include", "-D_GNU_SOURCE"]
+    )
+    job, plan, plan_digest, review = _setup_fixture_plan_and_job(
+        version=2, build_spec=spec
+    )
+    mem_state = _InMemoryState(job, plan, plan_digest, review)
+    mem_state.install(monkeypatch)
+    fake_sandbox = _FakeSandbox(
+        image_digest=plan["image_digest"],
+        build_recipe_digest=plan["build_recipe_digest"],
+        faces={"vulnerable": face, "fixed": face},
+        face_name="compile_commands.json",
+    )
+    result = execution.run_execution(
+        "dsn",
+        job["job_id"],
+        1,
+        case_root=str(FIXTURE_CASES),
+        run_root=run_root,
+        sandbox=fake_sandbox,
+    )
+    assert result.state == "REPRODUCED", result
+    verified = evidence.verify_bundle(result.evidence_path)
+    assert "model/audit.json" in verified.file_data
+    document = json.loads(verified.file_data["model/audit.json"])
+    # The closed 11-field schema of delta §8 - exactly, never more.
+    assert set(document) == set(MODEL_AUDIT_FIELDS)
+    assert document["provider"] == "offline"
+    assert document["outcome"] == "offline"
+    assert document["model_version"] is None
+    assert document["prompt_version"] is None
+    assert document["request_digest"] is None
+    assert document["response_digest"] is None
+    assert document["duration_seconds"] == 0
+    # The audit is anchored to the child job this bundle belongs to, and the
+    # offline stage is the hypothesis aggregator.
+    assert document["job_id"] == str(job["job_id"])
+    assert document["stage"] == "hypothesis_aggregator"
+    # Offline sends nothing: the digest is computed over the empty field set.
+    assert document["allowed_fields_digest"] == jsonutil.digest_json([])
+    assert document["redaction_version"] == DEFAULT_REDACTION_VERSION
+    report = json.loads(verified.file_data["report.json"])
+    assert report["bundle_kind"] == "execution"
+    assert set(report["model_audit"]) == set(MODEL_AUDIT_SUMMARY_FIELDS)
+    assert report["model_audit"] == {
+        field: document[field] for field in MODEL_AUDIT_SUMMARY_FIELDS
+    }
+    # Writer-side self-check: the archived document validates offline and
+    # binds to this bundle's job and report summary.
+    verify_model_audit_document(
+        document,
+        job_id=str(job["job_id"]),
+        report_model_audit=report["model_audit"],
+    )
+
+
+def test_v2_campaign_bundle_archives_offline_model_audit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """R2 (delta §8): the campaign writer path archives the same audit.
+
+    The campaign bundle is composed from the same two producers as the
+    execution bundle (``_build_report`` with ``bundle_kind="campaign"`` plus
+    ``_evidence_artifacts`` on a campaign context), so a campaign carries the
+    closed 11-field model/audit.json and the 6-field report.model_audit
+    exactly like a fixed round.
+    """
+    run_root, _ = _configure_isolated_roots(tmp_path, monkeypatch)
+    job, plan, plan_digest, review = _setup_fixture_plan_and_job(
+        version=2, build_spec=_cmake_spec(), round_no=None, job_kind="campaign"
+    )
+    mem_state = _InMemoryState(job, plan, plan_digest, review)
+    mem_state.install(monkeypatch)
+    context = execution._load_context(
+        "dsn",
+        job["job_id"],
+        1,
+        case_root=str(FIXTURE_CASES),
+        run_root=run_root,
+    )
+    report, _ = execution._build_report(
+        context,
+        verdict=None,
+        verdict_reason=None,
+        decision=None,
+        builds={},
+        runs=[],
+        probe=None,
+        evidence_refs=["report.json", "report.md"],
+        missing=[],
+        bundle_kind="campaign",
+    )
+    artifacts = execution._evidence_artifacts(
+        context,
+        run_root / "run",
+        builds={},
+        runs=[],
+        probe=None,
+        execution_metadata={},
+    )
+    assert report["bundle_kind"] == "campaign"
+    assert set(report["model_audit"]) == set(MODEL_AUDIT_SUMMARY_FIELDS)
+    role, data = artifacts["model/audit.json"]
+    assert role == "model_audit"
+    document = json.loads(data)
+    assert set(document) == set(MODEL_AUDIT_FIELDS)
+    assert document["provider"] == "offline"
+    assert document["outcome"] == "offline"
+    assert document["model_version"] is None
+    assert document["prompt_version"] is None
+    assert document["request_digest"] is None
+    assert document["response_digest"] is None
+    assert document["duration_seconds"] == 0
+    assert document["job_id"] == str(job["job_id"])
+    assert document["stage"] == "hypothesis_aggregator"
+    assert document["allowed_fields_digest"] == jsonutil.digest_json([])
+    assert document["redaction_version"] == DEFAULT_REDACTION_VERSION
+    assert report["model_audit"] == {
+        field: document[field] for field in MODEL_AUDIT_SUMMARY_FIELDS
+    }
+    verify_model_audit_document(
+        document,
+        job_id=str(job["job_id"]),
+        report_model_audit=report["model_audit"],
+    )
+
+
+def test_blocked_bundle_does_not_carry_model_audit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """R2 (delta §8): a v2 blocked bundle carries no model audit.
+
+    The model_audit role is required for execution and campaign bundles only;
+    a blocked bundle archives the block reason, not an analysis audit, so
+    neither model/audit.json nor the report summary may appear there.
+    """
+    run_root, _ = _configure_isolated_roots(tmp_path, monkeypatch)
+    spec = _cmake_spec()
+    face = _cmake_compile_commands_bytes(
+        flags=["-fsanitize=address", "-g", "-O1", "-I../include", "-D_GNU_SOURCE"]
+    )
+    parent_approval = "sha256:" + "e" * 64
+    job, plan, plan_digest, review = _setup_fixture_plan_and_job(
+        version=2, build_spec=spec
+    )
+    plan["parent_approval_digest"] = parent_approval
+    plan_digest = contracts.plan_digest(plan)
+    mem_state = _InMemoryState(job, plan, plan_digest, review)
+    mem_state.install(monkeypatch)
+    mem_state.review = {
+        "reviewer_id": "family-reviewer",
+        "decision": "approve",
+        "plan_digest": "sha256:" + "9" * 64,
+        "decided_at": review["decided_at"],
+    }
+    mem_state.admission = {
+        "admission_id": str(uuid4()),
+        "job_id": str(job["job_id"]),
+        "parent_job_id": str(job["parent_job_id"]),
+        "round_no": plan["round_no"],
+        "approval_kind": "policy",
+        "envelope_digest": plan["envelope_digest"],
+        "parent_approval_digest": parent_approval,
+        "seed_digest": plan["inputs"]["candidate"],
+        "predicate_version": "admission-v1",
+        "recomputable": True,
+        "supporting_bundle_digest": None,
+        "decided_at": "2099-01-01T00:00:00Z",
+    }
+    fake_sandbox = _FakeSandbox(
+        image_digest=plan["image_digest"],
+        build_recipe_digest=plan["build_recipe_digest"],
+        faces={"vulnerable": face, "fixed": face},
+        face_name="compile_commands.json",
+    )
+    original_build = fake_sandbox.build
+
+    def build(version: str, **kwargs: Any):
+        if version == "fixed":
+            raise SandboxPolicyError("seccomp profile mismatch")
+        return original_build(version, **kwargs)
+
+    fake_sandbox.build = build
+    result = execution.run_execution(
+        "dsn",
+        job["job_id"],
+        1,
+        case_root=str(FIXTURE_CASES),
+        run_root=run_root,
+        sandbox=fake_sandbox,
+    )
+    assert result.state == "BLOCKED", result
+    assert result.reason_code == "POLICY_DENIED"
+    verified = evidence.verify_bundle(result.evidence_path)
+    assert "model/audit.json" not in verified.file_data
+    report = json.loads(verified.file_data["report.json"])
+    assert report["bundle_kind"] == "blocked"
+    assert "model_audit" not in report

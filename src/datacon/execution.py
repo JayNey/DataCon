@@ -33,6 +33,12 @@ from datacon.cases import (
     load_registry,
 )
 from datacon.evidence import BundleError, verify_bundle, write_bundle
+from datacon.tools.model_outlet import (
+    build_model_audit,
+    model_audit_summary,
+    validate_model_audit_document,
+    verify_model_audit_document,
+)
 from datacon.tools.sandbox import (
     MAX_ARTIFACT_BYTES,
     MAX_LOG_BYTES,
@@ -3603,6 +3609,32 @@ def _replay_step(version: str, phase: str) -> str:
     return f"replay:{version}:{phase}"
 
 
+def _offline_model_audit(context: ExecutionContext) -> dict[str, Any]:
+    """Build the offline model audit record this bundle archives (delta §8).
+
+    The analysis that produced this bundle called no external model, so the
+    archive carries the honest offline record: the child job the bundle
+    belongs to, the hypothesis-aggregator stage, the provider pinned to
+    ``"offline"``, an empty sent-field set (nothing left the control plane)
+    and the offline outcome. The record is constructed and validated through
+    the model outlet's closed schema and re-verified against its own report
+    summary; any failure there is an internal fault no bundle may paper
+    over, so it propagates into the caller's existing failure path.
+    """
+    record = build_model_audit(
+        job_id=context.job_id_text,
+        stage="hypothesis_aggregator",
+        provider="offline",
+        allowed_fields=(),
+        outcome="offline",
+    )
+    document = validate_model_audit_document(record)
+    verify_model_audit_document(
+        document,
+        job_id=context.job_id_text,
+        report_model_audit=model_audit_summary(document),
+    )
+    return document
 
 
 def _policy_from_context(context: ExecutionContext) -> VerdictPolicy:
@@ -3727,6 +3759,15 @@ def _build_report(
                 _normalize_build_provenance_summary(build_provenance_summary)
                 if build_provenance_summary is not None
                 else _empty_build_provenance_summary(context, comparable=False)
+            )
+            # Delta §8: report.model_audit is the closed 6-field summary of
+            # the model/audit.json archived next to this report. Offline runs
+            # write it too (provider pinned to "offline", never omitted) - a
+            # report may not describe another provider than the audit in its
+            # own bundle. A blocked bundle carries neither the file nor the
+            # summary.
+            report["model_audit"] = model_audit_summary(
+                _offline_model_audit(context)
             )
     return report, render_report_markdown(report)
 
@@ -4155,6 +4196,16 @@ def _evidence_artifacts(
             "budget_snapshot",
             jsonutil.canonical_bytes(dict(context.budget_summary)) + b"\n",
         )
+        if not blocked:
+            # Delta §8: an execution or campaign bundle archives the offline
+            # model audit under the fixed model_audit role - this round
+            # called no model, and the archive says so. A blocked bundle
+            # carries no audit (the role is required for execution/campaign
+            # only), mirroring the admission gate above.
+            artifacts["model/audit.json"] = (
+                "model_audit",
+                jsonutil.canonical_bytes(_offline_model_audit(context)) + b"\n",
+            )
     if probe is not None:
         artifacts["metadata/probe.json"] = (
             "probe",
