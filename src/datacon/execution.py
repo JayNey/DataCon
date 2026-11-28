@@ -4112,18 +4112,26 @@ def _report_evidence_refs(
 ) -> list[str]:
     """Derive the report's document refs from the artifacts actually archived.
 
-    ``report.json``/``report.md`` are always written next to this report and
-    ``plan.json``/``review.json``/``admission.json`` are listed only when the
-    writer really archives them, so the refs can never name an approval
-    document the bundle does not carry: a policy round (admitted by its
-    admission, review cleared by ``_load_context``) lists ``admission.json``,
-    and a blocked policy round lists neither. Delta §8 requires every
-    ``evidence_refs`` entry to resolve inside the bundle. Other artifacts
-    (envelope, budget, metadata, ...) stay out: refs name the report, the
-    plan and the approval document only.
+    ``report.json``/``report.md`` are always written next to this report;
+    ``plan.json``/``review.json``/``admission.json`` and
+    ``metadata/execution.json`` are listed only when the writer really
+    archives them, so the refs can never name a document the bundle does not
+    carry: a policy round (admitted by its admission, review cleared by
+    ``_load_context``) lists ``admission.json``, and a blocked policy round
+    lists neither approval document. This keeps the refs resolvable in the
+    spirit of delta §8 - ``verify_bundle`` does not gate the report's
+    top-level ``evidence_refs``, so deriving them from the archived
+    artifacts is what keeps them truthful. Other artifacts (envelope,
+    budget, ...) stay out: refs name the report, the plan, the approval
+    document and the execution metadata only.
     """
     refs = ["report.json", "report.md"]
-    for name in ("plan.json", "review.json", "admission.json"):
+    for name in (
+        "plan.json",
+        "review.json",
+        "admission.json",
+        "metadata/execution.json",
+    ):
         if name in artifacts:
             refs.append(name)
     return refs
@@ -5502,9 +5510,6 @@ def run_execution(
         probe=probe_payload,
         execution_metadata=execution_metadata,
     )
-    evidence_refs = _report_evidence_refs(artifacts) + [
-        "metadata/execution.json"
-    ]
     report, report_markdown = _build_report(
         context,
         verdict=decision.verdict,
@@ -5513,7 +5518,7 @@ def run_execution(
         builds=builds,
         runs=runs,
         probe=probe_payload,
-        evidence_refs=evidence_refs,
+        evidence_refs=_report_evidence_refs(artifacts),
         missing=missing,
         build_provenance_summary=(
             provenance_outcome.report_summary
@@ -6054,38 +6059,41 @@ def _finish_blocked(
     # One decision, two consumers: the report's bundle_kind and the
     # writer's approval gate must not drift apart.
     bundle_kind = "blocked" if _is_v2_context(context) else "execution"
-    # Artifacts first, then the report: the refs must be derived from the
-    # documents this writer really archives (SF-2). On a blocked policy
-    # round the writer drops the admission below, so the refs must not
-    # claim any approval document either.
-    artifacts = _evidence_artifacts(
-        context,
-        build_root,
-        builds=builds or {},
-        runs=runs or [],
-        probe=probe,
-        execution_metadata={},
-        # The verifier rejects a blocked bundle that still carries
-        # the policy admission, so the writer drops it here (v1
-        # has no admission row and is unchanged).
-        blocked=bundle_kind == "blocked",
-    )
-    report, markdown = _build_report(
-        context,
-        verdict="BLOCKED",
-        verdict_reason=error.reason_code,
-        decision=None,
-        builds=builds or {},
-        runs=runs or [],
-        probe=probe,
-        evidence_refs=_report_evidence_refs(artifacts),
-        missing=[
-            "target execution blocked"
-        ],
-        error=f"{error.reason_code}: {error.message}",
-        bundle_kind=bundle_kind,
-    )
     try:
+        # The artifacts and the report are built inside the archive try
+        # (SF-1): _evidence_artifacts refuses a placeholder envelope or
+        # budget snapshot with BundleError, and that must converge to
+        # FAILED(EVIDENCE_WRITE_FAILED) like every other bundle error
+        # instead of escaping the finish path. The refs are derived from
+        # the documents this writer really archives, so a blocked policy
+        # round claims no approval document.
+        artifacts = _evidence_artifacts(
+            context,
+            build_root,
+            builds=builds or {},
+            runs=runs or [],
+            probe=probe,
+            execution_metadata={},
+            # The verifier rejects a blocked bundle that still carries
+            # the policy admission, so the writer drops it here (v1
+            # has no admission row and is unchanged).
+            blocked=bundle_kind == "blocked",
+        )
+        report, markdown = _build_report(
+            context,
+            verdict="BLOCKED",
+            verdict_reason=error.reason_code,
+            decision=None,
+            builds=builds or {},
+            runs=runs or [],
+            probe=probe,
+            evidence_refs=_report_evidence_refs(artifacts),
+            missing=[
+                "target execution blocked"
+            ],
+            error=f"{error.reason_code}: {error.message}",
+            bundle_kind=bundle_kind,
+        )
         digest, path, archive_error = _archive(
             dsn,
             context,
@@ -6196,38 +6204,42 @@ def _finish_failed(
         "TIMEOUT",
     )
     terminal = "INCONCLUSIVE" if incomplete else "FAILED"
-    # Artifacts first, then the report: the refs must be derived from the
-    # documents this writer really archives (SF-2), so a policy round lists
-    # its admission instead of a review.json it never carried.
-    artifacts = _evidence_artifacts(
-        context,
-        build_root,
-        builds=builds,
-        runs=runs,
-        probe=probe,
-        execution_metadata={
-            "job_id": context.job_id_text,
-            "plan_digest": context.plan_digest,
-            "generation": generation,
-            "probe": probe,
-            "builds": [dict(item) for item in builds.values()],
-            "replays": [dict(item) for item in runs],
-        },
-    )
-    report, markdown = _build_report(
-        context,
-        verdict=terminal,
-        verdict_reason=error.reason_code,
-        decision=None,
-        builds=builds,
-        runs=runs,
-        probe=probe,
-        evidence_refs=_report_evidence_refs(artifacts),
-        missing=["required replay evidence is incomplete"] if incomplete else ["execution failed"],
-        error=f"{error.reason_code}: {error.message}",
-        build_provenance_summary=build_provenance_summary,
-    )
     try:
+        # The artifacts and the report are built inside the archive try
+        # (SF-1): _evidence_artifacts refuses a placeholder envelope or
+        # budget snapshot with BundleError, and that must converge to
+        # FAILED(EVIDENCE_WRITE_FAILED) instead of escaping the finish
+        # path. The refs are derived from the documents this writer really
+        # archives, so a policy round lists its admission instead of a
+        # review.json it never carried.
+        artifacts = _evidence_artifacts(
+            context,
+            build_root,
+            builds=builds,
+            runs=runs,
+            probe=probe,
+            execution_metadata={
+                "job_id": context.job_id_text,
+                "plan_digest": context.plan_digest,
+                "generation": generation,
+                "probe": probe,
+                "builds": [dict(item) for item in builds.values()],
+                "replays": [dict(item) for item in runs],
+            },
+        )
+        report, markdown = _build_report(
+            context,
+            verdict=terminal,
+            verdict_reason=error.reason_code,
+            decision=None,
+            builds=builds,
+            runs=runs,
+            probe=probe,
+            evidence_refs=_report_evidence_refs(artifacts),
+            missing=["required replay evidence is incomplete"] if incomplete else ["execution failed"],
+            error=f"{error.reason_code}: {error.message}",
+            build_provenance_summary=build_provenance_summary,
+        )
         digest, path, archive_error = _archive(
             dsn,
             context,
