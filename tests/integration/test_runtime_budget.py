@@ -9,6 +9,7 @@ nothing sleeps.
 from __future__ import annotations
 
 from copy import deepcopy
+import json
 from types import SimpleNamespace
 from uuid import UUID, uuid4
 
@@ -982,3 +983,147 @@ def test_unchargeable_attempt_recovery_closes_out_without_spinning(
     execution._refresh_budget_summary_before_archive(isolated_database.dsn, b3_ctx)
     assert b3_ctx.budget_summary["spent_seconds"] == 45
     assert b3_ctx.budget_summary["remaining_seconds"] == 855
+
+
+def _insert_completed_campaign(database, family_id, tmp_path):
+    """Attach a COMPLETED archived campaign child with plan to a guided family."""
+    campaign_id = uuid4()
+    campaign_digest = _digest("e")
+    database.connection.execute(
+        "INSERT INTO jobs (job_id, request, state, stage, submitted_at, "
+        "job_contract_version, family_id, job_kind, parent_job_id, round_no, "
+        "generation, workflow_synced, evidence_status, evidence_path, evidence_digest) "
+        "VALUES (%s, %s, 'COMPLETED', 'done', clock_timestamp(), 2, %s, "
+        "'campaign', %s, NULL, 1, true, 'archived', %s, %s)",
+        (
+            campaign_id,
+            Jsonb(FAMILY_REQUEST),
+            family_id,
+            family_id,
+            str(tmp_path / f"campaign-{campaign_id}"),
+            campaign_digest,
+        ),
+    )
+    database.connection.execute(
+        "INSERT INTO plans (plan_id, job_id, plan_digest, plan, summary) "
+        "VALUES (%s, %s, %s, %s, %s)",
+        (uuid4(), campaign_id, FIRST_PLAN_DIGEST, Jsonb({}), Jsonb({})),
+    )
+    return campaign_id
+
+
+def test_crash_between_block_and_record_blocked_is_recovered(
+    isolated_database, tmp_path, monkeypatch
+):
+    """T12 B4: a crash between block_round_child and record_blocked is archived by worker scan."""
+    evidence_root = tmp_path / "evidence"
+    monkeypatch.setenv("DATACON_EVIDENCE_ROOT", str(evidence_root))
+    family_id, envelope = _seed_family(isolated_database, max_rounds=2)
+    _insert_completed_campaign(isolated_database, family_id, tmp_path)
+
+    outside = deepcopy(DEFAULT_EXPERIMENT)
+    outside["input_family"] = "format_string"
+
+    def crash(*args, **kwargs):
+        raise KeyboardInterrupt("died between block_round_child and record_blocked")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(execution, "record_blocked", crash)
+        with pytest.raises(KeyboardInterrupt):
+            _derive(
+                isolated_database,
+                family_id,
+                envelope,
+                round_no=1,
+                experiment=outside,
+            )
+
+    (round_id, _rno, rstate, rcode), = _round_jobs(isolated_database, family_id)
+    assert (rstate, rcode) == ("BLOCKED", "ENVELOPE_VIOLATION")
+    assert state.load_job(isolated_database.dsn, round_id)["evidence_status"] is None
+
+    # Direct converge_families before the blocked round is archived must wait,
+    # never prematurely terminate the family.
+    state.converge_families(isolated_database.dsn)
+    assert state.load_job(isolated_database.dsn, family_id)["state"] == "AGGREGATING", (
+        "family terminated before unarchived blocked round was recovered"
+    )
+
+    # Worker scan archives the blocked round idempotently, then applies family rules.
+    workflow.run_worker(isolated_database.dsn, once=True, execute=False)
+    recovered_round = state.load_job(isolated_database.dsn, round_id)
+    assert recovered_round["evidence_status"] == "archived", (
+        "worker scan did not archive the blocked round left unarchived after crash"
+    )
+    assert recovered_round["evidence_path"] and recovered_round["evidence_digest"]
+    # With max_rounds=2 and only round 1 policy-denied, family stays AGGREGATING.
+    assert state.load_job(isolated_database.dsn, family_id)["state"] == "AGGREGATING"
+
+    # With max_rounds=1, once the crashed blocked round is archived, no legal
+    # rounds remain so the family converges to BLOCKED(ENVELOPE_VIOLATION).
+    fam1, env1 = _seed_family(isolated_database, max_rounds=1)
+    _insert_completed_campaign(isolated_database, fam1, tmp_path)
+    with monkeypatch.context() as patch:
+        patch.setattr(execution, "record_blocked", crash)
+        with pytest.raises(KeyboardInterrupt):
+            _derive(isolated_database, fam1, env1, round_no=1, experiment=outside)
+    (r1_id, _, _, _), = _round_jobs(isolated_database, fam1)
+    out1 = workflow.run_worker(isolated_database.dsn, once=True, execute=False)
+    assert state.load_job(isolated_database.dsn, r1_id)["evidence_status"] == "archived"
+    fam1_row = state.load_job(isolated_database.dsn, fam1)
+    assert fam1_row["state"] == "BLOCKED"
+    assert fam1_row["reason_code"] == "ENVELOPE_VIOLATION"
+    assert out1["families_terminated"] == 1
+
+
+def test_policy_denied_round_keeps_family_aggregating_until_rounds_exhausted(
+    isolated_database, tmp_path, monkeypatch
+):
+    """T12 S1: a single policy-denied round does not immediately terminate the family."""
+    evidence_root = tmp_path / "evidence"
+    monkeypatch.setenv("DATACON_EVIDENCE_ROOT", str(evidence_root))
+    family_id, envelope = _seed_family(isolated_database, max_rounds=2)
+    _insert_completed_campaign(isolated_database, family_id, tmp_path)
+
+    outside = deepcopy(DEFAULT_EXPERIMENT)
+    outside["input_family"] = "format_string"
+    denied = _derive(
+        isolated_database,
+        family_id,
+        envelope,
+        round_no=1,
+        experiment=outside,
+    )
+    assert denied["admitted"] is False
+    assert denied["reason_code"] == "ENVELOPE_VIOLATION"
+
+    # Worker scan must leave family AGGREGATING so round 2 can still derive.
+    first_scan = workflow.run_worker(isolated_database.dsn, once=True, execute=False)
+    family_after_r1 = state.load_job(isolated_database.dsn, family_id)
+    assert family_after_r1["state"] == "AGGREGATING", (
+        "single policy-denied round immediately terminated the family"
+    )
+    assert first_scan["families_converged"] == 0
+    assert first_scan["families_terminated"] == 0
+
+    # Round 2 derives and is admitted under the same family.
+    r2 = _derive(isolated_database, family_id, envelope, round_no=2)
+    assert r2["derived"] is True and r2["admitted"] is True
+    r2_id = UUID(r2["job_id"])
+    isolated_database.connection.execute(
+        "UPDATE jobs SET state = 'INCONCLUSIVE', verdict = 'INCONCLUSIVE', "
+        "reason_code = 'EVIDENCE_INCOMPLETE', evidence_status = 'archived', "
+        "evidence_path = %s, evidence_digest = %s WHERE job_id = %s",
+        (str(tmp_path / "round-2-bundle"), _digest("9"), r2_id),
+    )
+
+    # Now max_rounds=2 is reached with round 2 executed: family archives
+    # COMPLETED and family.json indexes both the blocked round 1 and round 2.
+    final_scan = workflow.run_worker(isolated_database.dsn, once=True, execute=False)
+    assert final_scan["families_converged"] == 1
+    assert state.load_job(isolated_database.dsn, family_id)["state"] == "COMPLETED"
+    doc = json.loads((evidence_root / str(family_id) / "family.json").read_bytes())
+    assert [(entry["round_no"], entry["state"]) for entry in doc["rounds"]] == [
+        (1, "BLOCKED"),
+        (2, "INCONCLUSIVE"),
+    ]

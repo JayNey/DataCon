@@ -960,7 +960,11 @@ def create_round_child(
             "SELECT job_id FROM jobs WHERE parent_job_id = %s "
             "AND job_kind IN ('campaign', 'round') "
             "AND (state = ANY(%s) OR (state = 'BLOCKED' "
-            "AND workflow_synced = false)) LIMIT 1",
+            "AND workflow_synced = false) "
+            "OR (job_kind = 'round' AND state = 'BLOCKED' "
+            "AND evidence_status IS NULL "
+            "AND EXISTS (SELECT 1 FROM plans p WHERE p.job_id = jobs.job_id))) "
+            "LIMIT 1",
             (family_id, list(_ROUND_CHILD_ACTIVE_STATES)),
         ).fetchone()
         if active is not None:
@@ -1048,7 +1052,11 @@ def check_round_derivation(
             "SELECT 1 FROM jobs WHERE parent_job_id = %s "
             "AND job_kind IN ('campaign', 'round') "
             "AND (state = ANY(%s) OR (state = 'BLOCKED' "
-            "AND workflow_synced = false)) LIMIT 1",
+            "AND workflow_synced = false) "
+            "OR (job_kind = 'round' AND state = 'BLOCKED' "
+            "AND evidence_status IS NULL "
+            "AND EXISTS (SELECT 1 FROM plans p WHERE p.job_id = jobs.job_id))) "
+            "LIMIT 1",
             (family_id, list(_ROUND_CHILD_ACTIVE_STATES)),
         ).fetchone()
         if active is not None:
@@ -1101,6 +1109,29 @@ def unadmitted_round_children(
             "AND NOT EXISTS (SELECT 1 FROM admissions a WHERE a.job_id = j.job_id) "
             "ORDER BY j.updated_at",
             (grace_seconds,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def unarchived_blocked_round_children(dsn: str) -> list[dict[str, Any]]:
+    """List BLOCKED v2 rounds with a frozen plan whose blocked bundle was not archived (B4).
+
+    A crash or I/O error between ``block_round_child`` and
+    ``execution.record_blocked`` leaves the round ``BLOCKED`` with
+    ``evidence_status IS NULL``. Worker recovery archives these idempotently
+    before family convergence runs.
+    """
+    with _connect(dsn) as connection:
+        rows = connection.execute(
+            "SELECT j.job_id, j.family_id, j.round_no, j.reason_code, "
+            "j.last_error, j.generation "
+            "FROM jobs j "
+            "WHERE j.job_contract_version = 2 AND j.job_kind = 'round' "
+            "AND j.state = 'BLOCKED' AND j.evidence_status IS NULL "
+            "AND (j.lease_expires_at IS NULL "
+            "OR j.lease_expires_at <= clock_timestamp()) "
+            "AND EXISTS (SELECT 1 FROM plans p WHERE p.job_id = j.job_id) "
+            "ORDER BY j.updated_at, j.job_id"
         ).fetchall()
     return [dict(row) for row in rows]
 
@@ -1529,7 +1560,7 @@ def record_blocked_evidence(
     """
     with _connect(dsn) as connection:
         job = connection.execute(
-            "SELECT state, reason_code, generation FROM jobs "
+            "SELECT state, reason_code, generation, evidence_status FROM jobs "
             "WHERE job_id = %s FOR UPDATE",
             (job_id,),
         ).fetchone()
@@ -1537,7 +1568,11 @@ def record_blocked_evidence(
             return False
         if generation is None:
             generation = job["generation"]
-        if job["generation"] != generation or job["state"] != "BLOCKED":
+        if (
+            job["generation"] != generation
+            or job["state"] != "BLOCKED"
+            or job["evidence_status"] == "archived"
+        ):
             return False
         archived = bool(evidence_digest and evidence_path)
         if evidence_error is None and not archived:
@@ -6400,6 +6435,23 @@ def _family_transition_decision_at(
     ).fetchone()
 
 
+_POLICY_DENIED_ROUND_REASONS = frozenset(
+    {"ENVELOPE_VIOLATION", "ADMISSION_DENIED", "HARNESS_REJECTED"}
+)
+
+
+def _is_policy_denied_round(
+    child: Mapping[str, Any], admitted_job_ids: set[str]
+) -> bool:
+    """Return True if a round child was rejected at policy admission before running."""
+    return (
+        child["job_kind"] == "round"
+        and child["state"] == "BLOCKED"
+        and child["reason_code"] in _POLICY_DENIED_ROUND_REASONS
+        and str(child["job_id"]) not in admitted_job_ids
+    )
+
+
 def _family_archive_disposition(
     connection,
     family_id: UUID,
@@ -6410,14 +6462,14 @@ def _family_archive_disposition(
     """Decide whether a family may archive, must wait, or ends without index.
 
     ``archive`` requires a real conclusion: the last round formed a verdict,
-    the effective round ceiling was reached, or the budget is exhausted.
-    ``terminal`` fires when a child can never enter ``family.json`` (failed or
-    plan-less blocked evidence) or when the last round is itself BLOCKED/FAILED
-    without a conclusion. ``wait`` keeps the family AGGREGATING. Before
-    waiting, the transition decision recorded for the current campaign at the
-    current point (``after_round_no == rounds_used``) is consulted: only a
-    matching ``no_next_round`` archives the family. ``next_round``, a decision
-    at another point, or no decision keeps it waiting.
+    the effective round ceiling was reached, the total budget is exhausted, or
+    a current-point ``no_next_round`` decision was recorded (with at least one
+    non-policy-denied round when rounds exist). ``terminal`` fires when a child
+    can never enter ``family.json`` (failed or plan-less blocked evidence),
+    when the last round is FAILED or a non-policy BLOCKED terminal, or when
+    every round was policy-denied and no further legal round capacity remains
+    (§10: ``可继续其他合法轮次或终态 BLOCKED``). ``wait`` keeps the family
+    AGGREGATING so further legal rounds may be derived.
     """
     rounds = sorted(
         (
@@ -6429,6 +6481,7 @@ def _family_archive_disposition(
     )
     rounds_used = max((child["round_no"] for child in rounds), default=0)
     last = rounds[-1] if rounds else None
+    admitted_job_ids = _family_admitted_job_ids(connection, family_id)
 
     unindexable = next(
         (
@@ -6441,7 +6494,14 @@ def _family_archive_disposition(
     if unindexable is not None:
         family_state, reason = _family_terminal_state(unindexable)
         return ("terminal", family_state, reason)
-    if last is not None and last["state"] in ("BLOCKED", "FAILED"):
+    last_policy_denied = last is not None and _is_policy_denied_round(
+        last, admitted_job_ids
+    )
+    if (
+        last is not None
+        and last["state"] in ("BLOCKED", "FAILED")
+        and not last_policy_denied
+    ):
         family_state, reason = _family_terminal_state(last)
         return ("terminal", family_state, reason)
 
@@ -6451,16 +6511,11 @@ def _family_archive_disposition(
         "NOT_REPRODUCED",
     ):
         return ("archive",)
-    if rounds_used >= max_rounds:
-        return ("archive",)
-    if (
-        ledger is not None
-        and ledger["remaining_total_seconds"] < 1
-    ):
-        return ("archive",)
+
     campaigns = [
         child for child in children if child["job_kind"] == "campaign"
     ]
+    no_next_round = False
     if len(campaigns) == 1:
         decision = _family_transition_decision_at(
             connection, family_id, campaigns[0]["job_id"], rounds_used
@@ -6469,7 +6524,25 @@ def _family_archive_disposition(
             decision is not None
             and decision["detail"].get("decision") == "no_next_round"
         ):
-            return ("archive",)
+            no_next_round = True
+
+    exhausted = (
+        rounds_used >= max_rounds
+        or (ledger is not None and ledger["remaining_total_seconds"] < 1)
+        or no_next_round
+    )
+    if exhausted:
+        if (
+            last_policy_denied
+            and last is not None
+            and all(
+                _is_policy_denied_round(round_child, admitted_job_ids)
+                for round_child in rounds
+            )
+        ):
+            family_state, reason = _family_terminal_state(last)
+            return ("terminal", family_state, reason)
+        return ("archive",)
     return ("wait",)
 
 
@@ -6787,6 +6860,15 @@ def archive_family(
                         and not child["workflow_synced"]
                     ):
                         raise StateError("family has non-terminal children")
+                    if (
+                        child["job_kind"] == "round"
+                        and child["state"] == "BLOCKED"
+                        and child["evidence_status"] is None
+                        and child["plan_digest"] is not None
+                    ):
+                        raise FamilyNotTerminated(
+                            "family has a blocked round awaiting archive"
+                        )
                 if _family_has_uncharged_attempts(connection, family_id):
                     raise FamilyNotTerminated(
                         "family still has uncharged budget attempts pending "
@@ -7034,7 +7116,10 @@ def converge_families_detailed(
                 "SELECT 1 FROM jobs c WHERE c.parent_job_id = f.job_id AND ("
                 "c.state NOT IN ('COMPLETED', 'REPRODUCED', 'NOT_REPRODUCED', "
                 "'INCONCLUSIVE', 'BLOCKED', 'FAILED') "
-                "OR (c.state = 'BLOCKED' AND c.workflow_synced = false))) "
+                "OR (c.state = 'BLOCKED' AND c.workflow_synced = false) "
+                "OR (c.job_kind = 'round' AND c.state = 'BLOCKED' "
+                "AND c.evidence_status IS NULL "
+                "AND EXISTS (SELECT 1 FROM plans p WHERE p.job_id = c.job_id)))) "
                 "AND NOT EXISTS ("
                 "SELECT 1 FROM attempts a JOIN jobs c ON c.job_id = a.job_id "
                 "WHERE c.parent_job_id = f.job_id "
@@ -7190,7 +7275,7 @@ def _check_transition_point(
     and it ended ``INCONCLUSIVE`` (no conclusion); no later round exists.
     """
     rounds = connection.execute(
-        "SELECT round_no, state FROM jobs "
+        "SELECT job_id, job_kind, round_no, state, reason_code FROM jobs "
         "WHERE parent_job_id = %s AND job_kind = 'round' "
         "ORDER BY round_no DESC NULLS FIRST",
         (family_id,),
@@ -7206,10 +7291,13 @@ def _check_transition_point(
         raise StateError(
             f"after_round_no={after_round_no} is not the family's latest round"
         )
-    if rounds[0]["state"] != "INCONCLUSIVE":
+    admitted_job_ids = _family_admitted_job_ids(connection, family_id)
+    if rounds[0]["state"] != "INCONCLUSIVE" and not _is_policy_denied_round(
+        rounds[0], admitted_job_ids
+    ):
         raise StateError(
-            f"round {after_round_no} must be INCONCLUSIVE before the family "
-            "decides"
+            f"round {after_round_no} must be INCONCLUSIVE or policy-denied "
+            "before the family decides"
         )
 
 

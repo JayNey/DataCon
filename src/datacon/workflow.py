@@ -903,6 +903,39 @@ def recover_unadmitted_rounds(
     return handled
 
 
+def recover_unarchived_blocked_rounds(
+    dsn: str,
+    *,
+    run_root: str | None = None,
+) -> int:
+    """Worker scan (B4): idempotently archive BLOCKED rounds left unarchived after a crash.
+
+    A crash or I/O error between ``block_round_child`` and
+    ``execution.record_blocked`` leaves a derived round ``BLOCKED`` with
+    ``evidence_status IS NULL``. Running this scan before ``converge_families``
+    guarantees every blocked round gets its archived blocked bundle before the
+    family is evaluated for convergence. Transient database errors propagate
+    consistently with the other worker sweeps.
+    """
+    archived = 0
+    for row in state_store.unarchived_blocked_round_children(dsn):
+        reason_code = row.get("reason_code") or "ADMISSION_DENIED"
+        message = (
+            row.get("last_error")
+            or f"round {row.get('round_no')} blocked: {reason_code}"
+        )
+        if execution.record_blocked(
+            dsn,
+            row["job_id"],
+            reason_code=reason_code,
+            message=message,
+            generation=row["generation"],
+            run_root=run_root,
+        ):
+            archived += 1
+    return archived
+
+
 def _worker_id() -> str:
     return os.getenv("DATACON_WORKER_ID") or f"{socket.gethostname()}:{os.getpid()}"
 
@@ -934,8 +967,11 @@ def run_worker(
             # never freezes a stale pre-recovery budget or prematurely seals.
             recovered_charges = state_store.recover_uncharged_attempts(dsn)
             recovered_rounds = recover_unadmitted_rounds(dsn, run_root=run_root)
+            recovered_blocked_rounds = recover_unarchived_blocked_rounds(
+                dsn, run_root=run_root
+            )
             # T12/D43 crash-recovery sweep: converge families whose children
-            # are terminal and whose charges are accounted for.
+            # are terminal, archived, and whose charges are accounted for.
             family_sweep = state_store.converge_families_detailed(dsn)
             claimed = state_store.claim_next(
                 dsn, worker, lease_seconds=lease_seconds, execute=execute
@@ -948,6 +984,7 @@ def run_worker(
                         "families_converged": len(family_sweep.converged),
                         "families_terminated": len(family_sweep.terminated),
                         "rounds_recovered": recovered_rounds,
+                        "blocked_rounds_archived": recovered_blocked_rounds,
                         "charges_recovered": recovered_charges,
                     }
                 time.sleep(poll_seconds)
@@ -964,6 +1001,7 @@ def run_worker(
             result["families_converged"] = len(family_sweep.converged)
             result["families_terminated"] = len(family_sweep.terminated)
             result["rounds_recovered"] = recovered_rounds
+            result["blocked_rounds_archived"] = recovered_blocked_rounds
             result["charges_recovered"] = recovered_charges
             if once:
                 return result
