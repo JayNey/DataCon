@@ -562,16 +562,18 @@ def _derive(database, family_id, envelope, *, round_no, experiment=None):
 def test_round_derivation_is_gated_before_creating_a_child(
     isolated_database, step_clock
 ):
-    # Fuzz sub-budget drained by a finished campaign-like child: no new round.
+    # Fuzz sub-budget drained by a finished step while total budget remains:
+    # a validation round only runs general steps, so it MUST still derive and
+    # be admitted.
     family_id, envelope = _seed_family(
-        isolated_database, ledger_total=40, ledger_fuzz=1
+        isolated_database, ledger_total=900, ledger_fuzz=300
     )
     context = _running_round(isolated_database, family_id, envelope, round_no=1)
     _step(
         isolated_database,
         context,
         "fuzz:search",
-        RecordingContainer(context, step_clock, runtime=0.0),
+        RecordingContainer(context, step_clock, runtime=300.0),
         charge_kind="fuzz",
     )
     isolated_database.connection.execute(
@@ -580,18 +582,14 @@ def test_round_derivation_is_gated_before_creating_a_child(
         "lease_expires_at = NULL WHERE job_id = %s",
         (context.job_id,),
     )
-    before = _round_jobs(isolated_database, family_id)
-    refused = _derive(isolated_database, family_id, envelope, round_no=2)
-    assert refused["derived"] is False
-    assert refused["reason_code"] == "BUDGET_EXHAUSTED"
-    assert _round_jobs(isolated_database, family_id) == before, (
-        "a round child was created although the fuzz sub-budget is exhausted"
+    ledger = _ledger(isolated_database, family_id)
+    assert (ledger["remaining_total_seconds"], ledger["remaining_fuzz_seconds"]) == (600, 0)
+    allowed = _derive(isolated_database, family_id, envelope, round_no=2)
+    assert allowed["derived"] is True and allowed["admitted"] is True, (
+        "round derivation was refused although total budget remained and only "
+        "the fuzz sub-budget was exhausted"
     )
-    assert _count(
-        isolated_database,
-        "SELECT count(*) FROM audit_events WHERE event_type LIKE 'round_admi%%'",
-        (),
-    ) == 0
+    assert len(_round_jobs(isolated_database, family_id)) == 2
 
     # round_no beyond max_rounds: refused before any child exists.
     family_id, envelope = _seed_family(isolated_database, max_rounds=1)

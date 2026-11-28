@@ -1545,15 +1545,14 @@ def test_archive_family_retries_after_envelope_is_approved(
     assert _family_row(isolated_database, family_id)[5] == _digest(path)
 
 
-def test_guided_family_converges_when_fuzz_sub_budget_is_exhausted(
+def test_guided_family_waits_for_validation_when_only_fuzz_budget_is_exhausted(
     isolated_database, tmp_path, monkeypatch
 ):
-    """改9: a guided family whose fuzz sub-budget fell below one second archives.
+    """改9: a guided family whose fuzz sub-budget is exhausted stays AGGREGATING.
 
-    The runtime refuses to derive another round when either budget is below
-    one second (DefaultIterationGate / derive_and_admit_round), so a family
-    that still has total budget but no fuzz budget must not wait forever. A
-    fixed family (``max_fuzz_seconds=0``) is unaffected.
+    Validation rounds only execute general steps (build/replay), so exhausting
+    the fuzz sub-budget during campaign must not prematurely archive the family
+    while total budget and rounds remain.
     """
     evidence_root = tmp_path / "evidence"
     monkeypatch.setenv("DATACON_EVIDENCE_ROOT", str(evidence_root))
@@ -1577,8 +1576,7 @@ def test_guided_family_converges_when_fuzz_sub_budget_is_exhausted(
         fuzz=300,
     )
 
-    # A fixed family before its first round finishes: max_fuzz_seconds=0 and
-    # remaining_fuzz_seconds=0 must not be read as an exhausted fuzz budget.
+    # A fixed family before its first round finishes is unaffected too.
     fixed_family = _insert_family(isolated_database, request=_fixed_request())
     _insert_approval(isolated_database, fixed_family, "sha256:" + "5f" * 32)
     _insert_ledger(
@@ -1592,9 +1590,9 @@ def test_guided_family_converges_when_fuzz_sub_budget_is_exhausted(
 
     result = workflow.run_worker(isolated_database.dsn, once=True, execute=False)
 
-    assert _family_row(isolated_database, family_id)[0] == "COMPLETED", (
-        "guided family with an exhausted fuzz sub-budget stayed AGGREGATING"
+    assert _family_row(isolated_database, family_id)[0] == "AGGREGATING", (
+        "guided family archived before validation when only fuzz sub-budget was exhausted"
     )
-    assert result["families_converged"] == 1
-    assert (evidence_root / str(family_id) / "family.json").is_file()
+    assert result["families_converged"] == 0
+    assert not (evidence_root / str(family_id) / "family.json").exists()
     assert _family_row(isolated_database, fixed_family)[0] == "AGGREGATING"

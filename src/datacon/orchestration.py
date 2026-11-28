@@ -938,7 +938,7 @@ class DefaultIterationGate:
         remaining_fuzz_seconds: float | None = None,
         remaining_seeds: int | None = None,
     ) -> IterationDecision:
-        del family_id
+        del family_id, remaining_fuzz_seconds
         remaining_rounds = max(0, max_rounds - completed_round_no)
         if last_verdict in ("REPRODUCED", "NOT_REPRODUCED"):
             return IterationDecision(
@@ -961,12 +961,10 @@ class DefaultIterationGate:
                 remaining_rounds=0,
                 remaining_budget_seconds=remaining_budget_seconds,
             )
-        # The total budget and the fuzz sub-budget apply together with
-        # max_rounds. The boundary matches ``state.budget_gate``: a step needs
-        # at least one whole second, so a fractional remainder is exhausted.
-        if not _has_budget_capacity(remaining_budget_seconds) or not (
-            _has_budget_capacity(remaining_fuzz_seconds)
-        ):
+        # Round derivation checks max_rounds and the total budget only
+        # (ADR-004 #7): guided validation rounds run general steps, never fuzz,
+        # so an exhausted fuzz sub-budget must not block validation.
+        if not _has_budget_capacity(remaining_budget_seconds):
             return IterationDecision(
                 should_continue=False,
                 reason_code="BUDGET_EXHAUSTED",
@@ -2791,7 +2789,6 @@ class OrchestrationRunner:
             elif (
                 max_rounds == 0
                 or not _has_budget_capacity(_remaining_total())
-                or not _has_budget_capacity(_remaining_fuzz())
             ):
                 stop_reason_code = "BUDGET_EXHAUSTED"
             else:

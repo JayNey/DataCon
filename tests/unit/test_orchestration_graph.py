@@ -2483,11 +2483,12 @@ def test_intel_archive_audit_backward_compatibility_and_exports():
 
 
 def test_verify_iteration_requires_round_and_budget_capacity():
-    """T12 / edge #26: no new round without both round and budget capacity.
+    """T12 / edge #26: no new round without round and total budget capacity.
 
-    ``DefaultIterationGate`` must apply ``max_rounds``, the total budget and
-    the fuzz sub-budget together, with the same ``>= 1`` second boundary as
-    ``state.budget_gate``; exhaustion returns ``BUDGET_EXHAUSTED``.
+    ``DefaultIterationGate`` applies ``max_rounds`` and the total budget
+    together, with the ``>= 1`` second boundary of ``state.budget_gate``.
+    Validation rounds run only general steps, so an exhausted fuzz sub-budget
+    must NOT stop validation while total budget and seeds remain.
     """
     gate = orchestration.DefaultIterationGate()
 
@@ -2513,26 +2514,31 @@ def test_verify_iteration_requires_round_and_budget_capacity():
     assert at_max.reason_code == "BUDGET_EXHAUSTED"
     assert at_max.remaining_rounds == 0
 
-    # A fractional remainder below one second is exhausted, not "> 0".
+    # Total budget below one second is exhausted, not "> 0".
     for remaining in (0.0, 0.5, 0.999):
         total_short = check(remaining_budget_seconds=remaining)
         assert total_short.should_continue is False, (
             f"new round created with only {remaining}s total budget"
         )
         assert total_short.reason_code == "BUDGET_EXHAUSTED"
-        fuzz_short = check(remaining_fuzz_seconds=remaining)
-        assert fuzz_short.should_continue is False, (
-            f"new round created with only {remaining}s fuzz budget"
-        )
-        assert fuzz_short.reason_code == "BUDGET_EXHAUSTED"
 
-    # Exactly one second on both budgets is enough.
-    boundary = check(remaining_budget_seconds=1.0, remaining_fuzz_seconds=1.0)
+    # Exhausted fuzz sub-budget with remaining total budget and seeds still
+    # allows validation rounds (validation runs general steps only).
+    for remaining_fuzz in (0.0, 0.5, 0.999):
+        fuzz_short = check(remaining_fuzz_seconds=remaining_fuzz)
+        assert fuzz_short.should_continue is True, (
+            f"validation round refused with {remaining_fuzz}s fuzz budget "
+            "although total budget remains"
+        )
+        assert fuzz_short.reason_code is None
+
+    # Exactly one second of total budget is enough even when fuzz is 0.
+    boundary = check(remaining_budget_seconds=1.0, remaining_fuzz_seconds=0.0)
     assert boundary.should_continue is True
 
-    # max_rounds and budget apply together: the last allowed round still needs
-    # budget, and plenty of budget never extends past max_rounds.
-    last_round_no_budget = check(completed_round_no=2, remaining_fuzz_seconds=0.0)
+    # max_rounds and total budget apply together: the last allowed round still
+    # needs total budget, and plenty of budget never extends past max_rounds.
+    last_round_no_budget = check(completed_round_no=2, remaining_budget_seconds=0.0)
     assert last_round_no_budget.should_continue is False
     assert last_round_no_budget.reason_code == "BUDGET_EXHAUSTED"
     beyond = check(
@@ -2555,8 +2561,8 @@ def test_verify_iteration_requires_round_and_budget_capacity():
         assert concluded.should_continue is False
         assert concluded.reason_code is None
 
-    # End to end: a fuzz sub-budget below one second after the campaign stops
-    # the family before any round child is created (edge #23 capacity).
+    # End to end: campaign exhausting its fuzz sub-budget must still derive
+    # validation rounds while total budget and candidate seeds remain.
     clock = FakeClock()
     runner = workflow.OrchestrationRunner(
         sandbox=FakeSandbox(clock=clock, replay_faults=("timeout",)),
@@ -2571,7 +2577,27 @@ def test_verify_iteration_requires_round_and_budget_capacity():
         max_total_seconds=600.0,
         max_fuzz_seconds=1.5,
     )
-    assert family_run.round_children == (), (
-        "new round created after the fuzz sub-budget fell below one second"
+    assert len(family_run.round_children) > 0, (
+        "no validation round derived after campaign exhausted only fuzz sub-budget"
     )
-    assert family_run.stop_reason_code == "BUDGET_EXHAUSTED"
+
+    # End to end: when total budget falls below one second after campaign,
+    # no validation round is derived and the family stops with BUDGET_EXHAUSTED.
+    starved_clock = FakeClock()
+    starved_runner = workflow.OrchestrationRunner(
+        sandbox=FakeSandbox(clock=starved_clock, replay_faults=("timeout",)),
+        clock=starved_clock,
+        review_gate=FakeReviewGate(clock=starved_clock, decision="approve"),
+        envelope_policy=FakeEnvelopePolicy(clock=starved_clock, default_admit=True),
+    )
+    starved_run = starved_runner.run_family_guided(
+        family_id=str(uuid4()),
+        candidate_seeds=[b"seed-1", b"seed-2"],
+        max_rounds=2,
+        max_total_seconds=1.5,
+        max_fuzz_seconds=1.5,
+    )
+    assert starved_run.round_children == (), (
+        "new round created after total budget fell below one second"
+    )
+    assert starved_run.stop_reason_code == "BUDGET_EXHAUSTED"

@@ -1021,10 +1021,10 @@ def check_round_derivation(
     Order: the family's children run serially (a non-terminal child refuses
     with ``sub_reason=CHILD_NOT_TERMINAL`` and no reason code: the family
     simply is not ready); ``round_no`` beyond the effective ``max_rounds`` and
-    a total balance below one second refuse with ``BUDGET_EXHAUSTED``; a
-    guided family (``max_fuzz_seconds > 0``) also needs one second of fuzz
-    sub-budget. A refused transition creates nothing, and the family archives
-    through ``converge_families``.
+    a total balance below one second refuse with ``BUDGET_EXHAUSTED``. Guided
+    validation rounds only run general steps, so the fuzz sub-budget is gated
+    only on fuzz steps, not on round derivation. A refused transition creates
+    nothing, and the family archives through ``converge_families``.
     """
     try:
         family_id = uuid.UUID(str(family_id))
@@ -1069,7 +1069,9 @@ def check_round_derivation(
         return BudgetDecision(
             False, BUDGET_EXHAUSTED, 0, sub_reason="ROUND_BEYOND_MAX_ROUNDS"
         )
-    gate = budget_gate(ledger, fuzz=ledger["max_fuzz_seconds"] > 0)
+    # Guided validation rounds run only general steps (build/replay); the fuzz
+    # sub-budget applies only to fuzz steps via _gate_step_budget (ADR-004 #7).
+    gate = budget_gate(ledger, fuzz=False)
     if not gate.allowed:
         return BudgetDecision(
             False, BUDGET_EXHAUSTED, 0, sub_reason=BUDGET_EXHAUSTED
@@ -6336,18 +6338,8 @@ def _family_archive_disposition(
         return ("archive",)
     if (
         ledger is not None
-        and ledger["remaining_total_seconds"] <= 0
+        and ledger["remaining_total_seconds"] < 1
     ):
-        return ("archive",)
-    if (
-        ledger is not None
-        and ledger["max_fuzz_seconds"] > 0
-        and ledger["remaining_fuzz_seconds"] < 1
-    ):
-        # 改9: the runtime derives no further round once either budget is
-        # below one second, so a guided family whose fuzz sub-budget is gone
-        # has concluded. A fixed family (max_fuzz_seconds=0) never fuzzes and
-        # is not affected.
         return ("archive",)
     campaigns = [
         child for child in children if child["job_kind"] == "campaign"
