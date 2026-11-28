@@ -114,6 +114,7 @@ def guided_campaign_plan(
     *,
     envelope_harness_digest: str | None = None,
     max_fuzz_seconds: int = 120,
+    build_spec: dict[str, Any] | None = None,
 ):
     """A guided campaign plan, its approved envelope and family review.
 
@@ -122,7 +123,11 @@ def guided_campaign_plan(
     """
     job, plan, _plan_digest, review = _setup_fixture_plan_and_job(
         version=2,
-        build_spec=_cmake_spec(outputs=list(CAMPAIGN_OUTPUTS)),
+        build_spec=(
+            deepcopy(build_spec)
+            if build_spec is not None
+            else _cmake_spec(outputs=list(CAMPAIGN_OUTPUTS))
+        ),
         round_no=None,
         job_kind="campaign",
     )

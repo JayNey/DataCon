@@ -9,8 +9,10 @@ read-only. Coordinate registered in docs/spec/v0.2/test-plan-delta.md.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 import shutil
+import sys
 import subprocess
 from uuid import uuid4
 
@@ -28,6 +30,10 @@ from datacon.tools.sandbox import (
 )
 
 pytestmark = [pytest.mark.postgres, pytest.mark.docker]
+
+_CONTRACT_DIR = str(Path(__file__).resolve().parents[1] / "contract")
+if _CONTRACT_DIR not in sys.path:
+    sys.path.append(_CONTRACT_DIR)
 
 FIXTURE_CASES = Path(__file__).resolve().parents[1] / "fixtures" / "cases"
 IMAGE = (
@@ -206,3 +212,83 @@ def test_fuzz_container_profile_and_corpus_are_isolated(sandbox, tmp_path, monke
     assert b"WROTE" not in stdout and b"CHANGED" not in stdout, "fuzz corpus was writable"
     assert b"ROOTFS" not in stdout
     assert {path.name: path.read_bytes() for path in corpus.iterdir()} == before
+
+
+# ---------------------------------------------------------------------------
+# 改9 增补 (T12 B+C): the whole guided chain with real containers.
+# ---------------------------------------------------------------------------
+
+from datacon import build_provenance, evidence, state, workflow  # noqa: E402
+
+# The reviewed shell face of the fixture build: the runner's only log line.
+# Both versions produce the same normalized face (a pre-reviewed baseline).
+FIXTURE_SHELL_FACE = b"datacon-build-runner: warning: chmod -R u+w /work failed\n"
+
+
+def _reviewed_campaign_spec() -> dict:
+    spec = _campaign_spec()
+    spec["shell_face_digest"] = build_provenance.shell_face_digest(
+        FIXTURE_SHELL_FACE, repo_root="/work"
+    )
+    return spec
+
+
+def test_real_campaign_finds_a_crash_and_the_validation_round_reproduces(
+    isolated_database, tmp_path, monkeypatch
+):
+    """Real libFuzzer campaign → crash seed → reuse validation → REPRODUCED."""
+    if not _docker_ready():
+        pytest.fail("the pinned toolchain image is required for this docker coordinate")
+    from test_build_spec_execution import _configure_isolated_roots
+    from test_family_archive_recovery import _seed_ready_campaign
+
+    database = isolated_database
+    run_root, _evidence_root = _configure_isolated_roots(tmp_path, monkeypatch)
+    family_id, campaign_id, _plan, _approval, _envelope = _seed_ready_campaign(
+        database, max_fuzz_seconds=45, build_spec=_reviewed_campaign_spec()
+    )
+
+    def _worker():
+        return workflow.run_worker(
+            database.dsn,
+            once=True,
+            case_root=str(FIXTURE_CASES),
+            run_root=str(run_root),
+        )
+
+    first = _worker()
+    assert first["job_id"] == str(campaign_id)
+    campaign = state.load_job(database.dsn, campaign_id)
+    assert campaign["state"] == "COMPLETED", campaign
+    campaign_bundle = evidence.verify_bundle(campaign["evidence_path"])
+    provenance = json.loads(campaign_bundle.file_data[fuzz.FUZZ_PROVENANCE_PATH])
+    assert provenance["engine"] == "libfuzzer" and provenance["crash_count"] >= 1
+    assert b"AddressSanitizer: heap-buffer-overflow" in campaign_bundle.file_data[
+        fuzz.FUZZ_LOG_PATH
+    ]
+    for version in ("vulnerable", "fixed"):
+        assert campaign_bundle.file_data[f"build/{version}/fuzzer"]
+        assert campaign_bundle.file_data[f"build/{version}/parser"]
+    round_row = database.connection.execute(
+        "SELECT job_id, state FROM jobs WHERE parent_job_id = %s AND round_no = 1",
+        (family_id,),
+    ).fetchone()
+    assert round_row is not None and round_row[1] == "READY"
+
+    second = _worker()
+    assert second["job_id"] == str(round_row[0])
+    round_job = state.load_job(database.dsn, round_row[0])
+    assert (round_job["state"], round_job["verdict_reason"]) == (
+        "REPRODUCED",
+        "ASAN_SIGNATURE_MATCHED",
+    ), round_job
+    validation = evidence.verify_bundle(round_job["evidence_path"])
+    assert validation.manifest["reuse_origin"]["source_job_id"] == str(campaign_id)
+    for version in ("vulnerable", "fixed"):
+        for output in ("parser", "fuzzer"):
+            path = f"build/{version}/{output}"
+            assert validation.file_data[path] == campaign_bundle.file_data[path]
+
+    _worker()
+    family = state.load_job(database.dsn, family_id)
+    assert family["state"] == "COMPLETED", family

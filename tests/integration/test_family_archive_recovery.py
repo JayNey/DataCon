@@ -1726,10 +1726,10 @@ def test_worker_scan_charges_before_family_is_sealed(
 # family decision at the campaign point (edges #20/#23/#24).
 # ---------------------------------------------------------------------------
 
-def _seed_ready_campaign(database, *, max_fuzz_seconds=60):
+def _seed_ready_campaign(database, *, max_fuzz_seconds=60, build_spec=None):
     """A guided family whose human-approved campaign child is READY to claim."""
     job, plan, plan_digest, review, envelope = guided_campaign_plan(
-        max_fuzz_seconds=max_fuzz_seconds
+        max_fuzz_seconds=max_fuzz_seconds, build_spec=build_spec
     )
     family_id = uuid4()
     campaign_id = uuid4()
